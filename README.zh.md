@@ -47,7 +47,7 @@ use ormer::DbType;
 #[tokio::main]
 async fn main() {
     // ...
-    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    let db = Database::connect(DbType::Turso, "data.db").await?;
     // ...
 }
 ```
