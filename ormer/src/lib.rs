@@ -3,7 +3,10 @@ pub mod model;
 pub mod query;
 
 pub use model::{Error, FromValue, Model, Row, Value, generate_create_table_sql};
-pub use query::builder::{AgeColumn, NumericColumn, Select, WhereColumn, WhereExpr};
+pub use query::builder::{
+    AgeColumn, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, NumericColumn, RelatedSelect,
+    RightJoinedSelect, Select, WhereColumn, WhereExpr,
+};
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};
 
 // 重新导出 derive 宏
@@ -17,7 +20,10 @@ pub mod prelude {
 
 // 条件编译: 根据启用的 feature 导出 Database 和 DbType
 #[cfg(feature = "turso")]
-pub use abstract_layer::{Database, DbType};
+pub use abstract_layer::{Database, DbType, Transaction};
 
 #[cfg(all(feature = "postgresql", not(feature = "turso")))]
-pub use abstract_layer::DbType;
+pub use abstract_layer::{Database, DbType, Transaction};
+
+#[cfg(all(feature = "mysql", not(feature = "turso"), not(feature = "postgresql")))]
+pub use abstract_layer::{Database, DbType, Transaction};

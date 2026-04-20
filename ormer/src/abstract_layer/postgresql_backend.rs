@@ -1,5 +1,5 @@
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
-use crate::query::builder::{Select, WhereExpr};
+use crate::query::builder::{FourTableSelect, MultiTableSelect, RelatedSelect, Select, WhereExpr};
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -9,16 +9,31 @@ use tokio_postgres::NoTls;
 pub struct PostgreSQLTypeMapper;
 
 impl DbBackendTypeMapper for PostgreSQLTypeMapper {
-    fn sql_type(rust_type: &str, is_primary: bool, is_nullable: bool) -> String {
+    fn sql_type(
+        rust_type: &str,
+        is_primary: bool,
+        is_auto_increment: bool,
+        is_nullable: bool,
+    ) -> String {
         // 首先处理主键类型（主键自动 NOT NULL）
         if is_primary {
-            let serial_type = match rust_type {
-                "i8" | "i16" | "i32" => "SERIAL",
-                "i64" | "u16" | "u32" | "u64" => "BIGSERIAL",
-                "u8" => "SMALLSERIAL", // PostgreSQL 最小序列类型
-                _ => "SERIAL",         // 默认使用 SERIAL
-            };
-            return format!("{} PRIMARY KEY", serial_type);
+            if is_auto_increment {
+                let serial_type = match rust_type {
+                    "i8" | "i16" | "i32" => "SERIAL",
+                    "i64" | "u16" | "u32" | "u64" => "BIGSERIAL",
+                    "u8" => "SMALLSERIAL", // PostgreSQL 最小序列类型
+                    _ => "SERIAL",         // 默认使用 SERIAL
+                };
+                return format!("{serial_type} PRIMARY KEY");
+            } else {
+                let int_type = match rust_type {
+                    "i8" | "i16" | "u8" => "SMALLINT",
+                    "i32" | "u16" | "u32" => "INTEGER",
+                    "i64" | "u64" => "BIGINT",
+                    _ => "INTEGER",
+                };
+                return format!("{int_type} PRIMARY KEY");
+            }
         }
 
         // 基础类型映射
@@ -86,7 +101,7 @@ impl Database {
         // 在后台运行连接
         let connection_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("PostgreSQL connection error: {}", e);
+                eprintln!("PostgreSQL connection error: {e}");
             }
             Ok(())
         });
@@ -198,8 +213,8 @@ impl Database {
                 return Err(crate::Error::SchemaMismatch {
                     table: T::TABLE_NAME.to_string(),
                     reason: format!(
-                        "Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                        i, expected_col.name, actual_name
+                        "Column name mismatch at position {i}: expected '{}', but actual is '{actual_name}'",
+                        expected_col.name
                     ),
                 });
             }
@@ -235,8 +250,8 @@ impl Database {
                 return Err(crate::Error::SchemaMismatch {
                     table: T::TABLE_NAME.to_string(),
                     reason: format!(
-                        "Column type mismatch for '{}': expected '{}', but actual is '{}'",
-                        expected_col.name, expected_type, actual_type
+                        "Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
+                        expected_col.name
                     ),
                 });
             }
@@ -290,20 +305,41 @@ impl Database {
         normalize(actual) == normalize(expected)
     }
 
-    /// 插入记录
+    /// 插入单条记录
     pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+        self.insert_batch::<T>(&[model]).await
+    }
+
+    /// 批量插入记录
+    pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
         let columns = T::COLUMNS.join(", ");
-        let placeholders: Vec<String> = (1..=T::COLUMNS.len()).map(|i| format!("${}", i)).collect();
+        let col_count = T::COLUMNS.len();
 
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            T::TABLE_NAME,
-            columns,
-            placeholders.join(", ")
-        );
+        // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+        let mut param_idx = 1;
 
-        let values = model.field_values();
-        let params = values_to_params(&values)?;
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -341,6 +377,131 @@ impl Database {
             client: &self.client,
             _marker: PhantomData,
         }
+    }
+
+    /// 开始事务
+    pub async fn begin(&self) -> Result<Transaction, crate::Error> {
+        self.client
+            .execute("BEGIN", &[])
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        Ok(Transaction {
+            client: &self.client,
+            committed: false,
+            rolled_back: false,
+        })
+    }
+}
+
+/// PostgreSQL 事务对象
+pub struct Transaction<'a> {
+    client: &'a tokio_postgres::Client,
+    committed: bool,
+    rolled_back: bool,
+}
+
+impl<'a> Transaction<'a> {
+    /// 提交事务
+    pub async fn commit(mut self) -> Result<(), crate::Error> {
+        if self.committed || self.rolled_back {
+            return Err(crate::Error::Database(
+                "Transaction already committed or rolled back".to_string(),
+            ));
+        }
+        self.client
+            .execute("COMMIT", &[])
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        self.committed = true;
+        Ok(())
+    }
+
+    /// 回滚事务
+    pub async fn rollback(mut self) -> Result<(), crate::Error> {
+        if self.committed || self.rolled_back {
+            return Err(crate::Error::Database(
+                "Transaction already committed or rolled back".to_string(),
+            ));
+        }
+        self.client
+            .execute("ROLLBACK", &[])
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        self.rolled_back = true;
+        Ok(())
+    }
+
+    /// 创建 Select 查询执行器
+    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+        SelectExecutor {
+            select: Select::<T>::new(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建 Delete 执行器
+    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+        DeleteExecutor {
+            filters: Vec::new(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建 Update 执行器
+    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+        UpdateExecutor {
+            sets: Vec::new(),
+            filters: Vec::new(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 插入单条记录
+    pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+        self.insert_batch::<T>(&[model]).await
+    }
+
+    /// 批量插入记录
+    pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+        let mut param_idx = 1;
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        self.client
+            .execute(&sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -394,10 +555,64 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// 添加 JOIN 查询
+    pub fn join<J: Model>(
+        self,
+        join_type: crate::JoinType,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> Self {
+        Self {
+            select: self.select.join::<J>(join_type, f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 执行查询并收集结果
     pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<'a, T, C> {
         CollectFuture {
             executor: self,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
+    /// select::<User>().from::<User, Role>()
+    pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
+    where
+        T2: 'static,
+    {
+        RelatedSelectExecutor {
+            select: self.select.from::<T2, R>(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加关联表查询（支持3个表）
+    /// select::<User>().from3::<User, Role, Permission>()
+    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
+    where
+        T2: 'static,
+    {
+        MultiTableSelectExecutor {
+            select: self.select.from3::<T2, R1, R2>(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加关联表查询（支持4个表）
+    /// select::<User>().from4::<User, Role, Permission, Department>()
+    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(
+        self,
+    ) -> FourTableSelectExecutor<'a, T, R1, R2, R3>
+    where
+        T2: 'static,
+    {
+        FourTableSelectExecutor {
+            select: self.select.from4::<T2, R1, R2, R3>(),
+            client: self.client,
             _marker: PhantomData,
         }
     }
@@ -483,8 +698,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                         }
                         _ => {
                             return Err(crate::Error::Database(format!(
-                                "Unsupported nullable column type: {}",
-                                rust_type
+                                "Unsupported nullable column type: {rust_type}"
                             )));
                         }
                     }
@@ -513,8 +727,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                         }
                         _ => {
                             return Err(crate::Error::Database(format!(
-                                "Unsupported column type: {}",
-                                rust_type
+                                "Unsupported column type: {rust_type}"
                             )));
                         }
                     }
@@ -653,7 +866,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{} = ${}", col_name, params.len() + 1));
+            sql.push_str(&format!("{col_name} = ${}", params.len() + 1));
             params.push(value.clone());
             first = false;
         }
@@ -736,7 +949,7 @@ fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
             value: _,
         } => {
             use std::fmt::Write;
-            write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+            write!(sql, "{column} {operator} ${param_idx}").unwrap();
             *param_idx += 1;
         }
         FilterExpr::And(left, right) => {
@@ -766,7 +979,7 @@ fn format_filter_with_params(
             value,
         } => {
             use std::fmt::Write;
-            write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+            write!(sql, "{column} {operator} ${param_idx}").unwrap();
             params.push(value.clone().into());
             *param_idx += 1;
         }
@@ -780,5 +993,479 @@ fn format_filter_with_params(
             sql.push_str(" OR ");
             format_filter_with_params(right, sql, param_idx, params);
         }
+    }
+}
+
+/// Related 查询执行器（支持2表关联查询）
+pub struct RelatedSelectExecutor<'a, T: Model, R: Model> {
+    select: RelatedSelect<T, R>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, R)>,
+}
+
+impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn exec(self) -> RelatedCollectFuture<'a, T, R>
+    where
+        T: 'static,
+        R: 'static,
+    {
+        RelatedCollectFuture { executor: self }
+    }
+
+    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+        let pg_sql = convert_sql_to_pg(&sql);
+        let pg_params = values_to_params(&params)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = self
+            .client
+            .query(&pg_sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let column_info = &T::COLUMN_SCHEMA[i];
+                let rust_type = column_info.rust_type;
+                let is_nullable = column_info.is_nullable;
+
+                let ormer_value = if is_nullable {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "String" => {
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "f32" | "f64" => {
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "bool" => {
+                            let v: Option<bool> = row.get(i);
+                            match v {
+                                Some(true) => crate::model::Value::Integer(1),
+                                Some(false) => crate::model::Value::Integer(0),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported nullable column type: {rust_type}"
+                            )));
+                        }
+                    }
+                } else {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: i64 = row.get(i);
+                            crate::model::Value::Integer(v)
+                        }
+                        "String" => {
+                            let v: String = row.get(i);
+                            crate::model::Value::Text(v)
+                        }
+                        "f32" | "f64" => {
+                            let v: f64 = row.get(i);
+                            crate::model::Value::Real(v)
+                        }
+                        "bool" => {
+                            let v: bool = row.get(i);
+                            if v {
+                                crate::model::Value::Integer(1)
+                            } else {
+                                crate::model::Value::Integer(0)
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported column type: {rust_type}"
+                            )));
+                        }
+                    }
+                };
+                data.insert(col_name.to_string(), ormer_value);
+            }
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+        Ok(results)
+    }
+}
+
+pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
+    executor: RelatedSelectExecutor<'a, T, R>,
+}
+
+impl<'a, T: Model + 'static, R: Model + 'static> std::future::IntoFuture
+    for RelatedCollectFuture<'a, T, R>
+{
+    type Output = Result<Vec<T>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+/// MultiTable 查询执行器（支持3表关联查询）
+pub struct MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
+    select: MultiTableSelect<T, R1, R2>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, R1, R2)>,
+}
+
+impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R1::Where, R2::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn exec(self) -> MultiTableCollectFuture<'a, T, R1, R2>
+    where
+        T: 'static,
+        R1: 'static,
+        R2: 'static,
+    {
+        MultiTableCollectFuture { executor: self }
+    }
+
+    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+        let pg_sql = convert_sql_to_pg(&sql);
+        let pg_params = values_to_params(&params)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = self
+            .client
+            .query(&pg_sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let column_info = &T::COLUMN_SCHEMA[i];
+                let rust_type = column_info.rust_type;
+                let is_nullable = column_info.is_nullable;
+
+                let ormer_value = if is_nullable {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "String" => {
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "f32" | "f64" => {
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "bool" => {
+                            let v: Option<bool> = row.get(i);
+                            match v {
+                                Some(true) => crate::model::Value::Integer(1),
+                                Some(false) => crate::model::Value::Integer(0),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported nullable column type: {rust_type}"
+                            )));
+                        }
+                    }
+                } else {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: i64 = row.get(i);
+                            crate::model::Value::Integer(v)
+                        }
+                        "String" => {
+                            let v: String = row.get(i);
+                            crate::model::Value::Text(v)
+                        }
+                        "f32" | "f64" => {
+                            let v: f64 = row.get(i);
+                            crate::model::Value::Real(v)
+                        }
+                        "bool" => {
+                            let v: bool = row.get(i);
+                            if v {
+                                crate::model::Value::Integer(1)
+                            } else {
+                                crate::model::Value::Integer(0)
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported column type: {rust_type}"
+                            )));
+                        }
+                    }
+                };
+                data.insert(col_name.to_string(), ormer_value);
+            }
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+        Ok(results)
+    }
+}
+
+pub struct MultiTableCollectFuture<'a, T: Model, R1: Model, R2: Model> {
+    executor: MultiTableSelectExecutor<'a, T, R1, R2>,
+}
+
+impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static> std::future::IntoFuture
+    for MultiTableCollectFuture<'a, T, R1, R2>
+{
+    type Output = Result<Vec<T>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+/// FourTable 查询执行器（支持4表关联查询）
+pub struct FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> {
+    select: FourTableSelect<T, R1, R2, R3>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, R1, R2, R3)>,
+}
+
+impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, T, R1, R2, R3> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn exec(self) -> FourTableCollectFuture<'a, T, R1, R2, R3>
+    where
+        T: 'static,
+        R1: 'static,
+        R2: 'static,
+        R3: 'static,
+    {
+        FourTableCollectFuture { executor: self }
+    }
+
+    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+        let pg_sql = convert_sql_to_pg(&sql);
+        let pg_params = values_to_params(&params)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let rows = self
+            .client
+            .query(&pg_sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let column_info = &T::COLUMN_SCHEMA[i];
+                let rust_type = column_info.rust_type;
+                let is_nullable = column_info.is_nullable;
+
+                let ormer_value = if is_nullable {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "String" => {
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "f32" | "f64" => {
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "bool" => {
+                            let v: Option<bool> = row.get(i);
+                            match v {
+                                Some(true) => crate::model::Value::Integer(1),
+                                Some(false) => crate::model::Value::Integer(0),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported nullable column type: {rust_type}"
+                            )));
+                        }
+                    }
+                } else {
+                    match rust_type {
+                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                            let v: i64 = row.get(i);
+                            crate::model::Value::Integer(v)
+                        }
+                        "String" => {
+                            let v: String = row.get(i);
+                            crate::model::Value::Text(v)
+                        }
+                        "f32" | "f64" => {
+                            let v: f64 = row.get(i);
+                            crate::model::Value::Real(v)
+                        }
+                        "bool" => {
+                            let v: bool = row.get(i);
+                            if v {
+                                crate::model::Value::Integer(1)
+                            } else {
+                                crate::model::Value::Integer(0)
+                            }
+                        }
+                        _ => {
+                            return Err(crate::Error::Database(format!(
+                                "Unsupported column type: {rust_type}"
+                            )));
+                        }
+                    }
+                };
+                data.insert(col_name.to_string(), ormer_value);
+            }
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+        Ok(results)
+    }
+}
+
+pub struct FourTableCollectFuture<'a, T: Model, R1: Model, R2: Model, R3: Model> {
+    executor: FourTableSelectExecutor<'a, T, R1, R2, R3>,
+}
+
+impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model + 'static>
+    std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
+{
+    type Output = Result<Vec<T>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
     }
 }

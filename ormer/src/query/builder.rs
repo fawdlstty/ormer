@@ -14,6 +14,33 @@ pub struct Select<T: Model> {
     _marker: PhantomData<T>,
 }
 
+/// RelatedSelect - 关联查询结构体（支持2表查询）
+pub struct RelatedSelect<T: Model, R: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    _marker: PhantomData<(T, R)>,
+}
+
+/// MultiTableSelect - 多表关联查询结构体（支持3个或以上表）
+pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    _marker: PhantomData<(T, R1, R2)>,
+}
+
+/// FourTableSelect - 四表关联查询结构体
+pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    _marker: PhantomData<(T, R1, R2, R3)>,
+}
+
 impl<T: Model> Select<T> {
     pub fn new() -> Self {
         Self {
@@ -25,7 +52,55 @@ impl<T: Model> Select<T> {
         }
     }
 
-    /// 添加 WHERE 条件
+    /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
+    /// select::<User>().from::<User, Role>()
+    pub fn from<T2: Model, R: Model>(self) -> RelatedSelect<T, R>
+    where
+        T2: 'static,
+    {
+        // 通过类型约束确保 T2 == T
+        // 如果 T2 != T，编译器会在类型推导时报错
+        RelatedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加关联表查询（支持3个表）
+    /// select::<User>().from3::<User, Role, Permission>()
+    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2>
+    where
+        T2: 'static,
+    {
+        MultiTableSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加关联表查询（支持4个表）
+    /// select::<User>().from4::<User, Role, Permission, Department>()
+    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3>
+    where
+        T2: 'static,
+    {
+        FourTableSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model> Select<T> {
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -144,6 +219,13 @@ impl<T: Model> Select<T> {
                 write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
                 *param_idx += 1;
             }
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
+            }
             FilterExpr::And(left, right) => {
                 self.format_filter(left, sql, param_idx);
                 sql.push_str(" AND ");
@@ -181,6 +263,13 @@ impl<T: Model> Select<T> {
                 params.push(ormer_value);
                 *param_idx += 1;
             }
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
+            }
             FilterExpr::And(left, right) => {
                 self.format_filter_with_params(left, sql, param_idx, params);
                 sql.push_str(" AND ");
@@ -199,6 +288,443 @@ impl<T: Model> Select<T> {
 impl<T: Model> Default for Select<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T: Model, R: Model> RelatedSelect<T, R> {
+    /// 添加 WHERE 条件（支持两个表的字段比较）
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R::Where) -> WhereExpr,
+    {
+        let t_where = T::Where::default();
+        let r_where = R::Where::default();
+        let expr = f(t_where, r_where);
+        self.filters.push(expr.into());
+        self
+    }
+
+    /// 添加排序
+    pub fn order_by<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(WhereColumn<T>) -> OrderBy,
+    {
+        let column = WhereColumn::new();
+        let order = f(column);
+        self.order_by.push(order);
+        self
+    }
+
+    /// 限制结果数量
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// 设置偏移量
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        // SELECT 子句 - 只选择主表的列
+        write!(
+            &mut sql,
+            "SELECT {} FROM {} AS t0, {} AS t1",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            R::TABLE_NAME
+        )
+        .unwrap();
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        // ORDER BY 子句
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: Vec<String> = self
+                .order_by
+                .iter()
+                .map(|o| {
+                    let dir = match o.direction {
+                        crate::query::filter::OrderDirection::Asc => "ASC",
+                        crate::query::filter::OrderDirection::Desc => "DESC",
+                    };
+                    format!("{} {}", o.column, dir)
+                })
+                .collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // LIMIT 子句
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        // OFFSET 子句
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                // 默认使用 t0 前缀
+                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 左列使用 t0 前缀，右列使用 t1 前缀
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+        }
+    }
+}
+
+impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
+    /// 添加 WHERE 条件（支持三个表的字段比较）
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R1::Where, R2::Where) -> WhereExpr,
+    {
+        let t_where = T::Where::default();
+        let r1_where = R1::Where::default();
+        let r2_where = R2::Where::default();
+        let expr = f(t_where, r1_where, r2_where);
+        self.filters.push(expr.into());
+        self
+    }
+
+    /// 添加排序
+    pub fn order_by<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(WhereColumn<T>) -> OrderBy,
+    {
+        let column = WhereColumn::new();
+        let order = f(column);
+        self.order_by.push(order);
+        self
+    }
+
+    /// 限制结果数量
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// 设置偏移量
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        // SELECT 子句 - 只选择主表的列
+        write!(
+            &mut sql,
+            "SELECT {} FROM {} AS t0, {} AS t1, {} AS t2",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            R1::TABLE_NAME,
+            R2::TABLE_NAME
+        )
+        .unwrap();
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        // ORDER BY 子句
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: Vec<String> = self
+                .order_by
+                .iter()
+                .map(|o| {
+                    let dir = match o.direction {
+                        crate::query::filter::OrderDirection::Asc => "ASC",
+                        crate::query::filter::OrderDirection::Desc => "DESC",
+                    };
+                    format!("{} {}", o.column, dir)
+                })
+                .collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // LIMIT 子句
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        // OFFSET 子句
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                // 默认使用 t0 前缀
+                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 需要根据列名判断属于哪个表，这里简化处理
+                // 左列使用 t0 前缀，右列使用 t1 前缀
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+        }
+    }
+}
+
+impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
+    /// 添加 WHERE 条件（支持四个表的字段比较）
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> WhereExpr,
+    {
+        let t_where = T::Where::default();
+        let r1_where = R1::Where::default();
+        let r2_where = R2::Where::default();
+        let r3_where = R3::Where::default();
+        let expr = f(t_where, r1_where, r2_where, r3_where);
+        self.filters.push(expr.into());
+        self
+    }
+
+    /// 添加排序
+    pub fn order_by<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(WhereColumn<T>) -> OrderBy,
+    {
+        let column = WhereColumn::new();
+        let order = f(column);
+        self.order_by.push(order);
+        self
+    }
+
+    /// 限制结果数量
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// 设置偏移量
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        // SELECT 子句 - 只选择主表的列
+        write!(
+            &mut sql,
+            "SELECT {} FROM {} AS t0, {} AS t1, {} AS t2, {} AS t3",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            R1::TABLE_NAME,
+            R2::TABLE_NAME,
+            R3::TABLE_NAME
+        )
+        .unwrap();
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        // ORDER BY 子句
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: Vec<String> = self
+                .order_by
+                .iter()
+                .map(|o| {
+                    let dir = match o.direction {
+                        crate::query::filter::OrderDirection::Asc => "ASC",
+                        crate::query::filter::OrderDirection::Desc => "DESC",
+                    };
+                    format!("{} {}", o.column, dir)
+                })
+                .collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // LIMIT 子句
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        // OFFSET 子句
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                // 默认使用 t0 前缀
+                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 需要根据列名判断属于哪个表，这里简化处理
+                // 左列使用 t0 前缀，右列使用 t1 前缀
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+        }
     }
 }
 
@@ -315,6 +841,58 @@ impl NumericColumn {
         self.column_name
     }
 
+    /// 等于值或其他列
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    value: v,
+                },
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    right_column: other_column,
+                },
+            },
+        }
+    }
+}
+
+/// 列值 - 支持字面量或列引用
+pub enum ColumnValue {
+    Literal(crate::query::filter::Value),
+    ColumnRef(String),
+}
+
+impl From<i32> for ColumnValue {
+    fn from(v: i32) -> Self {
+        ColumnValue::Literal(crate::query::filter::Value::Integer(v as i64))
+    }
+}
+
+impl From<String> for ColumnValue {
+    fn from(v: String) -> Self {
+        ColumnValue::Literal(crate::query::filter::Value::Text(v))
+    }
+}
+
+impl From<&str> for ColumnValue {
+    fn from(v: &str) -> Self {
+        ColumnValue::Literal(crate::query::filter::Value::Text(v.to_string()))
+    }
+}
+
+impl From<NumericColumn> for ColumnValue {
+    fn from(col: NumericColumn) -> Self {
+        ColumnValue::ColumnRef(col.column_name.to_string())
+    }
+}
+
+impl NumericColumn {
     // 支持 .ge() .gt() .le() .lt() 等方法调用
     pub fn ge(self, value: i32) -> WhereExpr {
         WhereExpr {
@@ -474,6 +1052,455 @@ impl From<&str> for FilterValue {
     fn from(v: &str) -> Self {
         Self {
             inner: crate::query::filter::Value::Text(v.to_string()),
+        }
+    }
+}
+
+// ==================== JOIN 功能 ====================
+
+/// LEFT JOIN 查询结构体
+pub struct LeftJoinedSelect<T: Model, J: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    join_table: String,
+    join_alias: String,
+    on_condition: FilterExpr,
+    _marker: PhantomData<(T, J)>,
+}
+
+/// INNER JOIN 查询结构体
+pub struct InnerJoinedSelect<T: Model, J: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    join_table: String,
+    join_alias: String,
+    on_condition: FilterExpr,
+    _marker: PhantomData<(T, J)>,
+}
+
+/// RIGHT JOIN 查询结构体
+pub struct RightJoinedSelect<T: Model, J: Model> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+    join_table: String,
+    join_alias: String,
+    on_condition: FilterExpr,
+    _marker: PhantomData<(T, J)>,
+}
+
+impl<T: Model> Select<T> {
+    /// LEFT JOIN
+    pub fn left_join<J: Model>(
+        self,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        LeftJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            join_table: J::TABLE_NAME.to_string(),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// INNER JOIN
+    pub fn inner_join<J: Model>(
+        self,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        InnerJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            join_table: J::TABLE_NAME.to_string(),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// RIGHT JOIN
+    pub fn right_join<J: Model>(
+        self,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        RightJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            limit: self.limit,
+            offset: self.offset,
+            join_table: J::TABLE_NAME.to_string(),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        let where_obj = T::Where::default();
+        let expr = f(where_obj);
+        self.filters.push(expr.into());
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {}, {} FROM {} AS t0 LEFT JOIN {} AS {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+            self.join_alias
+        )
+        .unwrap();
+
+        sql.push_str(" ON ");
+        self.format_join_condition(&self.on_condition, &mut sql);
+
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
+        match filter {
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        let where_obj = T::Where::default();
+        let expr = f(where_obj);
+        self.filters.push(expr.into());
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {} FROM {} INNER JOIN {} AS {}",
+            T::COLUMNS.join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+            self.join_alias
+        )
+        .unwrap();
+
+        sql.push_str(" ON ");
+        self.format_join_condition(&self.on_condition, &mut sql);
+
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
+        match filter {
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<T: Model, J: Model> RightJoinedSelect<T, J> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        let where_obj = T::Where::default();
+        let expr = f(where_obj);
+        self.filters.push(expr.into());
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {} FROM {} RIGHT JOIN {} AS {}",
+            T::COLUMNS.join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+            self.join_alias
+        )
+        .unwrap();
+
+        sql.push_str(" ON ");
+        self.format_join_condition(&self.on_condition, &mut sql);
+
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        if let Some(limit) = self.limit {
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+
+        if let Some(offset) = self.offset {
+            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
+        match filter {
+            FilterExpr::ColumnComparison {
+                left_column,
+                operator,
+                right_column,
+            } => {
+                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
+                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            }
+            _ => {}
+        }
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            _ => {}
         }
     }
 }

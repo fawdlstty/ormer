@@ -27,12 +27,19 @@ pub enum DbType {
 
 impl DbType {
     /// 根据 Rust 类型和数据库类型获取 SQL 类型
-    pub fn sql_type(&self, rust_type: &str, is_primary: bool, is_nullable: bool) -> String {
+    pub fn sql_type(
+        &self,
+        rust_type: &str,
+        is_primary: bool,
+        is_auto_increment: bool,
+        is_nullable: bool,
+    ) -> String {
         match self {
             #[cfg(feature = "turso")]
             DbType::Turso => crate::abstract_layer::turso_backend::TursoTypeMapper::sql_type(
                 rust_type,
                 is_primary,
+                is_auto_increment,
                 is_nullable,
             ),
             #[cfg(feature = "postgresql")]
@@ -40,6 +47,7 @@ impl DbType {
                 crate::abstract_layer::postgresql_backend::PostgreSQLTypeMapper::sql_type(
                     rust_type,
                     is_primary,
+                    is_auto_increment,
                     is_nullable,
                 )
             }
@@ -47,6 +55,7 @@ impl DbType {
             DbType::MySQL => crate::abstract_layer::mysql_backend::MySQLTypeMapper::sql_type(
                 rust_type,
                 is_primary,
+                is_auto_increment,
                 is_nullable,
             ),
         }
@@ -55,4 +64,7 @@ impl DbType {
 
 // 统一使用 unified 模块提供接口，无论启用哪些 feature
 mod unified;
-pub use unified::{CollectFuture, Database, DeleteExecutor, SelectExecutor, UpdateExecutor};
+pub use unified::{
+    CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
+    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, Transaction, UpdateExecutor,
+};

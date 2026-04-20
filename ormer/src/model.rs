@@ -6,13 +6,21 @@ pub struct ColumnSchema {
     pub name: &'static str,
     pub rust_type: &'static str,
     pub is_primary: bool,
+    pub is_auto_increment: bool,
     pub is_nullable: bool,
+    pub unique_group: Option<i32>, // None表示不唯一，Some(group_id)表示属于哪个唯一键组
+    pub is_indexed: bool,
 }
 
 /// 数据库后端 trait - 用于 SQL 类型映射
 pub trait DbBackendTypeMapper {
     /// 根据 Rust 类型获取 SQL 类型
-    fn sql_type(rust_type: &str, is_primary: bool, is_nullable: bool) -> String;
+    fn sql_type(
+        rust_type: &str,
+        is_primary: bool,
+        is_auto_increment: bool,
+        is_nullable: bool,
+    ) -> String;
 }
 
 /// 模型 trait,所有 ORM 模型必须实现
@@ -47,13 +55,94 @@ pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbTyp
             sql.push_str(", ");
         }
 
-        let sql_type = db_type.sql_type(column.rust_type, column.is_primary, column.is_nullable);
+        let sql_type = db_type.sql_type(
+            column.rust_type,
+            column.is_primary,
+            column.is_auto_increment,
+            column.is_nullable,
+        );
 
-        sql.push_str(&format!("{} {}", column.name, sql_type));
+        sql.push_str(&format!("{} {sql_type}", column.name));
+
+        // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
+        if column.unique_group.is_some() {
+            // 检查这个 group 中是否有多个字段
+            let group_count = T::COLUMN_SCHEMA
+                .iter()
+                .filter(|c| c.unique_group == column.unique_group)
+                .count();
+
+            if group_count == 1 {
+                // 单列唯一约束
+                sql.push_str(" UNIQUE");
+            }
+        }
+    }
+
+    // 添加联合 UNIQUE 约束
+    let unique_constraints = generate_unique_constraints::<T>();
+    if !unique_constraints.is_empty() {
+        sql.push_str(", ");
+        sql.push_str(&unique_constraints.join(", "));
     }
 
     sql.push(')');
+
+    // 添加索引
+    let index_sql = generate_indexes::<T>(db_type);
+    if !index_sql.is_empty() {
+        sql.push_str(";");
+        sql.push_str(&index_sql);
+    }
+
     sql
+}
+
+/// 生成 UNIQUE 约束
+fn generate_unique_constraints<T: Model>() -> Vec<String> {
+    let mut constraints = Vec::new();
+
+    // 收集所有 unique_group
+    let mut group_map: std::collections::BTreeMap<i32, Vec<&str>> =
+        std::collections::BTreeMap::new();
+
+    for column in T::COLUMN_SCHEMA.iter() {
+        if let Some(group_id) = column.unique_group {
+            group_map.entry(group_id).or_default().push(column.name);
+        }
+    }
+
+    // 生成约束
+    for (_group_id, columns) in group_map {
+        if columns.len() == 1 {
+            // 单列唯一约束已经在列定义中处理
+        } else {
+            // 联合唯一约束
+            let cols = columns.join(", ");
+            constraints.push(format!("UNIQUE ({cols})"));
+        }
+    }
+
+    constraints
+}
+
+/// 生成索引 SQL
+fn generate_indexes<T: Model>(_db_type: crate::abstract_layer::DbType) -> String {
+    let mut sqls = Vec::new();
+
+    for column in T::COLUMN_SCHEMA.iter() {
+        if column.is_indexed {
+            let index_name = format!("idx_{}_{}", T::TABLE_NAME, column.name);
+            sqls.push(format!(
+                "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                index_name,
+                T::TABLE_NAME,
+                column.name
+            ));
+        }
+    }
+
+    sqls.join(";")
 }
 
 /// 数据库行抽象

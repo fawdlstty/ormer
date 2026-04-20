@@ -1,10 +1,10 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, Lit, Meta};
+use syn::{DeriveInput, Expr, ExprLit, Lit, Meta};
 
 pub fn derive_model(input: DeriveInput) -> TokenStream {
     let name = &input.ident;
-    let where_name = syn::Ident::new(&format!("{}Where", name), name.span());
+    let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
 
     // 提取表名
     let table_name = extract_table_name(&input);
@@ -18,18 +18,28 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         _ => panic!("Model must be a struct"),
     };
 
-    // 提取主键字段
-    let primary_key_field = fields
+    // 提取主键字段及自增信息
+    let primary_key_info = fields
         .iter()
         .find_map(|f| {
             for attr in &f.attrs {
                 if attr.path().is_ident("primary") {
-                    return Some(f.ident.as_ref().unwrap().clone());
+                    let field_name = f.ident.as_ref().unwrap().clone();
+                    // 检查是否有 (auto) 参数
+                    let is_auto = if let Meta::List(list) = &attr.meta {
+                        list.tokens.to_string().contains("auto")
+                    } else {
+                        false
+                    };
+                    return Some((field_name, is_auto));
                 }
             }
             None
         })
         .expect("Model must have a #[primary] field");
+
+    let primary_key_field = primary_key_info.0;
+    let is_auto_increment = primary_key_info.1;
 
     // 生成字段名列表
     let field_names: Vec<String> = fields
@@ -64,12 +74,21 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             type_str
         };
 
+        // 检查 unique 属性
+        let unique_group = extract_unique_group(f);
+
+        // 检查 index 属性
+        let is_indexed = f.attrs.iter().any(|attr| attr.path().is_ident("index"));
+
         quote! {
             ::ormer::model::ColumnSchema {
                 name: stringify!(#field_name),
                 rust_type: #rust_type,
                 is_primary: #is_primary,
+                is_auto_increment: #is_auto_increment,
                 is_nullable: #is_nullable,
+                unique_group: #unique_group,
+                is_indexed: #is_indexed,
             }
         }
     });
@@ -91,34 +110,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 Where 结构体的字段
-    // 根据字段类型生成不同的列代理
-    let where_fields = fields.iter().filter_map(|f| {
+    // 为所有字段生成列代理
+    let where_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_type = &f.ty;
-        let type_str = quote! { #field_type }.to_string();
-
-        // 为数值类型生成 NumericColumn
-        if is_numeric_type(&type_str) {
-            Some(quote! {
-                pub #field_name: ::ormer::query::builder::NumericColumn
-            })
-        } else {
-            None
+        quote! {
+            pub #field_name: ::ormer::query::builder::NumericColumn
         }
     });
 
     // 生成 Where 的 Default 实现
-    let where_default_fields = fields.iter().filter_map(|f| {
+    let where_default_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_type = &f.ty;
-        let type_str = quote! { #field_type }.to_string();
-
-        if is_numeric_type(&type_str) {
-            Some(quote! {
-                #field_name: ::ormer::query::builder::NumericColumn::new(stringify!(#field_name))
-            })
-        } else {
-            None
+        quote! {
+            #field_name: ::ormer::query::builder::NumericColumn::new(stringify!(#field_name))
         }
     });
 
@@ -219,9 +223,32 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
-fn is_numeric_type(type_str: &str) -> bool {
-    matches!(
-        type_str,
-        "i32" | "i64" | "f32" | "f64" | "u32" | "u64" | "i8" | "i16" | "u8" | "u16" | "bool"
-    )
+/// 提取 unique 属性的 group 值
+fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if attr.path().is_ident("unique") {
+            // 检查是否有 group 参数
+            if let Meta::List(list) = &attr.meta {
+                // 解析 tokens 查找 group = N
+                let tokens_str = list.tokens.to_string();
+                if tokens_str.contains("group") {
+                    // 尝试提取 group 值
+                    if let Ok(Meta::NameValue(meta)) = syn::parse2(list.tokens.clone()) {
+                        if let Expr::Lit(ExprLit {
+                            lit: Lit::Int(lit_int),
+                            ..
+                        }) = &meta.value
+                        {
+                            let group_value: i32 = lit_int.base10_parse().unwrap_or(0);
+                            return quote! { Some(#group_value) };
+                        }
+                    }
+                }
+            }
+            // 没有 group 参数，使用 0 作为默认组
+            return quote! { Some(0) };
+        }
+    }
+    // 没有 unique 属性
+    quote! { None }
 }
