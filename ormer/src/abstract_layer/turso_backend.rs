@@ -1269,11 +1269,11 @@ impl<T: Model> DeleteExecutor<T> {
 
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> Result<u64, crate::Error> {
-        let sql = self.build_sql();
+        let (sql, params) = self.build_sql();
 
         let result = self
             .conn
-            .execute(&sql, ())
+            .execute(&sql, params)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1285,8 +1285,9 @@ impl<T: Model> DeleteExecutor<T> {
         self.execute().await
     }
 
-    fn build_sql(&self) -> String {
+    fn build_sql(&self) -> (String, Vec<turso::Value>) {
         let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut ormer_params = Vec::new();
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
@@ -1295,11 +1296,17 @@ impl<T: Model> DeleteExecutor<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                format_filter(filter, &mut sql, &mut param_idx);
+                format_filter_with_params_for_delete(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut ormer_params,
+                );
             }
         }
 
-        sql
+        let turso_params = values_to_params(&ormer_params).unwrap_or_default();
+        (sql, turso_params)
     }
 }
 
@@ -1373,7 +1380,7 @@ impl<T: Model> UpdateExecutor<T> {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = ?{}", ormer_params.len() + 1));
+            sql.push_str(&format!("{col_name} = ?"));
             ormer_params.push(value.clone());
             first = false;
         }
@@ -1444,7 +1451,7 @@ fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
             value: _,
         } => {
             use std::fmt::Write;
-            write!(sql, "{column} {operator} ${param_idx}").unwrap();
+            write!(sql, "{column} {operator} ?").unwrap();
             *param_idx += 1;
         }
         FilterExpr::ColumnComparison {
@@ -1482,7 +1489,7 @@ fn format_filter_with_params(
             value,
         } => {
             use std::fmt::Write;
-            write!(sql, "{column} {operator} ${param_idx}").unwrap();
+            write!(sql, "{column} {operator} ?").unwrap();
             // 将 filter::Value 转换为 ormer::Value
             let ormer_value = match value {
                 crate::query::filter::Value::Integer(v) => Value::Integer(*v),
@@ -1510,6 +1517,51 @@ fn format_filter_with_params(
             format_filter_with_params(left, sql, param_idx, params);
             sql.push_str(" OR ");
             format_filter_with_params(right, sql, param_idx, params);
+        }
+    }
+}
+
+/// 格式化过滤器并收集参数 (用于 DELETE)
+fn format_filter_with_params_for_delete(
+    filter: &FilterExpr,
+    sql: &mut String,
+    param_idx: &mut usize,
+    params: &mut Vec<Value>,
+) {
+    match filter {
+        FilterExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => {
+            use std::fmt::Write;
+            write!(sql, "{column} {operator} ?").unwrap();
+            let ormer_value = match value {
+                crate::query::filter::Value::Integer(v) => Value::Integer(*v),
+                crate::query::filter::Value::Text(v) => Value::Text(v.clone()),
+                crate::query::filter::Value::Real(v) => Value::Real(*v),
+                crate::query::filter::Value::Null => Value::Null,
+            };
+            params.push(ormer_value);
+            *param_idx += 1;
+        }
+        FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } => {
+            use std::fmt::Write;
+            write!(sql, "{left_column} {operator} {right_column}").unwrap();
+        }
+        FilterExpr::And(left, right) => {
+            format_filter_with_params_for_delete(left, sql, param_idx, params);
+            sql.push_str(" AND ");
+            format_filter_with_params_for_delete(right, sql, param_idx, params);
+        }
+        FilterExpr::Or(left, right) => {
+            format_filter_with_params_for_delete(left, sql, param_idx, params);
+            sql.push_str(" OR ");
+            format_filter_with_params_for_delete(right, sql, param_idx, params);
         }
     }
 }

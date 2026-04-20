@@ -25,7 +25,7 @@ async fn test_transaction_commit() {
         .expect("Failed to create table");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin transaction");
+    let mut txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中插入数据
     let user1 = TestUser {
@@ -74,7 +74,7 @@ async fn test_transaction_rollback() {
         .expect("Failed to insert initial user");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin transaction");
+    let mut txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中插入数据
     let user1 = TestUser {
@@ -117,7 +117,7 @@ async fn test_transaction_with_query() {
         .expect("Failed to create table");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin transaction");
+    let mut txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中插入数据
     let user = TestUser {
@@ -173,7 +173,7 @@ async fn test_transaction_with_update() {
     db.insert(&user).await.expect("Failed to insert user");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin transaction");
+    let mut txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中更新数据
     use ormer::WhereColumn;
@@ -227,7 +227,7 @@ async fn test_transaction_with_delete() {
     db.insert(&user2).await.expect("Failed to insert user2");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin transaction");
+    let mut txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中删除数据
     txn.delete::<TestUser>()

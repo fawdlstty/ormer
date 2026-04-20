@@ -591,14 +591,14 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         match self {
             #[cfg(feature = "turso")]
             RelatedSelectExecutor::Turso(exec, _) => {
-                RelatedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                RelatedCollectFuture::Turso(exec.exec(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             RelatedSelectExecutor::PostgreSQL(exec) => {
-                RelatedCollectFuture::PostgreSQL(exec.collect::<C>())
+                RelatedCollectFuture::PostgreSQL(exec.exec())
             }
             #[cfg(feature = "mysql")]
-            RelatedSelectExecutor::MySQL(exec) => RelatedCollectFuture::MySQL(exec.collect::<C>()),
+            RelatedSelectExecutor::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
         }
     }
 
@@ -658,7 +658,7 @@ pub enum Transaction<'a> {
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::Transaction<'a>),
     #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::Transaction),
+    MySQL(mysql_backend::Transaction<'a>),
 }
 
 impl<'a> Transaction<'a> {
@@ -729,7 +729,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 插入记录
-    pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+    pub async fn insert<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
         match self {
             #[cfg(feature = "turso")]
             Transaction::Turso(txn, _) => txn.insert::<T>(model).await,

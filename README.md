@@ -46,59 +46,47 @@ use ormer::DbType;
 
 #[tokio::main]
 async fn main() {
-    let db = Database::connect(DbType::Turso, ":memory:")
-        .await
-        .expect("Failed to connect");
+    // ...
+    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    // ...
 }
 ```
 
 #### 3. Create Table
 
 ```rust
-db.create_table::<User>().await.expect("Failed to create table");
+db.create_table::<User>().await?;
 ```
 
 #### 4. Insert Data
 
 ```rust
-let user = User {
-    id: 0, // Will be auto-generated
+db.insert(&User {
+    id: 0, // 将自动生成
     name: "Alice".to_string(),
     age: 25,
     email: Some("alice@example.com".to_string()),
-};
-
-db.insert(&user).await.expect("Failed to insert");
+}).await?;
 ```
 
 #### 5. Query Data
 
 ```rust
-let users: Vec<User> = db
-    .select::<User>()
-    .collect::<Vec<User>>()
-    .await
-    .expect("Failed to query");
-
-for user in users {
-    println!("User: {:?}", user);
-}
+let users = db.select::<User>().collect::<Vec<User>>().await?;
+println!("用户: {users:?}");
 ```
 
 #### 6. Transaction
 
 ```rust
-let txn = db.begin().await.expect("Failed to begin transaction");
-
-let user = User {
+let txn = db.begin().await?;
+txn.insert(&User {
     id: 0,
     name: "Bob".to_string(),
     age: 30,
     email: None,
-};
-
-txn.insert(&user).await.expect("Failed to insert");
-txn.commit().await.expect("Failed to commit");
+}).await?;
+txn.commit().await?;
 ```
 
 ### Features

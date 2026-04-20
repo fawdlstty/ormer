@@ -49,8 +49,8 @@ mod create_table_tests {
     fn test_postgresql_create_table_sql() {
         let sql = generate_create_table_sql::<TestUser>(DbType::PostgreSQL);
 
-        // PostgreSQL 应该使用 SERIAL PRIMARY KEY
-        assert!(sql.contains("id SERIAL PRIMARY KEY"));
+        // PostgreSQL 没有 auto_increment，主键使用 INTEGER PRIMARY KEY
+        assert!(sql.contains("id INTEGER PRIMARY KEY"));
         assert!(sql.contains("name VARCHAR NOT NULL"));
         assert!(sql.contains("age INTEGER NOT NULL"));
         assert!(sql.contains("email VARCHAR")); // Option 类型，不加 NOT NULL
@@ -63,8 +63,8 @@ mod create_table_tests {
     fn test_mysql_create_table_sql() {
         let sql = generate_create_table_sql::<TestUser>(DbType::MySQL);
 
-        // MySQL 应该使用 INT PRIMARY KEY AUTO_INCREMENT
-        assert!(sql.contains("id INT PRIMARY KEY AUTO_INCREMENT"));
+        // MySQL 没有 auto_increment 标记，主键使用 INT PRIMARY KEY
+        assert!(sql.contains("id INT PRIMARY KEY"));
         assert!(sql.contains("name VARCHAR(255) NOT NULL"));
         assert!(sql.contains("age INT NOT NULL"));
         assert!(sql.contains("email VARCHAR(255)")); // Option 类型，不加 NOT NULL
@@ -90,8 +90,8 @@ mod create_table_tests {
     fn test_postgresql_complete_types() {
         let sql = generate_create_table_sql::<TestCompleteTypes>(DbType::PostgreSQL);
 
-        // 验证 PostgreSQL 完整类型映射
-        assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
+        // 验证 PostgreSQL 完整类型映射（没有 auto_increment）
+        assert!(sql.contains("id BIGINT PRIMARY KEY"));
         assert!(sql.contains("text_val VARCHAR NOT NULL"));
         assert!(sql.contains("optional_text VARCHAR")); // 不加 NOT NULL
         assert!(sql.contains("optional_int INTEGER")); // 不加 NOT NULL
@@ -106,8 +106,8 @@ mod create_table_tests {
     fn test_mysql_complete_types() {
         let sql = generate_create_table_sql::<TestCompleteTypes>(DbType::MySQL);
 
-        // 验证 MySQL 完整类型映射
-        assert!(sql.contains("id BIGINT PRIMARY KEY AUTO_INCREMENT"));
+        // 验证 MySQL 完整类型映射（没有 auto_increment）
+        assert!(sql.contains("id BIGINT PRIMARY KEY"));
         assert!(sql.contains("text_val VARCHAR(255) NOT NULL"));
         assert!(sql.contains("optional_text VARCHAR(255)")); // 不加 NOT NULL
         assert!(sql.contains("optional_int INT")); // 不加 NOT NULL

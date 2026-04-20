@@ -46,59 +46,47 @@ use ormer::DbType;
 
 #[tokio::main]
 async fn main() {
-    let db = Database::connect(DbType::Turso, ":memory:")
-        .await
-        .expect("连接数据库失败");
+    // ...
+    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    // ...
 }
 ```
 
 #### 3. 创建表
 
 ```rust
-db.create_table::<User>().await.expect("创建表失败");
+db.create_table::<User>().await?;
 ```
 
 #### 4. 插入数据
 
 ```rust
-let user = User {
+db.insert(&User {
     id: 0, // 将自动生成
     name: "Alice".to_string(),
     age: 25,
     email: Some("alice@example.com".to_string()),
-};
-
-db.insert(&user).await.expect("插入数据失败");
+}).await?;
 ```
 
 #### 5. 查询数据
 
 ```rust
-let users: Vec<User> = db
-    .select::<User>()
-    .collect::<Vec<User>>()
-    .await
-    .expect("查询数据失败");
-
-for user in users {
-    println!("用户: {:?}", user);
-}
+let users = db.select::<User>().collect::<Vec<User>>().await?;
+println!("用户: {users:?}");
 ```
 
 #### 6. 事务
 
 ```rust
-let txn = db.begin().await.expect("开启事务失败");
-
-let user = User {
+let txn = db.begin().await?;
+txn.insert(&User {
     id: 0,
     name: "Bob".to_string(),
     age: 30,
     email: None,
-};
-
-txn.insert(&user).await.expect("插入数据失败");
-txn.commit().await.expect("提交事务失败");
+}).await?;
+txn.commit().await?;
 ```
 
 ### 特性 (Features)

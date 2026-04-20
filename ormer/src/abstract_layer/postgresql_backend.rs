@@ -1,5 +1,8 @@
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
-use crate::query::builder::{FourTableSelect, MultiTableSelect, RelatedSelect, Select, WhereExpr};
+use crate::query::builder::{
+    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
+    RightJoinedSelect, Select, WhereExpr,
+};
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -223,6 +226,7 @@ impl Database {
             let expected_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
                 expected_col.rust_type,
                 expected_col.is_primary,
+                expected_col.is_auto_increment,
                 expected_col.is_nullable,
             );
 
@@ -240,6 +244,7 @@ impl Database {
                 let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
                     expected_col.rust_type,
                     false,
+                    expected_col.is_auto_increment,
                     expected_col.is_nullable,
                 );
                 // 去掉 " NOT NULL" 后缀
@@ -379,6 +384,15 @@ impl Database {
         }
     }
 
+    /// 创建 Related 查询执行器（关联查询）
+    pub fn related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<'_, T, R> {
+        RelatedSelectExecutor {
+            select: Select::<T>::new().from::<T, R>(),
+            client: &self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 开始事务
     pub async fn begin(&self) -> Result<Transaction, crate::Error> {
         self.client
@@ -432,7 +446,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Select 查询执行器
-    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
             client: self.client,
@@ -441,7 +455,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             client: self.client,
@@ -450,7 +464,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -505,6 +519,27 @@ impl<'a> Transaction<'a> {
     }
 }
 
+/// LEFT JOIN 查询执行器
+pub struct LeftJoinedSelectExecutor<'a, T: Model, J: Model> {
+    select: LeftJoinedSelect<T, J>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, J)>,
+}
+
+/// INNER JOIN 查询执行器
+pub struct InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
+    select: InnerJoinedSelect<T, J>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, J)>,
+}
+
+/// RIGHT JOIN 查询执行器
+pub struct RightJoinedSelectExecutor<'a, T: Model, J: Model> {
+    select: RightJoinedSelect<T, J>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, J)>,
+}
+
 /// Select 查询执行器
 pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
@@ -555,14 +590,37 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    /// 添加 JOIN 查询
-    pub fn join<J: Model>(
+    /// 添加 LEFT JOIN 查询
+    pub fn left_join<J: Model>(
         self,
-        join_type: crate::JoinType,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
-    ) -> Self {
-        Self {
-            select: self.select.join::<J>(join_type, f),
+    ) -> LeftJoinedSelectExecutor<'a, T, J> {
+        LeftJoinedSelectExecutor {
+            select: self.select.left_join::<J>(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 INNER JOIN 查询
+    pub fn inner_join<J: Model>(
+        self,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<'a, T, J> {
+        InnerJoinedSelectExecutor {
+            select: self.select.inner_join::<J>(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 RIGHT JOIN 查询
+    pub fn right_join<J: Model>(
+        self,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<'a, T, J> {
+        RightJoinedSelectExecutor {
+            select: self.select.right_join::<J>(f),
             client: self.client,
             _marker: PhantomData,
         }
@@ -952,6 +1010,14 @@ fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
             write!(sql, "{column} {operator} ${param_idx}").unwrap();
             *param_idx += 1;
         }
+        FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } => {
+            use std::fmt::Write;
+            write!(sql, "{left_column} {operator} {right_column}").unwrap();
+        }
         FilterExpr::And(left, right) => {
             format_filter(left, sql, param_idx);
             sql.push_str(" AND ");
@@ -982,6 +1048,14 @@ fn format_filter_with_params(
             write!(sql, "{column} {operator} ${param_idx}").unwrap();
             params.push(value.clone().into());
             *param_idx += 1;
+        }
+        FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } => {
+            use std::fmt::Write;
+            write!(sql, "{left_column} {operator} {right_column}").unwrap();
         }
         FilterExpr::And(left, right) => {
             format_filter_with_params(left, sql, param_idx, params);
@@ -1037,6 +1111,11 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         R: 'static,
     {
         RelatedCollectFuture { executor: self }
+    }
+
+    pub async fn collect<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
+        let results = self.collect_inner().await?;
+        Ok(results.into_iter().collect())
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
@@ -1467,5 +1546,190 @@ impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+/// LeftJoinedSelectExecutor 实现
+impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
+        self,
+    ) -> LeftJoinCollectFuture<'a, T, J> {
+        LeftJoinCollectFuture {
+            executor: self,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn execute(self) -> LeftJoinCollectFuture<'a, T, J>
+    where
+        T: 'static,
+        J: 'static,
+    {
+        self.collect::<Vec<(T, Option<J>)>>()
+    }
+}
+
+/// LEFT JOIN Collect future
+pub struct LeftJoinCollectFuture<'a, T: Model, J: Model> {
+    executor: LeftJoinedSelectExecutor<'a, T, J>,
+    _marker: PhantomData<(T, J)>,
+}
+
+impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+    for LeftJoinCollectFuture<'a, T, J>
+{
+    type Output = Result<Vec<(T, Option<J>)>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
+    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => {
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Text(t) => {
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Real(r) => {
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Null => {
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                }
+            })
+            .collect();
+
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = self
+            .client
+            .query(&sql, &pg_params_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        let t_col_count = T::COLUMNS.len();
+
+        for row in rows {
+            let mut t_data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: Option<i32> = row.try_get(i).ok().flatten();
+                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
+                    }
+                    "i64" => {
+                        let v: Option<i64> = row.try_get(i).ok().flatten();
+                        crate::model::Value::Integer(v.unwrap_or(0))
+                    }
+                    "String" => {
+                        let v: Option<String> = row.try_get(i).ok().flatten();
+                        crate::model::Value::Text(v.unwrap_or_default())
+                    }
+                    "f32" | "f64" => {
+                        let v: Option<f64> = row.try_get(i).ok().flatten();
+                        crate::model::Value::Real(v.unwrap_or(0.0))
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                t_data.insert(col_name.to_string(), ormer_value);
+            }
+            let t_model = T::from_row(&Row::new(t_data))?;
+
+            // 尝试读取 J 的列
+            let mut j_data = HashMap::new();
+            let mut j_is_null = true;
+            for (i, col_name) in J::COLUMNS.iter().enumerate() {
+                let idx = t_col_count + i;
+                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: Option<i32> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
+                    }
+                    "i64" => {
+                        let v: Option<i64> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        crate::model::Value::Integer(v.unwrap_or(0))
+                    }
+                    "String" => {
+                        let v: Option<String> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        crate::model::Value::Text(v.unwrap_or_default())
+                    }
+                    "f32" | "f64" => {
+                        let v: Option<f64> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        crate::model::Value::Real(v.unwrap_or(0.0))
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                j_data.insert(col_name.to_string(), ormer_value);
+            }
+
+            if j_is_null {
+                results.push((t_model, None));
+            } else {
+                let j_model = J::from_row(&Row::new(j_data))?;
+                results.push((t_model, Some(j_model)));
+            }
+        }
+
+        Ok(results.into_iter().collect())
     }
 }

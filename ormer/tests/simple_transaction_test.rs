@@ -22,7 +22,7 @@ async fn test_simple_transaction_commit() {
         .expect("Failed to create table");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin");
+    let mut txn = db.begin().await.expect("Failed to begin");
 
     // 插入数据
     let user = SimpleUser {
@@ -66,7 +66,7 @@ async fn test_simple_transaction_rollback() {
     db.insert(&initial).await.expect("Failed to insert initial");
 
     // 开始事务
-    let txn = db.begin().await.expect("Failed to begin");
+    let mut txn = db.begin().await.expect("Failed to begin");
 
     // 插入数据
     let user = SimpleUser {
