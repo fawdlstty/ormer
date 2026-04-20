@@ -2,6 +2,16 @@
 name = "ormer"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/fawdlstty/ormer"
+homepage = "https://github.com/fawdlstty/ormer"
+description = "The simplest ORM for Rust."
+authors = ["fawdlstty<f@fawdlstty.com>"]
+keywords = ["orm", "database"]
+categories = []
+readme = "../README.md"
+exclude = ["src/main.rs"]
 
 [features]
 default = ["turso"]
@@ -10,7 +20,7 @@ postgresql = ["dep:tokio-postgres", "dep:postgres-types"]
 mysql = ["dep:mysql_async"]
 
 [dependencies]
-ormer-derive = { path = "../ormer-derive" }
+ormer-derive = { version = "0.1.0", path = "../ormer-derive" }
 thiserror = "1.0"
 async-trait = "0.1"
 tokio = { version = "1.52.1", features = ["full"] }
@@ -19,3 +29,7 @@ turso = { version = "0.1", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
 postgres-types = { version = "0.2", optional = true }
 mysql_async = { version = "0.34", optional = true }
+
+# cargo publish -p ormer-derive --allow-dirty --registry crates-io
+# cargo publish -p ormer --allow-dirty --registry crates-io
+# cd docs && npm run docs:build && cd ..
