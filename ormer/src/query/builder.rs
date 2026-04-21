@@ -1309,8 +1309,17 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
 
         write!(
             &mut sql,
-            "SELECT {} FROM {} INNER JOIN {} AS {}",
-            T::COLUMNS.join(", "),
+            "SELECT {}, {} FROM {} AS t0 INNER JOIN {} AS {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
             T::TABLE_NAME,
             self.join_table,
             self.join_alias
@@ -1421,8 +1430,17 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
 
         write!(
             &mut sql,
-            "SELECT {} FROM {} RIGHT JOIN {} AS {}",
-            T::COLUMNS.join(", "),
+            "SELECT {}, {} FROM {} AS t0 RIGHT JOIN {} AS {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
             T::TABLE_NAME,
             self.join_table,
             self.join_alias

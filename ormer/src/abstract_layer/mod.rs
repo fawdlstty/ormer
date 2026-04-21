@@ -11,6 +11,13 @@ pub mod postgresql_backend;
 #[cfg(feature = "mysql")]
 pub mod mysql_backend;
 
+/// 公共辅助函数模块
+pub mod common_helpers;
+
+/// 宏定义模块 - 用于减少重复代码
+#[macro_use]
+pub mod macros;
+
 /// 数据库类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbType {

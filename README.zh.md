@@ -5,7 +5,7 @@
 
 [English](README.md) | 简体中文
 
-极简的Rust ORM框架。
+一款用法接近Linq的ORM框架，支持Turso(SQLite)、PostgresQL、MySQL。
 
 # 用法
 

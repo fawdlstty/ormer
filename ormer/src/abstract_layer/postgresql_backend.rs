@@ -1,3 +1,4 @@
+use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
@@ -845,7 +846,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                format_filter(filter, &mut sql, &mut param_idx);
+                common_helpers::format_filter(filter, &mut sql, &mut param_idx);
             }
         }
 
@@ -937,7 +938,12 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                common_helpers::format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                );
             }
         }
 
@@ -996,78 +1002,6 @@ fn convert_sql_to_pg(sql: &str) -> String {
     }
 
     result
-}
-
-/// 格式化过滤器 (不包含参数值,仅用于 DELETE)
-fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value: _,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{column} {operator} ${param_idx}").unwrap();
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
-        }
-        FilterExpr::And(left, right) => {
-            format_filter(left, sql, param_idx);
-            sql.push_str(" AND ");
-            format_filter(right, sql, param_idx);
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter(left, sql, param_idx);
-            sql.push_str(" OR ");
-            format_filter(right, sql, param_idx);
-        }
-    }
-}
-
-/// 格式化过滤器并收集参数 (用于 UPDATE)
-fn format_filter_with_params(
-    filter: &FilterExpr,
-    sql: &mut String,
-    param_idx: &mut usize,
-    params: &mut Vec<crate::model::Value>,
-) {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{column} {operator} ${param_idx}").unwrap();
-            params.push(value.clone().into());
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
-        }
-        FilterExpr::And(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
-            sql.push_str(" AND ");
-            format_filter_with_params(right, sql, param_idx, params);
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
-            sql.push_str(" OR ");
-            format_filter_with_params(right, sql, param_idx, params);
-        }
-    }
 }
 
 /// Related 查询执行器（支持2表关联查询）
@@ -1728,6 +1662,356 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                 let j_model = J::from_row(&Row::new(j_data))?;
                 results.push((t_model, Some(j_model)));
             }
+        }
+
+        Ok(results.into_iter().collect())
+    }
+}
+
+/// InnerJoinedSelectExecutor 实现
+impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<'a, T, J> {
+        InnerJoinCollectFuture {
+            executor: self,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn execute(self) -> InnerJoinCollectFuture<'a, T, J>
+    where
+        T: 'static,
+        J: 'static,
+    {
+        self.collect::<Vec<(T, J)>>()
+    }
+}
+
+/// INNER JOIN Collect future
+pub struct InnerJoinCollectFuture<'a, T: Model, J: Model> {
+    executor: InnerJoinedSelectExecutor<'a, T, J>,
+    _marker: PhantomData<(T, J)>,
+}
+
+impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+    for InnerJoinCollectFuture<'a, T, J>
+{
+    type Output = Result<Vec<(T, J)>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
+    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> Result<C, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => {
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Text(t) => {
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Real(r) => {
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Null => {
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                }
+            })
+            .collect();
+
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = self
+            .client
+            .query(&sql, &pg_params_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        let t_col_count = T::COLUMNS.len();
+
+        for row in rows {
+            let mut t_data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: i32 = row.get(i);
+                        crate::model::Value::Integer(v as i64)
+                    }
+                    "i64" => {
+                        let v: i64 = row.get(i);
+                        crate::model::Value::Integer(v)
+                    }
+                    "String" => {
+                        let v: String = row.get(i);
+                        crate::model::Value::Text(v)
+                    }
+                    "f32" | "f64" => {
+                        let v: f64 = row.get(i);
+                        crate::model::Value::Real(v)
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                t_data.insert(col_name.to_string(), ormer_value);
+            }
+            let t_model = T::from_row(&Row::new(t_data))?;
+
+            let mut j_data = HashMap::new();
+            for (i, col_name) in J::COLUMNS.iter().enumerate() {
+                let idx = t_col_count + i;
+                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: i32 = row.get(idx);
+                        crate::model::Value::Integer(v as i64)
+                    }
+                    "i64" => {
+                        let v: i64 = row.get(idx);
+                        crate::model::Value::Integer(v)
+                    }
+                    "String" => {
+                        let v: String = row.get(idx);
+                        crate::model::Value::Text(v)
+                    }
+                    "f32" | "f64" => {
+                        let v: f64 = row.get(idx);
+                        crate::model::Value::Real(v)
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                j_data.insert(col_name.to_string(), ormer_value);
+            }
+
+            let j_model = J::from_row(&Row::new(j_data))?;
+            results.push((t_model, j_model));
+        }
+
+        Ok(results.into_iter().collect())
+    }
+}
+
+/// RightJoinedSelectExecutor 实现
+impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn limit(self, limit: i64) -> Self {
+        Self {
+            select: self.select.limit(limit),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self {
+            select: self.select.offset(offset),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
+        self,
+    ) -> RightJoinCollectFuture<'a, T, J> {
+        RightJoinCollectFuture {
+            executor: self,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn execute(self) -> RightJoinCollectFuture<'a, T, J>
+    where
+        T: 'static,
+        J: 'static,
+    {
+        self.collect::<Vec<(Option<T>, J)>>()
+    }
+}
+
+/// RIGHT JOIN Collect future
+pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
+    executor: RightJoinedSelectExecutor<'a, T, J>,
+    _marker: PhantomData<(T, J)>,
+}
+
+impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+    for RightJoinCollectFuture<'a, T, J>
+{
+    type Output = Result<Vec<(Option<T>, J)>, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
+    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> Result<C, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params();
+
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => {
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Text(t) => {
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Real(r) => {
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Null => {
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                }
+            })
+            .collect();
+
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = self
+            .client
+            .query(&sql, &pg_params_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+        let t_col_count = T::COLUMNS.len();
+
+        for row in rows {
+            let mut t_data = HashMap::new();
+            let mut t_is_null = true;
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: Option<i32> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
+                    }
+                    "i64" => {
+                        let v: Option<i64> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        crate::model::Value::Integer(v.unwrap_or(0))
+                    }
+                    "String" => {
+                        let v: Option<String> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        crate::model::Value::Text(v.unwrap_or_default())
+                    }
+                    "f32" | "f64" => {
+                        let v: Option<f64> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        crate::model::Value::Real(v.unwrap_or(0.0))
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                t_data.insert(col_name.to_string(), ormer_value);
+            }
+
+            let t_model = if t_is_null {
+                None
+            } else {
+                Some(T::from_row(&Row::new(t_data))?)
+            };
+
+            let mut j_data = HashMap::new();
+            for (i, col_name) in J::COLUMNS.iter().enumerate() {
+                let idx = t_col_count + i;
+                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
+                let ormer_value = match rust_type {
+                    "i32" => {
+                        let v: i32 = row.get(idx);
+                        crate::model::Value::Integer(v as i64)
+                    }
+                    "i64" => {
+                        let v: i64 = row.get(idx);
+                        crate::model::Value::Integer(v)
+                    }
+                    "String" => {
+                        let v: String = row.get(idx);
+                        crate::model::Value::Text(v)
+                    }
+                    "f32" | "f64" => {
+                        let v: f64 = row.get(idx);
+                        crate::model::Value::Real(v)
+                    }
+                    _ => {
+                        return Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        )));
+                    }
+                };
+                j_data.insert(col_name.to_string(), ormer_value);
+            }
+
+            let j_model = J::from_row(&Row::new(j_data))?;
+            results.push((t_model, j_model));
         }
 
         Ok(results.into_iter().collect())

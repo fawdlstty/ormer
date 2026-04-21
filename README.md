@@ -5,7 +5,7 @@
 
 English | [简体中文](README.zh.md)
 
-The simplest ORM for Rust.
+An ORM framework with a usage style similar to Linq, supporting Turso(SQLite), PostgresQL, MySQL.
 
 # Usage
 

@@ -1,3 +1,4 @@
+use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
@@ -318,7 +319,7 @@ impl Database {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let (mut sql, col_count) = common_helpers::build_batch_insert_sql::<T>(models.len());
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -799,8 +800,12 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
                 if let Ok(value) = row.get_value(idx) {
-                    j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
-                    j_is_null = false;
+                    let ormer_value = convert_turso_value(&value)?;
+                    // 检查是否为 NULL，只有非 NULL 值才设置 j_is_null = false
+                    if !matches!(ormer_value, Value::Null) {
+                        j_is_null = false;
+                    }
+                    j_data.insert(col_name.to_string(), ormer_value);
                 }
             }
 
@@ -847,6 +852,14 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
     }
 
     pub fn exec(self) -> InnerJoinCollectFuture<T, J>
+    where
+        T: 'static,
+        J: 'static,
+    {
+        InnerJoinCollectFuture { executor: self }
+    }
+
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<T, J>
     where
         T: 'static,
         J: 'static,
@@ -942,6 +955,14 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
     }
 
     pub fn exec(self) -> RightJoinCollectFuture<T, J>
+    where
+        T: 'static,
+        J: 'static,
+    {
+        RightJoinCollectFuture { executor: self }
+    }
+
+    pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(self) -> RightJoinCollectFuture<T, J>
     where
         T: 'static,
         J: 'static,
@@ -1296,7 +1317,7 @@ impl<T: Model> DeleteExecutor<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                format_filter_with_params_for_delete(
+                common_helpers::format_filter_with_params(
                     filter,
                     &mut sql,
                     &mut param_idx,
@@ -1393,7 +1414,12 @@ impl<T: Model> UpdateExecutor<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                format_filter_with_params(filter, &mut sql, &mut param_idx, &mut ormer_params);
+                common_helpers::format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut ormer_params,
+                );
             }
         }
 
@@ -1439,129 +1465,5 @@ fn convert_turso_value(value: &turso::Value) -> Result<Value, crate::Error> {
             "Unsupported turso value type: {:?}",
             value
         ))),
-    }
-}
-
-/// 格式化过滤器 (不包含参数值,仅用于 DELETE)
-fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value: _,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{column} {operator} ?").unwrap();
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
-        }
-        FilterExpr::And(left, right) => {
-            format_filter(left, sql, param_idx);
-            sql.push_str(" AND ");
-            format_filter(right, sql, param_idx);
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter(left, sql, param_idx);
-            sql.push_str(" OR ");
-            format_filter(right, sql, param_idx);
-        }
-    }
-}
-
-/// 格式化过滤器并收集参数 (用于 UPDATE)
-fn format_filter_with_params(
-    filter: &FilterExpr,
-    sql: &mut String,
-    param_idx: &mut usize,
-    params: &mut Vec<Value>,
-) {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{column} {operator} ?").unwrap();
-            // 将 filter::Value 转换为 ormer::Value
-            let ormer_value = match value {
-                crate::query::filter::Value::Integer(v) => Value::Integer(*v),
-                crate::query::filter::Value::Text(v) => Value::Text(v.clone()),
-                crate::query::filter::Value::Real(v) => Value::Real(*v),
-                crate::query::filter::Value::Null => Value::Null,
-            };
-            params.push(ormer_value);
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
-        }
-        FilterExpr::And(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
-            sql.push_str(" AND ");
-            format_filter_with_params(right, sql, param_idx, params);
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
-            sql.push_str(" OR ");
-            format_filter_with_params(right, sql, param_idx, params);
-        }
-    }
-}
-
-/// 格式化过滤器并收集参数 (用于 DELETE)
-fn format_filter_with_params_for_delete(
-    filter: &FilterExpr,
-    sql: &mut String,
-    param_idx: &mut usize,
-    params: &mut Vec<Value>,
-) {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{column} {operator} ?").unwrap();
-            let ormer_value = match value {
-                crate::query::filter::Value::Integer(v) => Value::Integer(*v),
-                crate::query::filter::Value::Text(v) => Value::Text(v.clone()),
-                crate::query::filter::Value::Real(v) => Value::Real(*v),
-                crate::query::filter::Value::Null => Value::Null,
-            };
-            params.push(ormer_value);
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            use std::fmt::Write;
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
-        }
-        FilterExpr::And(left, right) => {
-            format_filter_with_params_for_delete(left, sql, param_idx, params);
-            sql.push_str(" AND ");
-            format_filter_with_params_for_delete(right, sql, param_idx, params);
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter_with_params_for_delete(left, sql, param_idx, params);
-            sql.push_str(" OR ");
-            format_filter_with_params_for_delete(right, sql, param_idx, params);
-        }
     }
 }
