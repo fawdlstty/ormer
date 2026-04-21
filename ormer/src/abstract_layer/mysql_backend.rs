@@ -1,3 +1,4 @@
+use crate::abstract_layer::DbType;
 use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
@@ -759,7 +760,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params();
+            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::MySQL);
 
             // 将ormer::Value转换为mysql_async Value
             let mut conn = self
@@ -830,7 +831,7 @@ impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFutu
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mut conn = self
             .pool
@@ -930,7 +931,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter(filter, &mut sql, &mut param_idx);
+                common_helpers::format_filter(filter, &mut sql, &mut param_idx, DbType::MySQL);
             }
         }
 
@@ -1028,6 +1029,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                     &mut sql,
                     &mut param_idx,
                     &mut params,
+                    DbType::MySQL,
                 );
             }
         }
@@ -1113,7 +1115,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mysql_params: Vec<mysql_async::Value> = params
             .iter()
@@ -1281,7 +1283,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mysql_params: Vec<mysql_async::Value> = params
             .iter()
@@ -1450,7 +1452,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
         let mut conn = self
             .pool
             .get_conn()
@@ -1638,7 +1640,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mysql_params = values_to_params(&params)?;
 
@@ -1796,7 +1798,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mysql_params = values_to_params(&params)?;
 
@@ -1941,7 +1943,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         let mysql_params = values_to_params(&params)?;
 

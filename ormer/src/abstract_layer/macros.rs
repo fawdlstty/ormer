@@ -139,16 +139,16 @@ macro_rules! impl_executor_methods {
 
 /// 示例用法 (在实际代码中使用):
 ///
-/// ```rust
+/// ```rust,ignore
 /// // 在 turso_backend.rs 中:
-/// impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<turso::Connection>);
-/// impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<turso::Connection>);
-/// impl_join_executor_methods!(RightJoinedSelectExecutor, conn, Arc<turso::Connection>);
+/// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<turso::Connection>);
+/// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<turso::Connection>);
+/// ormer::impl_join_executor_methods!(RightJoinedSelectExecutor, conn, Arc<turso::Connection>);
 ///
 /// // 在 mysql_backend.rs 中:
-/// impl_join_executor_methods!(LeftJoinedSelectExecutor, pool, &'a Pool);
-/// impl_join_executor_methods!(InnerJoinedSelectExecutor, pool, &'a Pool);
-/// impl_join_executor_methods!(RightJoinedSelectExecutor, pool, &'a Pool);
+/// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, pool, &'a Pool);
+/// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, pool, &'a Pool);
+/// ormer::impl_join_executor_methods!(RightJoinedSelectExecutor, pool, &'a Pool);
 /// ```
 ///
 pub fn _placeholder() {}

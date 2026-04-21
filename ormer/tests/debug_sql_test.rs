@@ -16,12 +16,12 @@ async fn test_debug_sql() -> Result<(), Box<dyn std::error::Error>> {
 
     // 测试不带filter的聚合
     let select1 = db.select::<TestDebugUser>();
-    let agg1 = select1.count(|p| p.id);
+    let _agg1 = select1.count(|p| p.id);
 
     // 测试带filter的聚合
     let select2 = db.select::<TestDebugUser>();
     let filtered = select2.filter(|p| p.age.ge(18));
-    let agg2 = filtered.count(|p| p.id);
+    let _agg2 = filtered.count(|p| p.id);
 
     println!("Tests completed");
     Ok(())

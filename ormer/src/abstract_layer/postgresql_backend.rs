@@ -1,3 +1,4 @@
+use crate::abstract_layer::DbType;
 use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
@@ -87,6 +88,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
 }
 
 /// PostgreSQL 数据库连接封装
+#[allow(dead_code)]
 pub struct Database {
     client: tokio_postgres::Client,
     connection_handle: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
@@ -358,7 +360,7 @@ impl Database {
     }
 
     /// 创建 Select 查询执行器
-    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
             client: &self.client,
@@ -367,7 +369,7 @@ impl Database {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             client: &self.client,
@@ -376,7 +378,7 @@ impl Database {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -395,7 +397,7 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> Result<Transaction, crate::Error> {
+    pub async fn begin(&self) -> Result<Transaction<'_>, crate::Error> {
         self.client
             .execute("BEGIN", &[])
             .await
@@ -767,7 +769,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params();
+            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::PostgreSQL);
 
             // 将ormer::Value转换为postgres_types::ToSql
             let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
@@ -875,10 +877,7 @@ impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFutu
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
-
-        // 将 SQL 从 Turso 格式转换为 PostgreSQL 格式 (?N -> $N)
-        let pg_sql = convert_sql_to_pg(&sql);
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
@@ -888,7 +887,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
         let rows = self
             .client
-            .query(&pg_sql, &param_refs)
+            .query(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1004,11 +1003,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> Result<u64, crate::Error> {
         let sql = self.build_sql();
-        let pg_sql = convert_sql_to_pg(&sql);
 
         let result = self
             .client
-            .execute(&pg_sql, &[])
+            .execute(&sql, &[])
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1025,7 +1023,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter(filter, &mut sql, &mut param_idx);
+                common_helpers::format_filter(filter, &mut sql, &mut param_idx, DbType::PostgreSQL);
             }
         }
 
@@ -1078,7 +1076,6 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     /// 执行更新操作
     pub async fn execute(self) -> Result<u64, crate::Error> {
         let (sql, params) = self.build_sql()?;
-        let pg_sql = convert_sql_to_pg(&sql);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
@@ -1087,7 +1084,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         let result = self
             .client
-            .execute(&pg_sql, &param_refs)
+            .execute(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1122,6 +1119,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                     &mut sql,
                     &mut param_idx,
                     &mut params,
+                    DbType::PostgreSQL,
                 );
             }
         }
@@ -1143,7 +1141,9 @@ impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
 fn values_to_params(
     values: &[crate::model::Value],
 ) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>, crate::Error> {
-    use tokio_postgres::types::{ToSql, Type};
+    // ToSql trait is used in the trait object type above
+    #[allow(unused_imports)]
+    use tokio_postgres::types::ToSql;
 
     let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
 
@@ -1162,25 +1162,6 @@ fn values_to_params(
     }
 
     Ok(params)
-}
-
-/// 将 SQL 从 Turso 格式转换为 PostgreSQL 格式
-/// Turso: ?1, ?2, ?3
-/// PostgreSQL: $1, $2, $3
-fn convert_sql_to_pg(sql: &str) -> String {
-    // 简单的替换，将 ?N 替换为 $N
-    let mut result = String::new();
-    let mut chars = sql.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '?' {
-            result.push('$');
-        } else {
-            result.push(c);
-        }
-    }
-
-    result
 }
 
 /// Related 查询执行器（支持2表关联查询）
@@ -1232,8 +1213,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
-        let pg_sql = convert_sql_to_pg(&sql);
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
@@ -1242,7 +1222,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
 
         let rows = self
             .client
-            .query(&pg_sql, &param_refs)
+            .query(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1390,8 +1370,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
-        let pg_sql = convert_sql_to_pg(&sql);
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
@@ -1400,7 +1379,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
 
         let rows = self
             .client
-            .query(&pg_sql, &param_refs)
+            .query(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1549,8 +1528,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
     }
 
     async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
-        let pg_sql = convert_sql_to_pg(&sql);
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
@@ -1559,7 +1537,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
 
         let rows = self
             .client
-            .query(&pg_sql, &param_refs)
+            .query(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
@@ -1728,7 +1706,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
             .into_iter()
@@ -1911,7 +1889,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
             .into_iter()
@@ -2078,7 +2056,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
             .into_iter()

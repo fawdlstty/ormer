@@ -1,17 +1,25 @@
+use crate::abstract_layer::DbType;
 use crate::model::{Model, Row, Value};
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
 use std::fmt::Write;
 
 /// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
-pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
+pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32, db_type: DbType) {
     match filter {
         FilterExpr::Comparison {
             column,
             operator,
             value: _,
         } => {
-            write!(sql, "{column} {operator} ?").unwrap();
+            match db_type {
+                DbType::PostgreSQL => {
+                    write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                }
+                DbType::Turso | DbType::MySQL => {
+                    write!(sql, "{} {} ?", column, operator).unwrap();
+                }
+            }
             *param_idx += 1;
         }
         FilterExpr::ColumnComparison {
@@ -19,17 +27,17 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32)
             operator,
             right_column,
         } => {
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
+            write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
         }
         FilterExpr::And(left, right) => {
-            format_filter(left, sql, param_idx);
+            format_filter(left, sql, param_idx, db_type);
             sql.push_str(" AND ");
-            format_filter(right, sql, param_idx);
+            format_filter(right, sql, param_idx, db_type);
         }
         FilterExpr::Or(left, right) => {
-            format_filter(left, sql, param_idx);
+            format_filter(left, sql, param_idx, db_type);
             sql.push_str(" OR ");
-            format_filter(right, sql, param_idx);
+            format_filter(right, sql, param_idx, db_type);
         }
     }
 }
@@ -40,6 +48,7 @@ pub fn format_filter_with_params(
     sql: &mut String,
     param_idx: &mut usize,
     params: &mut Vec<Value>,
+    db_type: DbType,
 ) {
     match filter {
         FilterExpr::Comparison {
@@ -47,7 +56,14 @@ pub fn format_filter_with_params(
             operator,
             value,
         } => {
-            write!(sql, "{column} {operator} ?").unwrap();
+            match db_type {
+                DbType::PostgreSQL => {
+                    write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                }
+                DbType::Turso | DbType::MySQL => {
+                    write!(sql, "{} {} ?", column, operator).unwrap();
+                }
+            }
             params.push(value.clone().into());
             *param_idx += 1;
         }
@@ -56,17 +72,17 @@ pub fn format_filter_with_params(
             operator,
             right_column,
         } => {
-            write!(sql, "{left_column} {operator} {right_column}").unwrap();
+            write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
         }
         FilterExpr::And(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
+            format_filter_with_params(left, sql, param_idx, params, db_type);
             sql.push_str(" AND ");
-            format_filter_with_params(right, sql, param_idx, params);
+            format_filter_with_params(right, sql, param_idx, params, db_type);
         }
         FilterExpr::Or(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params);
+            format_filter_with_params(left, sql, param_idx, params, db_type);
             sql.push_str(" OR ");
-            format_filter_with_params(right, sql, param_idx, params);
+            format_filter_with_params(right, sql, param_idx, params, db_type);
         }
     }
 }

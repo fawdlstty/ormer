@@ -23,7 +23,7 @@ async fn test_direct_create_table() -> Result<(), Box<dyn std::error::Error>> {
         name: "Test".to_string(),
         age: 25,
     };
-    let values = user.field_values();
+    let _values = user.field_values();
     let columns = <TestDirectUser as ormer::Model>::COLUMNS.join(", ");
     let placeholders: Vec<String> = (1..=<TestDirectUser as ormer::Model>::COLUMNS.len())
         .map(|_| "?".to_string())

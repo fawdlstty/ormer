@@ -1,3 +1,4 @@
+use crate::abstract_layer::DbType;
 use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
@@ -315,21 +316,11 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let (mut sql, col_count) = common_helpers::build_batch_insert_sql::<T>(models.len());
+        let (sql, _col_count) = common_helpers::build_batch_insert_sql::<T>(models.len());
         let mut all_params = Vec::new();
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
+        for model in models.iter() {
             let values = model.field_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
@@ -471,10 +462,13 @@ impl Transaction {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
 
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            T::TABLE_NAME,
+            T::COLUMNS.join(", ")
+        );
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -535,6 +529,7 @@ pub struct RelatedSelectExecutor<T: Model, R: Model> {
 }
 
 /// MultiTable 查询执行器（支持3个表关联查询）
+#[allow(dead_code)]
 pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
     select: MultiTableSelect<T, R1, R2>,
     conn: Arc<turso::Connection>,
@@ -542,6 +537,7 @@ pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
 }
 
 /// FourTable 查询执行器（支持4个表关联查询）
+#[allow(dead_code)]
 pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
     select: FourTableSelect<T, R1, R2, R3>,
     conn: Arc<turso::Connection>,
@@ -793,7 +789,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
 
     /// 获取 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        self.select.to_sql_with_params().0
+        self.select.to_sql_with_params(DbType::Turso).0
     }
 
     /// 执行查询并收集结果
@@ -819,7 +815,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -933,7 +929,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner(self) -> Result<Vec<(T, J)>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1036,7 +1032,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner(self) -> Result<Vec<(Option<T>, J)>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1119,7 +1115,7 @@ impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::Into
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params();
+            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Turso);
 
             let values: Vec<turso::Value> = params
                 .into_iter()
@@ -1287,7 +1283,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
     }
 
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1353,7 +1349,7 @@ impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
 
 impl<T: Model> SelectExecutor<T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params();
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
 
         // 将 ormer::Value 转换为 turso::Value
         let turso_params: Vec<turso::Value> = params
@@ -1456,6 +1452,7 @@ impl<T: Model> DeleteExecutor<T> {
                     &mut sql,
                     &mut param_idx,
                     &mut ormer_params,
+                    DbType::Turso,
                 );
             }
         }
@@ -1553,6 +1550,7 @@ impl<T: Model> UpdateExecutor<T> {
                     &mut sql,
                     &mut param_idx,
                     &mut ormer_params,
+                    DbType::Turso,
                 );
             }
         }

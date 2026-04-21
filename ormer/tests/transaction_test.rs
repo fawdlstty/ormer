@@ -173,9 +173,10 @@ async fn test_transaction_with_update() {
     db.insert(&user).await.expect("Failed to insert user");
 
     // 开始事务
-    let mut txn = db.begin().await.expect("Failed to begin transaction");
+    let txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中更新数据
+    #[allow(unused_imports)]
     use ormer::WhereColumn;
     txn.update::<TestUser>()
         .filter(|w| w.name.eq("Original"))
@@ -227,7 +228,7 @@ async fn test_transaction_with_delete() {
     db.insert(&user2).await.expect("Failed to insert user2");
 
     // 开始事务
-    let mut txn = db.begin().await.expect("Failed to begin transaction");
+    let txn = db.begin().await.expect("Failed to begin transaction");
 
     // 在事务中删除数据
     txn.delete::<TestUser>()

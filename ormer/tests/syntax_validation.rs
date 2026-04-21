@@ -14,6 +14,8 @@ struct TestUser {
 #[cfg(test)]
 mod syntax_validation {
     use super::*;
+    // ColumnBuilder is used for future tests
+    #[allow(unused_imports)]
     use ormer::query::builder::ColumnBuilder;
 
     // 注意：为了让语法工作，我们需要为 TestUser 实现字段访问
@@ -37,11 +39,12 @@ mod syntax_validation {
     fn test_query_with_filter() {
         // 简化测试:手动创建 FilterExpr
         use ormer::FilterExpr;
+        #[allow(unused_imports)]
         use ormer::query::builder::FilterValue;
         use ormer::query::filter::Value as FilterValueInner;
 
         // 模拟过程宏生成的代码
-        let filter = FilterExpr::Comparison {
+        let _filter = FilterExpr::Comparison {
             column: "age".to_string(),
             operator: ">".to_string(),
             value: FilterValueInner::Integer(18),
@@ -58,6 +61,7 @@ mod syntax_validation {
 
     #[test]
     fn test_complex_query() {
+        #[allow(unused_imports)]
         use ormer::{OrderBy, OrderDirection};
 
         let query = TestUser::query().limit(10).offset(20);

@@ -1,3 +1,4 @@
+use crate::abstract_layer::DbType;
 use crate::model::Model;
 use crate::query::filter::{FilterExpr, OrderBy};
 use std::fmt::Write;
@@ -51,7 +52,7 @@ pub struct AggregateSelect<T: Model, R = crate::model::Value> {
 
 impl<T: Model, R> AggregateSelect<T, R> {
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
 
@@ -73,7 +74,13 @@ impl<T: Model, R> AggregateSelect<T, R> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -86,6 +93,7 @@ impl<T: Model, R> AggregateSelect<T, R> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -93,8 +101,15 @@ impl<T: Model, R> AggregateSelect<T, R> {
                 operator,
                 value,
             } => {
-                // Turso使用?占位符
-                write!(sql, "{} {} ?", column, operator).unwrap();
+                // 根据数据库类型生成占位符
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
 
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
@@ -106,14 +121,14 @@ impl<T: Model, R> AggregateSelect<T, R> {
                 *param_idx += 1;
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
@@ -179,6 +194,7 @@ impl<T: Model> Select<T> {
     }
 
     /// 创建聚合查询
+    #[allow(dead_code)]
     fn aggregate(self, func: &str, column: &str) -> AggregateSelect<T> {
         AggregateSelect {
             aggregate_func: func.to_string(),
@@ -301,12 +317,13 @@ impl<T: Model> Select<T> {
 
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
-        let (sql, _) = self.to_sql_with_params();
+        // 默认使用Turso格式用于调试
+        let (sql, _) = self.to_sql_with_params(DbType::Turso);
         sql
     }
 
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
 
@@ -327,7 +344,13 @@ impl<T: Model> Select<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -362,14 +385,28 @@ impl<T: Model> Select<T> {
         (sql, params)
     }
 
-    fn format_filter(&self, filter: &FilterExpr, sql: &mut String, param_idx: &mut i32) {
+    #[allow(dead_code)]
+    fn format_filter(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        db_type: DbType,
+    ) {
         match filter {
             FilterExpr::Comparison {
                 column,
                 operator,
                 value: _,
             } => {
-                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
                 *param_idx += 1;
             }
             FilterExpr::ColumnComparison {
@@ -380,14 +417,14 @@ impl<T: Model> Select<T> {
                 write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
             }
             FilterExpr::And(left, right) => {
-                self.format_filter(left, sql, param_idx);
+                self.format_filter(left, sql, param_idx, db_type);
                 sql.push_str(" AND ");
-                self.format_filter(right, sql, param_idx);
+                self.format_filter(right, sql, param_idx, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter(left, sql, param_idx);
+                self.format_filter(left, sql, param_idx, db_type);
                 sql.push_str(" OR ");
-                self.format_filter(right, sql, param_idx);
+                self.format_filter(right, sql, param_idx, db_type);
             }
         }
     }
@@ -398,6 +435,7 @@ impl<T: Model> Select<T> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -405,7 +443,14 @@ impl<T: Model> Select<T> {
                 operator,
                 value,
             } => {
-                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
                 // 转换 filter Value 到 ormer Value
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
@@ -424,14 +469,14 @@ impl<T: Model> Select<T> {
                 write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
         }
     }
@@ -481,7 +526,7 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
     }
 
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -507,7 +552,13 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -547,6 +598,7 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -555,7 +607,14 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
                 value,
             } => {
                 // 默认使用 t0 前缀
-                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -574,14 +633,14 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
         }
     }
@@ -625,7 +684,7 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
     }
 
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -652,7 +711,13 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -692,6 +757,7 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -700,7 +766,14 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
                 value,
             } => {
                 // 默认使用 t0 前缀
-                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -720,14 +793,14 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
         }
     }
@@ -772,7 +845,7 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
     }
 
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -800,7 +873,13 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -840,6 +919,7 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -848,7 +928,14 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
                 value,
             } => {
                 // 默认使用 t0 前缀
-                write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -868,14 +955,14 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
         }
     }
@@ -1349,6 +1436,7 @@ pub trait ColumnBuilder {
 
 /// 过滤值
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FilterValue {
     inner: crate::query::filter::Value,
 }
@@ -1388,6 +1476,7 @@ impl From<&str> for FilterValue {
 // ==================== JOIN 功能 ====================
 
 /// LEFT JOIN 查询结构体
+#[allow(dead_code)]
 pub struct LeftJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
@@ -1400,6 +1489,7 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
 }
 
 /// INNER JOIN 查询结构体
+#[allow(dead_code)]
 pub struct InnerJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
@@ -1412,6 +1502,7 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
 }
 
 /// RIGHT JOIN 查询结构体
+#[allow(dead_code)]
 pub struct RightJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
@@ -1510,7 +1601,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
     }
 
     /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -1543,7 +1634,13 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -1578,6 +1675,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -1585,7 +1683,14 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 operator,
                 value,
             } => {
-                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -1596,14 +1701,14 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 *param_idx += 1;
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
@@ -1631,7 +1736,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         self
     }
 
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -1664,7 +1769,13 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -1699,6 +1810,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -1706,7 +1818,14 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 operator,
                 value,
             } => {
-                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -1717,14 +1836,14 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 *param_idx += 1;
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
@@ -1752,7 +1871,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         self
     }
 
-    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -1785,7 +1904,13 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+                self.format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    db_type,
+                );
             }
         }
 
@@ -1820,6 +1945,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         sql: &mut String,
         param_idx: &mut i32,
         params: &mut Vec<crate::model::Value>,
+        db_type: DbType,
     ) {
         match filter {
             FilterExpr::Comparison {
@@ -1827,7 +1953,14 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 operator,
                 value,
             } => {
-                write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        write!(sql, "{} {} ?", column, operator).unwrap();
+                    }
+                }
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
                     crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
@@ -1838,14 +1971,14 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 *param_idx += 1;
             }
             FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params);
+                self.format_filter_with_params(left, sql, param_idx, params, db_type);
                 sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params);
+                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
