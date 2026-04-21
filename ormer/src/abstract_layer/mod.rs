@@ -72,6 +72,7 @@ impl DbType {
 // 统一使用 unified 模块提供接口，无论启用哪些 feature
 mod unified;
 pub use unified::{
-    CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
-    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, Transaction, UpdateExecutor,
+    AggregateFuture, CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor,
+    Transaction, UpdateExecutor,
 };

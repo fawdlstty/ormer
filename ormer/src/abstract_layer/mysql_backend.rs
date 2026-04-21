@@ -627,6 +627,71 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// COUNT 聚合函数
+    pub fn count<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.count(f);
+        AggregateFuture {
+            aggregate_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// SUM 聚合函数
+    pub fn sum<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.sum(f);
+        AggregateFuture {
+            aggregate_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// AVG 聚合函数
+    pub fn avg<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.avg(f);
+        AggregateFuture {
+            aggregate_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MAX 聚合函数
+    pub fn max<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.max(f);
+        AggregateFuture {
+            aggregate_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MIN 聚合函数
+    pub fn min<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.min(f);
+        AggregateFuture {
+            aggregate_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
     pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
@@ -673,6 +738,75 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     executor: SelectExecutor<'a, T>,
     _marker: PhantomData<C>,
+}
+
+/// Aggregate future for聚合函数执行
+pub struct AggregateFuture<'a, T: Model> {
+    aggregate_select: crate::query::builder::AggregateSelect<T>,
+    pool: &'a Pool,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model + 'static> std::future::IntoFuture for AggregateFuture<'a, T> {
+    type Output = Result<crate::model::Value, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.aggregate_select.to_sql_with_params();
+
+            // 将ormer::Value转换为mysql_async Value
+            let mut conn = self
+                .pool
+                .get_conn()
+                .await
+                .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+
+            // 构建参数
+            let mysql_params: Vec<mysql_async::Value> = params
+                .into_iter()
+                .map(|v| match v {
+                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
+                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
+                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
+                    crate::model::Value::Null => mysql_async::Value::NULL,
+                })
+                .collect();
+
+            let mut exec_result = conn
+                .exec_iter(&sql, mysql_params)
+                .await
+                .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+
+            if let Some(row) = exec_result
+                .next()
+                .await
+                .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?
+            {
+                // 获取第一个列的值
+                let value: Option<mysql_async::Value> = row.get(0);
+                let value = value.unwrap_or(mysql_async::Value::NULL);
+
+                // 将mysql_async::Value转换为ormer::Value
+                let result = match value {
+                    mysql_async::Value::Int(i) => crate::model::Value::Integer(i),
+                    mysql_async::Value::UInt(u) => crate::model::Value::Integer(u as i64),
+                    mysql_async::Value::Float(f) => crate::model::Value::Real(f as f64),
+                    mysql_async::Value::Double(d) => crate::model::Value::Real(d),
+                    mysql_async::Value::Bytes(b) => String::from_utf8(b)
+                        .map(|s| crate::model::Value::Text(s))
+                        .unwrap_or(crate::model::Value::Null),
+                    mysql_async::Value::Date(_, _, _, _, _, _, _)
+                    | mysql_async::Value::Time(_, _, _, _, _, _) => crate::model::Value::Null,
+                    mysql_async::Value::NULL => crate::model::Value::Null,
+                };
+
+                Ok(result)
+            } else {
+                Ok(crate::model::Value::Null)
+            }
+        })
+    }
 }
 
 impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture

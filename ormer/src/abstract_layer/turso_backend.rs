@@ -655,6 +655,71 @@ impl<T: Model> SelectExecutor<T> {
         self.collect::<Vec<T>>()
     }
 
+    /// COUNT 聚合函数
+    pub fn count<F>(self, f: F) -> AggregateFuture<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.count(f);
+        AggregateFuture {
+            aggregate_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// SUM 聚合函数
+    pub fn sum<F>(self, f: F) -> AggregateFuture<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.sum(f);
+        AggregateFuture {
+            aggregate_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// AVG 聚合函数
+    pub fn avg<F>(self, f: F) -> AggregateFuture<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.avg(f);
+        AggregateFuture {
+            aggregate_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MAX 聚合函数
+    pub fn max<F>(self, f: F) -> AggregateFuture<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.max(f);
+        AggregateFuture {
+            aggregate_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MIN 聚合函数
+    pub fn min<F>(self, f: F) -> AggregateFuture<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.min(f);
+        AggregateFuture {
+            aggregate_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
     pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<T, R>
@@ -1037,6 +1102,69 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
 pub struct CollectFuture<T: Model, C: FromIterator<T>> {
     executor: SelectExecutor<T>,
     _marker: PhantomData<C>,
+}
+
+/// Aggregate future for聚合函数执行
+pub struct AggregateFuture<T: Model> {
+    aggregate_select: crate::query::builder::AggregateSelect<T>,
+    conn: Arc<turso::Connection>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Model + 'static> std::future::IntoFuture for AggregateFuture<T> {
+    type Output = Result<crate::model::Value, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.aggregate_select.to_sql_with_params();
+
+            let values: Vec<turso::Value> = params
+                .into_iter()
+                .map(|v| match v {
+                    crate::model::Value::Integer(i) => turso::Value::Integer(i),
+                    crate::model::Value::Text(t) => turso::Value::Text(t),
+                    crate::model::Value::Real(r) => turso::Value::Real(r),
+                    crate::model::Value::Null => turso::Value::Null,
+                })
+                .collect();
+
+            let mut rows = if values.is_empty() {
+                self.conn
+                    .query(&sql, ())
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            } else {
+                self.conn
+                    .query(&sql, values)
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            };
+
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+            {
+                let value = row
+                    .get_value(0)
+                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+                // 将turso::Value转换为ormer::Value
+                match value {
+                    turso::Value::Integer(i) => Ok(crate::model::Value::Integer(i)),
+                    turso::Value::Real(r) => Ok(crate::model::Value::Real(r)),
+                    turso::Value::Text(t) => Ok(crate::model::Value::Text(t)),
+                    turso::Value::Blob(b) => Ok(crate::model::Value::Text(
+                        String::from_utf8_lossy(&b).to_string(),
+                    )),
+                    turso::Value::Null => Ok(crate::model::Value::Null),
+                }
+            } else {
+                Ok(crate::model::Value::Null)
+            }
+        })
+    }
 }
 
 /// LEFT JOIN Collect future

@@ -54,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("queryed data: {users:?}");
 
+    // aggregate
+    let max_age = db.select::<User>().max(|p| p.age).await?;
+    println!("max_age: {:?}", max_age);
+
     // related query
     let users = db
         .select::<User>()

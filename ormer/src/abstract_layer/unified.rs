@@ -372,6 +372,91 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     {
         self.collect::<Vec<T>>()
     }
+
+    /// COUNT 聚合函数
+    pub fn count<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                AggregateFuture::Turso(exec.count(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.count(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.count(f)),
+        }
+    }
+
+    /// SUM 聚合函数
+    pub fn sum<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                AggregateFuture::Turso(exec.sum(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.sum(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.sum(f)),
+        }
+    }
+
+    /// AVG 聚合函数
+    pub fn avg<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                AggregateFuture::Turso(exec.avg(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.avg(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.avg(f)),
+        }
+    }
+
+    /// MAX 聚合函数
+    pub fn max<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                AggregateFuture::Turso(exec.max(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.max(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.max(f)),
+        }
+    }
+
+    /// MIN 聚合函数
+    pub fn min<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                AggregateFuture::Turso(exec.min(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.min(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.min(f)),
+        }
+    }
 }
 
 /// 统一的 DeleteExecutor 枚举
@@ -506,6 +591,35 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
     PostgreSQL(postgresql_backend::CollectFuture<'a, T, C>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::CollectFuture<'a, T, C>),
+}
+
+/// 统一的 AggregateFuture 枚举
+pub enum AggregateFuture<'a, T: Model> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::AggregateFuture<T>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::AggregateFuture<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::AggregateFuture<'a, T>),
+}
+
+impl<'a, T: Model + 'static> std::future::IntoFuture for AggregateFuture<'a, T> {
+    type Output = Result<crate::model::Value, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match self {
+            #[cfg(feature = "turso")]
+            AggregateFuture::Turso(future, _) => Box::pin(async move { future.await }),
+            #[cfg(feature = "postgresql")]
+            AggregateFuture::PostgreSQL(future) => Box::pin(async move { future.await }),
+            #[cfg(feature = "mysql")]
+            AggregateFuture::MySQL(future) => Box::pin(async move { future.await }),
+        }
+    }
 }
 
 /// 统一的 RelatedSelectExecutor 枚举

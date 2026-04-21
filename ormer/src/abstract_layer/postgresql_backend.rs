@@ -635,6 +635,71 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// COUNT 聚合函数
+    pub fn count<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.count(f);
+        AggregateFuture {
+            aggregate_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// SUM 聚合函数
+    pub fn sum<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.sum(f);
+        AggregateFuture {
+            aggregate_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// AVG 聚合函数
+    pub fn avg<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.avg(f);
+        AggregateFuture {
+            aggregate_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MAX 聚合函数
+    pub fn max<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.max(f);
+        AggregateFuture {
+            aggregate_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// MIN 聚合函数
+    pub fn min<F>(self, f: F) -> AggregateFuture<'a, T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let aggregate_select = self.select.min(f);
+        AggregateFuture {
+            aggregate_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
     pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
@@ -681,6 +746,113 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     executor: SelectExecutor<'a, T>,
     _marker: PhantomData<C>,
+}
+
+/// Aggregate future for聚合函数执行
+pub struct AggregateFuture<'a, T: Model> {
+    aggregate_select: crate::query::builder::AggregateSelect<T>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model + 'static> std::future::IntoFuture for AggregateFuture<'a, T> {
+    type Output = Result<crate::model::Value, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.aggregate_select.to_sql_with_params();
+
+            // 将ormer::Value转换为postgres_types::ToSql
+            let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+                .into_iter()
+                .map(|v| match v {
+                    crate::model::Value::Integer(i) => {
+                        Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Text(t) => {
+                        Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Real(r) => {
+                        Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Null => {
+                        Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                })
+                .collect();
+
+            let params_ref: Vec<&(dyn postgres_types::ToSql + Sync)> =
+                pg_params.iter().map(|p| p.as_ref()).collect();
+
+            let row = self
+                .client
+                .query_one(&sql, &params_ref)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+            // 获取第一列的值
+            use tokio_postgres::types::Type;
+            let column_type = row.columns()[0].type_();
+
+            // 根据类型获取值
+            let result = match *column_type {
+                Type::INT2 => {
+                    let val: Option<i16> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Integer(v as i64))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::INT4 => {
+                    let val: Option<i32> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Integer(v as i64))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::INT8 => {
+                    let val: Option<i64> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Integer(v))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::FLOAT4 => {
+                    let val: Option<f32> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Real(v as f64))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::FLOAT8 => {
+                    let val: Option<f64> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Real(v))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::NUMERIC => {
+                    // NUMERIC类型尝试作为f64读取
+                    let val: Option<f64> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Real(v))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::TEXT | Type::VARCHAR => {
+                    let val: Option<String> = row
+                        .try_get(0)
+                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    val.map(|v| crate::model::Value::Text(v))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                _ => crate::model::Value::Null,
+            };
+
+            Ok(result)
+        })
+    }
 }
 
 impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture

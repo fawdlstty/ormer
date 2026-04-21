@@ -41,6 +41,86 @@ pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
+/// AggregateSelect - 聚合查询结构体
+pub struct AggregateSelect<T: Model> {
+    aggregate_func: String, // COUNT, SUM, AVG, MAX, MIN
+    column_name: String,
+    filters: Vec<FilterExpr>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Model> AggregateSelect<T> {
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+
+        // SELECT 聚合函数
+        write!(
+            &mut sql,
+            "SELECT {}({}) FROM {}",
+            self.aggregate_func,
+            self.column_name,
+            T::TABLE_NAME
+        )
+        .unwrap();
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let mut param_idx = 1;
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                self.format_filter_with_params(filter, &mut sql, &mut param_idx, &mut params);
+            }
+        }
+
+        eprintln!("DEBUG AggregateSelect SQL: {}", sql);
+        (sql, params)
+    }
+
+    fn format_filter_with_params(
+        &self,
+        filter: &FilterExpr,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) {
+        match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => {
+                // Turso使用?1, ?2格式，PostgreSQL/MySQL使用$1, $2格式
+                write!(sql, "{} {} ?{}", column, operator, param_idx).unwrap();
+
+                let ormer_value = match value {
+                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
+                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
+                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
+                    crate::query::filter::Value::Null => crate::model::Value::Null,
+                };
+                params.push(ormer_value);
+                *param_idx += 1;
+            }
+            FilterExpr::And(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" AND ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            FilterExpr::Or(left, right) => {
+                self.format_filter_with_params(left, sql, param_idx, params);
+                sql.push_str(" OR ");
+                self.format_filter_with_params(right, sql, param_idx, params);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl<T: Model> Select<T> {
     pub fn new() -> Self {
         Self {
@@ -97,6 +177,66 @@ impl<T: Model> Select<T> {
             offset: self.offset,
             _marker: PhantomData,
         }
+    }
+
+    /// 创建聚合查询
+    fn aggregate(self, func: &str, column: &str) -> AggregateSelect<T> {
+        AggregateSelect {
+            aggregate_func: func.to_string(),
+            column_name: column.to_string(),
+            filters: self.filters,
+            _marker: PhantomData,
+        }
+    }
+
+    /// COUNT 聚合函数
+    pub fn count<F>(self, f: F) -> AggregateSelect<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate("COUNT", column.column_name())
+    }
+
+    /// SUM 聚合函数
+    pub fn sum<F>(self, f: F) -> AggregateSelect<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate("SUM", column.column_name())
+    }
+
+    /// AVG 聚合函数
+    pub fn avg<F>(self, f: F) -> AggregateSelect<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate("AVG", column.column_name())
+    }
+
+    /// MAX 聚合函数
+    pub fn max<F>(self, f: F) -> AggregateSelect<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate("MAX", column.column_name())
+    }
+
+    /// MIN 聚合函数
+    pub fn min<F>(self, f: F) -> AggregateSelect<T>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate("MIN", column.column_name())
     }
 }
 
