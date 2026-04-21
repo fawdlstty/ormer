@@ -110,11 +110,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 Where 结构体的字段
-    // 为所有字段生成列代理
+    // 为所有字段生成类型化列代理
     let where_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
+        let field_type = &f.ty;
         quote! {
-            pub #field_name: ::ormer::query::builder::NumericColumn
+            pub #field_name: ::ormer::query::builder::TypedColumn<#field_type>
         }
     });
 
@@ -122,7 +123,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let where_default_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
         quote! {
-            #field_name: ::ormer::query::builder::NumericColumn::new(stringify!(#field_name))
+            #field_name: ::ormer::query::builder::TypedColumn::new(stringify!(#field_name))
         }
     });
 

@@ -41,15 +41,11 @@ async fn test_count_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 测试 COUNT(*)
-    let count = db.select::<TestAggUser>().count(|p| p.id).await?;
+    let count: usize = db.select::<TestAggUser>().count(|p| p.id).await?;
     println!("COUNT result: {:?}", count);
 
     // 验证结果
-    if let ormer::Value::Integer(c) = count {
-        assert_eq!(c, 3);
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(count, 3);
 
     Ok(())
 }
@@ -84,15 +80,11 @@ async fn test_sum_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 测试 SUM(age)
-    let sum = db.select::<TestAggUser>().sum(|p| p.age).await?;
+    let sum: Option<i32> = db.select::<TestAggUser>().sum(|p| p.age).await?;
     println!("SUM result: {:?}", sum);
 
     // 验证结果
-    if let ormer::Value::Integer(s) = sum {
-        assert_eq!(s, 67); // 20 + 25 + 22
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(sum, Some(67)); // 20 + 25 + 22
 
     Ok(())
 }
@@ -127,15 +119,11 @@ async fn test_avg_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 测试 AVG(score)
-    let avg = db.select::<TestAggUser>().avg(|p| p.score).await?;
+    let avg: Option<f64> = db.select::<TestAggUser>().avg(|p| p.score).await?;
     println!("AVG result: {:?}", avg);
 
     // 验证结果 (85 + 92 + 78) / 3 = 85.0
-    if let ormer::Value::Real(a) = avg {
-        assert!((a - 85.0).abs() < 0.01);
-    } else {
-        panic!("Expected Real value");
-    }
+    assert!((avg.unwrap() - 85.0).abs() < 0.01);
 
     Ok(())
 }
@@ -170,15 +158,11 @@ async fn test_max_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 测试 MAX(age)
-    let max = db.select::<TestAggUser>().max(|p| p.age).await?;
+    let max: Option<i32> = db.select::<TestAggUser>().max(|p| p.age).await?;
     println!("MAX result: {:?}", max);
 
     // 验证结果
-    if let ormer::Value::Integer(m) = max {
-        assert_eq!(m, 25);
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(max, Some(25));
 
     Ok(())
 }
@@ -213,15 +197,11 @@ async fn test_min_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // 测试 MIN(age)
-    let min = db.select::<TestAggUser>().min(|p| p.age).await?;
+    let min: Option<i32> = db.select::<TestAggUser>().min(|p| p.age).await?;
     println!("MIN result: {:?}", min);
 
     // 验证结果
-    if let ormer::Value::Integer(m) = min {
-        assert_eq!(m, 20);
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(min, Some(20));
 
     Ok(())
 }
@@ -256,7 +236,7 @@ async fn test_aggregate_with_filter() -> Result<(), Box<dyn std::error::Error>> 
     .await?;
 
     // 测试带过滤条件的 COUNT: age >= 22
-    let count = db
+    let count: usize = db
         .select::<TestAggUser>()
         .filter(|p| p.age.ge(22))
         .count(|p| p.id)
@@ -264,14 +244,10 @@ async fn test_aggregate_with_filter() -> Result<(), Box<dyn std::error::Error>> 
     println!("COUNT with filter result: {:?}", count);
 
     // 验证结果 (Bob: 25, Charlie: 22)
-    if let ormer::Value::Integer(c) = count {
-        assert_eq!(c, 2);
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(count, 2);
 
     // 测试带过滤条件的 MAX: age >= 22
-    let max = db
+    let max: Option<i32> = db
         .select::<TestAggUser>()
         .filter(|p| p.age.ge(22))
         .max(|p| p.score)
@@ -279,11 +255,7 @@ async fn test_aggregate_with_filter() -> Result<(), Box<dyn std::error::Error>> 
     println!("MAX with filter result: {:?}", max);
 
     // 验证结果 (Bob: 92)
-    if let ormer::Value::Integer(m) = max {
-        assert_eq!(m, 92);
-    } else {
-        panic!("Expected Integer value");
-    }
+    assert_eq!(max, Some(92));
 
     Ok(())
 }

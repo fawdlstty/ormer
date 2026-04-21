@@ -108,7 +108,7 @@ impl Database {
 
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> Result<bool, crate::Error> {
-        let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1";
+        let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
         let mut rows = self
             .conn
@@ -327,9 +327,7 @@ impl Database {
                 sql.push_str(", ");
             }
 
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("?{}", idx * col_count + i))
-                .collect();
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
             let values = model.field_values();
@@ -484,9 +482,7 @@ impl Transaction {
                 sql.push_str(", ");
             }
 
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("?{}", idx * col_count + i))
-                .collect();
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
             let values = model.field_values();
@@ -656,9 +652,9 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// COUNT 聚合函数
-    pub fn count<F>(self, f: F) -> AggregateFuture<T>
+    pub fn count<F, C>(self, f: F) -> AggregateFuture<T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
     {
         let aggregate_select = self.select.count(f);
         AggregateFuture {
@@ -669,9 +665,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// SUM 聚合函数
-    pub fn sum<F>(self, f: F) -> AggregateFuture<T>
+    pub fn sum<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.sum(f);
         AggregateFuture {
@@ -682,9 +679,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// AVG 聚合函数
-    pub fn avg<F>(self, f: F) -> AggregateFuture<T>
+    pub fn avg<F, C>(self, f: F) -> AggregateFuture<T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.avg(f);
         AggregateFuture {
@@ -695,9 +693,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// MAX 聚合函数
-    pub fn max<F>(self, f: F) -> AggregateFuture<T>
+    pub fn max<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.max(f);
         AggregateFuture {
@@ -708,9 +707,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// MIN 聚合函数
-    pub fn min<F>(self, f: F) -> AggregateFuture<T>
+    pub fn min<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.min(f);
         AggregateFuture {
@@ -1105,14 +1105,16 @@ pub struct CollectFuture<T: Model, C: FromIterator<T>> {
 }
 
 /// Aggregate future for聚合函数执行
-pub struct AggregateFuture<T: Model> {
-    aggregate_select: crate::query::builder::AggregateSelect<T>,
+pub struct AggregateFuture<T: Model, R> {
+    aggregate_select: crate::query::builder::AggregateSelect<T, R>,
     conn: Arc<turso::Connection>,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(T, R)>,
 }
 
-impl<T: Model + 'static> std::future::IntoFuture for AggregateFuture<T> {
-    type Output = Result<crate::model::Value, crate::Error>;
+impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
+    for AggregateFuture<T, R>
+{
+    type Output = Result<R, crate::Error>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1151,17 +1153,21 @@ impl<T: Model + 'static> std::future::IntoFuture for AggregateFuture<T> {
                     .map_err(|e| crate::Error::Database(e.to_string()))?;
 
                 // 将turso::Value转换为ormer::Value
-                match value {
-                    turso::Value::Integer(i) => Ok(crate::model::Value::Integer(i)),
-                    turso::Value::Real(r) => Ok(crate::model::Value::Real(r)),
-                    turso::Value::Text(t) => Ok(crate::model::Value::Text(t)),
-                    turso::Value::Blob(b) => Ok(crate::model::Value::Text(
-                        String::from_utf8_lossy(&b).to_string(),
-                    )),
-                    turso::Value::Null => Ok(crate::model::Value::Null),
-                }
+                let ormer_value = match value {
+                    turso::Value::Integer(i) => crate::model::Value::Integer(i),
+                    turso::Value::Real(r) => crate::model::Value::Real(r),
+                    turso::Value::Text(t) => crate::model::Value::Text(t),
+                    turso::Value::Blob(b) => {
+                        crate::model::Value::Text(String::from_utf8_lossy(&b).to_string())
+                    }
+                    turso::Value::Null => crate::model::Value::Null,
+                };
+
+                // 使用 FromValue 转换为目标类型
+                R::from_value(&ormer_value)
             } else {
-                Ok(crate::model::Value::Null)
+                // 如果没有结果，返回 NULL 的转换
+                R::from_value(&crate::model::Value::Null)
             }
         })
     }
@@ -1489,9 +1495,9 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 设置要更新的字段
-    pub fn set<F, V>(mut self, field_fn: F, value: V) -> Self
+    pub fn set<F, V, C>(mut self, field_fn: F, value: V) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
         V: Into<Value>,
     {
         let where_obj = T::Where::default();

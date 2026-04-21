@@ -195,6 +195,16 @@ impl FromValue for i64 {
     }
 }
 
+impl FromValue for f64 {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        match value {
+            Value::Real(v) => Ok(*v),
+            Value::Integer(v) => Ok(*v as f64),
+            _ => Err(Error::TypeMismatch("f64".to_string())),
+        }
+    }
+}
+
 impl FromValue for String {
     fn from_value(value: &Value) -> Result<Self, Error> {
         match value {
@@ -209,6 +219,15 @@ impl FromValue for bool {
         match value {
             Value::Integer(v) => Ok(*v != 0),
             _ => Err(Error::TypeMismatch("bool".to_string())),
+        }
+    }
+}
+
+impl FromValue for usize {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        match value {
+            Value::Integer(v) => Ok(*v as usize),
+            _ => Err(Error::TypeMismatch("usize".to_string())),
         }
     }
 }
@@ -253,6 +272,17 @@ impl FromValue for Option<bool> {
     }
 }
 
+impl FromValue for Option<f64> {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Real(v) => Ok(Some(*v)),
+            Value::Integer(v) => Ok(Some(*v as f64)),
+            _ => Err(Error::TypeMismatch("Option<f64>".to_string())),
+        }
+    }
+}
+
 /// 错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -279,6 +309,12 @@ impl From<i32> for Value {
 impl From<i64> for Value {
     fn from(v: i64) -> Self {
         Value::Integer(v)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Real(v)
     }
 }
 

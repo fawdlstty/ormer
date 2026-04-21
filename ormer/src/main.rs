@@ -55,8 +55,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("queryed data: {users:?}");
 
     // aggregate
-    let max_age = db.select::<User>().max(|p| p.age).await?;
-    println!("max_age: {:?}", max_age);
+    let sum: Option<i32> = db.select::<User>().sum(|p| p.age).await?;
+    println!("sum: {sum:?}");
+    let min: Option<i32> = db.select::<User>().min(|p| p.age).await?;
+    println!("min: {min:?}");
+    let max: Option<i32> = db.select::<User>().max(|p| p.age).await?;
+    println!("max: {max:?}");
+    let avg: Option<f64> = db.select::<User>().avg(|p| p.age).await?;
+    println!("avg: {avg:?}");
+    let count: usize = db.select::<User>().count(|p| p.age).await?;
+    println!("count: {count:?}");
 
     // related query
     let users = db

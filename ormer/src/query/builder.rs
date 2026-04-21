@@ -42,14 +42,14 @@ pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
 }
 
 /// AggregateSelect - 聚合查询结构体
-pub struct AggregateSelect<T: Model> {
+pub struct AggregateSelect<T: Model, R = crate::model::Value> {
     aggregate_func: String, // COUNT, SUM, AVG, MAX, MIN
     column_name: String,
     filters: Vec<FilterExpr>,
-    _marker: PhantomData<T>,
+    _marker: PhantomData<(T, R)>,
 }
 
-impl<T: Model> AggregateSelect<T> {
+impl<T: Model, R> AggregateSelect<T, R> {
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
@@ -77,7 +77,6 @@ impl<T: Model> AggregateSelect<T> {
             }
         }
 
-        eprintln!("DEBUG AggregateSelect SQL: {}", sql);
         (sql, params)
     }
 
@@ -94,8 +93,8 @@ impl<T: Model> AggregateSelect<T> {
                 operator,
                 value,
             } => {
-                // Turso使用?1, ?2格式，PostgreSQL/MySQL使用$1, $2格式
-                write!(sql, "{} {} ?{}", column, operator, param_idx).unwrap();
+                // Turso使用?占位符
+                write!(sql, "{} {} ?", column, operator).unwrap();
 
                 let ormer_value = match value {
                     crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
@@ -189,54 +188,68 @@ impl<T: Model> Select<T> {
         }
     }
 
-    /// COUNT 聚合函数
-    pub fn count<F>(self, f: F) -> AggregateSelect<T>
-    where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
-    {
-        let where_obj = <T as Model>::Where::default();
-        let column = f(where_obj);
-        self.aggregate("COUNT", column.column_name())
+    /// 创建带类型参数的聚合查询
+    fn aggregate_typed<R>(self, func: &str, column: &str) -> AggregateSelect<T, R> {
+        AggregateSelect {
+            aggregate_func: func.to_string(),
+            column_name: column.to_string(),
+            filters: self.filters,
+            _marker: PhantomData,
+        }
     }
 
-    /// SUM 聚合函数
-    pub fn sum<F>(self, f: F) -> AggregateSelect<T>
+    /// COUNT 聚合函数 - 返回记录数量（usize类型）
+    pub fn count<F, C>(self, f: F) -> AggregateSelect<T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<C>,
     {
         let where_obj = <T as Model>::Where::default();
         let column = f(where_obj);
-        self.aggregate("SUM", column.column_name())
+        self.aggregate_typed("COUNT", column.column_name())
     }
 
-    /// AVG 聚合函数
-    pub fn avg<F>(self, f: F) -> AggregateSelect<T>
+    /// SUM 聚合函数 - 编译期类型推断
+    pub fn sum<F, C>(self, f: F) -> AggregateSelect<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<C>,
+        C: AggregateResultType + 'static,
     {
         let where_obj = <T as Model>::Where::default();
         let column = f(where_obj);
-        self.aggregate("AVG", column.column_name())
+        self.aggregate_typed("SUM", column.column_name())
     }
 
-    /// MAX 聚合函数
-    pub fn max<F>(self, f: F) -> AggregateSelect<T>
+    /// AVG 聚合函数 - 总是返回 f64
+    pub fn avg<F, C>(self, f: F) -> AggregateSelect<T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<C>,
+        C: AggregateResultType + 'static,
     {
         let where_obj = <T as Model>::Where::default();
         let column = f(where_obj);
-        self.aggregate("MAX", column.column_name())
+        self.aggregate_typed("AVG", column.column_name())
     }
 
-    /// MIN 聚合函数
-    pub fn min<F>(self, f: F) -> AggregateSelect<T>
+    /// MAX 聚合函数 - 编译期类型推断
+    pub fn max<F, C>(self, f: F) -> AggregateSelect<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<C>,
+        C: AggregateResultType + 'static,
     {
         let where_obj = <T as Model>::Where::default();
         let column = f(where_obj);
-        self.aggregate("MIN", column.column_name())
+        self.aggregate_typed("MAX", column.column_name())
+    }
+
+    /// MIN 聚合函数 - 编译期类型推断
+    pub fn min<F, C>(self, f: F) -> AggregateSelect<T, C::Output>
+    where
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<C>,
+        C: AggregateResultType + 'static,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        self.aggregate_typed("MIN", column.column_name())
     }
 }
 
@@ -967,40 +980,54 @@ impl AgeColumn {
     }
 }
 
-/// 数值列代理 - 支持所有数值类型的比较操作
-pub struct NumericColumn {
-    column_name: &'static str,
+/// 聚合结果类型映射 trait
+pub trait AggregateResultType {
+    /// 聚合函数返回的 Rust 类型
+    type Output;
 }
 
-impl NumericColumn {
+// 为不同字段类型实现 AggregateResultType
+impl AggregateResultType for i32 {
+    type Output = Option<i32>; // MAX/MIN 可能返回 NULL
+}
+
+impl AggregateResultType for i64 {
+    type Output = Option<i64>;
+}
+
+impl AggregateResultType for f64 {
+    type Output = Option<f64>;
+}
+
+impl AggregateResultType for String {
+    type Output = Option<String>;
+}
+
+impl AggregateResultType for usize {
+    type Output = usize;
+}
+
+/// 类型化列代理 - 携带字段类型信息
+pub struct TypedColumn<T> {
+    column_name: &'static str,
+    _marker: PhantomData<T>,
+}
+
+impl<T> TypedColumn<T> {
     pub fn new(name: &'static str) -> Self {
-        Self { column_name: name }
+        Self {
+            column_name: name,
+            _marker: PhantomData,
+        }
     }
 
     pub fn column_name(&self) -> &'static str {
         self.column_name
     }
-
-    /// 等于值或其他列
-    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
-        match value.into() {
-            ColumnValue::Literal(v) => WhereExpr {
-                inner: FilterExpr::Comparison {
-                    column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    value: v,
-                },
-            },
-            ColumnValue::ColumnRef(other_column) => WhereExpr {
-                inner: FilterExpr::ColumnComparison {
-                    left_column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    right_column: other_column,
-                },
-            },
-        }
-    }
 }
+
+// 保留 NumericColumn 作为类型别名向后兼容
+pub type NumericColumn = TypedColumn<i64>;
 
 /// 列值 - 支持字面量或列引用
 pub enum ColumnValue {
@@ -1026,14 +1053,94 @@ impl From<&str> for ColumnValue {
     }
 }
 
-impl From<NumericColumn> for ColumnValue {
-    fn from(col: NumericColumn) -> Self {
+impl<T> From<TypedColumn<T>> for ColumnValue {
+    fn from(col: TypedColumn<T>) -> Self {
         ColumnValue::ColumnRef(col.column_name.to_string())
     }
 }
 
-impl NumericColumn {
+impl TypedColumn<i64> {
     // 支持 .ge() .gt() .le() .lt() 等方法调用
+    pub fn ge(self, value: i64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: ">=".to_string(),
+                value: crate::query::filter::Value::Integer(value),
+            },
+        }
+    }
+
+    pub fn gt(self, value: i64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: ">".to_string(),
+                value: crate::query::filter::Value::Integer(value),
+            },
+        }
+    }
+
+    pub fn le(self, value: i64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: "<=".to_string(),
+                value: crate::query::filter::Value::Integer(value),
+            },
+        }
+    }
+
+    pub fn lt(self, value: i64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: "<".to_string(),
+                value: crate::query::filter::Value::Integer(value),
+            },
+        }
+    }
+
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    value: v,
+                },
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    right_column: other_column,
+                },
+            },
+        }
+    }
+}
+
+impl TypedColumn<i32> {
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    value: v,
+                },
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    right_column: other_column,
+                },
+            },
+        }
+    }
+
     pub fn ge(self, value: i32) -> WhereExpr {
         WhereExpr {
             inner: FilterExpr::Comparison {
@@ -1070,6 +1177,88 @@ impl NumericColumn {
                 column: self.column_name.to_string(),
                 operator: "<".to_string(),
                 value: crate::query::filter::Value::Integer(value as i64),
+            },
+        }
+    }
+}
+
+impl TypedColumn<String> {
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    value: v,
+                },
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    right_column: other_column,
+                },
+            },
+        }
+    }
+}
+
+impl TypedColumn<f64> {
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    value: v,
+                },
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "=".to_string(),
+                    right_column: other_column,
+                },
+            },
+        }
+    }
+
+    pub fn ge(self, value: f64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: ">=".to_string(),
+                value: crate::query::filter::Value::Real(value),
+            },
+        }
+    }
+
+    pub fn gt(self, value: f64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: ">".to_string(),
+                value: crate::query::filter::Value::Real(value),
+            },
+        }
+    }
+
+    pub fn le(self, value: f64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: "<=".to_string(),
+                value: crate::query::filter::Value::Real(value),
+            },
+        }
+    }
+
+    pub fn lt(self, value: f64) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: "<".to_string(),
+                value: crate::query::filter::Value::Real(value),
             },
         }
     }

@@ -374,9 +374,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// COUNT 聚合函数
-    pub fn count<F>(self, f: F) -> AggregateFuture<'a, T>
+    pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -391,9 +391,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// SUM 聚合函数
-    pub fn sum<F>(self, f: F) -> AggregateFuture<'a, T>
+    pub fn sum<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -408,9 +409,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// AVG 聚合函数
-    pub fn avg<F>(self, f: F) -> AggregateFuture<'a, T>
+    pub fn avg<F, C>(self, f: F) -> AggregateFuture<'a, T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -425,9 +427,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// MAX 聚合函数
-    pub fn max<F>(self, f: F) -> AggregateFuture<'a, T>
+    pub fn max<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -442,9 +445,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// MIN 聚合函数
-    pub fn min<F>(self, f: F) -> AggregateFuture<'a, T>
+    pub fn min<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -540,9 +544,9 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         }
     }
 
-    pub fn set<F, V>(self, field_fn: F, value: V) -> Self
+    pub fn set<F, V, C>(self, field_fn: F, value: V) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::NumericColumn,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
         V: Into<crate::model::Value>,
     {
         match self {
@@ -594,20 +598,22 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
 }
 
 /// 统一的 AggregateFuture 枚举
-pub enum AggregateFuture<'a, T: Model> {
+pub enum AggregateFuture<'a, T: Model, R> {
     #[cfg(feature = "turso")]
     Turso(
-        turso_backend::AggregateFuture<T>,
+        turso_backend::AggregateFuture<T, R>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::AggregateFuture<'a, T>),
+    PostgreSQL(postgresql_backend::AggregateFuture<'a, T, R>),
     #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::AggregateFuture<'a, T>),
+    MySQL(mysql_backend::AggregateFuture<'a, T, R>),
 }
 
-impl<'a, T: Model + 'static> std::future::IntoFuture for AggregateFuture<'a, T> {
-    type Output = Result<crate::model::Value, crate::Error>;
+impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
+    for AggregateFuture<'a, T, R>
+{
+    type Output = Result<R, crate::Error>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
