@@ -10,6 +10,11 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio_postgres::NoTls;
 
+// 导入宏
+use crate::impl_backend_executor_methods_with_lifetime;
+use crate::impl_backend_join_executor_methods_with_lifetime;
+use crate::impl_backend_related_executor_methods_with_lifetime;
+
 /// PostgreSQL 类型映射器
 pub struct PostgreSQLTypeMapper;
 

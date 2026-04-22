@@ -533,6 +533,247 @@ macro_rules! impl_unified_related_collect_future {
     };
 }
 
+/// 为数据库后端的 Executor 生成通用的 filter/order_by/range 方法
+/// 这个宏用于消除三个后端中重复的 Executor 方法实现
+#[macro_export]
+macro_rules! impl_backend_executor_methods {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<T: $crate::Model> $executor_type<T> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn order_by<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
+                Self {
+                    select: self.select.order_by(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn order_by_desc<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
+                Self {
+                    select: self.select.order_by_desc(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+/// 为数据库后端的 JOIN Executor 生成通用的 filter/range 方法
+#[macro_export]
+macro_rules! impl_backend_join_executor_methods {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<T: $crate::Model, J: $crate::Model> $executor_type<T, J> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+/// 为数据库后端的 RelatedSelectExecutor 生成通用方法
+#[macro_export]
+macro_rules! impl_backend_related_executor_methods {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<T: $crate::Model, R: $crate::Model> $executor_type<T, R> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+/// 为带有生命周期参数的数据库后端 Executor 生成通用的 filter/order_by/range 方法
+#[macro_export]
+macro_rules! impl_backend_executor_methods_with_lifetime {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<'a, T: $crate::Model> $executor_type<'a, T> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn order_by<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
+                Self {
+                    select: self.select.order_by(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn order_by_desc<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
+                Self {
+                    select: self.select.order_by_desc(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+/// 为带有生命周期参数的数据库后端 JOIN Executor 生成通用的 filter/range 方法
+#[macro_export]
+macro_rules! impl_backend_join_executor_methods_with_lifetime {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<'a, T: $crate::Model, J: $crate::Model> $executor_type<'a, T, J> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
+/// 为带有生命周期参数的数据库后端 RelatedSelectExecutor 生成通用方法
+#[macro_export]
+macro_rules! impl_backend_related_executor_methods_with_lifetime {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<'a, T: $crate::Model, R: $crate::Model> $executor_type<'a, T, R> {
+            pub fn filter<F>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
+            {
+                Self {
+                    select: self.select.filter(f),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+                Self {
+                    select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+        }
+    };
+}
+
 /// 示例用法 (在实际代码中使用):
 ///
 /// ```rust,ignore

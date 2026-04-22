@@ -346,17 +346,7 @@ impl<T: Model> Select<T> {
         // ORDER BY 子句
         if !self.order_by.is_empty() {
             sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self
-                .order_by
-                .iter()
-                .map(|o| {
-                    let dir = match o.direction {
-                        crate::query::filter::OrderDirection::Asc => "ASC",
-                        crate::query::filter::OrderDirection::Desc => "DESC",
-                    };
-                    format!("{} {}", o.column, dir)
-                })
-                .collect();
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
             sql.push_str(&order_strs.join(", "));
         }
 
@@ -455,17 +445,7 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         // ORDER BY 子句
         if !self.order_by.is_empty() {
             sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self
-                .order_by
-                .iter()
-                .map(|o| {
-                    let dir = match o.direction {
-                        crate::query::filter::OrderDirection::Asc => "ASC",
-                        crate::query::filter::OrderDirection::Desc => "DESC",
-                    };
-                    format!("{} {}", o.column, dir)
-                })
-                .collect();
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
             sql.push_str(&order_strs.join(", "));
         }
 
@@ -558,17 +538,7 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         // ORDER BY 子句
         if !self.order_by.is_empty() {
             sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self
-                .order_by
-                .iter()
-                .map(|o| {
-                    let dir = match o.direction {
-                        crate::query::filter::OrderDirection::Asc => "ASC",
-                        crate::query::filter::OrderDirection::Desc => "DESC",
-                    };
-                    format!("{} {}", o.column, dir)
-                })
-                .collect();
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
             sql.push_str(&order_strs.join(", "));
         }
 
@@ -663,17 +633,7 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         // ORDER BY 子句
         if !self.order_by.is_empty() {
             sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self
-                .order_by
-                .iter()
-                .map(|o| {
-                    let dir = match o.direction {
-                        crate::query::filter::OrderDirection::Asc => "ASC",
-                        crate::query::filter::OrderDirection::Desc => "DESC",
-                    };
-                    format!("{} {}", o.column, dir)
-                })
-                .collect();
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
             sql.push_str(&order_strs.join(", "));
         }
 
@@ -900,65 +860,33 @@ pub trait IsInValue<T> {
     fn to_in_value(self) -> T;
 }
 
-// 为整数类型实现 IsInValue
-macro_rules! impl_is_in_value_for_int {
-    ($t:ty) => {
-        impl IsInValue<$t> for $t {
-            fn to_in_value(self) -> $t {
-                self
+// 使用统一的宏为所有数值类型实现 IsInValue
+macro_rules! impl_is_in_value_for_numeric {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl IsInValue<$t> for $t {
+                fn to_in_value(self) -> $t {
+                    self
+                }
             }
-        }
 
-        impl IsInValue<$t> for &$t {
-            fn to_in_value(self) -> $t {
-                *self
+            impl IsInValue<$t> for &$t {
+                fn to_in_value(self) -> $t {
+                    *self
+                }
             }
-        }
 
-        impl IsInValue<$t> for &&$t {
-            fn to_in_value(self) -> $t {
-                **self
+            impl IsInValue<$t> for &&$t {
+                fn to_in_value(self) -> $t {
+                    **self
+                }
             }
-        }
+        )*
     };
 }
 
-impl_is_in_value_for_int!(i8);
-impl_is_in_value_for_int!(i16);
-impl_is_in_value_for_int!(i32);
-impl_is_in_value_for_int!(i64);
-impl_is_in_value_for_int!(u8);
-impl_is_in_value_for_int!(u16);
-impl_is_in_value_for_int!(u32);
-impl_is_in_value_for_int!(u64);
-impl_is_in_value_for_int!(isize);
-impl_is_in_value_for_int!(usize);
-
-// 为浮点类型实现 IsInValue
-macro_rules! impl_is_in_value_for_float {
-    ($t:ty) => {
-        impl IsInValue<$t> for $t {
-            fn to_in_value(self) -> $t {
-                self
-            }
-        }
-
-        impl IsInValue<$t> for &$t {
-            fn to_in_value(self) -> $t {
-                *self
-            }
-        }
-
-        impl IsInValue<$t> for &&$t {
-            fn to_in_value(self) -> $t {
-                **self
-            }
-        }
-    };
-}
-
-impl_is_in_value_for_float!(f32);
-impl_is_in_value_for_float!(f64);
+// 为所有整数和浮点类型实现
+impl_is_in_value_for_numeric!(i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64,);
 
 // 为字符串类型实现 IsInValue
 impl IsInValue<String> for String {

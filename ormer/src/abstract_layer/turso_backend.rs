@@ -10,6 +10,11 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+// 导入宏
+use crate::impl_backend_executor_methods;
+use crate::impl_backend_join_executor_methods;
+use crate::impl_backend_related_executor_methods;
+
 /// Turso 类型映射器
 pub struct TursoTypeMapper;
 
@@ -698,18 +703,6 @@ pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
 }
 
 impl<T: Model> SelectExecutor<T> {
-    /// 添加 WHERE 条件
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
     /// 添加 LEFT JOIN 查询
     pub fn left_join<J: Model>(
         self,
@@ -741,41 +734,6 @@ impl<T: Model> SelectExecutor<T> {
     ) -> RightJoinedSelectExecutor<T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加排序
-    pub fn order_by<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加降序排序
-    pub fn order_by_desc<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by_desc(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 设置范围
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -916,27 +874,19 @@ impl<T: Model> SelectExecutor<T> {
     }
 }
 
+// 使用宏生成通用的 filter/order_by/range 方法
+impl_backend_executor_methods!(SelectExecutor, conn, Arc<turso::Connection>, Select);
+
 // LEFT JOIN Executor
+// 使用宏生成通用的 filter/range 方法
+impl_backend_join_executor_methods!(
+    LeftJoinedSelectExecutor,
+    conn,
+    Arc<turso::Connection>,
+    LeftJoinedSelect
+);
+
 impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
     /// 获取 SQL（用于调试）
     pub fn to_sql(&self) -> String {
         self.select.to_sql_with_params(DbType::Turso).0
@@ -1034,26 +984,16 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
 }
 
 // INNER JOIN Executor
+// INNER JOIN Executor
+// 使用宏生成通用的 filter/range 方法
+impl_backend_join_executor_methods!(
+    InnerJoinedSelectExecutor,
+    conn,
+    Arc<turso::Connection>,
+    InnerJoinedSelect
+);
+
 impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn exec(self) -> InnerJoinCollectFuture<T, J>
     where
         T: 'static,
@@ -1129,26 +1069,16 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
 }
 
 // RIGHT JOIN Executor
+// RIGHT JOIN Executor
+// 使用宏生成通用的 filter/range 方法
+impl_backend_join_executor_methods!(
+    RightJoinedSelectExecutor,
+    conn,
+    Arc<turso::Connection>,
+    RightJoinedSelect
+);
+
 impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn exec(self) -> RightJoinCollectFuture<T, J>
     where
         T: 'static,
@@ -1362,28 +1292,16 @@ impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     }
 }
 
+// RelatedSelectExecutor
+// 使用宏生成通用的 filter/range 方法
+impl_backend_related_executor_methods!(
+    RelatedSelectExecutor,
+    conn,
+    Arc<turso::Connection>,
+    RelatedSelect
+);
+
 impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
-    /// 添加 WHERE 条件（支持两个表的字段比较）
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where, R::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 设置范围
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
     /// 执行查询并收集结果
     pub fn collect<C: FromIterator<T> + 'static>(self) -> RelatedCollectFuture<T, R> {
         RelatedCollectFuture { executor: self }

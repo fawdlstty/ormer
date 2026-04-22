@@ -284,24 +284,30 @@ pub trait FromValue: Sized {
     fn from_value(value: &Value) -> Result<Self, Error>;
 }
 
-impl FromValue for i32 {
-    fn from_value(value: &Value) -> Result<Self, Error> {
-        match value {
-            Value::Integer(v) => Ok(*v as i32),
-            _ => Err(Error::TypeMismatch("i32".to_string())),
-        }
-    }
+// 使用宏生成 FromValue 实现，减少重复代码
+macro_rules! impl_from_value_for {
+    ($($type:ty => $variant:ident),* $(,)?) => {
+        $(
+            impl FromValue for $type {
+                fn from_value(value: &Value) -> Result<Self, Error> {
+                    match value {
+                        Value::$variant(v) => Ok(*v as $type),
+                        _ => Err(Error::TypeMismatch(stringify!($type).to_string())),
+                    }
+                }
+            }
+        )*
+    };
 }
 
-impl FromValue for i64 {
-    fn from_value(value: &Value) -> Result<Self, Error> {
-        match value {
-            Value::Integer(v) => Ok(*v),
-            _ => Err(Error::TypeMismatch("i64".to_string())),
-        }
-    }
-}
+// 为基本类型生成 FromValue 实现
+impl_from_value_for!(
+    i32 => Integer,
+    i64 => Integer,
+    usize => Integer,
+);
 
+// f64 特殊处理（支持 Integer 和 Real）
 impl FromValue for f64 {
     fn from_value(value: &Value) -> Result<Self, Error> {
         match value {
@@ -312,6 +318,7 @@ impl FromValue for f64 {
     }
 }
 
+// String 特殊处理（需要 clone）
 impl FromValue for String {
     fn from_value(value: &Value) -> Result<Self, Error> {
         match value {
@@ -321,6 +328,7 @@ impl FromValue for String {
     }
 }
 
+// bool 特殊处理（0/1 转换）
 impl FromValue for bool {
     fn from_value(value: &Value) -> Result<Self, Error> {
         match value {
@@ -330,34 +338,28 @@ impl FromValue for bool {
     }
 }
 
-impl FromValue for usize {
-    fn from_value(value: &Value) -> Result<Self, Error> {
-        match value {
-            Value::Integer(v) => Ok(*v as usize),
-            _ => Err(Error::TypeMismatch("usize".to_string())),
-        }
-    }
+// 使用宏生成 Option<T> 的 FromValue 实现
+macro_rules! impl_from_value_for_option {
+    ($($type:ty => $variant:ident),* $(,)?) => {
+        $(
+            impl FromValue for Option<$type> {
+                fn from_value(value: &Value) -> Result<Self, Error> {
+                    match value {
+                        Value::Null => Ok(None),
+                        Value::$variant(v) => Ok(Some(*v as $type)),
+                        _ => Err(Error::TypeMismatch(concat!("Option<", stringify!($type), ">").to_string())),
+                    }
+                }
+            }
+        )*
+    };
 }
 
-impl FromValue for Option<i32> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Integer(v) => Ok(Some(*v as i32)),
-            _ => Err(Error::TypeMismatch("Option<i32>".to_string())),
-        }
-    }
-}
-
-impl FromValue for Option<i64> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Integer(v) => Ok(Some(*v)),
-            _ => Err(Error::TypeMismatch("Option<i64>".to_string())),
-        }
-    }
-}
+// 为 Option 类型生成 FromValue 实现
+impl_from_value_for_option!(
+    i32 => Integer,
+    i64 => Integer,
+);
 
 impl FromValue for Option<String> {
     fn from_value(value: &Value) -> Result<Self, Error> {
@@ -406,31 +408,40 @@ pub enum Error {
     SchemaMismatch { table: String, reason: String },
 }
 
-/// 实现 Value 的 From trait
-impl From<i32> for Value {
-    fn from(v: i32) -> Self {
-        Value::Integer(v as i64)
-    }
+// 使用宏生成 From<T> for Value 实现
+macro_rules! impl_from_for_value {
+    ($($type:ty => $variant:ident),* $(,)?) => {
+        $(
+            impl From<$type> for Value {
+                fn from(v: $type) -> Self {
+                    Value::$variant(v as i64)
+                }
+            }
+        )*
+    };
 }
 
-impl From<i64> for Value {
-    fn from(v: i64) -> Self {
-        Value::Integer(v)
-    }
-}
+// 为整数类型生成 From 实现
+impl_from_for_value!(
+    i32 => Integer,
+    i64 => Integer,
+);
 
+// f64 特殊处理
 impl From<f64> for Value {
     fn from(v: f64) -> Self {
         Value::Real(v)
     }
 }
 
+// String 特殊处理
 impl From<String> for Value {
     fn from(v: String) -> Self {
         Value::Text(v)
     }
 }
 
+// bool 特殊处理（转为 0/1）
 impl From<bool> for Value {
     fn from(v: bool) -> Self {
         if v {
@@ -441,6 +452,29 @@ impl From<bool> for Value {
     }
 }
 
+// 使用宏生成 Option<T> 的 From 实现
+macro_rules! impl_from_option_for_value {
+    ($($type:ty => { Some($variant:ident), None => Null }),* $(,)?) => {
+        $(
+            impl From<Option<$type>> for Value {
+                fn from(v: Option<$type>) -> Self {
+                    match v {
+                        Some(val) => Value::$variant(val as i64),
+                        None => Value::Null,
+                    }
+                }
+            }
+        )*
+    };
+}
+
+// 为 Option 整数类型生成 From 实现
+impl_from_option_for_value!(
+    i32 => { Some(Integer), None => Null },
+    i64 => { Some(Integer), None => Null },
+);
+
+// Option<String> 特殊处理
 impl From<Option<String>> for Value {
     fn from(v: Option<String>) -> Self {
         match v {
@@ -450,24 +484,7 @@ impl From<Option<String>> for Value {
     }
 }
 
-impl From<Option<i32>> for Value {
-    fn from(v: Option<i32>) -> Self {
-        match v {
-            Some(n) => Value::Integer(n as i64),
-            None => Value::Null,
-        }
-    }
-}
-
-impl From<Option<i64>> for Value {
-    fn from(v: Option<i64>) -> Self {
-        match v {
-            Some(n) => Value::Integer(n),
-            None => Value::Null,
-        }
-    }
-}
-
+// Option<bool> 特殊处理
 impl From<Option<bool>> for Value {
     fn from(v: Option<bool>) -> Self {
         match v {

@@ -68,4 +68,13 @@ impl OrderBy {
             direction: OrderDirection::Desc,
         }
     }
+
+    /// 将 OrderBy 转换为 SQL 字符串
+    pub fn to_sql(&self) -> String {
+        let dir = match self.direction {
+            OrderDirection::Asc => "ASC",
+            OrderDirection::Desc => "DESC",
+        };
+        format!("{} {}", self.column, dir)
+    }
 }
