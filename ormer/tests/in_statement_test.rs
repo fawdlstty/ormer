@@ -86,7 +86,7 @@ fn test_in_with_other_filters() {
     let sql = ormer::Select::<TestUser>::new()
         .filter(|p| p.age.ge(18))
         .filter(|p| p.age.is_in(values))
-        .limit(10)
+        .range(..10)
         .to_sql();
 
     println!("SQL: {}", sql);

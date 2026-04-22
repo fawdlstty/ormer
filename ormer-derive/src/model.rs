@@ -80,6 +80,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 index 属性
         let is_indexed = f.attrs.iter().any(|attr| attr.path().is_ident("index"));
 
+        // 检查 foreign 属性
+        let foreign_key = extract_foreign_key(f);
+
         quote! {
             ::ormer::model::ColumnSchema {
                 name: stringify!(#field_name),
@@ -89,6 +92,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 is_nullable: #is_nullable,
                 unique_group: #unique_group,
                 is_indexed: #is_indexed,
+                foreign_key: #foreign_key,
             }
         }
     });
@@ -251,5 +255,37 @@ fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
         }
     }
     // 没有 unique 属性
+    quote! { None }
+}
+
+/// 提取 foreign 属性的外键信息
+fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if attr.path().is_ident("foreign") {
+            // 解析 #[foreign(Type.field)] 格式
+            if let Meta::List(list) = &attr.meta {
+                let tokens_str = list.tokens.to_string();
+
+                // 尝试解析为 Type.field 格式
+                // tokens 应该是类似 `User . id` 的形式
+                let parts: Vec<&str> = tokens_str.split('.').collect();
+                if parts.len() == 2 {
+                    let ref_type = parts[0].trim();
+                    let ref_field = parts[1].trim();
+
+                    // 将类型名转换为表名（蛇形）
+                    let ref_table = to_snake_case(ref_type);
+
+                    return quote! {
+                        Some(::ormer::model::ForeignKeyInfo {
+                            ref_table: #ref_table,
+                            ref_column: #ref_field,
+                        })
+                    };
+                }
+            }
+        }
+    }
+    // 没有 foreign 属性
     quote! { None }
 }

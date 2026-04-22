@@ -225,18 +225,18 @@ async fn test_inner_join_with_filter() -> Result<(), Box<dyn std::error::Error>>
     })
     .await?;
 
-    // 测试带 limit 的 INNER JOIN
+    // 测试带 range 的 INNER JOIN
     let user_roles: Vec<(TestUserJoin, TestRoleJoin)> = db
         .select::<TestUserJoin>()
         .inner_join::<TestRoleJoin>(|u, r| u.id.eq(r.uid))
-        .limit(1)
+        .range(..1)
         .collect::<Vec<_>>()
         .await?;
 
     assert_eq!(user_roles.len(), 1);
 
     println!(
-        "✓ Inner join with limit test passed: {} records",
+        "✓ Inner join with range test passed: {} records",
         user_roles.len()
     );
 

@@ -178,6 +178,30 @@ impl Database {
             Database::MySQL(db) => db.drop_table::<T>().await,
         }
     }
+
+    /// 执行原生 SQL 查询并返回模型列表
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => db.exec_table::<T>(sql).await,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.exec_table::<T>(sql).await,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.exec_table::<T>(sql).await,
+        }
+    }
+
+    /// 执行原生非查询 SQL 并返回影响的行数
+    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => db.exec_non_query(sql).await,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.exec_non_query(sql).await,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.exec_non_query(sql).await,
+        }
+    }
 }
 
 /// 统一的 SelectExecutor 枚举

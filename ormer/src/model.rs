@@ -10,6 +10,14 @@ pub struct ColumnSchema {
     pub is_nullable: bool,
     pub unique_group: Option<i32>, // None表示不唯一，Some(group_id)表示属于哪个唯一键组
     pub is_indexed: bool,
+    pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
+}
+
+/// 外键信息
+#[derive(Debug, Clone)]
+pub struct ForeignKeyInfo {
+    pub ref_table: &'static str,  // 引用的表名
+    pub ref_column: &'static str, // 引用的列名
 }
 
 /// 数据库后端 trait - 用于 SQL 类型映射
@@ -155,6 +163,13 @@ pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbTyp
         }
     }
 
+    // 添加外键约束
+    let foreign_key_constraints = generate_foreign_key_constraints::<T>();
+    if !foreign_key_constraints.is_empty() {
+        sql.push_str(", ");
+        sql.push_str(&foreign_key_constraints.join(", "));
+    }
+
     // 添加联合 UNIQUE 约束
     let unique_constraints = generate_unique_constraints::<T>();
     if !unique_constraints.is_empty() {
@@ -219,6 +234,22 @@ fn generate_indexes<T: Model>(_db_type: crate::abstract_layer::DbType) -> String
     }
 
     sqls.join(";")
+}
+
+/// 生成外键约束 SQL
+fn generate_foreign_key_constraints<T: Model>() -> Vec<String> {
+    let mut constraints = Vec::new();
+
+    for column in T::COLUMN_SCHEMA.iter() {
+        if let Some(fk) = &column.foreign_key {
+            constraints.push(format!(
+                "FOREIGN KEY ({}) REFERENCES {} ({})",
+                column.name, fk.ref_table, fk.ref_column
+            ));
+        }
+    }
+
+    constraints
 }
 
 /// 数据库行抽象

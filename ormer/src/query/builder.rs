@@ -5,32 +5,65 @@ use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
 
+/// 范围边界类型,支持多种 range 语法
+pub struct RangeBounds {
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+}
+
+impl From<std::ops::Range<usize>> for RangeBounds {
+    fn from(range: std::ops::Range<usize>) -> Self {
+        RangeBounds {
+            start: Some(range.start),
+            end: Some(range.end),
+        }
+    }
+}
+
+impl From<std::ops::RangeTo<usize>> for RangeBounds {
+    fn from(range: std::ops::RangeTo<usize>) -> Self {
+        RangeBounds {
+            start: None,
+            end: Some(range.end),
+        }
+    }
+}
+
+impl From<std::ops::RangeFrom<usize>> for RangeBounds {
+    fn from(range: std::ops::RangeFrom<usize>) -> Self {
+        RangeBounds {
+            start: Some(range.start),
+            end: None,
+        }
+    }
+}
+
 /// Select 查询结构体
 ///
 /// 使用方式:Select::<User>().filter(|p| p.age > 12).to_sql()
 pub struct Select<T: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     _marker: PhantomData<T>,
 }
 
-/// RelatedSelect - 关联查询结构体（支持2表查询）
+/// RelatedSelect - 关联查询结构体(支持2表查询)
 pub struct RelatedSelect<T: Model, R: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     _marker: PhantomData<(T, R)>,
 }
 
-/// MultiTableSelect - 多表关联查询结构体（支持3个或以上表）
+/// MultiTableSelect - 多表关联查询结构体(支持3个或以上表)
 pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     _marker: PhantomData<(T, R1, R2)>,
 }
 
@@ -38,8 +71,8 @@ pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
 pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
@@ -90,8 +123,8 @@ impl<T: Model> Select<T> {
         Self {
             filters: Vec::new(),
             order_by: Vec::new(),
-            limit: None,
-            offset: None,
+            range_start: None,
+            range_end: None,
             _marker: PhantomData,
         }
     }
@@ -103,12 +136,12 @@ impl<T: Model> Select<T> {
         T2: 'static,
     {
         // 通过类型约束确保 T2 == T
-        // 如果 T2 != T，编译器会在类型推导时报错
+        // 如果 T2 != T,编译器会在类型推导时报错
         RelatedSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             _marker: PhantomData,
         }
     }
@@ -122,8 +155,8 @@ impl<T: Model> Select<T> {
         MultiTableSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             _marker: PhantomData,
         }
     }
@@ -137,8 +170,8 @@ impl<T: Model> Select<T> {
         FourTableSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             _marker: PhantomData,
         }
     }
@@ -243,25 +276,35 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加排序
-    pub fn order_by<F>(mut self, f: F) -> Self
+    pub fn order_by<F, O>(mut self, f: F) -> Self
     where
-        F: FnOnce(WhereColumn<T>) -> OrderBy,
+        F: FnOnce(T::Where) -> O,
+        O: Into<OrderBy>,
     {
-        let column = WhereColumn::new();
-        let order = f(column);
+        let where_obj = T::Where::default();
+        let order = f(where_obj).into();
         self.order_by.push(order);
         self
     }
 
-    /// 限制结果数量
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
+    /// 添加降序排序
+    pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> O,
+        O: Into<OrderBy>,
+    {
+        let where_obj = T::Where::default();
+        let mut order = f(where_obj).into();
+        order.direction = crate::query::filter::OrderDirection::Desc;
+        self.order_by.push(order);
         self
     }
 
-    /// 设置偏移量
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    /// 设置范围 - 支持完整范围 (start..end)、只有上限 (..end)、只有下限 (start..)
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -317,14 +360,17 @@ impl<T: Model> Select<T> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // LIMIT 子句
-        if let Some(limit) = self.limit {
+        // RANGE 子句 (LIMIT + OFFSET)
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        // OFFSET 子句
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         // 返回参数
@@ -363,15 +409,11 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         self
     }
 
-    /// 限制结果数量
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// 设置偏移量
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    /// 设置范围 - 支持完整范围 (start..end)、只有上限 (..end)、只有下限 (start..)
+    pub fn range<RRR: Into<RangeBounds>>(mut self, range: RRR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -427,14 +469,17 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // LIMIT 子句
-        if let Some(limit) = self.limit {
+        // RANGE 子句 (LIMIT + OFFSET)
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        // OFFSET 子句
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)
@@ -466,15 +511,11 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         self
     }
 
-    /// 限制结果数量
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// 设置偏移量
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    /// 设置范围 - 支持完整范围 (start..end)、只有上限 (..end)、只有下限 (start..)
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -531,14 +572,17 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // LIMIT 子句
-        if let Some(limit) = self.limit {
+        // RANGE 子句 (LIMIT + OFFSET)
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        // OFFSET 子句
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)
@@ -571,15 +615,11 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         self
     }
 
-    /// 限制结果数量
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    /// 设置偏移量
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    /// 设置范围 - 支持完整范围 (start..end)、只有上限 (..end)、只有下限 (start..)
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -637,14 +677,17 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // LIMIT 子句
-        if let Some(limit) = self.limit {
+        // RANGE 子句 (LIMIT + OFFSET)
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        // OFFSET 子句
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)
@@ -965,6 +1008,22 @@ impl<T> TypedColumn<T> {
     pub fn column_name(&self) -> &'static str {
         self.column_name
     }
+
+    /// 创建升序排序
+    pub fn asc(self) -> OrderBy {
+        OrderBy::asc(self.column_name.to_string())
+    }
+
+    /// 创建降序排序
+    pub fn desc(self) -> OrderBy {
+        OrderBy::desc(self.column_name.to_string())
+    }
+}
+
+impl<T> From<TypedColumn<T>> for OrderBy {
+    fn from(col: TypedColumn<T>) -> Self {
+        OrderBy::asc(col.column_name.to_string())
+    }
 }
 
 // 保留 NumericColumn 作为类型别名向后兼容
@@ -1234,8 +1293,8 @@ impl From<&str> for FilterValue {
 pub struct LeftJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -1247,8 +1306,8 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
 pub struct InnerJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -1260,8 +1319,8 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
 pub struct RightJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -1281,8 +1340,8 @@ impl<T: Model> Select<T> {
         LeftJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -1302,8 +1361,8 @@ impl<T: Model> Select<T> {
         InnerJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -1323,8 +1382,8 @@ impl<T: Model> Select<T> {
         RightJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
-            limit: self.limit,
-            offset: self.offset,
+            range_start: self.range_start,
+            range_end: self.range_end,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -1344,13 +1403,10 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         self
     }
 
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -1396,12 +1452,16 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             }
         }
 
-        if let Some(limit) = self.limit {
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)
@@ -1433,13 +1493,10 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         self
     }
 
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -1484,12 +1541,16 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             }
         }
 
-        if let Some(limit) = self.limit {
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)
@@ -1521,13 +1582,10 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         self
     }
 
-    pub fn limit(mut self, limit: i64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    pub fn offset(mut self, offset: i64) -> Self {
-        self.offset = Some(offset);
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
         self
     }
 
@@ -1572,12 +1630,16 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             }
         }
 
-        if let Some(limit) = self.limit {
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
             write!(&mut sql, " LIMIT {}", limit).unwrap();
         }
-
-        if let Some(offset) = self.offset {
-            write!(&mut sql, " OFFSET {}", offset).unwrap();
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
         }
 
         (sql, params)

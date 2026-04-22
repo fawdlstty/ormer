@@ -479,6 +479,53 @@ impl Database {
 
         Ok(())
     }
+
+    /// 执行原生 SQL 查询并返回模型列表
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let rows: Vec<mysql_async::Row> = conn
+            .query(sql)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+
+        for row in rows {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let ormer_value = convert_mysql_value(&row, i)?;
+                data.insert(col_name.to_string(), ormer_value);
+            }
+
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+
+        Ok(results)
+    }
+
+    /// 执行原生非查询 SQL 并返回影响的行数
+    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        conn.query_drop(sql)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        // 获取影响的行数
+        let affected_rows = conn.affected_rows();
+        Ok(affected_rows)
+    }
 }
 
 /// MySQL 事务对象
@@ -670,9 +717,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 添加排序
-    pub fn order_by<F>(self, f: F) -> Self
+    pub fn order_by<F, O>(self, f: F) -> Self
     where
-        F: FnOnce(crate::WhereColumn<T>) -> crate::OrderBy,
+        F: FnOnce(T::Where) -> O,
+        O: Into<crate::OrderBy>,
     {
         Self {
             select: self.select.order_by(f),
@@ -681,19 +729,23 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    /// 限制结果数量
-    pub fn limit(self, limit: i64) -> Self {
+    /// 添加降序排序
+    pub fn order_by_desc<F, O>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> O,
+        O: Into<crate::OrderBy>,
+    {
         Self {
-            select: self.select.limit(limit),
+            select: self.select.order_by_desc(f),
             pool: self.pool,
             _marker: PhantomData,
         }
     }
 
-    /// 设置偏移量
-    pub fn offset(self, offset: i64) -> Self {
+    /// 设置范围
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1200,17 +1252,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1372,17 +1416,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1540,17 +1576,9 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1702,17 +1730,9 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1862,17 +1882,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2005,17 +2017,9 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2150,4 +2154,38 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 
         Ok(results.into_iter().collect())
     }
+}
+
+/// 将 MySQL 行中的值转换为 ormer Value
+fn convert_mysql_value(
+    row: &mysql_async::Row,
+    index: usize,
+) -> Result<crate::model::Value, crate::Error> {
+    // 尝试整数类型
+    if let Some(v) = row.get::<Option<i64>, _>(index) {
+        return Ok(crate::model::Value::Integer(v.unwrap_or(0)));
+    }
+
+    // 尝试字符串类型
+    if let Some(v) = row.get::<Option<String>, _>(index) {
+        return Ok(crate::model::Value::Text(v.unwrap_or_default()));
+    }
+
+    // 尝试浮点类型
+    if let Some(v) = row.get::<Option<f64>, _>(index) {
+        return Ok(crate::model::Value::Real(v.unwrap_or(0.0)));
+    }
+
+    // 尝试布尔类型
+    if let Some(v) = row.get::<Option<bool>, _>(index) {
+        return Ok(if v.unwrap_or(false) {
+            crate::model::Value::Integer(1)
+        } else {
+            crate::model::Value::Integer(0)
+        });
+    }
+
+    Err(crate::Error::Database(format!(
+        "Unsupported column type at index {index}"
+    )))
 }

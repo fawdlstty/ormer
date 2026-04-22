@@ -35,7 +35,7 @@ async fn test_schema_validation() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 测试表结构验证功能 ===\n");
 
     // 连接到数据库
-    let db = ormer::Database::connect(ormer::DbType::Turso, "data.db").await?;
+    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
 
     // 测试 1: 首次创建表（应该成功）
     println!("测试 1: 首次创建表");

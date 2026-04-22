@@ -20,9 +20,7 @@ struct TestDropRole {
 
 #[tokio::test]
 async fn test_drop_table_basic() {
-    let db = Database::connect(DbType::Turso, "test_drop_basic.db")
-        .await
-        .unwrap();
+    let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
 
     // 创建表
     db.create_table::<TestDropUser>().await.unwrap();
@@ -44,14 +42,11 @@ async fn test_drop_table_basic() {
 
     // 清理
     db.drop_table::<TestDropUser>().await.unwrap();
-    std::fs::remove_file("test_drop_basic.db").ok();
 }
 
 #[tokio::test]
 async fn test_drop_table_if_exists() {
-    let db = Database::connect(DbType::Turso, "test_drop_exists.db")
-        .await
-        .unwrap();
+    let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
 
     // 删除一个不存在的表（应该不报错）
     db.drop_table::<TestDropRole>().await.unwrap();
@@ -64,16 +59,11 @@ async fn test_drop_table_if_exists() {
 
     // 再次删除（应该不报错，因为使用了 IF EXISTS）
     db.drop_table::<TestDropRole>().await.unwrap();
-
-    // 清理
-    std::fs::remove_file("test_drop_exists.db").ok();
 }
 
 #[tokio::test]
 async fn test_drop_multiple_tables() {
-    let db = Database::connect(DbType::Turso, "test_drop_multi.db")
-        .await
-        .unwrap();
+    let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
 
     // 创建多个表
     db.create_table::<TestDropUser>().await.unwrap();
@@ -106,14 +96,11 @@ async fn test_drop_multiple_tables() {
     // 清理
     db.drop_table::<TestDropUser>().await.unwrap();
     db.drop_table::<TestDropRole>().await.unwrap();
-    std::fs::remove_file("test_drop_multi.db").ok();
 }
 
 #[tokio::test]
 async fn test_drop_table_and_recreate() {
-    let db = Database::connect(DbType::Turso, "test_drop_recreate.db")
-        .await
-        .unwrap();
+    let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
 
     // 创建表
     db.create_table::<TestDropUser>().await.unwrap();
@@ -159,5 +146,4 @@ async fn test_drop_table_and_recreate() {
 
     // 清理
     db.drop_table::<TestDropUser>().await.unwrap();
-    std::fs::remove_file("test_drop_recreate.db").ok();
 }

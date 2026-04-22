@@ -2,7 +2,7 @@
 ///
 /// 本文件包含用于生成重复代码模式的宏
 
-/// 为 JOIN Executor 生成通用的 filter/limit/offset 方法
+/// 为 JOIN Executor 生成通用的 filter/range 方法
 #[macro_export]
 macro_rules! impl_join_executor_methods {
     (
@@ -22,17 +22,9 @@ macro_rules! impl_join_executor_methods {
                 }
             }
 
-            pub fn limit(self, limit: i64) -> Self {
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 Self {
-                    select: self.select.limit(limit),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn offset(self, offset: i64) -> Self {
-                Self {
-                    select: self.select.offset(offset),
+                    select: self.select.range(range),
                     $conn_field: self.$conn_field,
                     _marker: std::marker::PhantomData,
                 }
@@ -87,7 +79,7 @@ macro_rules! impl_single_collect_future {
     };
 }
 
-/// 为 Executor 生成通用的方法 (filter/order_by/limit/offset)
+/// 为 Executor 生成通用的方法 (filter/order_by/range)
 #[macro_export]
 macro_rules! impl_executor_methods {
     (
@@ -107,9 +99,10 @@ macro_rules! impl_executor_methods {
                 }
             }
 
-            pub fn order_by<F>(self, f: F) -> Self
+            pub fn order_by<F, O>(self, f: F) -> Self
             where
-                F: FnOnce($crate::WhereColumn<T>) -> $crate::OrderBy,
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
             {
                 Self {
                     select: self.select.order_by(f),
@@ -118,17 +111,21 @@ macro_rules! impl_executor_methods {
                 }
             }
 
-            pub fn limit(self, limit: i64) -> Self {
+            pub fn order_by_desc<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
                 Self {
-                    select: self.select.limit(limit),
+                    select: self.select.order_by_desc(f),
                     $conn_field: self.$conn_field,
                     _marker: std::marker::PhantomData,
                 }
             }
 
-            pub fn offset(self, offset: i64) -> Self {
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 Self {
-                    select: self.select.offset(offset),
+                    select: self.select.range(range),
                     $conn_field: self.$conn_field,
                     _marker: std::marker::PhantomData,
                 }
@@ -137,7 +134,7 @@ macro_rules! impl_executor_methods {
     };
 }
 
-/// 为统一的 SelectExecutor 生成方法（filter/order_by/limit/offset）
+/// 为统一的 SelectExecutor 生成方法（filter/order_by/range）
 #[macro_export]
 macro_rules! impl_unified_select_executor_methods {
     ($executor_name:ident, $turso_phantom:expr) => {
@@ -158,9 +155,10 @@ macro_rules! impl_unified_select_executor_methods {
                 }
             }
 
-            pub fn order_by<F>(self, f: F) -> Self
+            pub fn order_by<F, O>(self, f: F) -> Self
             where
-                F: FnOnce($crate::WhereColumn<T>) -> $crate::OrderBy,
+                F: FnOnce(T::Where) -> O,
+                O: Into<$crate::OrderBy>,
             {
                 match self {
                     #[cfg(feature = "turso")]
@@ -176,33 +174,37 @@ macro_rules! impl_unified_select_executor_methods {
                 }
             }
 
-            pub fn limit(self, limit: i64) -> Self {
+            pub fn order_by_desc<F, O>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> O,
+                O: Into<$crate::OrderBy>,
+            {
                 match self {
                     #[cfg(feature = "turso")]
                     $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.limit(limit), $turso_phantom)
+                        $executor_name::Turso(exec.order_by_desc(f), $turso_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.limit(limit))
+                        $executor_name::PostgreSQL(exec.order_by_desc(f))
                     }
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.limit(limit)),
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
                 }
             }
 
-            pub fn offset(self, offset: i64) -> Self {
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "turso")]
                     $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.offset(offset), $turso_phantom)
+                        $executor_name::Turso(exec.range(range), $turso_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.offset(offset))
+                        $executor_name::PostgreSQL(exec.range(range))
                     }
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.offset(offset)),
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                 }
             }
         }
@@ -368,7 +370,7 @@ macro_rules! impl_unified_aggregate_future {
     };
 }
 
-/// 为统一的 JOIN Executor 生成 filter/limit/offset 方法
+/// 为统一的 JOIN Executor 生成 filter/range 方法
 #[macro_export]
 macro_rules! impl_unified_join_executor {
     ($executor_name:ident, $turso_phantom:expr) => {
@@ -389,33 +391,18 @@ macro_rules! impl_unified_join_executor {
                 }
             }
 
-            pub fn limit(self, limit: i64) -> Self {
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "turso")]
                     $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.limit(limit), $turso_phantom)
+                        $executor_name::Turso(exec.range(range), $turso_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.limit(limit))
+                        $executor_name::PostgreSQL(exec.range(range))
                     }
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.limit(limit)),
-                }
-            }
-
-            pub fn offset(self, offset: i64) -> Self {
-                match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.offset(offset), $turso_phantom)
-                    }
-                    #[cfg(feature = "postgresql")]
-                    $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.offset(offset))
-                    }
-                    #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.offset(offset)),
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                 }
             }
         }
@@ -468,18 +455,18 @@ macro_rules! impl_unified_related_select_executor {
                 }
             }
 
-            pub fn limit(self, limit: i64) -> Self {
+            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "turso")]
                     $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.limit(limit), $turso_phantom)
+                        $executor_name::Turso(exec.range(range), $turso_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.limit(limit))
+                        $executor_name::PostgreSQL(exec.range(range))
                     }
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.limit(limit)),
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                 }
             }
 

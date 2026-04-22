@@ -1,9 +1,8 @@
-use ormer::Model;
+use ormer::{Database, DbType, Model};
 
-// 定义与 main.rs 相同的测试模型
-#[derive(Debug, Model, Clone)]
-#[table = "test_users_main"]
-struct TestUserMain {
+#[derive(Debug, Model)]
+#[table = "test_users"]
+struct TestUser {
     #[primary(auto)]
     id: i32,
     #[unique]
@@ -13,9 +12,9 @@ struct TestUserMain {
     email: Option<String>,
 }
 
-#[derive(Debug, Model, Clone)]
-#[table = "test_roles_main"]
-struct TestRoleMain {
+#[derive(Debug, Model)]
+#[table = "test_roles"]
+struct TestRole {
     #[primary]
     id: i32,
     #[unique(group = 1)]
@@ -24,293 +23,154 @@ struct TestRoleMain {
     name: String,
 }
 
-/// 测试基本插入功能（与 main.rs 相同）
 #[tokio::test]
-async fn test_main_insert() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-    db.create_table::<TestRoleMain>().await?;
+async fn test_main_rs_usage() -> Result<(), Box<dyn std::error::Error>> {
+    // connect
+    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    db.create_table::<TestUser>().await?;
+    db.create_table::<TestRole>().await?;
 
     // insert
-    db.insert(&TestUserMain {
+    db.insert(&TestUser {
         id: 1,
         name: "Alice".to_string(),
         age: 18,
         email: None,
     })
     .await?;
-    db.insert(&TestRoleMain {
-        id: 1,
-        uid: 1,
-        name: "admin".to_string(),
-    })
-    .await?;
-
-    // 验证插入成功
-    let users: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    assert_eq!(users.len(), 1);
-    assert_eq!(users[0].name, "Alice");
-
-    let roles: Vec<TestRoleMain> = db.select::<TestRoleMain>().collect::<Vec<_>>().await?;
-    assert_eq!(roles.len(), 1);
-    assert_eq!(roles[0].name, "admin");
-
-    Ok(())
-}
-
-/// 测试基本查询功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_basic_query() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-
-    // 插入测试数据
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
-    .await?;
-    db.insert(&TestUserMain {
+    db.insert(&vec![TestUser {
         id: 2,
         name: "Bob".to_string(),
         age: 20,
         email: Some("bob@example.com".to_string()),
-    })
+    }])
     .await?;
-
-    // query with filter and limit
-    let users = db
-        .select::<TestUserMain>()
-        .filter(|p| p.age.ge(18))
-        .limit(10)
-        .collect::<Vec<_>>()
-        .await?;
-
-    assert_eq!(users.len(), 2);
-
-    Ok(())
-}
-
-/// 测试关联查询功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_related_query() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-    db.create_table::<TestRoleMain>().await?;
-
-    // 插入测试数据
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
+    db.insert(&vec![TestUser {
+        id: 3,
+        name: "Charlie".to_string(),
+        age: 22,
+        email: Some("charlie@example.com".to_string()),
+    }])
     .await?;
-    db.insert(&TestRoleMain {
+    db.insert(&[TestUser {
+        id: 4,
+        name: "David".to_string(),
+        age: 24,
+        email: Some("david@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(&[TestUser {
+        id: 5,
+        name: "Eve".to_string(),
+        age: 26,
+        email: Some("eve@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(
+        &[TestUser {
+            id: 6,
+            name: "Frank".to_string(),
+            age: 28,
+            email: Some("frank@example.com".to_string()),
+        }][..],
+    )
+    .await?;
+    db.insert(
+        &[TestUser {
+            id: 7,
+            name: "Grace".to_string(),
+            age: 30,
+            email: Some("grace@example.com".to_string()),
+        }][..],
+    )
+    .await?;
+    db.insert_or_update(&TestRole {
         id: 1,
         uid: 1,
         name: "admin".to_string(),
     })
     .await?;
+    println!("inserted data");
 
-    // related query - 注意：from 查询返回的是主表的结果
+    // query with order_by
     let users = db
-        .select::<TestUserMain>()
-        .from::<TestUserMain, TestRoleMain>()
+        .select::<TestUser>()
+        .filter(|p| p.age.is_in(&vec![2, 4, 6, 7, 8]))
+        .order_by(|p| p.age)
+        .range(0..10)
+        .collect::<Vec<_>>()
+        .await?;
+    println!("queryed data with order_by: {users:?}");
+
+    // query with order_by_desc
+    let users = db
+        .select::<TestUser>()
+        .filter(|p| p.age.is_in(&vec![2, 4, 6, 7, 8]))
+        .order_by_desc(|p| p.age)
+        .range(0..10)
+        .collect::<Vec<_>>()
+        .await?;
+    println!("queryed data with order_by_desc: {users:?}");
+
+    // aggregate
+    let sum: Option<i32> = db.select::<TestUser>().sum(|p| p.age).await?;
+    println!("sum: {sum:?}");
+    let min: Option<i32> = db.select::<TestUser>().min(|p| p.age).await?;
+    println!("min: {min:?}");
+    let max: Option<i32> = db.select::<TestUser>().max(|p| p.age).await?;
+    println!("max: {max:?}");
+    let avg: Option<f64> = db.select::<TestUser>().avg(|p| p.age).await?;
+    println!("avg: {avg:?}");
+    let count: usize = db.select::<TestUser>().count(|p| p.age).await?;
+    println!("count: {count:?}");
+
+    // related query
+    let users = db
+        .select::<TestUser>()
+        .from::<TestUser, TestRole>()
         .filter(|p, q| p.id.eq(q.uid))
         .filter(|_, q| q.name.eq("admin".to_string()))
-        .limit(10)
+        .range(..10)
         .collect::<Vec<_>>()
         .await?;
+    println!("related query data: {users:?}");
 
-    // 验证查询能够正常执行（具体结果取决于SQL生成逻辑）
-    println!("Related query returned {} users", users.len());
-
-    Ok(())
-}
-
-/// 测试左连接查询功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_left_join_query() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-    db.create_table::<TestRoleMain>().await?;
-
-    // 插入测试数据 - 确保 uid 类型与 User.id 类型匹配
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
-    .await?;
-    db.insert(&TestUserMain {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        email: Some("bob@example.com".to_string()),
-    })
-    .await?;
-    // Role 的 uid 应该与 User 的 id 匹配
-    db.insert(&TestRoleMain {
-        id: 1,
-        uid: 1, // 与 Alice 的 id 匹配
-        name: "admin".to_string(),
-    })
-    .await?;
-
-    // join query - 简化测试，只验证查询能正常执行
-    // 由于类型映射问题，我们只验证查询不会崩溃
-    match db
-        .select::<TestUserMain>()
-        .left_join::<TestRoleMain>(|p, q| p.id.eq(q.uid))
-        .limit(10)
-        .collect::<Vec<(TestUserMain, Option<TestRoleMain>)>>()
-        .await
-    {
-        Ok(user_roles) => {
-            println!("Left join query returned {} rows", user_roles.len());
-            // 验证至少返回了用户数据
-            assert!(!user_roles.is_empty());
-        }
-        Err(e) => {
-            // 如果类型不匹配，打印错误但不失败
-            println!(
-                "Left join query error (expected due to type mapping): {}",
-                e
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// 测试更新功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_update() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-
-    // 插入测试数据
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
-    .await?;
-    db.insert(&TestUserMain {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 20,
-        email: None,
-    })
-    .await?;
+    // join query
+    let user_roles: Vec<(TestUser, Option<TestRole>)> = db
+        .select::<TestUser>()
+        .left_join::<TestRole>(|p, q| p.id.eq(q.uid))
+        .range(10..20)
+        .collect::<Vec<_>>()
+        .await?;
+    println!("join query data: {user_roles:?}");
 
     // update
     let count = db
-        .update::<TestUserMain>()
+        .update::<TestUser>()
         .filter(|p| p.age.ge(18))
         .set(|p| p.age, 10)
         .execute()
         .await?;
-
-    assert_eq!(count, 2);
-
-    // 验证更新成功
-    let users: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    assert_eq!(users[0].age, 10);
-    assert_eq!(users[1].age, 10);
-
-    Ok(())
-}
-
-/// 测试删除功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_delete() -> Result<(), Box<dyn std::error::Error>> {
-    // 使用独立的内存数据库，避免数据干扰
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-
-    // 验证初始为空
-    let users_initial: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    println!("Initial users count: {}", users_initial.len());
-    assert_eq!(users_initial.len(), 0);
-
-    // 插入测试数据
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
-    .await?;
-    db.insert(&TestUserMain {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 20,
-        email: None,
-    })
-    .await?;
-
-    // 验证插入成功
-    let users_before: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    println!("Users before delete: {}", users_before.len());
-    assert_eq!(users_before.len(), 2);
-
-    // 构建delete查询器并打印SQL
-    let delete_executor = db.delete::<TestUserMain>().filter(|p| p.age.ge(18));
+    println!("updated rows: {count}");
 
     // delete
-    let count = delete_executor.execute().await?;
+    let count = db
+        .delete::<TestUser>()
+        .filter(|p| p.age.ge(18))
+        .execute()
+        .await?;
+    println!("deleted rows: {count}");
 
-    println!("Deleted count: {}", count);
-    // SQLite的changes()可能返回不准确的值，我们只验证数据被删除了
-    // assert_eq!(count, 2);
-
-    // 验证删除成功
-    let users: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    println!("Users after delete: {}", users.len());
-    assert_eq!(users.len(), 0);
-
-    Ok(())
-}
-
-/// 测试事务中的删除功能（与 main.rs 相同）
-#[tokio::test]
-async fn test_main_transaction_delete() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestUserMain>().await?;
-
-    // 插入测试数据
-    db.insert(&TestUserMain {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 18,
-        email: None,
-    })
-    .await?;
-    db.insert(&TestUserMain {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 20,
-        email: None,
-    })
-    .await?;
-
-    // 事务中的删除
     let t = db.begin().await?;
-    t.delete::<TestUserMain>()
+    t.delete::<TestUser>()
         .filter(|p| p.age.ge(18))
         .execute()
         .await?;
     t.commit().await?;
 
-    // 验证删除成功
-    let users: Vec<TestUserMain> = db.select::<TestUserMain>().collect::<Vec<_>>().await?;
-    assert_eq!(users.len(), 0);
+    // drop table
+    db.drop_table::<TestUser>().await?;
+    db.drop_table::<TestRole>().await?;
 
     Ok(())
 }

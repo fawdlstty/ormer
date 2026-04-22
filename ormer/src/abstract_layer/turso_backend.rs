@@ -450,6 +450,48 @@ impl Database {
             .map_err(|e| crate::Error::Database(e.to_string()))?;
         Ok(())
     }
+
+    /// 执行原生 SQL 查询并返回模型列表
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+        let mut rows = self
+            .conn
+            .query(sql, ())
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let mut results = Vec::new();
+
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?
+        {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let value = row
+                    .get_value(i)
+                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                let ormer_value = convert_turso_value(&value)?;
+                data.insert(col_name.to_string(), ormer_value);
+            }
+
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+
+        Ok(results)
+    }
+
+    /// 执行原生非查询 SQL 并返回影响的行数
+    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+        let result = self
+            .conn
+            .execute(sql, ())
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        Ok(result)
+    }
 }
 
 /// Turso 事务对象
@@ -705,9 +747,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 添加排序
-    pub fn order_by<F>(self, f: F) -> Self
+    pub fn order_by<F, O>(self, f: F) -> Self
     where
-        F: FnOnce(crate::WhereColumn<T>) -> crate::OrderBy,
+        F: FnOnce(T::Where) -> O,
+        O: Into<crate::OrderBy>,
     {
         Self {
             select: self.select.order_by(f),
@@ -716,19 +759,23 @@ impl<T: Model> SelectExecutor<T> {
         }
     }
 
-    /// 限制结果数量
-    pub fn limit(self, limit: i64) -> Self {
+    /// 添加降序排序
+    pub fn order_by_desc<F, O>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> O,
+        O: Into<crate::OrderBy>,
+    {
         Self {
-            select: self.select.limit(limit),
+            select: self.select.order_by_desc(f),
             conn: self.conn,
             _marker: PhantomData,
         }
     }
 
-    /// 设置偏移量
-    pub fn offset(self, offset: i64) -> Self {
+    /// 设置范围
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -882,17 +929,9 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -1007,17 +1046,9 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -1110,17 +1141,9 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         }
     }
 
-    pub fn limit(self, limit: i64) -> Self {
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -1352,19 +1375,10 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         }
     }
 
-    /// 限制结果数量
-    pub fn limit(self, limit: i64) -> Self {
+    /// 设置范围
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
         Self {
-            select: self.select.limit(limit),
-            conn: self.conn,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 设置偏移量
-    pub fn offset(self, offset: i64) -> Self {
-        Self {
-            select: self.select.offset(offset),
+            select: self.select.range(range),
             conn: self.conn,
             _marker: PhantomData,
         }

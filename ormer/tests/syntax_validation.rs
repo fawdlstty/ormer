@@ -64,7 +64,8 @@ mod syntax_validation {
         #[allow(unused_imports)]
         use ormer::{OrderBy, OrderDirection};
 
-        let query = TestUser::query().limit(10).offset(20);
+        // offset方法已被range替代，使用range(start..end)语法
+        let query = TestUser::query().range(20..30);
 
         let sql = query.to_sql();
 
@@ -75,7 +76,7 @@ mod syntax_validation {
     #[test]
     fn test_sql_generation_placeholders() {
         // 验证 SQL 生成使用占位符（防 SQL 注入）
-        let query = TestUser::query().limit(10);
+        let query = TestUser::query().range(..10);
 
         let sql = query.to_sql();
 
