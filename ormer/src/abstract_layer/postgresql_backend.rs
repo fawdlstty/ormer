@@ -318,6 +318,11 @@ impl Database {
         self.insert_batch::<T>(&[model]).await
     }
 
+    /// 插入或更新单条记录（遇到重复键时更新）
+    pub async fn insert_or_update<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+        self.insert_or_update_batch::<T>(&[model]).await
+    }
+
     /// 批量插入记录
     pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
         if models.is_empty() {
@@ -345,6 +350,65 @@ impl Database {
 
             let values = model.field_values();
             all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        self.client
+            .execute(&sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 批量插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update_batch<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+        let primary_key = T::primary_key_column();
+
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+        let mut param_idx = 1;
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        // 添加 ON CONFLICT DO UPDATE 子句
+        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
+        let mut first = true;
+        for col_name in T::COLUMNS.iter() {
+            if col_name == &primary_key {
+                continue; // 跳过主键
+            }
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            first = false;
         }
 
         let params = values_to_params(&all_values)?;
@@ -407,6 +471,16 @@ impl Database {
             committed: false,
             rolled_back: false,
         })
+    }
+
+    /// 删除表
+    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
+        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        self.client
+            .execute(&sql, &[])
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -481,15 +555,49 @@ impl<'a> Transaction<'a> {
         self.insert_batch::<T>(&[model]).await
     }
 
+    /// 插入或更新单条记录（遇到重复键时更新）
+    pub async fn insert_or_update<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+        self.insert_or_update_batch::<T>(&[model]).await
+    }
+
     /// 批量插入记录
     pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
         if models.is_empty() {
             return Ok(());
         }
 
+        let (sql, _) = crate::abstract_layer::common_helpers::build_batch_insert_sql_postgresql::<T>(
+            models.len(),
+        );
+        let all_values =
+            crate::abstract_layer::common_helpers::collect_batch_insert_values::<T>(models);
+
+        let params = values_to_params(&all_values)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        self.client
+            .execute(&sql, &param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 批量插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update_batch<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
+        let primary_key = T::primary_key_column();
 
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
         let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
         let mut param_idx = 1;
@@ -507,6 +615,20 @@ impl<'a> Transaction<'a> {
 
             let values = model.field_values();
             all_values.extend(values);
+        }
+
+        // 添加 ON CONFLICT DO UPDATE 子句
+        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
+        let mut first = true;
+        for col_name in T::COLUMNS.iter() {
+            if col_name == &primary_key {
+                continue; // 跳过主键
+            }
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            first = false;
         }
 
         let params = values_to_params(&all_values)?;

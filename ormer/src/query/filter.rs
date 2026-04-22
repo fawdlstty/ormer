@@ -1,18 +1,20 @@
 /// 过滤表达式
 #[derive(Debug, Clone)]
 pub enum FilterExpr {
-    /// 简单比较：column operator value
+    /// 简单比较:column operator value
     Comparison {
         column: String,
         operator: String,
         value: Value,
     },
-    /// 列-列比较：column1 operator column2
+    /// 列-列比较:column1 operator column2
     ColumnComparison {
         left_column: String,
         operator: String,
         right_column: String,
     },
+    /// IN 语句:column IN (value1, value2, ...)
+    In { column: String, values: Vec<Value> },
     /// AND 连接
     And(Box<FilterExpr>, Box<FilterExpr>),
     /// OR 连接

@@ -29,6 +29,25 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
         } => {
             write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
         }
+        FilterExpr::In { column, values } => {
+            // 生成 IN 语句: column IN (?, ?, ...)
+            write!(sql, "{} IN (", column).unwrap();
+            for (i, _) in values.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "${}", param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        sql.push('?');
+                    }
+                }
+                *param_idx += 1;
+            }
+            sql.push(')');
+        }
         FilterExpr::And(left, right) => {
             format_filter(left, sql, param_idx, db_type);
             sql.push_str(" AND ");
@@ -73,6 +92,26 @@ pub fn format_filter_with_params(
             right_column,
         } => {
             write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
+        }
+        FilterExpr::In { column, values } => {
+            // 生成 IN 语句: column IN (?, ?, ...)
+            write!(sql, "{} IN (", column).unwrap();
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                match db_type {
+                    DbType::PostgreSQL => {
+                        write!(sql, "${}", param_idx).unwrap();
+                    }
+                    DbType::Turso | DbType::MySQL => {
+                        sql.push('?');
+                    }
+                }
+                params.push(value.clone().into());
+                *param_idx += 1;
+            }
+            sql.push(')');
         }
         FilterExpr::And(left, right) => {
             format_filter_with_params(left, sql, param_idx, params, db_type);
@@ -145,7 +184,7 @@ pub fn convert_column_value(
     }
 }
 
-/// 构建批量插入 SQL 的公共函数
+/// 构建批量插入 SQL 的公共函数（使用 ? 占位符）
 pub fn build_batch_insert_sql<T: Model>(models_count: usize) -> (String, usize) {
     let columns = T::COLUMNS.join(", ");
     let col_count = T::COLUMNS.len();
@@ -162,4 +201,40 @@ pub fn build_batch_insert_sql<T: Model>(models_count: usize) -> (String, usize) 
     }
 
     (sql, col_count)
+}
+
+/// 构建批量插入 SQL（PostgreSQL 使用 $1, $2 占位符）
+pub fn build_batch_insert_sql_postgresql<T: Model>(models_count: usize) -> (String, usize) {
+    let columns = T::COLUMNS.join(", ");
+    let col_count = T::COLUMNS.len();
+
+    let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+    let mut param_idx = 1;
+
+    for idx in 0..models_count {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+
+        let placeholders: Vec<String> = (1..=col_count)
+            .map(|i| {
+                let idx = param_idx + i - 1;
+                format!("${}", idx)
+            })
+            .collect();
+        sql.push_str(&format!("({})", placeholders.join(", ")));
+        param_idx += col_count;
+    }
+
+    (sql, col_count)
+}
+
+/// 收集批量插入的所有模型值
+pub fn collect_batch_insert_values<T: Model>(models: &[&T]) -> Vec<Value> {
+    let mut all_values = Vec::new();
+    for model in models {
+        let values = model.field_values();
+        all_values.extend(values);
+    }
+    all_values
 }

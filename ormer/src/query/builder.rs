@@ -1,6 +1,7 @@
 use crate::abstract_layer::DbType;
 use crate::model::Model;
 use crate::query::filter::{FilterExpr, OrderBy};
+use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
 
@@ -70,68 +71,17 @@ impl<T: Model, R> AggregateSelect<T, R> {
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
             let mut param_idx = 1;
+            let formatter = FilterFormatter::new(db_type);
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
         (sql, params)
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                // 根据数据库类型生成占位符
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            _ => {}
-        }
     }
 }
 
@@ -340,17 +290,13 @@ impl<T: Model> Select<T> {
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
             let mut param_idx = 1;
+            let formatter = FilterFormatter::new(db_type);
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -383,102 +329,6 @@ impl<T: Model> Select<T> {
 
         // 返回参数
         (sql, params)
-    }
-
-    #[allow(dead_code)]
-    fn format_filter(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value: _,
-            } => {
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-                *param_idx += 1;
-            }
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter(left, sql, param_idx, db_type);
-                sql.push_str(" AND ");
-                self.format_filter(right, sql, param_idx, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter(left, sql, param_idx, db_type);
-                sql.push_str(" OR ");
-                self.format_filter(right, sql, param_idx, db_type);
-            }
-        }
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-                // 转换 filter Value 到 ormer Value
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-        }
     }
 }
 
@@ -548,17 +398,15 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         // WHERE 子句
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -590,59 +438,6 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         }
 
         (sql, params)
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                // 默认使用 t0 前缀
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 左列使用 t0 前缀，右列使用 t1 前缀
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-        }
     }
 }
 
@@ -707,17 +502,15 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         // WHERE 子句
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -749,60 +542,6 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         }
 
         (sql, params)
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                // 默认使用 t0 前缀
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 需要根据列名判断属于哪个表，这里简化处理
-                // 左列使用 t0 前缀，右列使用 t1 前缀
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-        }
     }
 }
 
@@ -869,17 +608,15 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         // WHERE 子句
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -911,60 +648,6 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         }
 
         (sql, params)
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                // 默认使用 t0 前缀
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "t0.{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "t0.{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 需要根据列名判断属于哪个表，这里简化处理
-                // 左列使用 t0 前缀，右列使用 t1 前缀
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-        }
     }
 }
 
@@ -1094,6 +777,177 @@ impl AggregateResultType for usize {
     type Output = usize;
 }
 
+// ==================== ColumnValueType Trait ====================
+// 用于统一处理不同 Rust 类型到 FilterValue 的转换
+
+/// 列值类型 trait - 定义 Rust 类型如何转换为 FilterValue
+pub trait ColumnValueType {
+    /// 将 Rust 值转换为 FilterValue
+    fn to_filter_value(value: Self) -> crate::query::filter::Value;
+
+    /// 是否支持数值比较操作（>, >=, <, <=）
+    fn supports_comparison() -> bool;
+}
+
+// 为所有整数类型实现 ColumnValueType
+macro_rules! impl_column_value_type_for_int {
+    ($($t:ty),*) => {
+        $(
+            impl ColumnValueType for $t {
+                fn to_filter_value(value: Self) -> crate::query::filter::Value {
+                    crate::query::filter::Value::Integer(value as i64)
+                }
+
+                fn supports_comparison() -> bool {
+                    true
+                }
+            }
+        )*
+    };
+}
+
+impl_column_value_type_for_int!(i8, i16, i32, i64, u8, u16, u32, u64, isize, usize);
+
+// 为浮点类型实现 ColumnValueType
+macro_rules! impl_column_value_type_for_float {
+    ($($t:ty),*) => {
+        $(
+            impl ColumnValueType for $t {
+                fn to_filter_value(value: Self) -> crate::query::filter::Value {
+                    crate::query::filter::Value::Real(value as f64)
+                }
+
+                fn supports_comparison() -> bool {
+                    true
+                }
+            }
+        )*
+    };
+}
+
+impl_column_value_type_for_float!(f32, f64);
+
+// 为 String 实现 ColumnValueType
+impl ColumnValueType for String {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        crate::query::filter::Value::Text(value)
+    }
+
+    fn supports_comparison() -> bool {
+        false // 字符串不支持数值比较
+    }
+}
+
+// 为 &str 实现 ColumnValueType
+impl ColumnValueType for &str {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        crate::query::filter::Value::Text(value.to_string())
+    }
+
+    fn supports_comparison() -> bool {
+        false
+    }
+}
+
+// ==================== 统一的 IsInValue Trait ====================
+// 使用泛型支持所有类型的 IN 语句
+
+/// 用于 is_in 方法的值转换 trait（泛型版本）
+pub trait IsInValue<T> {
+    fn to_in_value(self) -> T;
+}
+
+// 为整数类型实现 IsInValue
+macro_rules! impl_is_in_value_for_int {
+    ($t:ty) => {
+        impl IsInValue<$t> for $t {
+            fn to_in_value(self) -> $t {
+                self
+            }
+        }
+
+        impl IsInValue<$t> for &$t {
+            fn to_in_value(self) -> $t {
+                *self
+            }
+        }
+
+        impl IsInValue<$t> for &&$t {
+            fn to_in_value(self) -> $t {
+                **self
+            }
+        }
+    };
+}
+
+impl_is_in_value_for_int!(i8);
+impl_is_in_value_for_int!(i16);
+impl_is_in_value_for_int!(i32);
+impl_is_in_value_for_int!(i64);
+impl_is_in_value_for_int!(u8);
+impl_is_in_value_for_int!(u16);
+impl_is_in_value_for_int!(u32);
+impl_is_in_value_for_int!(u64);
+impl_is_in_value_for_int!(isize);
+impl_is_in_value_for_int!(usize);
+
+// 为浮点类型实现 IsInValue
+macro_rules! impl_is_in_value_for_float {
+    ($t:ty) => {
+        impl IsInValue<$t> for $t {
+            fn to_in_value(self) -> $t {
+                self
+            }
+        }
+
+        impl IsInValue<$t> for &$t {
+            fn to_in_value(self) -> $t {
+                *self
+            }
+        }
+
+        impl IsInValue<$t> for &&$t {
+            fn to_in_value(self) -> $t {
+                **self
+            }
+        }
+    };
+}
+
+impl_is_in_value_for_float!(f32);
+impl_is_in_value_for_float!(f64);
+
+// 为字符串类型实现 IsInValue
+impl IsInValue<String> for String {
+    fn to_in_value(self) -> String {
+        self
+    }
+}
+
+impl IsInValue<String> for &String {
+    fn to_in_value(self) -> String {
+        self.clone()
+    }
+}
+
+impl IsInValue<String> for &&String {
+    fn to_in_value(self) -> String {
+        (*self).clone()
+    }
+}
+
+impl IsInValue<String> for &str {
+    fn to_in_value(self) -> String {
+        self.to_string()
+    }
+}
+
+impl IsInValue<String> for &&str {
+    fn to_in_value(self) -> String {
+        (*self).to_string()
+    }
+}
+
 /// 类型化列代理 - 携带字段类型信息
 pub struct TypedColumn<T> {
     column_name: &'static str,
@@ -1146,48 +1000,11 @@ impl<T> From<TypedColumn<T>> for ColumnValue {
     }
 }
 
-impl TypedColumn<i64> {
-    // 支持 .ge() .gt() .le() .lt() 等方法调用
-    pub fn ge(self, value: i64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">=".to_string(),
-                value: crate::query::filter::Value::Integer(value),
-            },
-        }
-    }
+// ==================== TypedColumn 泛型实现 ====================
+// 为所有实现了 ColumnValueType 的类型提供统一的方法
 
-    pub fn gt(self, value: i64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">".to_string(),
-                value: crate::query::filter::Value::Integer(value),
-            },
-        }
-    }
-
-    pub fn le(self, value: i64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<=".to_string(),
-                value: crate::query::filter::Value::Integer(value),
-            },
-        }
-    }
-
-    pub fn lt(self, value: i64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<".to_string(),
-                value: crate::query::filter::Value::Integer(value),
-            },
-        }
-    }
-
+impl<T: ColumnValueType> TypedColumn<T> {
+    /// 等于比较 - 支持字面量或列引用
     pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
         match value.into() {
             ColumnValue::Literal(v) => WhereExpr {
@@ -1203,149 +1020,86 @@ impl TypedColumn<i64> {
                     operator: "=".to_string(),
                     right_column: other_column,
                 },
+            },
+        }
+    }
+
+    /// IN 语句 - 支持多种集合类型
+    pub fn is_in<I, V>(self, values: I) -> WhereExpr
+    where
+        I: IntoIterator<Item = V>,
+        V: IsInValue<T>,
+    {
+        WhereExpr {
+            inner: FilterExpr::In {
+                column: self.column_name.to_string(),
+                values: values
+                    .into_iter()
+                    .map(|v| ColumnValueType::to_filter_value(v.to_in_value()))
+                    .collect(),
             },
         }
     }
 }
 
-impl TypedColumn<i32> {
-    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
-        match value.into() {
-            ColumnValue::Literal(v) => WhereExpr {
-                inner: FilterExpr::Comparison {
-                    column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    value: v,
-                },
-            },
-            ColumnValue::ColumnRef(other_column) => WhereExpr {
-                inner: FilterExpr::ColumnComparison {
-                    left_column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    right_column: other_column,
-                },
-            },
-        }
-    }
-
-    pub fn ge(self, value: i32) -> WhereExpr {
+// 为支持比较操作的类型（整数和浮点数）实现比较方法
+impl<T: ColumnValueType> TypedColumn<T> {
+    /// 大于等于
+    pub fn ge(self, value: T) -> WhereExpr {
+        debug_assert!(
+            T::supports_comparison(),
+            "Type does not support comparison operations"
+        );
         WhereExpr {
             inner: FilterExpr::Comparison {
                 column: self.column_name.to_string(),
                 operator: ">=".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
+                value: ColumnValueType::to_filter_value(value),
             },
         }
     }
 
-    pub fn gt(self, value: i32) -> WhereExpr {
+    /// 大于
+    pub fn gt(self, value: T) -> WhereExpr {
+        debug_assert!(
+            T::supports_comparison(),
+            "Type does not support comparison operations"
+        );
         WhereExpr {
             inner: FilterExpr::Comparison {
                 column: self.column_name.to_string(),
                 operator: ">".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
+                value: ColumnValueType::to_filter_value(value),
             },
         }
     }
 
-    pub fn le(self, value: i32) -> WhereExpr {
+    /// 小于等于
+    pub fn le(self, value: T) -> WhereExpr {
+        debug_assert!(
+            T::supports_comparison(),
+            "Type does not support comparison operations"
+        );
         WhereExpr {
             inner: FilterExpr::Comparison {
                 column: self.column_name.to_string(),
                 operator: "<=".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
+                value: ColumnValueType::to_filter_value(value),
             },
         }
     }
 
-    pub fn lt(self, value: i32) -> WhereExpr {
+    /// 小于
+    pub fn lt(self, value: T) -> WhereExpr {
+        debug_assert!(
+            T::supports_comparison(),
+            "Type does not support comparison operations"
+        );
         WhereExpr {
             inner: FilterExpr::Comparison {
                 column: self.column_name.to_string(),
                 operator: "<".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
-            },
-        }
-    }
-}
-
-impl TypedColumn<String> {
-    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
-        match value.into() {
-            ColumnValue::Literal(v) => WhereExpr {
-                inner: FilterExpr::Comparison {
-                    column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    value: v,
-                },
-            },
-            ColumnValue::ColumnRef(other_column) => WhereExpr {
-                inner: FilterExpr::ColumnComparison {
-                    left_column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    right_column: other_column,
-                },
-            },
-        }
-    }
-}
-
-impl TypedColumn<f64> {
-    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
-        match value.into() {
-            ColumnValue::Literal(v) => WhereExpr {
-                inner: FilterExpr::Comparison {
-                    column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    value: v,
-                },
-            },
-            ColumnValue::ColumnRef(other_column) => WhereExpr {
-                inner: FilterExpr::ColumnComparison {
-                    left_column: self.column_name.to_string(),
-                    operator: "=".to_string(),
-                    right_column: other_column,
-                },
-            },
-        }
-    }
-
-    pub fn ge(self, value: f64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">=".to_string(),
-                value: crate::query::filter::Value::Real(value),
-            },
-        }
-    }
-
-    pub fn gt(self, value: f64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">".to_string(),
-                value: crate::query::filter::Value::Real(value),
-            },
-        }
-    }
-
-    pub fn le(self, value: f64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<=".to_string(),
-                value: crate::query::filter::Value::Real(value),
-            },
-        }
-    }
-
-    pub fn lt(self, value: f64) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<".to_string(),
-                value: crate::query::filter::Value::Real(value),
+                value: ColumnValueType::to_filter_value(value),
             },
         }
     }
@@ -1630,17 +1384,15 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -1664,51 +1416,6 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             } => {
                 // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
-        }
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
@@ -1765,17 +1472,15 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -1799,51 +1504,6 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             } => {
                 // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
-        }
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }
@@ -1900,17 +1560,15 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                self.format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    db_type,
-                );
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
             }
         }
 
@@ -1934,51 +1592,6 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             } => {
                 // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
                 write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
-        }
-    }
-
-    fn format_filter_with_params(
-        &self,
-        filter: &FilterExpr,
-        sql: &mut String,
-        param_idx: &mut i32,
-        params: &mut Vec<crate::model::Value>,
-        db_type: DbType,
-    ) {
-        match filter {
-            FilterExpr::Comparison {
-                column,
-                operator,
-                value,
-            } => {
-                match db_type {
-                    DbType::PostgreSQL => {
-                        write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
-                    }
-                    DbType::Turso | DbType::MySQL => {
-                        write!(sql, "{} {} ?", column, operator).unwrap();
-                    }
-                }
-                let ormer_value = match value {
-                    crate::query::filter::Value::Integer(v) => crate::model::Value::Integer(*v),
-                    crate::query::filter::Value::Text(v) => crate::model::Value::Text(v.clone()),
-                    crate::query::filter::Value::Real(v) => crate::model::Value::Real(*v),
-                    crate::query::filter::Value::Null => crate::model::Value::Null,
-                };
-                params.push(ormer_value);
-                *param_idx += 1;
-            }
-            FilterExpr::And(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" AND ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
-            }
-            FilterExpr::Or(left, right) => {
-                self.format_filter_with_params(left, sql, param_idx, params, db_type);
-                sql.push_str(" OR ");
-                self.format_filter_with_params(right, sql, param_idx, params, db_type);
             }
             _ => {}
         }

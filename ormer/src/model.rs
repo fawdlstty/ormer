@@ -46,6 +46,82 @@ pub trait Model: Sized {
     fn primary_key_value(&self) -> Value;
 }
 
+/// 用于 insert/insert_or_update 的参数类型 trait
+pub trait Insertable {
+    type Model: crate::model::Model;
+    fn as_refs(&self) -> Vec<&Self::Model>;
+}
+
+impl<T: crate::model::Model> Insertable for &T {
+    type Model = T;
+    fn as_refs(&self) -> Vec<&T> {
+        vec![*self]
+    }
+}
+
+impl<T: crate::model::Model> Insertable for Vec<T> {
+    type Model = T;
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+}
+
+impl<T: crate::model::Model> Insertable for &Vec<T> {
+    type Model = T;
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+}
+
+impl<T: crate::model::Model> Insertable for &[T] {
+    type Model = T;
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+}
+
+impl<T: crate::model::Model, const N: usize> Insertable for &[T; N] {
+    type Model = T;
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+}
+
+/// 为具体的 Model 类型生成引用的集合类型的 Insertable 实现
+/// 这个宏用于解决 orphan rule 问题
+#[macro_export]
+macro_rules! impl_insertable_for_ref_collections {
+    ($model_type:ty) => {
+        impl Insertable for Vec<&$model_type> {
+            type Model = $model_type;
+            fn as_refs(&self) -> Vec<&$model_type> {
+                self.as_slice().to_vec()
+            }
+        }
+
+        impl Insertable for &Vec<&$model_type> {
+            type Model = $model_type;
+            fn as_refs(&self) -> Vec<&$model_type> {
+                self.as_slice().to_vec()
+            }
+        }
+
+        impl<const N: usize> Insertable for &[&$model_type; N] {
+            type Model = $model_type;
+            fn as_refs(&self) -> Vec<&$model_type> {
+                self.to_vec()
+            }
+        }
+
+        impl Insertable for &[&$model_type] {
+            type Model = $model_type;
+            fn as_refs(&self) -> Vec<&$model_type> {
+                self.to_vec()
+            }
+        }
+    };
+}
+
 /// 运行时动态生成 CREATE TABLE SQL
 pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbType) -> String {
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", T::TABLE_NAME);

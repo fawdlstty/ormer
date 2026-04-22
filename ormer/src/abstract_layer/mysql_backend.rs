@@ -308,6 +308,11 @@ impl Database {
         self.insert_batch::<T>(&[model]).await
     }
 
+    /// 插入或更新单条记录（遇到重复键时更新）
+    pub async fn insert_or_update<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+        self.insert_or_update_batch::<T>(&[model]).await
+    }
+
     /// 批量插入记录
     pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
         if models.is_empty() {
@@ -337,6 +342,60 @@ impl Database {
 
             let values = model.field_values();
             all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        conn.exec_drop(&sql, params)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 批量插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update_batch<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        // 添加 ON DUPLICATE KEY UPDATE 子句
+        sql.push_str(" ON DUPLICATE KEY UPDATE ");
+        let mut first = true;
+        for col_name in T::COLUMNS.iter() {
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            first = false;
         }
 
         let params = values_to_params(&all_values)?;
@@ -403,6 +462,22 @@ impl Database {
             committed: false,
             rolled_back: false,
         })
+    }
+
+    /// 删除表
+    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
+        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        conn.query_drop(&sql)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -478,8 +553,36 @@ impl<'a> Transaction<'a> {
         self.insert_batch::<T>(&[model]).await
     }
 
+    /// 插入或更新单条记录（遇到重复键时更新）
+    pub async fn insert_or_update<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
+        self.insert_or_update_batch::<T>(&[model]).await
+    }
+
     /// 批量插入记录
     pub async fn insert_batch<T: Model>(&mut self, models: &[&T]) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let (sql, _) =
+            crate::abstract_layer::common_helpers::build_batch_insert_sql::<T>(models.len());
+        let all_values =
+            crate::abstract_layer::common_helpers::collect_batch_insert_values::<T>(models);
+        let params = values_to_params(&all_values)?;
+
+        self.conn
+            .exec_drop(&sql, params)
+            .await
+            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// 批量插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update_batch<T: Model>(
+        &mut self,
+        models: &[&T],
+    ) -> Result<(), crate::Error> {
         if models.is_empty() {
             return Ok(());
         }
@@ -487,6 +590,7 @@ impl<'a> Transaction<'a> {
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
 
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
         let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
 
@@ -500,6 +604,17 @@ impl<'a> Transaction<'a> {
 
             let values = model.field_values();
             all_values.extend(values);
+        }
+
+        // 添加 ON DUPLICATE KEY UPDATE 子句
+        sql.push_str(" ON DUPLICATE KEY UPDATE ");
+        let mut first = true;
+        for col_name in T::COLUMNS.iter() {
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            first = false;
         }
 
         let params = values_to_params(&all_values)?;

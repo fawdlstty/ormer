@@ -37,7 +37,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         email: None,
     })
     .await?;
-    db.insert(&Role {
+    db.insert(&vec![User {
+        id: 2,
+        name: "Bob".to_string(),
+        age: 20,
+        email: Some("bob@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(&vec![User {
+        id: 3,
+        name: "Charlie".to_string(),
+        age: 22,
+        email: Some("charlie@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(&[User {
+        id: 4,
+        name: "David".to_string(),
+        age: 24,
+        email: Some("david@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(&[User {
+        id: 5,
+        name: "Eve".to_string(),
+        age: 26,
+        email: Some("eve@example.com".to_string()),
+    }])
+    .await?;
+    db.insert(
+        &[User {
+            id: 6,
+            name: "Frank".to_string(),
+            age: 28,
+            email: Some("frank@example.com".to_string()),
+        }][..],
+    )
+    .await?;
+    db.insert(
+        &[User {
+            id: 7,
+            name: "Grace".to_string(),
+            age: 30,
+            email: Some("grace@example.com".to_string()),
+        }][..],
+    )
+    .await?;
+    db.insert_or_update(&Role {
         id: 1,
         uid: 1,
         name: "admin".to_string(),
@@ -48,7 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // query
     let users = db
         .select::<User>()
-        .filter(|p| p.age.ge(18))
+        //.filter(|p| p.age.ge(18))
+        .filter(|p| p.age.is_in(&vec![2, 4, 6, 7, 8]))
         .limit(10)
         .collect::<Vec<_>>()
         .await?;
@@ -109,5 +156,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .execute()
         .await?;
     t.commit().await?;
+
+    // drop table
+    db.drop_table::<User>().await?;
+    db.drop_table::<Role>().await?;
     Ok(())
 }

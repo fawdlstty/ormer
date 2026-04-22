@@ -62,14 +62,31 @@ impl Database {
     }
 
     /// 插入记录
-    pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
+    pub async fn insert<I: crate::model::Insertable>(&self, models: I) -> Result<(), crate::Error> {
+        let refs = models.as_refs();
         match self {
             #[cfg(feature = "turso")]
-            Database::Turso(db) => db.insert::<T>(model).await,
+            Database::Turso(db) => db.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.insert::<T>(model).await,
+            Database::PostgreSQL(db) => db.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.insert::<T>(model).await,
+            Database::MySQL(db) => db.insert_batch::<I::Model>(&refs).await,
+        }
+    }
+
+    /// 插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> Result<(), crate::Error> {
+        let refs = models.as_refs();
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
         }
     }
 
@@ -149,6 +166,18 @@ impl Database {
             }
         }
     }
+
+    /// 删除表
+    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => db.drop_table::<T>().await,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.drop_table::<T>().await,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.drop_table::<T>().await,
+        }
+    }
 }
 
 /// 统一的 SelectExecutor 枚举
@@ -164,65 +193,9 @@ pub enum SelectExecutor<'a, T: Model> {
     MySQL(mysql_backend::SelectExecutor<'a, T>),
 }
 
+crate::impl_unified_select_executor_methods!(SelectExecutor, std::marker::PhantomData);
+
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                SelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.filter(f)),
-            #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.filter(f)),
-        }
-    }
-
-    pub fn order_by<F>(self, f: F) -> Self
-    where
-        F: FnOnce(crate::WhereColumn<T>) -> crate::OrderBy,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                SelectExecutor::Turso(exec.order_by(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.order_by(f)),
-            #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.order_by(f)),
-        }
-    }
-
-    pub fn limit(self, limit: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                SelectExecutor::Turso(exec.limit(limit), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.limit(limit)),
-            #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.limit(limit)),
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                SelectExecutor::Turso(exec.offset(offset), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.offset(offset)),
-            #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.offset(offset)),
-        }
-    }
-
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
     pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
@@ -476,43 +449,7 @@ pub enum DeleteExecutor<'a, T: Model> {
     MySQL(mysql_backend::DeleteExecutor<'a, T>),
 }
 
-impl<'a, T: Model> DeleteExecutor<'a, T> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            DeleteExecutor::Turso(exec, _) => {
-                DeleteExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            DeleteExecutor::PostgreSQL(exec) => DeleteExecutor::PostgreSQL(exec.filter(f)),
-            #[cfg(feature = "mysql")]
-            DeleteExecutor::MySQL(exec) => DeleteExecutor::MySQL(exec.filter(f)),
-        }
-    }
-
-    pub async fn execute(self) -> Result<u64, crate::Error> {
-        match self {
-            #[cfg(feature = "turso")]
-            DeleteExecutor::Turso(exec, _) => exec.execute().await,
-            #[cfg(feature = "postgresql")]
-            DeleteExecutor::PostgreSQL(exec) => exec.execute().await,
-            #[cfg(feature = "mysql")]
-            DeleteExecutor::MySQL(exec) => exec.execute().await,
-        }
-    }
-}
-
-impl<'a, T: Model + 'static> std::future::IntoFuture for DeleteExecutor<'a, T> {
-    type Output = Result<u64, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move { self.execute().await })
-    }
-}
+crate::impl_unified_delete_executor!(DeleteExecutor, std::marker::PhantomData);
 
 /// 统一的 UpdateExecutor 枚举
 pub enum UpdateExecutor<'a, T: Model> {
@@ -527,62 +464,7 @@ pub enum UpdateExecutor<'a, T: Model> {
     MySQL(mysql_backend::UpdateExecutor<'a, T>),
 }
 
-impl<'a, T: Model> UpdateExecutor<'a, T> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            UpdateExecutor::Turso(exec, _) => {
-                UpdateExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            UpdateExecutor::PostgreSQL(exec) => UpdateExecutor::PostgreSQL(exec.filter(f)),
-            #[cfg(feature = "mysql")]
-            UpdateExecutor::MySQL(exec) => UpdateExecutor::MySQL(exec.filter(f)),
-        }
-    }
-
-    pub fn set<F, V, C>(self, field_fn: F, value: V) -> Self
-    where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
-        V: Into<crate::model::Value>,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            UpdateExecutor::Turso(exec, _) => {
-                UpdateExecutor::Turso(exec.set(field_fn, value), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            UpdateExecutor::PostgreSQL(exec) => {
-                UpdateExecutor::PostgreSQL(exec.set(field_fn, value))
-            }
-            #[cfg(feature = "mysql")]
-            UpdateExecutor::MySQL(exec) => UpdateExecutor::MySQL(exec.set(field_fn, value)),
-        }
-    }
-
-    pub async fn execute(self) -> Result<u64, crate::Error> {
-        match self {
-            #[cfg(feature = "turso")]
-            UpdateExecutor::Turso(exec, _) => exec.execute().await,
-            #[cfg(feature = "postgresql")]
-            UpdateExecutor::PostgreSQL(exec) => exec.execute().await,
-            #[cfg(feature = "mysql")]
-            UpdateExecutor::MySQL(exec) => exec.execute().await,
-        }
-    }
-}
-
-impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
-    type Output = Result<u64, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move { self.execute().await })
-    }
-}
+crate::impl_unified_update_executor!(UpdateExecutor, std::marker::PhantomData);
 
 /// 统一的 CollectFuture 枚举
 pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
@@ -610,23 +492,7 @@ pub enum AggregateFuture<'a, T: Model, R> {
     MySQL(mysql_backend::AggregateFuture<'a, T, R>),
 }
 
-impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
-    for AggregateFuture<'a, T, R>
-{
-    type Output = Result<R, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            AggregateFuture::Turso(future, _) => Box::pin(async move { future.await }),
-            #[cfg(feature = "postgresql")]
-            AggregateFuture::PostgreSQL(future) => Box::pin(async move { future.await }),
-            #[cfg(feature = "mysql")]
-            AggregateFuture::MySQL(future) => Box::pin(async move { future.await }),
-        }
-    }
-}
+crate::impl_unified_aggregate_future!(AggregateFuture, std::marker::PhantomData);
 
 /// 统一的 RelatedSelectExecutor 枚举
 pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
@@ -745,94 +611,9 @@ pub enum RightJoinCollectFuture<'a, T: Model, J: Model> {
     MySQL(mysql_backend::RightJoinCollectFuture<'a, T, J>),
 }
 
-impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
-    for CollectFuture<'a, T, C>
-{
-    type Output = Result<C, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+crate::impl_unified_collect_future!(CollectFuture, std::marker::PhantomData);
 
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            CollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            CollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            CollectFuture::MySQL(future) => Box::pin(future.into_future()),
-        }
-    }
-}
-
-impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where, R::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            RelatedSelectExecutor::Turso(exec, _) => {
-                RelatedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RelatedSelectExecutor::PostgreSQL(exec) => {
-                RelatedSelectExecutor::PostgreSQL(exec.filter(f))
-            }
-            #[cfg(feature = "mysql")]
-            RelatedSelectExecutor::MySQL(exec) => RelatedSelectExecutor::MySQL(exec.filter(f)),
-        }
-    }
-
-    pub fn limit(self, limit: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            RelatedSelectExecutor::Turso(exec, _) => {
-                RelatedSelectExecutor::Turso(exec.limit(limit), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RelatedSelectExecutor::PostgreSQL(exec) => {
-                RelatedSelectExecutor::PostgreSQL(exec.limit(limit))
-            }
-            #[cfg(feature = "mysql")]
-            RelatedSelectExecutor::MySQL(exec) => RelatedSelectExecutor::MySQL(exec.limit(limit)),
-        }
-    }
-
-    pub fn collect<C: FromIterator<T> + 'static>(self) -> RelatedCollectFuture<'a, T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            RelatedSelectExecutor::Turso(exec, _) => {
-                RelatedCollectFuture::Turso(exec.exec(), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RelatedSelectExecutor::PostgreSQL(exec) => {
-                RelatedCollectFuture::PostgreSQL(exec.exec())
-            }
-            #[cfg(feature = "mysql")]
-            RelatedSelectExecutor::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
-        }
-    }
-
-    pub fn exec(self) -> RelatedCollectFuture<'a, T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        self.collect::<Vec<T>>()
-    }
-
-    /// 执行查询并返回 Vec<T> (exec 的别名)
-    pub fn execute(self) -> RelatedCollectFuture<'a, T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        self.collect::<Vec<T>>()
-    }
-}
+crate::impl_unified_related_select_executor!(RelatedSelectExecutor, std::marker::PhantomData);
 
 /// 统一的 RelatedCollectFuture 枚举
 pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
@@ -847,23 +628,7 @@ pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
     MySQL(mysql_backend::RelatedCollectFuture<'a, T, R>),
 }
 
-impl<'a, T: Model + 'static, R: Model + 'static> std::future::IntoFuture
-    for RelatedCollectFuture<'a, T, R>
-{
-    type Output = Result<Vec<T>, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            RelatedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            RelatedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            RelatedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-        }
-    }
-}
+crate::impl_unified_related_collect_future!(RelatedCollectFuture, std::marker::PhantomData);
 
 /// 统一的 Transaction 枚举
 pub enum Transaction<'a> {
@@ -943,73 +708,41 @@ impl<'a> Transaction<'a> {
     }
 
     /// 插入记录
-    pub async fn insert<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
+    pub async fn insert<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> Result<(), crate::Error> {
+        let refs = models.as_refs();
         match self {
             #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => txn.insert::<T>(model).await,
+            Transaction::Turso(txn, _) => txn.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "postgresql")]
-            Transaction::PostgreSQL(txn) => txn.insert::<T>(model).await,
+            Transaction::PostgreSQL(txn) => txn.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => txn.insert::<T>(model).await,
+            Transaction::MySQL(txn) => txn.insert_batch::<I::Model>(&refs).await,
+        }
+    }
+
+    /// 插入或更新记录（遇到重复键时更新）
+    pub async fn insert_or_update<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> Result<(), crate::Error> {
+        let refs = models.as_refs();
+        match self {
+            #[cfg(feature = "turso")]
+            Transaction::Turso(txn, _) => txn.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => txn.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(txn) => txn.insert_or_update_batch::<I::Model>(&refs).await,
         }
     }
 }
 
+crate::impl_unified_join_executor!(LeftJoinedSelectExecutor, std::marker::PhantomData);
+
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            LeftJoinedSelectExecutor::Turso(exec, _) => {
-                LeftJoinedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            LeftJoinedSelectExecutor::PostgreSQL(exec) => {
-                LeftJoinedSelectExecutor::PostgreSQL(exec.filter(f))
-            }
-            #[cfg(feature = "mysql")]
-            LeftJoinedSelectExecutor::MySQL(exec) => {
-                LeftJoinedSelectExecutor::MySQL(exec.filter(f))
-            }
-        }
-    }
-
-    pub fn limit(self, limit: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            LeftJoinedSelectExecutor::Turso(exec, _) => {
-                LeftJoinedSelectExecutor::Turso(exec.limit(limit), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            LeftJoinedSelectExecutor::PostgreSQL(exec) => {
-                LeftJoinedSelectExecutor::PostgreSQL(exec.limit(limit))
-            }
-            #[cfg(feature = "mysql")]
-            LeftJoinedSelectExecutor::MySQL(exec) => {
-                LeftJoinedSelectExecutor::MySQL(exec.limit(limit))
-            }
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            LeftJoinedSelectExecutor::Turso(exec, _) => {
-                LeftJoinedSelectExecutor::Turso(exec.offset(offset), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            LeftJoinedSelectExecutor::PostgreSQL(exec) => {
-                LeftJoinedSelectExecutor::PostgreSQL(exec.offset(offset))
-            }
-            #[cfg(feature = "mysql")]
-            LeftJoinedSelectExecutor::MySQL(exec) => {
-                LeftJoinedSelectExecutor::MySQL(exec.offset(offset))
-            }
-        }
-    }
-
     pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
         self,
     ) -> LeftJoinCollectFuture<'a, T, J>
@@ -1043,61 +776,9 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     }
 }
 
+crate::impl_unified_join_executor!(InnerJoinedSelectExecutor, std::marker::PhantomData);
+
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            InnerJoinedSelectExecutor::Turso(exec, _) => {
-                InnerJoinedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            InnerJoinedSelectExecutor::PostgreSQL(exec) => {
-                InnerJoinedSelectExecutor::PostgreSQL(exec.filter(f))
-            }
-            #[cfg(feature = "mysql")]
-            InnerJoinedSelectExecutor::MySQL(exec) => {
-                InnerJoinedSelectExecutor::MySQL(exec.filter(f))
-            }
-        }
-    }
-
-    pub fn limit(self, limit: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            InnerJoinedSelectExecutor::Turso(exec, _) => {
-                InnerJoinedSelectExecutor::Turso(exec.limit(limit), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            InnerJoinedSelectExecutor::PostgreSQL(exec) => {
-                InnerJoinedSelectExecutor::PostgreSQL(exec.limit(limit))
-            }
-            #[cfg(feature = "mysql")]
-            InnerJoinedSelectExecutor::MySQL(exec) => {
-                InnerJoinedSelectExecutor::MySQL(exec.limit(limit))
-            }
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            InnerJoinedSelectExecutor::Turso(exec, _) => {
-                InnerJoinedSelectExecutor::Turso(exec.offset(offset), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            InnerJoinedSelectExecutor::PostgreSQL(exec) => {
-                InnerJoinedSelectExecutor::PostgreSQL(exec.offset(offset))
-            }
-            #[cfg(feature = "mysql")]
-            InnerJoinedSelectExecutor::MySQL(exec) => {
-                InnerJoinedSelectExecutor::MySQL(exec.offset(offset))
-            }
-        }
-    }
-
     pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<'a, T, J>
     where
         T: 'static,
@@ -1129,61 +810,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
     }
 }
 
+crate::impl_unified_join_executor!(RightJoinedSelectExecutor, std::marker::PhantomData);
+
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        match self {
-            #[cfg(feature = "turso")]
-            RightJoinedSelectExecutor::Turso(exec, _) => {
-                RightJoinedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RightJoinedSelectExecutor::PostgreSQL(exec) => {
-                RightJoinedSelectExecutor::PostgreSQL(exec.filter(f))
-            }
-            #[cfg(feature = "mysql")]
-            RightJoinedSelectExecutor::MySQL(exec) => {
-                RightJoinedSelectExecutor::MySQL(exec.filter(f))
-            }
-        }
-    }
-
-    pub fn limit(self, limit: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            RightJoinedSelectExecutor::Turso(exec, _) => {
-                RightJoinedSelectExecutor::Turso(exec.limit(limit), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RightJoinedSelectExecutor::PostgreSQL(exec) => {
-                RightJoinedSelectExecutor::PostgreSQL(exec.limit(limit))
-            }
-            #[cfg(feature = "mysql")]
-            RightJoinedSelectExecutor::MySQL(exec) => {
-                RightJoinedSelectExecutor::MySQL(exec.limit(limit))
-            }
-        }
-    }
-
-    pub fn offset(self, offset: i64) -> Self {
-        match self {
-            #[cfg(feature = "turso")]
-            RightJoinedSelectExecutor::Turso(exec, _) => {
-                RightJoinedSelectExecutor::Turso(exec.offset(offset), std::marker::PhantomData)
-            }
-            #[cfg(feature = "postgresql")]
-            RightJoinedSelectExecutor::PostgreSQL(exec) => {
-                RightJoinedSelectExecutor::PostgreSQL(exec.offset(offset))
-            }
-            #[cfg(feature = "mysql")]
-            RightJoinedSelectExecutor::MySQL(exec) => {
-                RightJoinedSelectExecutor::MySQL(exec.offset(offset))
-            }
-        }
-    }
-
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
         self,
     ) -> RightJoinCollectFuture<'a, T, J>
@@ -1217,56 +846,20 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 }
 
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
-    for LeftJoinCollectFuture<'a, T, J>
-{
-    type Output = Result<Vec<(T, Option<J>)>, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+crate::impl_unified_join_collect_future!(
+    LeftJoinCollectFuture,
+    Result<Vec<(T, Option<J>)>, crate::Error>,
+    std::marker::PhantomData
+);
 
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            LeftJoinCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            LeftJoinCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            LeftJoinCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-        }
-    }
-}
+crate::impl_unified_join_collect_future!(
+    InnerJoinCollectFuture,
+    Result<Vec<(T, J)>, crate::Error>,
+    std::marker::PhantomData
+);
 
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
-    for InnerJoinCollectFuture<'a, T, J>
-{
-    type Output = Result<Vec<(T, J)>, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            InnerJoinCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            InnerJoinCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            InnerJoinCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-        }
-    }
-}
-
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
-    for RightJoinCollectFuture<'a, T, J>
-{
-    type Output = Result<Vec<(Option<T>, J)>, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "turso")]
-            RightJoinCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            RightJoinCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            RightJoinCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-        }
-    }
-}
+crate::impl_unified_join_collect_future!(
+    RightJoinCollectFuture,
+    Result<Vec<(Option<T>, J)>, crate::Error>,
+    std::marker::PhantomData
+);
