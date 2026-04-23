@@ -761,10 +761,14 @@ impl<T: Model> SelectExecutor<T> {
         }
     }
 
-    /// 字段投影 - 将查询结果映射到单个字段
-    pub fn map_to<F, V>(self, f: F) -> MappedSelectExecutor<T, V>
+    /// 字段投影 - 将查询结果映射到单个字段或元组
+    /// 支持：
+    /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<T, i32>
+    /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<T, (i32, i32)>
+    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<T, M::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<V>,
+        F: FnOnce(<T as Model>::Where) -> M,
+        M: crate::query::builder::MapToResult,
     {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
@@ -1684,7 +1688,7 @@ pub struct MappedCollectFuture<T: Model, V, C: FromIterator<V>> {
     _marker: PhantomData<C>,
 }
 
-impl<T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterator<V> + 'static>
+impl<T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for MappedCollectFuture<T, V, C>
 {
     type Output = Result<C, crate::Error>;
@@ -1692,6 +1696,32 @@ impl<T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterator<V
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+/// ModelCollectWithFuture - 用于collect_with的Future，支持类型转换
+pub struct ModelCollectWithFuture<T: Model, V, C, M, F> {
+    executor: MappedSelectExecutor<T, V>,
+    transform: F,
+    _marker: PhantomData<(C, M)>,
+}
+
+impl<T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<T, V, C, M, F>
+where
+    T: Model + 'static,
+    V: crate::model::FromRowValues + 'static,
+    C: FromIterator<M> + 'static,
+    M: 'static,
+    F: Fn(V) -> M + Clone + 'static,
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let results: Vec<V> = self.executor.collect_inner().await?;
+            Ok(results.into_iter().map(|v| (self.transform)(v)).collect())
+        })
     }
 }
 
@@ -1709,9 +1739,25 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
         }
     }
 
+    /// 执行查询并收集结果，同时应用转换函数
+    /// 用于将查询结果转换为其他类型（如Model）
+    /// 示例：collect_with(|v| Uids { id: v })
+    pub fn collect_with<C, F, M>(&self, f: F) -> ModelCollectWithFuture<T, V, C, M, F>
+    where
+        C: FromIterator<M> + 'static,
+        F: Fn(V) -> M + Clone + 'static,
+        M: 'static,
+    {
+        ModelCollectWithFuture {
+            executor: self.clone(),
+            transform: f,
+            _marker: PhantomData,
+        }
+    }
+
     async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
     where
-        V: crate::model::FromValue,
+        V: crate::model::FromRowValues,
     {
         let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
 
@@ -1744,11 +1790,19 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?
         {
-            let value = row
-                .get_value(0)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
-            let ormer_value = convert_turso_value(&value)?;
-            let typed_value = V::from_value(&ormer_value)?;
+            // 获取行中的所有值
+            let column_count = self.select.column_names().len();
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = row
+                    .get_value(i)
+                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                let ormer_value = convert_turso_value(&value)?;
+                values.push(ormer_value);
+            }
+
+            // 使用 FromRowValues 从多个值构建类型
+            let typed_value = V::from_row_values(&values)?;
             results.push(typed_value);
         }
 

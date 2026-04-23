@@ -90,7 +90,8 @@ pub struct MappedSelect<T: Model, V> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
-    column_name: String, // 要查询的字段名
+    column_names: Vec<String>,        // 要查询的字段名列表（支持多字段）
+    alias_names: Option<Vec<String>>, // 别名列表（用于映射到目标Model）
     _marker: PhantomData<(T, V)>,
 }
 
@@ -101,7 +102,8 @@ impl<T: Model, V> Clone for MappedSelect<T, V> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
-            column_name: self.column_name.clone(),
+            column_names: self.column_names.clone(),
+            alias_names: self.alias_names.clone(),
             _marker: PhantomData,
         }
     }
@@ -142,19 +144,35 @@ impl<T: Model, R> AggregateSelect<T, R> {
 }
 
 impl<T: Model, V> MappedSelect<T, V> {
+    /// 获取列名列表
+    pub fn column_names(&self) -> &[String] {
+        &self.column_names
+    }
+
+    /// 设置别名列表（用于映射到目标Model）
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.alias_names = Some(aliases);
+        self
+    }
+
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
 
-        // SELECT 单个字段
-        write!(
-            &mut sql,
-            "SELECT {} FROM {}",
-            self.column_name,
-            T::TABLE_NAME
-        )
-        .unwrap();
+        // SELECT 字段（支持单个或多个字段，带别名）
+        let columns = if let Some(ref aliases) = self.alias_names {
+            // 使用别名：column AS alias
+            self.column_names
+                .iter()
+                .zip(aliases.iter())
+                .map(|(col, alias)| format!("{} AS {}", col, alias))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.column_names.join(", ")
+        };
+        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME).unwrap();
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -334,19 +352,48 @@ impl<T: Model> Select<T> {
         self.aggregate_typed("MIN", column.column_name())
     }
 
-    /// 字段投影 - 将查询结果映射到单个字段
-    pub fn map_to<F, V>(self, f: F) -> MappedSelect<T, V>
+    /// 字段投影 - 将查询结果映射到单个字段或元组
+    /// 支持：
+    /// - 单字段：map_to(|r| r.uid) -> MappedSelect<T, i32>
+    /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelect<T, (i32, i32)>
+    pub fn map_to<F, M>(self, f: F) -> MappedSelect<T, M::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> TypedColumn<V>,
+        F: FnOnce(<T as Model>::Where) -> M,
+        M: MapToResult,
     {
         let where_obj = <T as Model>::Where::default();
-        let column = f(where_obj);
+        let result = f(where_obj);
         MappedSelect {
             filters: self.filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
-            column_name: column.column_name().to_string(),
+            column_names: result.column_names(),
+            alias_names: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影并映射到目标Model - 自动生成别名以匹配目标Model的列名
+    /// 例如：map_to_model(|r| r.uid) 会生成 "SELECT uid AS id FROM ..."
+    pub fn map_to_model<F, TargetModel>(self, f: F) -> MappedSelect<T, TargetModel>
+    where
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<<TargetModel as Model>::QueryBuilder>,
+        TargetModel: Model,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+
+        // 使用目标Model的列名作为别名
+        let alias_names = TargetModel::COLUMNS.iter().map(|s| s.to_string()).collect();
+
+        MappedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            column_names: vec![column.column_name.to_string()],
+            alias_names: Some(alias_names),
             _marker: PhantomData,
         }
     }
@@ -886,6 +933,46 @@ impl AggregateResultType for usize {
 
 // ==================== ColumnValueType Trait ====================
 // 用于统一处理不同 Rust 类型到 FilterValue 的转换
+
+/// MapToResult trait - 用于 map_to 方法的返回类型
+pub trait MapToResult {
+    type Output;
+    fn column_names(&self) -> Vec<String>;
+}
+
+// 为 TypedColumn 实现 MapToResult（单字段）
+impl<T> MapToResult for TypedColumn<T> {
+    type Output = T;
+
+    fn column_names(&self) -> Vec<String> {
+        vec![self.column_name.to_string()]
+    }
+}
+
+// 为二元组实现 MapToResult
+impl<T1, T2> MapToResult for (TypedColumn<T1>, TypedColumn<T2>) {
+    type Output = (T1, T2);
+
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+        ]
+    }
+}
+
+// 为三元组实现 MapToResult
+impl<T1, T2, T3> MapToResult for (TypedColumn<T1>, TypedColumn<T2>, TypedColumn<T3>) {
+    type Output = (T1, T2, T3);
+
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+            self.2.column_name.to_string(),
+        ]
+    }
+}
 
 /// 列值类型 trait - 定义 Rust 类型如何转换为 FilterValue
 pub trait ColumnValueType {

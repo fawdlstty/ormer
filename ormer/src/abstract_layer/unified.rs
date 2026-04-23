@@ -938,11 +938,24 @@ pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     // MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
 }
 
+/// 统一的 ModelCollectWithFuture 枚举
+pub enum ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::ModelCollectWithFuture<T, V, C, M, F>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+}
+
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    /// 字段投影 - 将查询结果映射到单个字段
-    pub fn map_to<F, V>(self, f: F) -> MappedSelectExecutor<'a, T, V>
+    /// 字段投影 - 将查询结果映射到单个字段或元组
+    /// 支持：
+    /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<'a, T, i32>
+    /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<'a, T, (i32, i32)>
+    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<V>,
+        F: FnOnce(<T as Model>::Where) -> M,
+        M: crate::query::builder::MapToResult,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -960,7 +973,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
-        V: crate::model::FromValue + 'static,
+        V: crate::model::FromRowValues + 'static,
         C: FromIterator<V> + 'static,
     {
         match self {
@@ -974,6 +987,26 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
               // }
               // #[cfg(feature = "mysql")]
               // MappedSelectExecutor::MySQL(exec) => MappedCollectFuture::MySQL(exec.collect::<C>()),
+        }
+    }
+
+    /// 执行查询并收集结果，同时应用转换函数
+    /// 用于将查询结果转换为其他类型（如Model）
+    /// 示例：collect_with(|v| Uids { id: v })
+    pub fn collect_with<C, F, M>(&self, f: F) -> ModelCollectWithFuture<'a, T, V, C, M, F>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+        C: FromIterator<M> + 'static,
+        F: Fn(V) -> M + Clone + 'static,
+        M: 'static,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            MappedSelectExecutor::Turso(exec, _) => ModelCollectWithFuture::Turso(
+                exec.collect_with::<C, F, M>(f),
+                std::marker::PhantomData,
+            ),
         }
     }
 }
@@ -1031,7 +1064,7 @@ impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
     }
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterator<V> + 'static>
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = Result<C, crate::Error>;
@@ -1046,6 +1079,25 @@ impl<'a, T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterat
             // MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
             // #[cfg(feature = "mysql")]
             // MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+        }
+    }
+}
+
+impl<'a, T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<'a, T, V, C, M, F>
+where
+    T: Model + 'static,
+    V: crate::model::FromRowValues + 'static,
+    C: FromIterator<M> + 'static,
+    M: 'static,
+    F: Fn(V) -> M + Clone + 'static,
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match self {
+            #[cfg(feature = "turso")]
+            ModelCollectWithFuture::Turso(future, _) => Box::pin(future.into_future()),
         }
     }
 }

@@ -105,6 +105,17 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         }
     });
 
+    // 生成 from_row_values 实现（按顺序从行值中读取）
+    let from_row_values_fields = fields.iter().enumerate().map(|(i, f)| {
+        let field_name = f.ident.as_ref().unwrap();
+        let field_type = &f.ty;
+        quote! {
+            #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
+                &values[#i..#i+1]
+            )?
+        }
+    });
+
     // 生成 field_values 实现
     let field_names_for_values = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
@@ -164,6 +175,17 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             fn from_row(row: &::ormer::Row) -> Result<Self, ::ormer::Error> {
                 Ok(Self {
                     #(#from_row_fields),*
+                })
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> Result<Self, ::ormer::Error> {
+                if values.len() < Self::COLUMNS.len() {
+                    return Err(::ormer::Error::TypeMismatch(
+                        format!("Expected {} values for {}", Self::COLUMNS.len(), stringify!(#name))
+                    ));
+                }
+                Ok(Self {
+                    #(#from_row_values_fields),*
                 })
             }
 

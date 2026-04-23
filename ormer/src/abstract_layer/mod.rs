@@ -75,8 +75,8 @@ impl DbType {
 mod unified;
 pub use unified::{
     AggregateFuture, CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, RelatedCollectFuture,
-    RelatedSelectExecutor, SelectExecutor, Transaction, UpdateExecutor,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, Transaction, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出

@@ -172,23 +172,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     t.commit().await?;
 
-    // // 子查询示例：先执行子查询获取 uids
-    // let admin_role_uids = conn
-    //     .select::<Role>()
-    //     .filter(|r| r.name.eq("admin"))
-    //     .map_to(|r| r.uid);
+    #[derive(Debug, ormer::Model)]
+    #[table = "uids"]
+    struct Uids {
+        #[primary]
+        id: i32,
+    }
 
-    // // 直接使用查询
-    // let uids = admin_role_uids.collect::<Vec<i32>>().await?;
-    // println!("Admin uids: {:?}", uids);
+    // 子查询示例：先执行子查询获取 uids
+    let admin_role_uids = db
+        .select::<Role>()
+        .filter(|r| r.name.eq("admin"))
+        .map_to(|r| r.uid);
 
-    // // 使用 uids 做 IN 查询（Turso 不支持子查询 IN，需要先执行子查询）
-    // let admin_users = conn
-    //     .select::<Role>()
-    //     .filter(|u| u.uid.is_in(uids))
-    //     .collect::<Vec<_>>()
-    //     .await?;
-    // println!("Admin roles: {:?}", admin_users);
+    #[derive(Debug, ormer::Model)]
+    #[table = "uidrids"]
+    struct UidRids {
+        #[primary]
+        id: i32,
+        rid: i32,
+    }
+
+    // 子查询示例：先执行子查询获取 uids
+    let uidrids = db
+        .select::<Role>()
+        .filter(|r| r.name.eq("admin"))
+        .map_to(|r| (r.uid, r.id));
+
+    // 直接使用查询
+    let uids = admin_role_uids.collect::<Vec<i32>>().await?;
+    let uids: Vec<Uids> = admin_role_uids.collect_with(|v| Uids { id: v }).await?;
+    println!("Admin uids: {:?}", uids);
+
+    // 使用 uids 做 IN 查询（Turso 不支持子查询 IN，需要先执行子查询）
+    let admin_users = db
+        .select::<Role>()
+        .filter(|u| u.uid.is_in(admin_role_uids))
+        .collect::<Vec<_>>()
+        .await?;
+    println!("Admin roles: {:?}", admin_users);
 
     let pool = ormer::Database::create_pool(ormer::DbType::PostgreSQL, "postgres://localhost/db")
         .range(1..10)

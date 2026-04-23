@@ -55,6 +55,7 @@ pub trait Model: Sized {
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
     fn from_row(row: &Row) -> Result<Self, Error>;
+    fn from_row_values(values: &[Value]) -> Result<Self, Error>;
 
     /// 获取字段值 (用于 INSERT/UPDATE)
     fn field_values(&self) -> Vec<Value>;
@@ -297,6 +298,30 @@ pub trait FromValue: Sized {
     fn from_value(value: &Value) -> Result<Self, Error>;
 }
 
+/// FromRowValues trait - 用于从一行中的多个值构建类型（如元组、Model）
+pub trait FromRowValues: Sized {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error>;
+}
+
+/// FromSingleValue trait - 用于从单个值构建Model（用于map_to后的转换）
+/// 当查询单列结果并想转换为Model时使用
+pub trait FromSingleValue<V>: Sized {
+    fn from_single_value(value: V, column_name: &str) -> Result<Self, Error>;
+}
+
+// 为所有可以转换为Value的类型实现FromSingleValue的blanket implementation
+impl<T, V> FromSingleValue<V> for T
+where
+    T: Model,
+    V: Into<Value>,
+    T: FromValue,
+{
+    fn from_single_value(value: V, _column_name: &str) -> Result<Self, Error> {
+        let ormer_value: Value = value.into();
+        Self::from_value(&ormer_value)
+    }
+}
+
 // 使用宏生成 FromValue 实现，减少重复代码
 macro_rules! impl_from_value_for {
     ($($type:ty => $variant:ident),* $(,)?) => {
@@ -320,6 +345,34 @@ impl_from_value_for!(
     usize => Integer,
 );
 
+// 为基本类型实现 FromRowValues（从单列构建）
+impl FromRowValues for i32 {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("i32".to_string()));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl FromRowValues for i64 {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("i64".to_string()));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl FromRowValues for usize {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("usize".to_string()));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
 // f64 特殊处理（支持 Integer 和 Real）
 impl FromValue for f64 {
     fn from_value(value: &Value) -> Result<Self, Error> {
@@ -328,6 +381,15 @@ impl FromValue for f64 {
             Value::Integer(v) => Ok(*v as f64),
             _ => Err(Error::TypeMismatch("f64".to_string())),
         }
+    }
+}
+
+impl FromRowValues for f64 {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("f64".to_string()));
+        }
+        Self::from_value(&values[0])
     }
 }
 
@@ -341,6 +403,15 @@ impl FromValue for String {
     }
 }
 
+impl FromRowValues for String {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("String".to_string()));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
 // bool 特殊处理（0/1 转换）
 impl FromValue for bool {
     fn from_value(value: &Value) -> Result<Self, Error> {
@@ -348,6 +419,56 @@ impl FromValue for bool {
             Value::Integer(v) => Ok(*v != 0),
             _ => Err(Error::TypeMismatch("bool".to_string())),
         }
+    }
+}
+
+impl FromRowValues for bool {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch("bool".to_string()));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+// 为二元组实现 FromValue
+impl<T1: FromValue, T2: FromValue> FromValue for (T1, T2) {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        // 元组不能从单个Value构建，这个实现仅用于类型系统完整性
+        // 实际上元组应该从多个Value构建
+        Err(Error::TypeMismatch("tuple".to_string()))
+    }
+}
+
+// 为二元组实现 FromRowValues
+impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.len() < 2 {
+            return Err(Error::TypeMismatch("tuple (T1, T2)".to_string()));
+        }
+        let v1 = T1::from_row_values(&values[0..1])?;
+        let v2 = T2::from_row_values(&values[1..2])?;
+        Ok((v1, v2))
+    }
+}
+
+// 为三元组实现 FromValue
+impl<T1: FromValue, T2: FromValue, T3: FromValue> FromValue for (T1, T2, T3) {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        Err(Error::TypeMismatch("tuple".to_string()))
+    }
+}
+
+// 为三元组实现 FromRowValues
+impl<T1: FromRowValues, T2: FromRowValues, T3: FromRowValues> FromRowValues for (T1, T2, T3) {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.len() < 3 {
+            return Err(Error::TypeMismatch("tuple (T1, T2, T3)".to_string()));
+        }
+        let v1 = T1::from_row_values(&values[0..1])?;
+        let v2 = T2::from_row_values(&values[1..2])?;
+        let v3 = T3::from_row_values(&values[2..3])?;
+        Ok((v1, v2, v3))
     }
 }
 
@@ -401,6 +522,26 @@ impl FromValue for Option<f64> {
             Value::Real(v) => Ok(Some(*v)),
             Value::Integer(v) => Ok(Some(*v as f64)),
             _ => Err(Error::TypeMismatch("Option<f64>".to_string())),
+        }
+    }
+}
+
+// 为 Option 类型实现 FromRowValues
+impl<T: FromValue> FromRowValues for Option<T> {
+    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+        if values.is_empty() {
+            return Err(Error::TypeMismatch(format!(
+                "Option<{}>",
+                std::any::type_name::<T>()
+            )));
+        }
+        // 直接使用 Option<T> 的 from_value 实现
+        match &values[0] {
+            Value::Null => Ok(None),
+            _ => {
+                let inner = T::from_value(&values[0])?;
+                Ok(Some(inner))
+            }
         }
     }
 }
