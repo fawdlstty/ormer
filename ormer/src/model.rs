@@ -16,8 +16,20 @@ pub struct ColumnSchema {
 /// 外键信息
 #[derive(Debug, Clone)]
 pub struct ForeignKeyInfo {
-    pub ref_table: &'static str,  // 引用的表名
-    pub ref_column: &'static str, // 引用的列名
+    pub ref_table: &'static str,                     // 引用的表名
+    pub ref_column: &'static str,                    // 引用的列名（对于静态指定的情况）
+    pub ref_column_fn: Option<fn() -> &'static str>, // 运行时获取列名的函数（对于自动关联主键的情况）
+}
+
+impl ForeignKeyInfo {
+    /// 获取引用列名
+    pub fn get_ref_column(&self) -> &'static str {
+        if let Some(fn_get) = self.ref_column_fn {
+            fn_get()
+        } else {
+            self.ref_column
+        }
+    }
 }
 
 /// 数据库后端 trait - 用于 SQL 类型映射
@@ -242,9 +254,10 @@ fn generate_foreign_key_constraints<T: Model>() -> Vec<String> {
 
     for column in T::COLUMN_SCHEMA.iter() {
         if let Some(fk) = &column.foreign_key {
+            let ref_column = fk.get_ref_column();
             constraints.push(format!(
                 "FOREIGN KEY ({}) REFERENCES {} ({})",
-                column.name, fk.ref_table, fk.ref_column
+                column.name, fk.ref_table, ref_column
             ));
         }
     }

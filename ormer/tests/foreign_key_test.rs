@@ -13,7 +13,7 @@ struct TestUser {
 struct TestRole {
     #[primary]
     id: i32,
-    #[foreign(TestUser.id)]
+    #[foreign(TestUser)]
     user_id: i32,
     role_name: String,
 }

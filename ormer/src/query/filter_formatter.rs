@@ -137,6 +137,27 @@ impl FilterFormatter {
                 }
                 sql.push(')');
             }
+            FilterExpr::InSubquery {
+                column,
+                subquery_sql,
+                subquery_params,
+            } => {
+                // 生成子查询 IN 语句: column IN (SELECT ...)
+                let col_name = if let Some(ref prefix) = self.table_prefix {
+                    format!("{}.{}", prefix, column)
+                } else {
+                    column.clone()
+                };
+
+                use std::fmt::Write;
+                write!(sql, "{} IN ({})", col_name, subquery_sql).unwrap();
+
+                // 添加子查询的参数
+                for param in subquery_params {
+                    params.push(param.clone());
+                    *param_idx += 1;
+                }
+            }
             FilterExpr::And(left, right) => {
                 self.format_recursive(left, sql, param_idx, params);
                 sql.push_str(" AND ");

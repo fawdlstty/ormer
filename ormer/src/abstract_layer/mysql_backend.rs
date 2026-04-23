@@ -526,6 +526,15 @@ impl Database {
         let affected_rows = conn.affected_rows();
         Ok(affected_rows)
     }
+
+    /// 检查连接是否有效
+    pub async fn is_valid(&self) -> bool {
+        if let Ok(mut conn) = self.pool.get_conn().await {
+            conn.query_drop("SELECT 1").await.is_ok()
+        } else {
+            false
+        }
+    }
 }
 
 /// MySQL 事务对象
@@ -866,9 +875,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
-    pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
+    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         RelatedSelectExecutor {
             select: self.select.from::<T2, R>(),
@@ -879,9 +888,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持3个表）
     /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
+    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         MultiTableSelectExecutor {
             select: self.select.from3::<T2, R1, R2>(),
@@ -892,11 +901,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持4个表）
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
         self,
     ) -> FourTableSelectExecutor<'a, T, R1, R2, R3>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         FourTableSelectExecutor {
             select: self.select.from4::<T2, R1, R2, R3>(),

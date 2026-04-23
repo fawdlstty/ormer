@@ -259,15 +259,16 @@ fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
 }
 
 /// 提取 foreign 属性的外键信息
+/// 支持两种语法：
+/// - #[foreign(Type)] - 新语法，自动关联到目标 model 的主键
+/// - #[foreign(Type.field)] - 旧语法，显式指定字段
 fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
     for attr in &field.attrs {
         if attr.path().is_ident("foreign") {
-            // 解析 #[foreign(Type.field)] 格式
             if let Meta::List(list) = &attr.meta {
                 let tokens_str = list.tokens.to_string();
 
-                // 尝试解析为 Type.field 格式
-                // tokens 应该是类似 `User . id` 的形式
+                // 尝试解析为 Type.field 格式（旧语法）
                 let parts: Vec<&str> = tokens_str.split('.').collect();
                 if parts.len() == 2 {
                     let ref_type = parts[0].trim();
@@ -280,6 +281,21 @@ fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
                         Some(::ormer::model::ForeignKeyInfo {
                             ref_table: #ref_table,
                             ref_column: #ref_field,
+                            ref_column_fn: None,
+                        })
+                    };
+                } else if parts.len() == 1 {
+                    // 新语法：只传递类型，自动关联到目标 model 的主键
+                    let ref_type = parts[0].trim();
+                    let ref_table = to_snake_case(ref_type);
+                    let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
+
+                    // 使用函数指针在运行时获取主键字段名
+                    return quote! {
+                        Some(::ormer::model::ForeignKeyInfo {
+                            ref_table: #ref_table,
+                            ref_column: "",
+                            ref_column_fn: Some(<#ref_type_ident as ::ormer::Model>::primary_key_column),
                         })
                     };
                 }

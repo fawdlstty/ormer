@@ -84,6 +84,29 @@ pub struct AggregateSelect<T: Model, R = crate::model::Value> {
     _marker: PhantomData<(T, R)>,
 }
 
+/// MappedSelect - 字段投影查询结构体
+pub struct MappedSelect<T: Model, V> {
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    column_name: String, // 要查询的字段名
+    _marker: PhantomData<(T, V)>,
+}
+
+impl<T: Model, V> Clone for MappedSelect<T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            column_name: self.column_name.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<T: Model, R> AggregateSelect<T, R> {
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
@@ -115,6 +138,66 @@ impl<T: Model, R> AggregateSelect<T, R> {
         }
 
         (sql, params)
+    }
+}
+
+impl<T: Model, V> MappedSelect<T, V> {
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+
+        // SELECT 单个字段
+        write!(
+            &mut sql,
+            "SELECT {} FROM {}",
+            self.column_name,
+            T::TABLE_NAME
+        )
+        .unwrap();
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let mut param_idx = 1;
+            let formatter = FilterFormatter::new(db_type);
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // ORDER BY 子句
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // RANGE 子句 (LIMIT + OFFSET)
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    /// 生成 SQL（用于调试）
+    pub fn to_sql(&self) -> String {
+        // 默认使用Turso格式用于调试
+        let (sql, _) = self.to_sql_with_params(DbType::Turso);
+        sql
     }
 }
 
@@ -249,6 +332,23 @@ impl<T: Model> Select<T> {
         let where_obj = <T as Model>::Where::default();
         let column = f(where_obj);
         self.aggregate_typed("MIN", column.column_name())
+    }
+
+    /// 字段投影 - 将查询结果映射到单个字段
+    pub fn map_to<F, V>(self, f: F) -> MappedSelect<T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> TypedColumn<V>,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let column = f(where_obj);
+        MappedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            column_name: column.column_name().to_string(),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -683,6 +783,10 @@ impl From<WhereExpr> for FilterExpr {
 }
 
 impl WhereExpr {
+    pub fn from_filter(inner: FilterExpr) -> Self {
+        Self { inner }
+    }
+
     pub fn and(self, other: WhereExpr) -> Self {
         Self {
             inner: FilterExpr::And(Box::new(self.inner), Box::new(other.inner)),
@@ -919,6 +1023,63 @@ impl IsInValue<String> for &&str {
     }
 }
 
+/// IsInValues trait - 支持集合和子查询作为 is_in 的参数
+pub trait IsInValues<T> {
+    fn to_in_expr(self, column: String) -> WhereExpr;
+}
+
+// 为集合类型实现 IsInValues
+impl<T: ColumnValueType, I, V> IsInValues<T> for I
+where
+    I: IntoIterator<Item = V>,
+    V: IsInValue<T>,
+{
+    fn to_in_expr(self, column: String) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::In {
+                column,
+                values: self
+                    .into_iter()
+                    .map(|v| ColumnValueType::to_filter_value(v.to_in_value()))
+                    .collect(),
+            },
+        }
+    }
+}
+
+/// SubqueryParam - 子查询参数包装器
+pub struct SubqueryParam {
+    pub sql: String,
+    pub params: Vec<crate::model::Value>,
+}
+
+impl<T: ColumnValueType> IsInValues<T> for SubqueryParam {
+    fn to_in_expr(self, column: String) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::InSubquery {
+                column,
+                subquery_sql: self.sql,
+                subquery_params: self.params,
+            },
+        }
+    }
+}
+
+// 为 MappedSelect 实现 IsInValues（子查询）
+impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
+    fn to_in_expr(self, column: String) -> WhereExpr {
+        let db_type = DbType::Turso;
+        let (sql, params) = self.to_sql_with_params(db_type);
+        WhereExpr {
+            inner: FilterExpr::InSubquery {
+                column,
+                subquery_sql: sql,
+                subquery_params: params,
+            },
+        }
+    }
+}
+
 /// 类型化列代理 - 携带字段类型信息
 pub struct TypedColumn<T> {
     column_name: &'static str,
@@ -1011,21 +1172,9 @@ impl<T: ColumnValueType> TypedColumn<T> {
         }
     }
 
-    /// IN 语句 - 支持多种集合类型
-    pub fn is_in<I, V>(self, values: I) -> WhereExpr
-    where
-        I: IntoIterator<Item = V>,
-        V: IsInValue<T>,
-    {
-        WhereExpr {
-            inner: FilterExpr::In {
-                column: self.column_name.to_string(),
-                values: values
-                    .into_iter()
-                    .map(|v| ColumnValueType::to_filter_value(v.to_in_value()))
-                    .collect(),
-            },
-        }
+    /// IN 语句 - 支持多种集合类型和子查询
+    pub fn is_in(self, values: impl IsInValues<T>) -> WhereExpr {
+        values.to_in_expr(self.column_name.to_string())
     }
 }
 

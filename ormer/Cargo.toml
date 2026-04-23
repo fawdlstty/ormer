@@ -13,6 +13,9 @@ categories = []
 readme = "../README.md"
 exclude = ["src/main.rs"]
 
+# [lib]
+# doctest = false
+
 [dependencies]
 ormer-derive = { version = "0.1.2", path = "../ormer-derive" }
 thiserror = "1.0"
@@ -20,7 +23,9 @@ async-trait = "0.1"
 tokio = { version = "1.52.1", features = ["full"] }
 anyhow = "1.0.102"
 turso = { version = "0.1", optional = true }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres = { version = "0.7", features = [
+    "with-chrono-0_4",
+], optional = true }
 postgres-types = { version = "0.2", optional = true }
 mysql_async = { version = "0.34", optional = true }
 

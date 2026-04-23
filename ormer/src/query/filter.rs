@@ -15,6 +15,12 @@ pub enum FilterExpr {
     },
     /// IN 语句:column IN (value1, value2, ...)
     In { column: String, values: Vec<Value> },
+    /// 子查询 IN: column IN (subquery)
+    InSubquery {
+        column: String,
+        subquery_sql: String,
+        subquery_params: Vec<crate::model::Value>,
+    },
     /// AND 连接
     And(Box<FilterExpr>, Box<FilterExpr>),
     /// OR 连接
@@ -28,6 +34,12 @@ pub enum Value {
     Text(String),
     Real(f64),
     Null,
+}
+
+/// 子查询 trait - 用于 is_in 方法
+pub trait Subquery {
+    /// 获取子查询的 SQL 和参数
+    fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>);
 }
 
 impl FilterExpr {

@@ -202,6 +202,15 @@ impl Database {
             Database::MySQL(db) => db.exec_non_query(sql).await,
         }
     }
+
+    /// 创建连接池
+    #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+    pub fn create_pool(
+        db_type: super::DbType,
+        connection_string: &str,
+    ) -> super::connection_pool::PoolBuilder {
+        super::connection_pool::PoolBuilder::new(db_type, connection_string)
+    }
 }
 
 /// 统一的 SelectExecutor 枚举
@@ -887,3 +896,156 @@ crate::impl_unified_join_collect_future!(
     Result<Vec<(Option<T>, J)>, crate::Error>,
     std::marker::PhantomData
 );
+
+/// 统一的 MappedSelectExecutor 枚举
+pub enum MappedSelectExecutor<'a, T: Model, V> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::MappedSelectExecutor<T, V>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    // TODO: 实现 postgresql 和 mysql 后端
+    // #[cfg(feature = "postgresql")]
+    // PostgreSQL(postgresql_backend::MappedSelectExecutor<'a, T, V>),
+    // #[cfg(feature = "mysql")]
+    // MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
+}
+
+impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
+    fn clone(&self) -> Self {
+        match self {
+            #[cfg(feature = "turso")]
+            MappedSelectExecutor::Turso(exec, phantom) => {
+                MappedSelectExecutor::Turso(exec.clone(), *phantom)
+            }
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+        }
+    }
+}
+
+/// 统一的 MappedCollectFuture 枚举
+pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::MappedCollectFuture<T, V, C>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    // TODO: 实现 postgresql 和 mysql 后端
+    // #[cfg(feature = "postgresql")]
+    // PostgreSQL(postgresql_backend::MappedCollectFuture<'a, T, V, C>),
+    // #[cfg(feature = "mysql")]
+    // MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
+}
+
+impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 字段投影 - 将查询结果映射到单个字段
+    pub fn map_to<F, V>(self, f: F) -> MappedSelectExecutor<'a, T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<V>,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                MappedSelectExecutor::Turso(exec.map_to(f), std::marker::PhantomData)
+            }
+            // TODO: 实现 postgresql 和 mysql 后端
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+        }
+    }
+}
+
+impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromValue + 'static,
+        C: FromIterator<V> + 'static,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            MappedSelectExecutor::Turso(exec, _) => {
+                MappedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+            } // TODO: 实现 postgresql 和 mysql 后端
+              // #[cfg(feature = "postgresql")]
+              // MappedSelectExecutor::PostgreSQL(exec) => {
+              //     MappedCollectFuture::PostgreSQL(exec.collect::<C>())
+              // }
+              // #[cfg(feature = "mysql")]
+              // MappedSelectExecutor::MySQL(exec) => MappedCollectFuture::MySQL(exec.collect::<C>()),
+        }
+    }
+}
+
+// 为 MappedSelectExecutor 实现 Subquery trait
+impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a, T, V> {
+    fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
+        match self {
+            #[cfg(feature = "turso")]
+            MappedSelectExecutor::Turso(exec, _) => exec.to_subquery_sql(),
+            // TODO: 实现 postgresql 和 mysql 后端
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+        }
+    }
+}
+
+// 为 MappedSelectExecutor 实现 IsInValues trait
+impl<'a, T: Model, V: crate::query::builder::ColumnValueType> crate::query::builder::IsInValues<V>
+    for MappedSelectExecutor<'a, T, V>
+{
+    fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
+        use crate::query::filter::Subquery;
+
+        let (sql, params) = self.to_subquery_sql();
+
+        // 构造 FilterExpr::InSubquery
+        let filter_expr = crate::query::filter::FilterExpr::InSubquery {
+            column,
+            subquery_sql: sql,
+            subquery_params: params,
+        };
+
+        crate::query::builder::WhereExpr::from_filter(filter_expr)
+    }
+}
+
+// 为 &MappedSelectExecutor 实现 IsInValues trait（引用版本）
+impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
+    crate::query::builder::IsInValues<V> for &'b MappedSelectExecutor<'a, T, V>
+{
+    fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
+        use crate::query::filter::Subquery;
+
+        let (sql, params) = self.to_subquery_sql();
+
+        // 构造 FilterExpr::InSubquery
+        let filter_expr = crate::query::filter::FilterExpr::InSubquery {
+            column,
+            subquery_sql: sql,
+            subquery_params: params,
+        };
+
+        crate::query::builder::WhereExpr::from_filter(filter_expr)
+    }
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match self {
+            #[cfg(feature = "turso")]
+            MappedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
+            // TODO: 实现 postgresql 和 mysql 后端
+            // #[cfg(feature = "postgresql")]
+            // MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
+            // #[cfg(feature = "mysql")]
+            // MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+        }
+    }
+}

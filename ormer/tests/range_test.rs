@@ -1,6 +1,6 @@
 use ormer::Model;
 use ormer::abstract_layer::DbType;
-use ormer::query::builder::{LeftJoinedSelect, RelatedSelect, Select};
+use ormer::query::builder::Select;
 
 // 定义测试用的 User 模型
 #[derive(Debug, Model)]

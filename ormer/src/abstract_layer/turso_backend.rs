@@ -2,8 +2,8 @@ use crate::abstract_layer::DbType;
 use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
-    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
-    RightJoinedSelect, Select, WhereExpr,
+    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect, MultiTableSelect,
+    RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
@@ -497,6 +497,11 @@ impl Database {
             .map_err(|e| crate::Error::Database(e.to_string()))?;
         Ok(result)
     }
+
+    /// 检查连接是否有效
+    pub async fn is_valid(&self) -> bool {
+        self.conn.execute("SELECT 1", ()).await.is_ok()
+    }
 }
 
 /// Turso 事务对象
@@ -702,6 +707,23 @@ pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
+/// Mapped 查询执行器（字段投影查询）
+pub struct MappedSelectExecutor<T: Model, V> {
+    select: MappedSelect<T, V>,
+    conn: Arc<turso::Connection>,
+    _marker: PhantomData<(T, V)>,
+}
+
+impl<T: Model, V> Clone for MappedSelectExecutor<T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<T: Model> SelectExecutor<T> {
     /// 添加 LEFT JOIN 查询
     pub fn left_join<J: Model>(
@@ -734,6 +756,19 @@ impl<T: Model> SelectExecutor<T> {
     ) -> RightJoinedSelectExecutor<T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影 - 将查询结果映射到单个字段
+    pub fn map_to<F, V>(self, f: F) -> MappedSelectExecutor<T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<V>,
+    {
+        let mapped_select = self.select.map_to(f);
+        MappedSelectExecutor {
+            select: mapped_select,
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -834,9 +869,9 @@ impl<T: Model> SelectExecutor<T> {
 
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
-    pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<T, R>
+    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<T, R>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         RelatedSelectExecutor {
             select: self.select.from::<T2, R>(),
@@ -847,9 +882,9 @@ impl<T: Model> SelectExecutor<T> {
 
     /// 添加关联表查询（支持3个表）
     /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2>
+    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         MultiTableSelectExecutor {
             select: self.select.from3::<T2, R1, R2>(),
@@ -860,11 +895,11 @@ impl<T: Model> SelectExecutor<T> {
 
     /// 添加关联表查询（支持4个表）
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
         self,
     ) -> FourTableSelectExecutor<T, R1, R2, R3>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         FourTableSelectExecutor {
             select: self.select.from4::<T2, R1, R2, R3>(),
@@ -1640,5 +1675,83 @@ fn convert_turso_value(value: &turso::Value) -> Result<Value, crate::Error> {
             "Unsupported turso value type: {:?}",
             value
         ))),
+    }
+}
+
+/// Mapped Select Collect future
+pub struct MappedCollectFuture<T: Model, V, C: FromIterator<V>> {
+    executor: MappedSelectExecutor<T, V>,
+    _marker: PhantomData<C>,
+}
+
+impl<T: Model + 'static, V: crate::model::FromValue + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for MappedCollectFuture<T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<T: Model, V> MappedSelectExecutor<T, V> {
+    /// 获取子查询的 SQL 和参数
+    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
+        self.select.to_sql_with_params(DbType::Turso)
+    }
+
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<T, V, C> {
+        MappedCollectFuture {
+            executor: self.clone(),
+            _marker: PhantomData,
+        }
+    }
+
+    async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
+    where
+        V: crate::model::FromValue,
+    {
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+
+        let turso_params: Vec<turso::Value> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => turso::Value::Integer(i),
+                crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Null => turso::Value::Null,
+            })
+            .collect();
+
+        let mut rows = if turso_params.is_empty() {
+            self.conn
+                .query(&sql, ())
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        } else {
+            self.conn
+                .query(&sql, turso_params)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        };
+
+        let mut results = Vec::new();
+
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?
+        {
+            let value = row
+                .get_value(0)
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+            let ormer_value = convert_turso_value(&value)?;
+            let typed_value = V::from_value(&ormer_value)?;
+            results.push(typed_value);
+        }
+
+        Ok(results.into_iter().collect())
     }
 }

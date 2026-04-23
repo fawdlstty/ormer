@@ -1,7 +1,6 @@
 mod model;
 
 use proc_macro::TokenStream;
-use syn;
 
 #[proc_macro_derive(Model, attributes(table, primary, unique, index, foreign))]
 pub fn derive_model(input: TokenStream) -> TokenStream {

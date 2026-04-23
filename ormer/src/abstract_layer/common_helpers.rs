@@ -48,6 +48,20 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             }
             sql.push(')');
         }
+        FilterExpr::InSubquery {
+            column,
+            subquery_sql,
+            subquery_params: _,
+        } => {
+            // 生成子查询 IN 语句: column IN (SELECT ...)
+            write!(sql, "{} IN ({})", column, subquery_sql).unwrap();
+            // 注意：子查询的参数数量需要累加到 param_idx
+            // 但在这个函数中我们不处理参数值，只处理占位符
+            // 子查询的 SQL 中已经包含了占位符，我们需要计算占位符数量
+            let placeholder_count =
+                subquery_sql.matches('?').count() + subquery_sql.matches('$').count();
+            *param_idx += placeholder_count as i32;
+        }
         FilterExpr::And(left, right) => {
             format_filter(left, sql, param_idx, db_type);
             sql.push_str(" AND ");
@@ -112,6 +126,19 @@ pub fn format_filter_with_params(
                 *param_idx += 1;
             }
             sql.push(')');
+        }
+        FilterExpr::InSubquery {
+            column,
+            subquery_sql,
+            subquery_params,
+        } => {
+            // 生成子查询 IN 语句: column IN (SELECT ...)
+            write!(sql, "{} IN ({})", column, subquery_sql).unwrap();
+            // 添加子查询的参数
+            for param in subquery_params {
+                params.push(param.clone());
+                *param_idx += 1;
+            }
         }
         FilterExpr::And(left, right) => {
             format_filter_with_params(left, sql, param_idx, params, db_type);
