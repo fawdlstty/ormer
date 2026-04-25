@@ -7,67 +7,7 @@ English | [简体中文](README.zh.md)
 
 An ORM framework with a usage style similar to Linq, supporting Turso(SQLite), PostgresQL, MySQL.
 
-# Usage
-
-<!-- [Online Documentation](https://ormer.fawdlstty.com) -->
-
-Add the library reference:
-
-```sh
-cargo add ormer --features turso # can be changed to mysql, postgresql
-cargo add tokio --features full
-```
-
-#### Define Model
-
-Use the `#[derive(Model)]` macro to define your database model:
-
-```rust
-use ormer::Model;
-
-#[derive(Model, Debug, Clone)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    #[index]
-    age: i32,
-    email: Option<String>,
-}
-```
-
-#### Access Database
-
-```rust
-#[tokio::main]
-async fn main() {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-
-    db.create_table::<User>().await?;
-    db.insert(&User {
-        id: 0, // will be auto-generated
-        name: "Alice".to_string(),
-        age: 25,
-        email: Some("alice@example.com".to_string()),
-    }).await?;
-    let users = db.select::<User>().collect::<Vec<User>>().await?;
-}
-```
-
-### Features
-
-- **turso** (default): Use Turso/libsql database backend
-- **postgresql**: Use PostgreSQL database backend
-- **mysql**: Use MySQL database backend
-
-Enable features in your `Cargo.toml`:
-
-```toml
-[dependencies]
-ormer = { version = "0.1", features = ["postgresql"] }
-```
+[Online Documentation](https://ormer.fawdlstty.com/en/)
 
 ## Comparison with Other Rust ORMs
 

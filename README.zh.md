@@ -7,67 +7,7 @@
 
 一款用法接近Linq的ORM框架，支持Turso(SQLite)、PostgresQL、MySQL。
 
-# 用法
-
-<!-- [在线文档](https://ormer.fawdlstty.com) -->
-
-加入库的引用：
-
-```sh
-cargo add ormer --features turso # 可改为mysql、postgresql
-cargo add tokio --features full
-```
-
-#### 定义模型
-
-使用 `#[derive(Model)]` 宏来定义你的数据库模型：
-
-```rust
-use ormer::Model;
-
-#[derive(Model, Debug, Clone)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    #[index]
-    age: i32,
-    email: Option<String>,
-}
-```
-
-#### 访问数据库
-
-```rust
-#[tokio::main]
-async fn main() {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-
-    db.create_table::<User>().await?;
-    db.insert(&User {
-        id: 0,
-        name: "Alice".to_string(),
-        age: 25,
-        email: Some("alice@example.com".to_string()),
-    }).await?;
-    let users = db.select::<User>().collect::<Vec<User>>().await?;
-}
-```
-
-### 特性 (Features)
-
-- **turso** (默认): 使用 Turso/libsql 数据库后端
-- **postgresql**: 使用 PostgreSQL 数据库后端
-- **mysql**: 使用 MySQL 数据库后端
-
-在 `Cargo.toml` 中启用特性：
-
-```toml
-[dependencies]
-ormer = { version = "0.1", features = ["postgresql"] }
-```
+[在线文档](https://ormer.fawdlstty.com/)
 
 ## 与其他 Rust ORM 的对比
 
