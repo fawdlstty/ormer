@@ -74,11 +74,18 @@ impl FilterFormatter {
                 };
 
                 match self.db_type {
+                    #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
                         use std::fmt::Write;
                         write!(sql, "{} {} ${}", col_name, operator, param_idx).unwrap();
                     }
-                    DbType::Turso | DbType::MySQL => {
+                    #[cfg(feature = "turso")]
+                    DbType::Turso => {
+                        use std::fmt::Write;
+                        write!(sql, "{} {} ?", col_name, operator).unwrap();
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
                         use std::fmt::Write;
                         write!(sql, "{} {} ?", col_name, operator).unwrap();
                     }
@@ -123,10 +130,16 @@ impl FilterFormatter {
                         sql.push_str(", ");
                     }
                     match self.db_type {
+                        #[cfg(feature = "postgresql")]
                         DbType::PostgreSQL => {
                             write!(sql, "${}", param_idx).unwrap();
                         }
-                        DbType::Turso | DbType::MySQL => {
+                        #[cfg(feature = "turso")]
+                        DbType::Turso => {
+                            sql.push('?');
+                        }
+                        #[cfg(feature = "mysql")]
+                        DbType::MySQL => {
                             sql.push('?');
                         }
                     }

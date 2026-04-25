@@ -2,6 +2,7 @@
 /// 根据运行时指定的数据库类型选择对应的数据库后端
 use crate::model::DbBackendTypeMapper;
 
+#[cfg(feature = "turso")]
 pub mod turso_backend;
 
 #[cfg(feature = "postgresql")]
@@ -10,7 +11,8 @@ pub mod postgresql_backend;
 #[cfg(feature = "mysql")]
 pub mod mysql_backend;
 
-/// 连接池模块 - 始终可用
+/// 连接池模块 - 当启用任一数据库 feature 时可用
+#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 pub mod connection_pool;
 
 /// 公共辅助函数模块
@@ -71,8 +73,10 @@ impl DbType {
     }
 }
 
-// 统一使用 unified 模块提供接口，无论启用哪些 feature
+// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
+#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 mod unified;
+#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 pub use unified::{
     AggregateFuture, CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture,
     LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,

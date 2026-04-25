@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 #[derive(Debug, Model)]
 #[table = "test_users"]
 struct TestUser {
@@ -30,12 +32,13 @@ struct TestUserMissingColumn {
     // 缺少 age 和 email 字段
 }
 
-#[tokio::test]
-async fn test_schema_validation() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_schema_validation_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("=== 测试表结构验证功能 ===\n");
 
     // 连接到数据库
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+    let db = _test_common::create_db_connection(config).await?;
 
     // 测试 1: 首次创建表（应该成功）
     println!("测试 1: 首次创建表");
@@ -67,5 +70,10 @@ async fn test_schema_validation() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== 测试完成 ===");
 
+    // 清理测试表
+    db.drop_table::<TestUser>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_schema_validation_impl);

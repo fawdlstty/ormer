@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 // 定义与 main.rs 相同的测试模型
 #[derive(Debug, Model, Clone)]
 #[table = "test_users_insert"]
@@ -25,9 +27,10 @@ struct TestRoleInsert {
 }
 
 /// 测试所有 insert 调用方式（基于 main.rs 的用法）
-#[tokio::test]
-async fn test_all_insert_patterns() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_all_insert_patterns_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserInsert>().await?;
     db.create_table::<TestRoleInsert>().await?;
 
@@ -123,13 +126,19 @@ async fn test_all_insert_patterns() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(roles[0].name, "admin");
 
     println!("所有 insert 用法测试通过！");
+
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<TestRoleInsert>().await?;
+    db.drop_table::<TestUserInsert>().await?;
+
     Ok(())
 }
 
 /// 测试批量插入功能
-#[tokio::test]
-async fn test_batch_insert() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_batch_insert_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserInsert>().await?;
 
     // 批量插入多个用户
@@ -163,13 +172,18 @@ async fn test_batch_insert() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(users[2].name, "User3");
 
     println!("批量插入测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestUserInsert>().await?;
+
     Ok(())
 }
 
 /// 测试 insert_or_update 的所有调用方式
-#[tokio::test]
-async fn test_insert_or_update_patterns() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_patterns_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestRoleInsert>().await?;
 
     // 1. 插入或更新单个对象引用 &T
@@ -219,13 +233,18 @@ async fn test_insert_or_update_patterns() -> Result<(), Box<dyn std::error::Erro
     assert!(names.contains(&"guest"));
 
     println!("所有 insert_or_update 用法测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestRoleInsert>().await?;
+
     Ok(())
 }
 
 /// 测试 insert_or_update 的更新功能
-#[tokio::test]
-async fn test_insert_or_update_update() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_update_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestRoleInsert>().await?;
 
     // 第一次插入
@@ -249,5 +268,14 @@ async fn test_insert_or_update_update() -> Result<(), Box<dyn std::error::Error>
     assert_eq!(roles[0].name, "super_admin");
 
     println!("insert_or_update 更新功能测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestRoleInsert>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_all_insert_patterns_impl);
+test_on_all_dbs_result!(test_batch_insert_impl);
+test_on_all_dbs_result!(test_insert_or_update_patterns_impl);
+test_on_all_dbs_result!(test_insert_or_update_update_impl);

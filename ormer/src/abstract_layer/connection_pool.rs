@@ -207,6 +207,14 @@ impl PoolBuilder {
 
     /// 构建连接池
     pub async fn build(self) -> Result<ConnectionPool, crate::Error> {
+        // 对于 turso 后端，连接池最大连接数必须为 1，超过 1 则报错
+        #[cfg(feature = "turso")]
+        if self.db_type == DbType::Turso && self.config.max_size > 1 {
+            return Err(crate::Error::Database(
+                "Turso backend only supports a maximum of 1 connection in the pool".to_string(),
+            ));
+        }
+
         let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
 
         // 如果 min_size > 0,预先创建最小连接数
@@ -342,6 +350,18 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::PostgreSQL(db) => db.create_table::<T>().await,
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.create_table::<T>().await,
+        }
+    }
+
+    /// 验证表结构
+    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+        match self.get_connection() {
+            #[cfg(feature = "turso")]
+            ConnectionWrapper::Turso(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => db.validate_table::<T>().await,
         }
     }
 

@@ -62,7 +62,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             "f32" => "REAL",
             "f64" => "DOUBLE PRECISION",
             // 字符串类型
-            "String" => "VARCHAR",
+            "String" => "TEXT",
             // 布尔类型
             "bool" => "BOOLEAN",
             // 字节数组
@@ -112,7 +112,7 @@ impl Database {
         // 在后台运行连接
         let connection_handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
-                eprintln!("PostgreSQL connection error: {e}");
+                // PostgreSQL connection error silently handled
             }
             Ok(())
         });
@@ -125,31 +125,47 @@ impl Database {
 
     /// 创建表
     pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().await?;
-
-        if table_exists {
-            // 表已存在，验证表结构
-            self.validate_table_schema::<T>().await?;
-            // 结构匹配，无需创建
-            return Ok(());
-        }
-
         // 表不存在，创建新表
         let create_sql =
             crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::PostgreSQL);
 
-        self.client
-            .execute(&create_sql, &[])
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        // 分离 CREATE TABLE 和 CREATE INDEX 语句
+        let sql_parts: Vec<&str> = create_sql.split(';').collect();
+
+        for sql_part in sql_parts.iter() {
+            let sql_part = sql_part.trim();
+            if sql_part.is_empty() {
+                continue;
+            }
+
+            self.client
+                .execute(sql_part, &[])
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+        }
 
         Ok(())
     }
 
+    /// 验证表结构是否与模型定义匹配
+    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+        // 检查表是否存在
+        let table_exists = self.check_table_exists::<T>().await?;
+
+        if !table_exists {
+            return Err(crate::Error::SchemaMismatch {
+                table: T::TABLE_NAME.to_string(),
+                reason: "Table does not exist".to_string(),
+            });
+        }
+
+        // 表已存在，验证表结构
+        self.validate_table_schema::<T>().await
+    }
+
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> Result<bool, crate::Error> {
-        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_name=$1";
+        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public' AND table_name=$1";
 
         let row = self
             .client
@@ -164,13 +180,13 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// 验证表结构是否与模型定义匹配
+    /// 验证表结构是否与模型定义匹配（内部使用）
     async fn validate_table_schema<T: Model>(&self) -> Result<(), crate::Error> {
         // 查询表的列信息
         let sql = r#"
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_name = $1
+            WHERE table_schema='public' AND table_name = $1
             ORDER BY ordinal_position
         "#;
 
@@ -239,12 +255,20 @@ impl Database {
             );
 
             // 对于类型比较，我们需要提取基础类型（不包含 SERIAL, PRIMARY KEY, NOT NULL 等约束）
-            let type_to_compare = if expected_col.is_primary {
+            let type_to_compare = if expected_col.is_primary && expected_col.is_auto_increment {
+                // SERIAL类型在PostgreSQL中实际存储为integer/bigint
+                match expected_col.rust_type {
+                    "i8" | "i16" | "u8" => "SMALLINT".to_string(), // SMALLSERIAL -> SMALLINT
+                    "i32" | "u16" | "u32" => "INTEGER".to_string(), // SERIAL -> INTEGER
+                    "i64" | "u64" => "BIGINT".to_string(),         // BIGSERIAL -> BIGINT
+                    _ => "INTEGER".to_string(),
+                }
+            } else if expected_col.is_primary {
                 // 主键的基础类型
                 match expected_col.rust_type {
-                    "i8" | "i16" | "i32" => "SMALLINT".to_string(),
-                    "i64" | "u16" | "u32" | "u64" => "BIGINT".to_string(),
-                    "u8" => "SMALLINT".to_string(),
+                    "i8" | "i16" | "u8" => "SMALLINT".to_string(),
+                    "i32" | "u16" | "u32" => "INTEGER".to_string(),
+                    "i64" | "u64" => "BIGINT".to_string(),
                     _ => "INTEGER".to_string(),
                 }
             } else {
@@ -291,27 +315,37 @@ impl Database {
 
     /// 检查 SQL 类型是否兼容
     fn types_compatible(&self, actual: &str, expected: &str) -> bool {
-        // 标准化类型名称
+        // 标准化类型名称 - 只提取基础类型，去除约束
         fn normalize(s: &str) -> String {
             let upper = s.to_uppercase();
-            match upper.as_str() {
+            // 提取第一个单词作为基础类型
+            let base_type = upper.split_whitespace().next().unwrap_or(&upper);
+
+            match base_type {
                 // 整数类型
                 "SMALLINT" | "INT2" => "SMALLINT".to_string(),
                 "INTEGER" | "INT" | "INT4" | "SERIAL" => "INTEGER".to_string(),
                 "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT".to_string(),
                 // 字符串类型
-                "CHARACTER VARYING" | "VARCHAR" | "TEXT" | "CHAR" | "CHARACTER" | "BPCHAR" => {
-                    "VARCHAR".to_string()
+                "CHARACTER" => {
+                    // CHARACTER VARYING 需要特殊处理
+                    if upper.starts_with("CHARACTER VARYING") || upper.starts_with("CHARACTER(") {
+                        "VARCHAR".to_string()
+                    } else {
+                        "CHAR".to_string()
+                    }
                 }
+                "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => "VARCHAR".to_string(),
                 // 布尔类型
                 "BOOLEAN" | "BOOL" => "BOOLEAN".to_string(),
                 // 浮点类型
                 "REAL" | "FLOAT4" => "REAL".to_string(),
-                "DOUBLE PRECISION" | "FLOAT8" | "FLOAT" => "DOUBLE PRECISION".to_string(),
+                "DOUBLE" => "DOUBLE PRECISION".to_string(), // DOUBLE PRECISION
+                "FLOAT8" | "FLOAT" => "DOUBLE PRECISION".to_string(),
                 // 字节类型
                 "BYTEA" | "BLOB" => "BYTEA".to_string(),
                 // 其他
-                _ => upper,
+                _ => base_type.to_string(),
             }
         }
 
@@ -357,7 +391,10 @@ impl Database {
             all_values.extend(values);
         }
 
-        let params = values_to_params(&all_values)?;
+        // 获取列的rust类型信息
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -416,14 +453,16 @@ impl Database {
             first = false;
         }
 
-        let params = values_to_params(&all_values)?;
+        // 获取列的rust_type信息
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| crate::Error::Database(format!("db error: {}", e)))?;
 
         Ok(())
     }
@@ -480,7 +519,7 @@ impl Database {
 
     /// 删除表
     pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
         self.client
             .execute(&sql, &[])
             .await
@@ -617,14 +656,17 @@ impl<'a> Transaction<'a> {
         let all_values =
             crate::abstract_layer::common_helpers::collect_batch_insert_values::<T>(models);
 
-        let params = values_to_params(&all_values)?;
+        // 获取列的rust_type信息
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| crate::Error::Database(format!("db error: {}", e)))?;
 
         Ok(())
     }
@@ -676,7 +718,9 @@ impl<'a> Transaction<'a> {
             first = false;
         }
 
-        let params = values_to_params(&all_values)?;
+        // 获取列的rust_type信息
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
@@ -715,6 +759,82 @@ pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<T>,
+}
+
+/// 映射查询结果执行器
+pub struct MappedSelectExecutor<'a, T: Model, V> {
+    select: crate::query::builder::MappedSelect<T, V>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, V)>,
+}
+
+impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        MappedCollectFuture {
+            select: self.select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 克隆executor（保持相同的client引用）
+    pub fn clone_with_client(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// 映射查询收集Future
+pub struct MappedCollectFuture<'a, T: Model, V, C> {
+    select: crate::query::builder::MappedSelect<T, V>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, V, C)>,
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+            let pg_params = values_to_params(&params)?;
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                pg_params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = self
+                .client
+                .query(&sql, &param_refs)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                // 将行数据转换为Vec<Value>
+                let mut values = Vec::new();
+                for i in 0..row.columns().len() {
+                    let value = convert_postgres_value(&row, i)?;
+                    values.push(value);
+                }
+
+                // 使用FromRowValues转换为V
+                let v = V::from_row_values(&values)?;
+                results.push(v);
+            }
+
+            Ok(results.into_iter().collect())
+        })
+    }
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -796,6 +916,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     ) -> RightJoinedSelectExecutor<'a, T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 映射查询结果到自定义类型
+    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    where
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        let mapped_select = self.select.map_to(f);
+        MappedSelectExecutor {
+            select: mapped_select,
             client: self.client,
             _marker: PhantomData,
         }
@@ -941,14 +1075,33 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::PostgreSQL);
+            let (mut sql, params) = self.aggregate_select.to_sql_with_params(DbType::PostgreSQL);
+
+            // 对于 AVG 聚合，PostgreSQL 返回 NUMERIC 类型，需要 CAST 为 FLOAT8
+            // 这样可以避免 tokio-postgres 不支持 NUMERIC 类型的问题
+            if sql.contains("SELECT AVG(") {
+                sql = sql.replace("SELECT AVG(", "SELECT AVG(");
+                // 在 AVG 函数的闭括号后添加 ::FLOAT8
+                // 找到 "AVG(column_name)" 并替换为 "AVG(column_name)::FLOAT8"
+                if let Some(avg_start) = sql.find("AVG(") {
+                    if let Some(paren_end) = sql[avg_start..].find(')') {
+                        let insert_pos = avg_start + paren_end + 1;
+                        sql.insert_str(insert_pos, "::FLOAT8");
+                    }
+                }
+            }
 
             // 将ormer::Value转换为postgres_types::ToSql
             let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
                 .into_iter()
                 .map(|v| match v {
                     crate::model::Value::Integer(i) => {
-                        Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                        // PostgreSQL INTEGER (Int4) 是 32 位，需要将 i64 转换为 i32
+                        if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                            Box::new(i as i32) as Box<dyn postgres_types::ToSql + Sync>
+                        } else {
+                            Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                        }
                     }
                     crate::model::Value::Text(t) => {
                         Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
@@ -1013,12 +1166,14 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::NUMERIC => {
-                    // NUMERIC类型尝试作为f64读取
-                    let val: Option<f64> = row
-                        .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
-                    val.map(|v| crate::model::Value::Real(v))
-                        .unwrap_or(crate::model::Value::Null)
+                    // NUMERIC类型处理 - 由于tokio-postgres不直接支持NUMERIC到f64的转换
+                    // 我们尝试直接读取为f64
+                    let val_result: Result<Option<f64>, _> = row.try_get(0);
+                    match val_result {
+                        Ok(Some(v)) => crate::model::Value::Real(v),
+                        Ok(None) => crate::model::Value::Null,
+                        Err(_) => crate::model::Value::Null,
+                    }
                 }
                 Type::TEXT | Type::VARCHAR => {
                     let val: Option<String> = row
@@ -1074,30 +1229,54 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 let is_nullable = column_info.is_nullable;
 
                 let ormer_value = if is_nullable {
-                    // 处理可空类型
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                    // 处理可空类型 - 根据PostgreSQL的实际列类型读取
+                    use tokio_postgres::types::Type;
+                    let pg_type = row.columns()[i].type_();
+
+                    match *pg_type {
+                        Type::INT2 => {
+                            let v: Option<i16> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val as i64),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        Type::INT4 => {
+                            let v: Option<i32> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val as i64),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        Type::INT8 => {
                             let v: Option<i64> = row.get(i);
                             match v {
                                 Some(val) => crate::model::Value::Integer(val),
                                 None => crate::model::Value::Null,
                             }
                         }
-                        "String" => {
+                        Type::TEXT | Type::VARCHAR => {
                             let v: Option<String> = row.get(i);
                             match v {
                                 Some(val) => crate::model::Value::Text(val),
                                 None => crate::model::Value::Null,
                             }
                         }
-                        "f32" | "f64" => {
+                        Type::FLOAT4 => {
+                            let v: Option<f32> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val as f64),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        Type::FLOAT8 => {
                             let v: Option<f64> = row.get(i);
                             match v {
                                 Some(val) => crate::model::Value::Real(val),
                                 None => crate::model::Value::Null,
                             }
                         }
-                        "bool" => {
+                        Type::BOOL => {
                             let v: Option<bool> = row.get(i);
                             match v {
                                 Some(true) => crate::model::Value::Integer(1),
@@ -1106,27 +1285,76 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
+                            // 备用方案：使用rust_type
+                            match rust_type {
+                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                                    let v: Option<i64> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Integer(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "String" => {
+                                    let v: Option<String> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Text(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "f32" | "f64" => {
+                                    let v: Option<f64> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Real(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "bool" => {
+                                    let v: Option<bool> = row.get(i);
+                                    match v {
+                                        Some(true) => crate::model::Value::Integer(1),
+                                        Some(false) => crate::model::Value::Integer(0),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                _ => {
+                                    return Err(crate::Error::Database(format!(
+                                        "Unsupported nullable column type: {rust_type}"
+                                    )));
+                                }
+                            }
                         }
                     }
                 } else {
-                    // 处理非空类型
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                    // 处理非空类型 - 根据PostgreSQL的实际列类型读取
+                    use tokio_postgres::types::Type;
+                    let pg_type = row.columns()[i].type_();
+
+                    match *pg_type {
+                        Type::INT2 => {
+                            let v: i16 = row.get(i);
+                            crate::model::Value::Integer(v as i64)
+                        }
+                        Type::INT4 => {
+                            let v: i32 = row.get(i);
+                            crate::model::Value::Integer(v as i64)
+                        }
+                        Type::INT8 => {
                             let v: i64 = row.get(i);
                             crate::model::Value::Integer(v)
                         }
-                        "String" => {
+                        Type::TEXT | Type::VARCHAR => {
                             let v: String = row.get(i);
                             crate::model::Value::Text(v)
                         }
-                        "f32" | "f64" => {
+                        Type::FLOAT4 => {
+                            let v: f32 = row.get(i);
+                            crate::model::Value::Real(v as f64)
+                        }
+                        Type::FLOAT8 => {
                             let v: f64 = row.get(i);
                             crate::model::Value::Real(v)
                         }
-                        "bool" => {
+                        Type::BOOL => {
                             let v: bool = row.get(i);
                             if v {
                                 crate::model::Value::Integer(1)
@@ -1135,9 +1363,34 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
+                            // 备用方案：使用rust_type
+                            match rust_type {
+                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                                    let v: i64 = row.get(i);
+                                    crate::model::Value::Integer(v)
+                                }
+                                "String" => {
+                                    let v: String = row.get(i);
+                                    crate::model::Value::Text(v)
+                                }
+                                "f32" | "f64" => {
+                                    let v: f64 = row.get(i);
+                                    crate::model::Value::Real(v)
+                                }
+                                "bool" => {
+                                    let v: bool = row.get(i);
+                                    if v {
+                                        crate::model::Value::Integer(1)
+                                    } else {
+                                        crate::model::Value::Integer(0)
+                                    }
+                                }
+                                _ => {
+                                    return Err(crate::Error::Database(format!(
+                                        "Unsupported column type: {rust_type}"
+                                    )));
+                                }
+                            }
                         }
                     }
                 };
@@ -1310,6 +1563,73 @@ impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
 }
 
 /// 将 ormer Value 转换为 tokio-postgres 参数
+/// 根据列的rust_type选择正确的参数类型（i32或i64）
+fn values_to_params_with_types(
+    values: &[crate::model::Value],
+    rust_types: &[&str],
+) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>, crate::Error> {
+    // ToSql trait is used in the trait object type above
+    #[allow(unused_imports)]
+    use tokio_postgres::types::ToSql;
+
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+
+    for (idx, value) in values.iter().enumerate() {
+        // 循环使用rust_types，因为values可能包含多个记录的所有字段
+        let rust_type = rust_types[idx % rust_types.len()];
+
+        let param: Box<dyn tokio_postgres::types::ToSql + Sync> = match value {
+            crate::model::Value::Integer(v) => {
+                // 根据列的rust_type选择合适的整数类型
+                // tokio-postgres要求Rust类型与PostgreSQL类型严格匹配
+                let use_i64 = matches!(rust_type, "i64" | "u64");
+                if use_i64 {
+                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                } else {
+                    // 对于i32列，将值转换为i32
+                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                }
+            }
+            crate::model::Value::Text(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Real(v) => {
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Null => {
+                // 根据列类型选择NULL的类型
+                match rust_type {
+                    "i64" | "u64" => {
+                        let null_val: Option<i64> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    "i32" | "i16" | "i8" | "u16" | "u32" | "u8" => {
+                        let null_val: Option<i32> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    "String" | "&str" => {
+                        let null_val: Option<String> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    "f32" | "f64" => {
+                        let null_val: Option<f64> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    _ => {
+                        // 默认使用Option<i32>
+                        let null_val: Option<i32> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                }
+            }
+        };
+        params.push(param);
+    }
+
+    Ok(params)
+}
+
+/// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）
 fn values_to_params(
     values: &[crate::model::Value],
 ) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>, crate::Error> {
@@ -1321,13 +1641,25 @@ fn values_to_params(
 
     for value in values {
         let param: Box<dyn tokio_postgres::types::ToSql + Sync> = match value {
-            crate::model::Value::Integer(v) => Box::new(*v),
-            crate::model::Value::Text(v) => Box::new(v.clone()),
-            crate::model::Value::Real(v) => Box::new(*v),
+            crate::model::Value::Integer(v) => {
+                // PostgreSQL INTEGER (Int4) 是 32 位，需要将 i64 转换为 i32
+                // 如果值超出 i32 范围，则使用 i64 (Int8/BIGINT)
+                if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                } else {
+                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                }
+            }
+            crate::model::Value::Text(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Real(v) => {
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
             crate::model::Value::Null => {
-                // 使用 Option<i64> 的 None 来表示 NULL
-                let null_val: Option<i64> = None;
-                Box::new(null_val)
+                // 使用 Option<i32> 的 None 来表示 NULL（默认用于INTEGER列）
+                let null_val: Option<i32> = None;
+                Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
             }
         };
         params.push(param);
@@ -2304,40 +2636,78 @@ fn convert_postgres_value(
     row: &tokio_postgres::Row,
     index: usize,
 ) -> Result<crate::model::Value, crate::Error> {
-    // 尝试整数类型
-    if let Ok(v) = row.try_get::<_, Option<i64>>(index) {
-        return Ok(match v {
-            Some(val) => crate::model::Value::Integer(val),
-            None => crate::model::Value::Null,
-        });
-    }
+    use tokio_postgres::types::Type;
 
-    // 尝试字符串类型
-    if let Ok(v) = row.try_get::<_, Option<String>>(index) {
-        return Ok(match v {
-            Some(val) => crate::model::Value::Text(val),
-            None => crate::model::Value::Null,
-        });
-    }
+    let col_type = row.columns()[index].type_();
 
-    // 尝试浮点类型
-    if let Ok(v) = row.try_get::<_, Option<f64>>(index) {
-        return Ok(match v {
-            Some(val) => crate::model::Value::Real(val),
-            None => crate::model::Value::Null,
-        });
-    }
-
-    // 尝试布尔类型
-    if let Ok(v) = row.try_get::<_, Option<bool>>(index) {
-        return Ok(match v {
-            Some(true) => crate::model::Value::Integer(1),
-            Some(false) => crate::model::Value::Integer(0),
-            None => crate::model::Value::Null,
-        });
+    // 根据PostgreSQL类型选择正确的Rust类型
+    match *col_type {
+        // 整数类型 - 需要根据实际大小选择
+        Type::INT2 => {
+            if let Ok(v) = row.try_get::<_, Option<i16>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Integer(val as i64),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        Type::INT4 => {
+            if let Ok(v) = row.try_get::<_, Option<i32>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Integer(val as i64),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        Type::INT8 => {
+            if let Ok(v) = row.try_get::<_, Option<i64>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Integer(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        // 文本类型
+        Type::TEXT | Type::VARCHAR | Type::CHAR | Type::BPCHAR | Type::NAME => {
+            if let Ok(v) = row.try_get::<_, Option<String>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Text(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        // 浮点类型
+        Type::FLOAT4 => {
+            if let Ok(v) = row.try_get::<_, Option<f32>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Real(val as f64),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        Type::FLOAT8 => {
+            if let Ok(v) = row.try_get::<_, Option<f64>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Real(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        // 布尔类型
+        Type::BOOL => {
+            if let Ok(v) = row.try_get::<_, Option<bool>>(index) {
+                return Ok(match v {
+                    Some(true) => crate::model::Value::Integer(1),
+                    Some(false) => crate::model::Value::Integer(0),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        _ => {}
     }
 
     Err(crate::Error::Database(format!(
-        "Unsupported column type at index {index}"
+        "Unsupported column type {:?} at index {}",
+        col_type, index
     )))
 }

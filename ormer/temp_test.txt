@@ -1,0 +1,56 @@
+warning: unreachable pattern
+  --> ormer\tests\create_table_test.rs:76:17
+   |
+76 |                 _ => "Unknown",
+   |                 ^ no value can reach this
+   |
+note: multiple earlier patterns match some of the same values
+  --> ormer\tests\create_table_test.rs:76:17
+   |
+71 |                 ormer::DbType::Turso => "Turso",
+   |                 -------------------- matches some of the same values
+72 |                 #[cfg(feature = "postgresql")]
+73 |                 ormer::DbType::PostgreSQL => "PostgreSQL",
+   |                 ------------------------- matches some of the same values
+74 |                 #[cfg(feature = "mysql")]
+75 |                 ormer::DbType::MySQL => "MySQL",
+   |                 -------------------- matches some of the same values
+76 |                 _ => "Unknown",
+   |                 ^ collectively making this unreachable
+   = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> ormer\tests\create_table_test.rs:326:17
+    |
+326 |                 _ => "Unknown",
+    |                 ^ no value can reach this
+    |
+note: multiple earlier patterns match some of the same values
+   --> ormer\tests\create_table_test.rs:326:17
+    |
+321 |                 ormer::DbType::Turso => "Turso",
+    |                 -------------------- matches some of the same values
+322 |                 #[cfg(feature = "postgresql")]
+323 |                 ormer::DbType::PostgreSQL => "PostgreSQL",
+    |                 ------------------------- matches some of the same values
+324 |                 #[cfg(feature = "mysql")]
+325 |                 ormer::DbType::MySQL => "MySQL",
+    |                 -------------------- matches some of the same values
+326 |                 _ => "Unknown",
+    |                 ^ collectively making this unreachable
+
+warning: `ormer` (test "create_table_test") generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running tests\create_table_test.rs (e:\GitHub_fa\ormer\target\debug\deps\create_table_test-d8d1e90bebd587b7.exe)
+
+running 7 tests
+test create_table_tests::test_on_all_dbs_test_different_databases_produce_different_sql_impl ... ok
+test create_table_tests::test_on_all_dbs_test_mysql_complete_types_impl ... ok
+test create_table_tests::test_on_all_dbs_test_postgresql_complete_types_impl ... ok
+test create_table_tests::test_on_all_dbs_test_mysql_create_table_sql_impl ... ok
+test create_table_tests::test_on_all_dbs_test_postgresql_create_table_sql_impl ... ok
+test create_table_tests::test_on_all_dbs_test_turso_create_table_sql_impl ... ok
+test create_table_tests::test_on_all_dbs_test_turso_complete_types_impl ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

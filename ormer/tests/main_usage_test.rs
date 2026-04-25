@@ -1,4 +1,6 @@
-use ormer::{Database, DbType, Model};
+use ormer::Model;
+
+mod _test_common;
 
 #[derive(Debug, Model)]
 #[table = "test_users"]
@@ -23,10 +25,11 @@ struct TestRole {
     name: String,
 }
 
-#[tokio::test]
-async fn test_main_rs_usage() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_main_rs_usage_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     // connect
-    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUser>().await?;
     db.create_table::<TestRole>().await?;
 
@@ -174,3 +177,5 @@ async fn test_main_rs_usage() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+test_on_all_dbs_result!(test_main_rs_usage_impl);

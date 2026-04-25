@@ -295,13 +295,12 @@ fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
                 if parts.len() == 2 {
                     let ref_type = parts[0].trim();
                     let ref_field = parts[1].trim();
+                    let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
 
-                    // 将类型名转换为表名（蛇形）
-                    let ref_table = to_snake_case(ref_type);
-
+                    // 使用目标模型的实际表名，而不是简单转换
                     return quote! {
                         Some(::ormer::model::ForeignKeyInfo {
-                            ref_table: #ref_table,
+                            ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
                             ref_column: #ref_field,
                             ref_column_fn: None,
                         })
@@ -309,13 +308,12 @@ fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
                 } else if parts.len() == 1 {
                     // 新语法：只传递类型，自动关联到目标 model 的主键
                     let ref_type = parts[0].trim();
-                    let ref_table = to_snake_case(ref_type);
                     let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
 
-                    // 使用函数指针在运行时获取主键字段名
+                    // 使用函数指针在运行时获取目标模型的主键字段名（避免在常量上下文中调用非 const 函数）
                     return quote! {
                         Some(::ormer::model::ForeignKeyInfo {
-                            ref_table: #ref_table,
+                            ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
                             ref_column: "",
                             ref_column_fn: Some(<#ref_type_ident as ::ormer::Model>::primary_key_column),
                         })

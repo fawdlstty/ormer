@@ -1,6 +1,7 @@
 use ormer::Model;
-use ormer::abstract_layer::DbType;
 use ormer::generate_create_table_sql;
+
+mod _test_common;
 
 // 测试模型定义
 #[derive(Model)]
@@ -30,106 +31,314 @@ struct TestCompleteTypes {
 mod create_table_tests {
     use super::*;
 
-    #[cfg(feature = "turso")]
-    #[test]
-    fn test_turso_create_table_sql() {
-        let sql = generate_create_table_sql::<TestUser>(DbType::Turso);
+    async fn test_turso_create_table_sql_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestUser>(config.0);
 
-        // Turso/SQLite 应该使用 INTEGER PRIMARY KEY
-        assert!(sql.contains("id INTEGER PRIMARY KEY"));
-        assert!(sql.contains("name TEXT NOT NULL"));
-        assert!(sql.contains("age INTEGER NOT NULL"));
-        assert!(sql.contains("email TEXT")); // Option 类型，不加 NOT NULL
+        // 根据不同的数据库类型进行不同的断言
+        #[allow(unreachable_patterns)]
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT")); // Option 类型，不加 NOT NULL
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT")); // Option 类型，不加 NOT NULL
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                assert!(sql.contains("id INT PRIMARY KEY"));
+                assert!(!sql.contains("AUTO_INCREMENT")); // 没有auto，所以不应该有AUTO_INCREMENT
+                assert!(sql.contains("name VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("age INT NOT NULL"));
+                assert!(sql.contains("email VARCHAR(255)")); // Option 类型，不加 NOT NULL
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
 
-        println!("Turso SQL: {}", sql);
+        let db_type_name = match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => "Turso",
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => "PostgreSQL",
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => "MySQL",
+            #[allow(unreachable_patterns)]
+            _ => "Unknown",
+        };
+        println!("{} SQL: {}", db_type_name, sql);
     }
 
-    #[cfg(feature = "postgresql")]
-    #[test]
-    fn test_postgresql_create_table_sql() {
-        let sql = generate_create_table_sql::<TestUser>(DbType::PostgreSQL);
+    async fn test_postgresql_create_table_sql_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestUser>(config.0);
 
-        // PostgreSQL 没有 auto_increment，主键使用 INTEGER PRIMARY KEY
-        assert!(sql.contains("id INTEGER PRIMARY KEY"));
-        assert!(sql.contains("name VARCHAR NOT NULL"));
-        assert!(sql.contains("age INTEGER NOT NULL"));
-        assert!(sql.contains("email VARCHAR")); // Option 类型，不加 NOT NULL
-
-        println!("PostgreSQL SQL: {}", sql);
+        // 根据不同的数据库类型进行不同的断言
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                // Turso/SQLite 使用 INTEGER
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT"));
+                println!("Turso SQL: {}", sql);
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                // PostgreSQL 使用 INTEGER 和 TEXT
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT"));
+                println!("PostgreSQL SQL: {}", sql);
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                // MySQL 使用 INT 和 VARCHAR(255)
+                assert!(sql.contains("id INT PRIMARY KEY"));
+                assert!(sql.contains("name VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("age INT NOT NULL"));
+                assert!(sql.contains("email VARCHAR(255)"));
+                println!("MySQL SQL: {}", sql);
+            }
+        }
     }
 
-    #[cfg(feature = "mysql")]
-    #[test]
-    fn test_mysql_create_table_sql() {
-        let sql = generate_create_table_sql::<TestUser>(DbType::MySQL);
+    async fn test_mysql_create_table_sql_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestUser>(config.0);
 
-        // MySQL 没有 auto_increment 标记，主键使用 INT PRIMARY KEY
-        assert!(sql.contains("id INT PRIMARY KEY"));
-        assert!(sql.contains("name VARCHAR(255) NOT NULL"));
-        assert!(sql.contains("age INT NOT NULL"));
-        assert!(sql.contains("email VARCHAR(255)")); // Option 类型，不加 NOT NULL
-
-        println!("MySQL SQL: {}", sql);
+        // 根据不同的数据库类型进行不同的断言
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                // Turso/SQLite 使用 INTEGER
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT"));
+                println!("Turso SQL: {}", sql);
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                // PostgreSQL 使用 INTEGER 和 TEXT
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("name TEXT NOT NULL"));
+                assert!(sql.contains("age INTEGER NOT NULL"));
+                assert!(sql.contains("email TEXT"));
+                println!("PostgreSQL SQL: {}", sql);
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                // MySQL 使用 INT 和 VARCHAR(255)
+                assert!(sql.contains("id INT PRIMARY KEY"));
+                assert!(sql.contains("name VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("age INT NOT NULL"));
+                assert!(sql.contains("email VARCHAR(255)"));
+                println!("MySQL SQL: {}", sql);
+            }
+        }
     }
 
-    #[cfg(all(feature = "turso", feature = "postgresql", feature = "mysql"))]
-    #[test]
-    fn test_different_databases_produce_different_sql() {
-        let turso_sql = generate_create_table_sql::<TestUser>(DbType::Turso);
-        let pg_sql = generate_create_table_sql::<TestUser>(DbType::PostgreSQL);
-        let mysql_sql = generate_create_table_sql::<TestUser>(DbType::MySQL);
+    async fn test_different_databases_produce_different_sql_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        // 使用条件编译确保只使用已启用的数据库类型
+        #[cfg(all(feature = "turso", feature = "postgresql", feature = "mysql"))]
+        {
+            // 使用 TestCompleteTypes 来测试，因为它包含 bool 类型，在不同数据库中映射不同
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
 
-        // 验证三个数据库生成的SQL确实不同
-        assert_ne!(turso_sql, pg_sql);
-        assert_ne!(turso_sql, mysql_sql);
-        assert_ne!(pg_sql, mysql_sql);
+            // 验证三个数据库生成的SQL确实不同
+            // Turso: bool -> INTEGER, String -> TEXT
+            // PostgreSQL: bool -> BOOLEAN, String -> TEXT
+            // MySQL: bool -> TINYINT(1), String -> VARCHAR(255)
+            assert_ne!(
+                turso_sql, pg_sql,
+                "Turso and PostgreSQL SQL should be different"
+            );
+            assert_ne!(
+                turso_sql, mysql_sql,
+                "Turso and MySQL SQL should be different"
+            );
+            assert_ne!(
+                pg_sql, mysql_sql,
+                "PostgreSQL and MySQL SQL should be different"
+            );
+        }
+
+        #[cfg(all(feature = "turso", feature = "postgresql", not(feature = "mysql")))]
+        {
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
+            assert_ne!(turso_sql, pg_sql);
+        }
+
+        #[cfg(all(feature = "turso", feature = "mysql", not(feature = "postgresql")))]
+        {
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
+            assert_ne!(turso_sql, mysql_sql);
+        }
+
+        #[cfg(all(feature = "postgresql", feature = "mysql", not(feature = "turso")))]
+        {
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
+            assert_ne!(pg_sql, mysql_sql);
+        }
     }
 
-    #[cfg(feature = "postgresql")]
-    #[test]
-    fn test_postgresql_complete_types() {
-        let sql = generate_create_table_sql::<TestCompleteTypes>(DbType::PostgreSQL);
+    async fn test_postgresql_complete_types_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
 
-        // 验证 PostgreSQL 完整类型映射（没有 auto_increment）
-        assert!(sql.contains("id BIGINT PRIMARY KEY"));
-        assert!(sql.contains("text_val VARCHAR NOT NULL"));
-        assert!(sql.contains("optional_text VARCHAR")); // 不加 NOT NULL
-        assert!(sql.contains("optional_int INTEGER")); // 不加 NOT NULL
-        assert!(sql.contains("bool_val BOOLEAN NOT NULL"));
-        assert!(sql.contains("optional_bool BOOLEAN")); // 不加 NOT NULL
-
-        println!("PostgreSQL Complete Types SQL: {}", sql);
+        // 根据不同的数据库类型进行不同的断言
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                // Turso 使用 INTEGER 和 TEXT
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT"));
+                assert!(sql.contains("optional_int INTEGER"));
+                assert!(sql.contains("bool_val INTEGER NOT NULL"));
+                assert!(sql.contains("optional_bool INTEGER"));
+                println!("Turso Complete Types SQL: {}", sql);
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                // PostgreSQL 使用 BIGINT、TEXT、INTEGER、BOOLEAN
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT"));
+                assert!(sql.contains("optional_int INTEGER"));
+                assert!(sql.contains("bool_val BOOLEAN NOT NULL"));
+                assert!(sql.contains("optional_bool BOOLEAN"));
+                println!("PostgreSQL Complete Types SQL: {}", sql);
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                // MySQL 使用 BIGINT、VARCHAR(255)、INT、TINYINT(1)
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(sql.contains("text_val VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("optional_text VARCHAR(255)"));
+                assert!(sql.contains("optional_int INT"));
+                assert!(sql.contains("bool_val TINYINT(1) NOT NULL"));
+                assert!(sql.contains("optional_bool TINYINT(1)"));
+                println!("MySQL Complete Types SQL: {}", sql);
+            }
+        }
     }
 
-    #[cfg(feature = "mysql")]
-    #[test]
-    fn test_mysql_complete_types() {
-        let sql = generate_create_table_sql::<TestCompleteTypes>(DbType::MySQL);
+    async fn test_mysql_complete_types_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
 
-        // 验证 MySQL 完整类型映射（没有 auto_increment）
-        assert!(sql.contains("id BIGINT PRIMARY KEY"));
-        assert!(sql.contains("text_val VARCHAR(255) NOT NULL"));
-        assert!(sql.contains("optional_text VARCHAR(255)")); // 不加 NOT NULL
-        assert!(sql.contains("optional_int INT")); // 不加 NOT NULL
-        assert!(sql.contains("bool_val TINYINT(1) NOT NULL"));
-        assert!(sql.contains("optional_bool TINYINT(1)")); // 不加 NOT NULL
-
-        println!("MySQL Complete Types SQL: {}", sql);
+        // 根据不同的数据库类型进行不同的断言
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                // Turso 使用 INTEGER 和 TEXT
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT"));
+                assert!(sql.contains("optional_int INTEGER"));
+                assert!(sql.contains("bool_val INTEGER NOT NULL"));
+                assert!(sql.contains("optional_bool INTEGER"));
+                println!("Turso Complete Types SQL: {}", sql);
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                // PostgreSQL 使用 BIGINT、TEXT、INTEGER、BOOLEAN
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT"));
+                assert!(sql.contains("optional_int INTEGER"));
+                assert!(sql.contains("bool_val BOOLEAN NOT NULL"));
+                assert!(sql.contains("optional_bool BOOLEAN"));
+                println!("PostgreSQL Complete Types SQL: {}", sql);
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                // MySQL 使用 BIGINT、VARCHAR(255)、INT、TINYINT(1)
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(sql.contains("text_val VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("optional_text VARCHAR(255)"));
+                assert!(sql.contains("optional_int INT"));
+                assert!(sql.contains("bool_val TINYINT(1) NOT NULL"));
+                assert!(sql.contains("optional_bool TINYINT(1)"));
+                println!("MySQL Complete Types SQL: {}", sql);
+            }
+        }
     }
 
-    #[cfg(feature = "turso")]
-    #[test]
-    fn test_turso_complete_types() {
-        let sql = generate_create_table_sql::<TestCompleteTypes>(DbType::Turso);
+    async fn test_turso_complete_types_impl(config: &_test_common::DbConfig) {
+        let _ = config; // 避免未使用变量警告
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
 
-        // 验证 Turso 完整类型映射
-        assert!(sql.contains("id INTEGER PRIMARY KEY"));
-        assert!(sql.contains("text_val TEXT NOT NULL"));
-        assert!(sql.contains("optional_text TEXT")); // 不加 NOT NULL
-        assert!(sql.contains("optional_int INTEGER")); // 不加 NOT NULL
-        assert!(sql.contains("bool_val INTEGER NOT NULL"));
-        assert!(sql.contains("optional_bool INTEGER")); // 不加 NOT NULL
+        // 根据不同的数据库类型进行不同的断言
+        match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => {
+                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT")); // 不加 NOT NULL
+                assert!(sql.contains("optional_int INTEGER")); // 不加 NOT NULL
+                assert!(sql.contains("bool_val INTEGER NOT NULL"));
+                assert!(sql.contains("optional_bool INTEGER")); // 不加 NOT NULL
+            }
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => {
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(sql.contains("text_val TEXT NOT NULL"));
+                assert!(sql.contains("optional_text TEXT"));
+                assert!(sql.contains("optional_int INTEGER"));
+                assert!(sql.contains("bool_val BOOLEAN NOT NULL"));
+                assert!(sql.contains("optional_bool BOOLEAN"));
+            }
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => {
+                assert!(sql.contains("id BIGINT PRIMARY KEY"));
+                assert!(!sql.contains("AUTO_INCREMENT")); // 没有auto，所以不应该有AUTO_INCREMENT
+                assert!(sql.contains("text_val VARCHAR(255) NOT NULL"));
+                assert!(sql.contains("optional_text VARCHAR(255)"));
+                assert!(sql.contains("optional_int INT"));
+                assert!(sql.contains("bool_val TINYINT(1) NOT NULL"));
+                assert!(sql.contains("optional_bool TINYINT(1)"));
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
 
-        println!("Turso Complete Types SQL: {}", sql);
+        let db_type_name = match config.0 {
+            #[cfg(feature = "turso")]
+            ormer::DbType::Turso => "Turso",
+            #[cfg(feature = "postgresql")]
+            ormer::DbType::PostgreSQL => "PostgreSQL",
+            #[cfg(feature = "mysql")]
+            ormer::DbType::MySQL => "MySQL",
+            #[allow(unreachable_patterns)]
+            _ => "Unknown",
+        };
+        println!("{} Complete Types SQL: {}", db_type_name, sql);
     }
+
+    test_on_all_dbs!(test_turso_create_table_sql_impl);
+    test_on_all_dbs!(test_postgresql_create_table_sql_impl);
+    test_on_all_dbs!(test_mysql_create_table_sql_impl);
+    test_on_all_dbs!(test_different_databases_produce_different_sql_impl);
+    test_on_all_dbs!(test_postgresql_complete_types_impl);
+    test_on_all_dbs!(test_mysql_complete_types_impl);
+    test_on_all_dbs!(test_turso_complete_types_impl);
 }

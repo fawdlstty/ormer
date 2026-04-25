@@ -1,6 +1,7 @@
 use ormer::Model;
-use ormer::abstract_layer::DbType;
 use ormer::generate_create_table_sql;
+
+mod _test_common;
 
 #[derive(Debug, Model)]
 #[table = "test_users"]
@@ -25,9 +26,8 @@ struct TestRole {
     name: String,
 }
 
-#[test]
-fn test_generate_sql_with_new_features() {
-    let user_sql = generate_create_table_sql::<TestUser>(DbType::Turso);
+async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfig) {
+    let user_sql = generate_create_table_sql::<TestUser>(config.0);
     println!("User SQL: {}", user_sql);
 
     // 验证 AUTOINCREMENT
@@ -52,7 +52,7 @@ fn test_generate_sql_with_new_features() {
         "Should have index on age"
     );
 
-    let role_sql = generate_create_table_sql::<TestRole>(DbType::Turso);
+    let role_sql = generate_create_table_sql::<TestRole>(config.0);
     println!("Role SQL: {}", role_sql);
 
     // 验证没有 AUTOINCREMENT（因为主键没有 auto）
@@ -67,3 +67,5 @@ fn test_generate_sql_with_new_features() {
         "Should have UNIQUE (uid, name)"
     );
 }
+
+test_on_all_dbs!(test_generate_sql_with_new_features_impl);

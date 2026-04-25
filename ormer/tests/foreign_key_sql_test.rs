@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 #[derive(Debug, Model)]
 #[table = "verify_users"]
 struct VerifyUser {
@@ -18,10 +20,9 @@ struct VerifyRole {
     role_name: String,
 }
 
-#[test]
-fn test_foreign_key_sql_generation() {
+async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
     // 验证生成的 CREATE TABLE SQL 包含外键约束
-    let sql = ormer::model::generate_create_table_sql::<VerifyRole>(ormer::DbType::Turso);
+    let sql = ormer::model::generate_create_table_sql::<VerifyRole>(config.0);
 
     println!("Generated SQL:\n{}", sql);
 
@@ -39,11 +40,13 @@ fn test_foreign_key_sql_generation() {
         "SQL should reference the correct column"
     );
 
-    // 验证完整的约束语句（注意：VerifyUser 转换为 verify_user）
+    // 验证完整的约束语句（注意：VerifyUser 的表名是 verify_users）
     assert!(
-        sql.contains("FOREIGN KEY (user_id) REFERENCES verify_user (id)"),
+        sql.contains("FOREIGN KEY (user_id) REFERENCES verify_users (id)"),
         "SQL should contain the complete foreign key constraint"
     );
 
     println!("Foreign key SQL generation test passed!");
 }
+
+test_on_all_dbs!(test_foreign_key_sql_generation_impl);

@@ -1,9 +1,61 @@
 use ormer::Model;
 
-// 定义测试模型
+mod _test_common;
+
+// 定义测试模型 - 每个测试使用不同的表名避免并发冲突
 #[derive(Debug, Model, Clone)]
-#[table = "test_agg_users"]
-struct TestAggUser {
+#[table = "test_agg_count_users"]
+struct TestAggCountUser {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    score: i32,
+}
+
+#[derive(Debug, Model, Clone)]
+#[table = "test_agg_sum_users"]
+struct TestAggSumUser {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    score: i32,
+}
+
+#[derive(Debug, Model, Clone)]
+#[table = "test_agg_avg_users"]
+struct TestAggAvgUser {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    score: i32,
+}
+
+#[derive(Debug, Model, Clone)]
+#[table = "test_agg_max_users"]
+struct TestAggMaxUser {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    score: i32,
+}
+
+#[derive(Debug, Model, Clone)]
+#[table = "test_agg_min_users"]
+struct TestAggMinUser {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    score: i32,
+}
+
+#[derive(Debug, Model, Clone)]
+#[table = "test_agg_filter_users"]
+struct TestAggFilterUser {
     #[primary(auto)]
     id: i32,
     name: String,
@@ -12,27 +64,29 @@ struct TestAggUser {
 }
 
 /// 测试 COUNT 聚合函数
-#[tokio::test]
-async fn test_count_aggregate() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_count_aggregate_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggCountUser>().await;
+    db.create_table::<TestAggCountUser>().await?;
+
+    db.insert(&TestAggCountUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggCountUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggCountUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -40,38 +94,40 @@ async fn test_count_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 COUNT(*)
-    let count: usize = db.select::<TestAggUser>().count(|p| p.id).await?;
+    let count: usize = db.select::<TestAggCountUser>().count(|p| p.id).await?;
     println!("COUNT result: {:?}", count);
 
-    // 验证结果
     assert_eq!(count, 3);
+
+    let _ = db.drop_table::<TestAggCountUser>().await;
 
     Ok(())
 }
 
 /// 测试 SUM 聚合函数
-#[tokio::test]
-async fn test_sum_aggregate() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_sum_aggregate_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggSumUser>().await;
+    db.create_table::<TestAggSumUser>().await?;
+
+    db.insert(&TestAggSumUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggSumUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggSumUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -79,38 +135,40 @@ async fn test_sum_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 SUM(age)
-    let sum: Option<i32> = db.select::<TestAggUser>().sum(|p| p.age).await?;
+    let sum: Option<i32> = db.select::<TestAggSumUser>().sum(|p| p.age).await?;
     println!("SUM result: {:?}", sum);
 
-    // 验证结果
     assert_eq!(sum, Some(67)); // 20 + 25 + 22
+
+    db.drop_table::<TestAggSumUser>().await?;
 
     Ok(())
 }
 
 /// 测试 AVG 聚合函数
-#[tokio::test]
-async fn test_avg_aggregate() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_avg_aggregate_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggAvgUser>().await;
+    db.create_table::<TestAggAvgUser>().await?;
+
+    db.insert(&TestAggAvgUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggAvgUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggAvgUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -118,38 +176,40 @@ async fn test_avg_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 AVG(score)
-    let avg: Option<f64> = db.select::<TestAggUser>().avg(|p| p.score).await?;
+    let avg: Option<f64> = db.select::<TestAggAvgUser>().avg(|p| p.score).await?;
     println!("AVG result: {:?}", avg);
 
-    // 验证结果 (85 + 92 + 78) / 3 = 85.0
     assert!((avg.unwrap() - 85.0).abs() < 0.01);
+
+    db.drop_table::<TestAggAvgUser>().await?;
 
     Ok(())
 }
 
 /// 测试 MAX 聚合函数
-#[tokio::test]
-async fn test_max_aggregate() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_max_aggregate_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggMaxUser>().await;
+    db.create_table::<TestAggMaxUser>().await?;
+
+    db.insert(&TestAggMaxUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggMaxUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggMaxUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -157,38 +217,40 @@ async fn test_max_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 MAX(age)
-    let max: Option<i32> = db.select::<TestAggUser>().max(|p| p.age).await?;
+    let max: Option<i32> = db.select::<TestAggMaxUser>().max(|p| p.age).await?;
     println!("MAX result: {:?}", max);
 
-    // 验证结果
     assert_eq!(max, Some(25));
+
+    db.drop_table::<TestAggMaxUser>().await?;
 
     Ok(())
 }
 
 /// 测试 MIN 聚合函数
-#[tokio::test]
-async fn test_min_aggregate() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_min_aggregate_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggMinUser>().await;
+    db.create_table::<TestAggMinUser>().await?;
+
+    db.insert(&TestAggMinUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggMinUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggMinUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -196,38 +258,40 @@ async fn test_min_aggregate() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 MIN(age)
-    let min: Option<i32> = db.select::<TestAggUser>().min(|p| p.age).await?;
+    let min: Option<i32> = db.select::<TestAggMinUser>().min(|p| p.age).await?;
     println!("MIN result: {:?}", min);
 
-    // 验证结果
     assert_eq!(min, Some(20));
+
+    db.drop_table::<TestAggMinUser>().await?;
 
     Ok(())
 }
 
 /// 测试带过滤条件的聚合函数
-#[tokio::test]
-async fn test_aggregate_with_filter() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
-    db.create_table::<TestAggUser>().await?;
+async fn test_aggregate_with_filter_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    // 插入测试数据
-    db.insert(&TestAggUser {
+    let _ = db.drop_table::<TestAggFilterUser>().await;
+    db.create_table::<TestAggFilterUser>().await?;
+
+    db.insert(&TestAggFilterUser {
         id: 1,
         name: "Alice".to_string(),
         age: 20,
         score: 85,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggFilterUser {
         id: 2,
         name: "Bob".to_string(),
         age: 25,
         score: 92,
     })
     .await?;
-    db.insert(&TestAggUser {
+    db.insert(&TestAggFilterUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 22,
@@ -235,27 +299,32 @@ async fn test_aggregate_with_filter() -> Result<(), Box<dyn std::error::Error>> 
     })
     .await?;
 
-    // 测试带过滤条件的 COUNT: age >= 22
     let count: usize = db
-        .select::<TestAggUser>()
+        .select::<TestAggFilterUser>()
         .filter(|p| p.age.ge(22))
         .count(|p| p.id)
         .await?;
     println!("COUNT with filter result: {:?}", count);
 
-    // 验证结果 (Bob: 25, Charlie: 22)
     assert_eq!(count, 2);
 
-    // 测试带过滤条件的 MAX: age >= 22
     let max: Option<i32> = db
-        .select::<TestAggUser>()
+        .select::<TestAggFilterUser>()
         .filter(|p| p.age.ge(22))
         .max(|p| p.score)
         .await?;
     println!("MAX with filter result: {:?}", max);
 
-    // 验证结果 (Bob: 92)
     assert_eq!(max, Some(92));
+
+    db.drop_table::<TestAggFilterUser>().await?;
 
     Ok(())
 }
+
+test_on_all_dbs_result!(test_count_aggregate_impl);
+test_on_all_dbs_result!(test_sum_aggregate_impl);
+test_on_all_dbs_result!(test_avg_aggregate_impl);
+test_on_all_dbs_result!(test_max_aggregate_impl);
+test_on_all_dbs_result!(test_min_aggregate_impl);
+test_on_all_dbs_result!(test_aggregate_with_filter_impl);

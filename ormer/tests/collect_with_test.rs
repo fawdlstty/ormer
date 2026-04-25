@@ -1,4 +1,6 @@
-use ormer::{Database, DbType, Model};
+use ormer::Model;
+
+mod _test_common;
 
 #[derive(Debug, Model)]
 #[table = "test_users"]
@@ -26,14 +28,22 @@ struct UserId {
     id: i32,
 }
 
-#[tokio::test]
-async fn test_collect_with() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_collect_with_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 创建内存数据库
-    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    let db = _test_common::create_db_connection(config).await?;
+    println!("[TEST] Created database connection");
+
+    // 先删除表（如果存在）
+    let _ = db.drop_table::<TestRole>().await;
+    let _ = db.drop_table::<TestUser>().await;
 
     // 创建表
     db.create_table::<TestUser>().await?;
+    println!("[TEST] Created TestUser table");
     db.create_table::<TestRole>().await?;
+    println!("[TEST] Created TestRole table");
 
     // 插入测试数据
     db.insert(&TestUser {
@@ -42,18 +52,21 @@ async fn test_collect_with() -> Result<(), Box<dyn std::error::Error>> {
         age: 25,
     })
     .await?;
+    println!("[TEST] Inserted TestUser 1");
     db.insert(&TestUser {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
     })
     .await?;
+    println!("[TEST] Inserted TestUser 2");
     db.insert(&TestUser {
         id: 3,
         name: "Charlie".to_string(),
         age: 35,
     })
     .await?;
+    println!("[TEST] Inserted TestUser 3");
 
     db.insert(&TestRole {
         id: 1,
@@ -115,5 +128,11 @@ async fn test_collect_with() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n✅ All tests passed!");
 
+    // 清理测试表
+    db.drop_table::<TestRole>().await?;
+    db.drop_table::<TestUser>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_collect_with_impl);

@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 // 定义测试模型
 #[derive(Debug, Model, Clone)]
 #[table = "test_users_iou"]
@@ -22,9 +24,15 @@ struct TestRoleIOU {
 }
 
 /// 测试 insert_or_update 的所有调用方式
-#[tokio::test]
-async fn test_insert_or_update_all_patterns() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_all_patterns_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleIOU>().await;
+    let _ = db.drop_table::<TestUserIOU>().await;
+
     db.create_table::<TestUserIOU>().await?;
     db.create_table::<TestRoleIOU>().await?;
 
@@ -101,13 +109,23 @@ async fn test_insert_or_update_all_patterns() -> Result<(), Box<dyn std::error::
     assert_eq!(users[6].name, "Grace");
 
     println!("所有 insert_or_update 插入用法测试通过！");
+
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<TestRoleIOU>().await?;
+    db.drop_table::<TestUserIOU>().await?;
+
     Ok(())
 }
 
 /// 测试 insert_or_update 的更新功能（遇到重复键时更新）
-#[tokio::test]
-async fn test_insert_or_update_update_behavior() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_update_behavior_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestUserIOU>().await;
+
     db.create_table::<TestUserIOU>().await?;
 
     // 第一次插入
@@ -137,13 +155,22 @@ async fn test_insert_or_update_update_behavior() -> Result<(), Box<dyn std::erro
     assert_eq!(users[0].age, 25);
 
     println!("insert_or_update 更新行为测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestUserIOU>().await?;
+
     Ok(())
 }
 
 /// 测试 insert_or_update 批量更新功能
-#[tokio::test]
-async fn test_insert_or_update_batch_update() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_batch_update_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestUserIOU>().await;
+
     db.create_table::<TestUserIOU>().await?;
 
     // 批量插入
@@ -191,13 +218,22 @@ async fn test_insert_or_update_batch_update() -> Result<(), Box<dyn std::error::
     assert_eq!(users[3].name, "User4"); // id=4 新插入
 
     println!("insert_or_update 批量更新测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestUserIOU>().await?;
+
     Ok(())
 }
 
 /// 测试 insert_or_update 使用数组引用
-#[tokio::test]
-async fn test_insert_or_update_with_array() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_or_update_with_array_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleIOU>().await;
+
     db.create_table::<TestRoleIOU>().await?;
 
     // 使用数组引用插入
@@ -223,13 +259,22 @@ async fn test_insert_or_update_with_array() -> Result<(), Box<dyn std::error::Er
     assert_eq!(roles[0].name, "super_admin");
 
     println!("insert_or_update 数组引用测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestRoleIOU>().await?;
+
     Ok(())
 }
 
 /// 测试 insert 和 insert_or_update 混合使用
-#[tokio::test]
-async fn test_insert_and_insert_or_update_mix() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_insert_and_insert_or_update_mix_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestUserIOU>().await;
+
     db.create_table::<TestUserIOU>().await?;
 
     // 使用 insert 插入
@@ -270,5 +315,15 @@ async fn test_insert_and_insert_or_update_mix() -> Result<(), Box<dyn std::error
     assert_eq!(users[2].name, "Charlie");
 
     println!("insert 和 insert_or_update 混合使用测试通过！");
+
+    // 清理测试表
+    db.drop_table::<TestUserIOU>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_insert_or_update_all_patterns_impl);
+test_on_all_dbs_result!(test_insert_or_update_update_behavior_impl);
+test_on_all_dbs_result!(test_insert_or_update_batch_update_impl);
+test_on_all_dbs_result!(test_insert_or_update_with_array_impl);
+test_on_all_dbs_result!(test_insert_and_insert_or_update_mix_impl);

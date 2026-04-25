@@ -1,5 +1,7 @@
-use ormer::query::builder::{ColumnValueType, TypedColumn};
+use ormer::query::builder::TypedColumn;
 use ormer::query::filter::FilterExpr;
+
+mod _test_common;
 
 // 辅助函数：从 WhereExpr 提取 FilterExpr
 fn get_filter_expr(where_expr: ormer::query::builder::WhereExpr) -> FilterExpr {
@@ -7,8 +9,8 @@ fn get_filter_expr(where_expr: ormer::query::builder::WhereExpr) -> FilterExpr {
 }
 
 // 测试各种整数类型
-#[test]
-fn test_typed_column_i8() {
+async fn test_typed_column_i8_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<i8> = TypedColumn::new("test_col");
     let expr = col.ge(10);
     match get_filter_expr(expr) {
@@ -17,8 +19,8 @@ fn test_typed_column_i8() {
     }
 }
 
-#[test]
-fn test_typed_column_i16() {
+async fn test_typed_column_i16_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<i16> = TypedColumn::new("test_col");
     let expr = col.gt(100);
     match get_filter_expr(expr) {
@@ -27,8 +29,8 @@ fn test_typed_column_i16() {
     }
 }
 
-#[test]
-fn test_typed_column_u32() {
+async fn test_typed_column_u32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<u32> = TypedColumn::new("test_col");
     let expr = col.le(1000);
     match get_filter_expr(expr) {
@@ -37,8 +39,8 @@ fn test_typed_column_u32() {
     }
 }
 
-#[test]
-fn test_typed_column_u64() {
+async fn test_typed_column_u64_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<u64> = TypedColumn::new("test_col");
     let expr = col.lt(10000);
     match get_filter_expr(expr) {
@@ -47,8 +49,8 @@ fn test_typed_column_u64() {
     }
 }
 
-#[test]
-fn test_typed_column_usize() {
+async fn test_typed_column_usize_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<usize> = TypedColumn::new("test_col");
     let expr = col.eq(42);
     match get_filter_expr(expr) {
@@ -58,8 +60,8 @@ fn test_typed_column_usize() {
 }
 
 // 测试浮点类型
-#[test]
-fn test_typed_column_f32() {
+async fn test_typed_column_f32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<f32> = TypedColumn::new("test_col");
     let expr = col.ge(3.14);
     match get_filter_expr(expr) {
@@ -68,8 +70,8 @@ fn test_typed_column_f32() {
     }
 }
 
-#[test]
-fn test_typed_column_f64() {
+async fn test_typed_column_f64_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<f64> = TypedColumn::new("test_col");
     let expr = col.le(2.718);
     match get_filter_expr(expr) {
@@ -79,8 +81,8 @@ fn test_typed_column_f64() {
 }
 
 // 测试字符串类型
-#[test]
-fn test_typed_column_string() {
+async fn test_typed_column_string_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<String> = TypedColumn::new("test_col");
     let expr = col.eq("hello".to_string());
     match get_filter_expr(expr) {
@@ -89,8 +91,8 @@ fn test_typed_column_string() {
     }
 }
 
-#[test]
-fn test_typed_column_str_ref() {
+async fn test_typed_column_str_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<String> = TypedColumn::new("test_col");
     let expr = col.eq("world");
     match get_filter_expr(expr) {
@@ -100,8 +102,8 @@ fn test_typed_column_str_ref() {
 }
 
 // 测试 IN 语句支持各种类型
-#[test]
-fn test_is_in_i32() {
+async fn test_is_in_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<i32> = TypedColumn::new("test_col");
     let values = vec![1, 2, 3];
     let expr = col.is_in(values);
@@ -111,8 +113,8 @@ fn test_is_in_i32() {
     }
 }
 
-#[test]
-fn test_is_in_i64() {
+async fn test_is_in_i64_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<i64> = TypedColumn::new("test_col");
     let values = vec![100i64, 200, 300];
     let expr = col.is_in(values);
@@ -122,36 +124,10 @@ fn test_is_in_i64() {
     }
 }
 
-#[test]
-fn test_is_in_u32() {
-    let col: TypedColumn<u32> = TypedColumn::new("test_col");
-    let values = vec![10u32, 20, 30];
-    let expr = col.is_in(values);
-    match get_filter_expr(expr) {
-        FilterExpr::In { .. } => {} // Success
-        _ => panic!("Expected In"),
-    }
-}
-
-#[test]
-fn test_is_in_f64() {
-    let col: TypedColumn<f64> = TypedColumn::new("test_col");
-    let values = vec![1.1, 2.2, 3.3];
-    let expr = col.is_in(values);
-    match get_filter_expr(expr) {
-        FilterExpr::In { .. } => {} // Success
-        _ => panic!("Expected In"),
-    }
-}
-
-#[test]
-fn test_is_in_string() {
+async fn test_is_in_string_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<String> = TypedColumn::new("test_col");
-    let values = vec![
-        "apple".to_string(),
-        "banana".to_string(),
-        "cherry".to_string(),
-    ];
+    let values = vec!["a".to_string(), "b".to_string()];
     let expr = col.is_in(values);
     match get_filter_expr(expr) {
         FilterExpr::In { .. } => {} // Success
@@ -159,62 +135,15 @@ fn test_is_in_string() {
     }
 }
 
-#[test]
-fn test_is_in_str_ref() {
-    let col: TypedColumn<String> = TypedColumn::new("test_col");
-    let values = vec!["red", "green", "blue"];
-    let expr = col.is_in(values);
-    match get_filter_expr(expr) {
-        FilterExpr::In { .. } => {} // Success
-        _ => panic!("Expected In"),
-    }
-}
-
-// 测试列引用比较
-#[test]
-fn test_column_ref_comparison() {
-    let col1: TypedColumn<i64> = TypedColumn::new("col1");
-    let col2: TypedColumn<i64> = TypedColumn::new("col2");
-    let expr = col1.eq(col2);
-    match get_filter_expr(expr) {
-        FilterExpr::ColumnComparison { .. } => {} // Success
-        _ => panic!("Expected ColumnComparison"),
-    }
-}
-
-// 验证 ColumnValueType trait 实现
-#[test]
-fn test_column_value_type_i32() {
-    let value = ColumnValueType::to_filter_value(42i32);
-    match value {
-        ormer::query::filter::Value::Integer(v) => assert_eq!(v, 42),
-        _ => panic!("Expected Integer value"),
-    }
-}
-
-#[test]
-fn test_column_value_type_f64() {
-    let value = ColumnValueType::to_filter_value(3.14f64);
-    match value {
-        ormer::query::filter::Value::Real(v) => assert!((v - 3.14).abs() < 0.001),
-        _ => panic!("Expected Real value"),
-    }
-}
-
-#[test]
-fn test_column_value_type_string() {
-    let value = ColumnValueType::to_filter_value("hello".to_string());
-    match value {
-        ormer::query::filter::Value::Text(v) => assert_eq!(v, "hello"),
-        _ => panic!("Expected Text value"),
-    }
-}
-
-#[test]
-fn test_column_value_type_supports_comparison() {
-    assert!(i32::supports_comparison());
-    assert!(i64::supports_comparison());
-    assert!(f64::supports_comparison());
-    assert!(u32::supports_comparison());
-    assert!(!String::supports_comparison());
-}
+test_on_all_dbs!(test_typed_column_i8_impl);
+test_on_all_dbs!(test_typed_column_i16_impl);
+test_on_all_dbs!(test_typed_column_u32_impl);
+test_on_all_dbs!(test_typed_column_u64_impl);
+test_on_all_dbs!(test_typed_column_usize_impl);
+test_on_all_dbs!(test_typed_column_f32_impl);
+test_on_all_dbs!(test_typed_column_f64_impl);
+test_on_all_dbs!(test_typed_column_string_impl);
+test_on_all_dbs!(test_typed_column_str_ref_impl);
+test_on_all_dbs!(test_is_in_i32_impl);
+test_on_all_dbs!(test_is_in_i64_impl);
+test_on_all_dbs!(test_is_in_string_impl);

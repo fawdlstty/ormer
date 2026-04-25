@@ -6,10 +6,13 @@ struct TestRole {
     name: String,
 }
 
-#[tokio::test]
-async fn test_insert_or_update() -> Result<(), Box<dyn std::error::Error>> {
+mod _test_common;
+
+async fn test_insert_or_update_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 连接数据库
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestRole>().await?;
 
     // 第一次插入
@@ -42,5 +45,10 @@ async fn test_insert_or_update() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n测试通过！insert_or_update 方法在遇到重复记录时成功执行了更新操作");
 
+    // 清理测试表
+    db.drop_table::<TestRole>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_insert_or_update_impl);

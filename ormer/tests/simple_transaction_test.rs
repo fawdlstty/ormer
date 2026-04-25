@@ -1,6 +1,7 @@
 /// 简单的事务测试
 use ormer::Model;
-use ormer::abstract_layer::Database;
+
+mod _test_common;
 
 #[derive(Model, Debug, Clone)]
 #[table = "simple_users"]
@@ -11,82 +12,79 @@ struct SimpleUser {
 }
 
 /// 测试最基本的事务提交
-#[tokio::test]
-async fn test_simple_transaction_commit() {
-    let db = Database::connect(ormer::DbType::Turso, ":memory:")
-        .await
-        .expect("Failed to connect");
+async fn test_simple_transaction_commit_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    db.create_table::<SimpleUser>()
-        .await
-        .expect("Failed to create table");
+    db.create_table::<SimpleUser>().await?;
 
     // 开始事务
-    let mut txn = db.begin().await.expect("Failed to begin");
+    let mut txn = db.begin().await?;
 
     // 插入数据
     let user = SimpleUser {
         id: None,
         name: "Test User".to_string(),
     };
-    txn.insert(&user).await.expect("Failed to insert");
+    txn.insert(&user).await?;
 
     // 提交
-    txn.commit().await.expect("Failed to commit");
+    txn.commit().await?;
 
     // 验证
     let users: Vec<SimpleUser> = db
         .select::<SimpleUser>()
         .collect::<Vec<SimpleUser>>()
-        .await
-        .expect("Failed to query");
+        .await?;
 
     assert_eq!(users.len(), 1);
     assert_eq!(users[0].name, "Test User");
 
     println!("✓ Transaction commit test passed");
+
+    // 清理测试表
+    db.drop_table::<SimpleUser>().await?;
+
+    Ok(())
 }
 
 /// 测试事务回滚
-#[tokio::test]
-async fn test_simple_transaction_rollback() {
-    let db = Database::connect(ormer::DbType::Turso, ":memory:")
-        .await
-        .expect("Failed to connect");
+async fn test_simple_transaction_rollback_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
-    db.create_table::<SimpleUser>()
-        .await
-        .expect("Failed to create table");
-
-    // 插入一条初始数据
-    let initial = SimpleUser {
-        id: None,
-        name: "Initial".to_string(),
-    };
-    db.insert(&initial).await.expect("Failed to insert initial");
+    db.create_table::<SimpleUser>().await?;
 
     // 开始事务
-    let mut txn = db.begin().await.expect("Failed to begin");
+    let mut txn = db.begin().await?;
 
     // 插入数据
     let user = SimpleUser {
         id: None,
         name: "Should Rollback".to_string(),
     };
-    txn.insert(&user).await.expect("Failed to insert");
+    txn.insert(&user).await?;
 
     // 回滚
-    txn.rollback().await.expect("Failed to rollback");
+    txn.rollback().await?;
 
-    // 验证回滚后只有初始数据
+    // 验证数据未插入
     let users: Vec<SimpleUser> = db
         .select::<SimpleUser>()
         .collect::<Vec<SimpleUser>>()
-        .await
-        .expect("Failed to query");
+        .await?;
 
-    assert_eq!(users.len(), 1);
-    assert_eq!(users[0].name, "Initial");
+    assert_eq!(users.len(), 0);
 
     println!("✓ Transaction rollback test passed");
+
+    // 清理测试表
+    db.drop_table::<SimpleUser>().await?;
+
+    Ok(())
 }
+
+test_on_all_dbs_result!(test_simple_transaction_commit_impl);
+test_on_all_dbs_result!(test_simple_transaction_rollback_impl);

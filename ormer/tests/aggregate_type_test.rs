@@ -1,6 +1,8 @@
 // 测试聚合函数的编译期类型推断
 use ormer::Model;
 
+mod _test_common;
+
 #[derive(Model, Debug)]
 #[table = "test_users"]
 struct TestUser {
@@ -11,9 +13,14 @@ struct TestUser {
     score: f64,
 }
 
-#[tokio::test]
-async fn test_aggregate_type_inference() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_aggregate_type_inference_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+
+    // 先删除表（如果存在）
+    let _ = db.drop_table::<TestUser>().await;
+
     db.create_table::<TestUser>().await?;
 
     // 插入测试数据
@@ -59,5 +66,11 @@ async fn test_aggregate_type_inference() -> Result<(), Box<dyn std::error::Error
     assert_eq!(count, 2);
 
     println!("All aggregate type inference tests passed!");
+
+    // 清理测试表
+    db.drop_table::<TestUser>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_aggregate_type_inference_impl);

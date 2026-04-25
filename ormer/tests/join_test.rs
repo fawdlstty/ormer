@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 // 定义测试模型
 #[derive(Debug, Model, Clone)]
 #[table = "test_users_join"]
@@ -22,9 +24,10 @@ struct TestRoleJoin {
 }
 
 /// 测试 INNER JOIN 查询
-#[tokio::test]
-async fn test_inner_join() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_inner_join_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserJoin>().await?;
     db.create_table::<TestRoleJoin>().await?;
 
@@ -64,15 +67,20 @@ async fn test_inner_join() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ Inner join test passed: {} records", user_roles.len());
 
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<TestRoleJoin>().await?;
+    db.drop_table::<TestUserJoin>().await?;
+
     Ok(())
 }
 
 /// 测试 RIGHT JOIN 查询
-/// 注意：SQLite/Turso 不支持 RIGHT JOIN，此测试仅用于验证接口
-#[tokio::test]
-#[ignore] // 跳过，因为 SQLite 不支持 RIGHT JOIN
-async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+/// 注意:SQLite/Turso 不支持 RIGHT JOIN,在Turso上跳过测试
+#[cfg(not(feature = "turso"))]
+async fn test_right_join_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserJoin>().await?;
     db.create_table::<TestRoleJoin>().await?;
 
@@ -85,7 +93,7 @@ async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     // Bob 没有插入
 
-    // 插入角色，包括一个没有对应用户的角色
+    // 插入角色,包括一个没有对应用户的角色
     db.insert(&TestRoleJoin {
         id: 1,
         uid: 1,
@@ -99,7 +107,7 @@ async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
 
-    // 测试 RIGHT JOIN - 返回所有角色，即使没有匹配的用户
+    // 测试 RIGHT JOIN - 返回所有角色,即使没有匹配的用户
     let user_roles: Vec<(Option<TestUserJoin>, TestRoleJoin)> = db
         .select::<TestUserJoin>()
         .right_join::<TestRoleJoin>(|u, r| u.id.eq(r.uid))
@@ -109,7 +117,7 @@ async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
     // RIGHT JOIN 应该返回所有角色
     assert_eq!(user_roles.len(), 2);
 
-    // 找到 admin 角色（有对应用户）
+    // 找到 admin 角色(有对应用户)
     let admin_role = user_roles
         .iter()
         .find(|(_, role)| role.role_name == "admin")
@@ -117,7 +125,7 @@ async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
     assert!(admin_role.0.is_some());
     assert_eq!(admin_role.0.as_ref().unwrap().name, "Alice");
 
-    // 找到 orphan_role（没有对应用户）
+    // 找到 orphan_role(没有对应用户)
     let orphan_role = user_roles
         .iter()
         .find(|(_, role)| role.role_name == "orphan_role")
@@ -126,13 +134,27 @@ async fn test_right_join() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ Right join test passed: {} records", user_roles.len());
 
+    // 清理测试表(先删除有外键的表)
+    db.drop_table::<TestRoleJoin>().await?;
+    db.drop_table::<TestUserJoin>().await?;
+
+    Ok(())
+}
+
+/// Turso版本:跳过RIGHT JOIN测试
+#[cfg(feature = "turso")]
+async fn test_right_join_impl(
+    _config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("⊘ Right join test skipped on Turso (SQLite doesn't support RIGHT JOIN)");
     Ok(())
 }
 
 /// 测试 LEFT JOIN 查询（对比验证）
-#[tokio::test]
-async fn test_left_join() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_left_join_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserJoin>().await?;
     db.create_table::<TestRoleJoin>().await?;
 
@@ -188,13 +210,18 @@ async fn test_left_join() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ Left join test passed: {} records", user_roles.len());
 
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<TestRoleJoin>().await?;
+    db.drop_table::<TestUserJoin>().await?;
+
     Ok(())
 }
 
 /// 测试带条件的 INNER JOIN
-#[tokio::test]
-async fn test_inner_join_with_filter() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_inner_join_with_filter_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUserJoin>().await?;
     db.create_table::<TestRoleJoin>().await?;
 
@@ -240,5 +267,14 @@ async fn test_inner_join_with_filter() -> Result<(), Box<dyn std::error::Error>>
         user_roles.len()
     );
 
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<TestRoleJoin>().await?;
+    db.drop_table::<TestUserJoin>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_inner_join_impl);
+test_on_all_dbs_result!(test_right_join_impl);
+test_on_all_dbs_result!(test_left_join_impl);
+test_on_all_dbs_result!(test_inner_join_with_filter_impl);

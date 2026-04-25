@@ -433,7 +433,7 @@ impl FromRowValues for bool {
 
 // 为二元组实现 FromValue
 impl<T1: FromValue, T2: FromValue> FromValue for (T1, T2) {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(_value: &Value) -> Result<Self, Error> {
         // 元组不能从单个Value构建，这个实现仅用于类型系统完整性
         // 实际上元组应该从多个Value构建
         Err(Error::TypeMismatch("tuple".to_string()))
@@ -454,7 +454,7 @@ impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
 
 // 为三元组实现 FromValue
 impl<T1: FromValue, T2: FromValue, T3: FromValue> FromValue for (T1, T2, T3) {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(_value: &Value) -> Result<Self, Error> {
         Err(Error::TypeMismatch("tuple".to_string()))
     }
 }

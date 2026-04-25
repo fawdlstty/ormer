@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 #[derive(Debug, Model, Clone)]
 #[table = "test_direct_users"]
 struct TestDirectUser {
@@ -9,9 +11,10 @@ struct TestDirectUser {
     age: i32,
 }
 
-#[tokio::test]
-async fn test_direct_create_table() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+async fn test_direct_create_table_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
 
     println!("Creating table...");
     db.create_table::<TestDirectUser>().await?;
@@ -45,5 +48,10 @@ async fn test_direct_create_table() -> Result<(), Box<dyn std::error::Error>> {
     let users: Vec<TestDirectUser> = db.select::<TestDirectUser>().collect().await?;
     println!("Users: {:?}", users);
 
+    // 清理测试表
+    db.drop_table::<TestDirectUser>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_direct_create_table_impl);

@@ -61,6 +61,18 @@ impl Database {
         }
     }
 
+    /// 验证表结构
+    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.validate_table::<T>().await,
+        }
+    }
+
     /// 插入记录
     pub async fn insert<I: crate::model::Insertable>(&self, models: I) -> Result<(), crate::Error> {
         let refs = models.as_refs();
@@ -904,11 +916,12 @@ pub enum MappedSelectExecutor<'a, T: Model, V> {
         turso_backend::MappedSelectExecutor<T, V>,
         std::marker::PhantomData<&'a ()>,
     ),
-    // TODO: 实现 postgresql 和 mysql 后端
-    // #[cfg(feature = "postgresql")]
-    // PostgreSQL(postgresql_backend::MappedSelectExecutor<'a, T, V>),
-    // #[cfg(feature = "mysql")]
-    // MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::MappedSelectExecutor<'a, T, V>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
 impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
@@ -918,8 +931,19 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::Turso(exec, phantom) => {
                 MappedSelectExecutor::Turso(exec.clone(), *phantom)
             }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+            #[cfg(feature = "postgresql")]
+            MappedSelectExecutor::PostgreSQL(_exec) => {
+                // PostgreSQL MappedSelectExecutor不能clone，因为client是引用
+                panic!("Cannot clone PostgreSQL MappedSelectExecutor")
+            }
+            #[cfg(feature = "mysql")]
+            MappedSelectExecutor::MySQL(exec) => {
+                MappedSelectExecutor::MySQL(exec.clone_with_pool())
+            }
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            MappedSelectExecutor::NotImplemented(phantom) => {
+                MappedSelectExecutor::NotImplemented(*phantom)
+            }
         }
     }
 }
@@ -931,11 +955,12 @@ pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
         turso_backend::MappedCollectFuture<T, V, C>,
         std::marker::PhantomData<&'a ()>,
     ),
-    // TODO: 实现 postgresql 和 mysql 后端
-    // #[cfg(feature = "postgresql")]
-    // PostgreSQL(postgresql_backend::MappedCollectFuture<'a, T, V, C>),
-    // #[cfg(feature = "mysql")]
-    // MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::MappedCollectFuture<'a, T, V, C>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
 /// 统一的 ModelCollectWithFuture 枚举
@@ -945,6 +970,20 @@ pub enum ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
         turso_backend::ModelCollectWithFuture<T, V, C, M, F>,
         std::marker::PhantomData<&'a ()>,
     ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQLCollect(
+        postgresql_backend::MappedCollectFuture<'a, T, V, Vec<V>>,
+        F,
+        std::marker::PhantomData<&'a (T, C, M)>,
+    ),
+    #[cfg(feature = "mysql")]
+    MySQLCollect(
+        mysql_backend::MappedCollectFuture<'a, T, V, Vec<V>>,
+        F,
+        std::marker::PhantomData<&'a (T, C, M)>,
+    ),
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    NotImplemented(std::marker::PhantomData<&'a (T, V, C, M, F)>),
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -952,6 +991,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 支持：
     /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<'a, T, i32>
     /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<'a, T, (i32, i32)>
+    #[allow(unused_variables)]
     pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(<T as Model>::Where) -> M,
@@ -962,15 +1002,18 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::Turso(exec, _) => {
                 MappedSelectExecutor::Turso(exec.map_to(f), std::marker::PhantomData)
             }
-            // TODO: 实现 postgresql 和 mysql 后端
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => MappedSelectExecutor::PostgreSQL(exec.map_to(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => MappedSelectExecutor::MySQL(exec.map_to(f)),
             #[allow(unreachable_patterns)]
-            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+            _ => unreachable!("MappedSelectExecutor not implemented for this backend"),
         }
     }
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -980,19 +1023,24 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             #[cfg(feature = "turso")]
             MappedSelectExecutor::Turso(exec, _) => {
                 MappedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
-            } // TODO: 实现 postgresql 和 mysql 后端
-              // #[cfg(feature = "postgresql")]
-              // MappedSelectExecutor::PostgreSQL(exec) => {
-              //     MappedCollectFuture::PostgreSQL(exec.collect::<C>())
-              // }
-              // #[cfg(feature = "mysql")]
-              // MappedSelectExecutor::MySQL(exec) => MappedCollectFuture::MySQL(exec.collect::<C>()),
+            }
+            #[cfg(feature = "postgresql")]
+            MappedSelectExecutor::PostgreSQL(exec) => {
+                MappedCollectFuture::PostgreSQL(exec.collect::<C>())
+            }
+            #[cfg(feature = "mysql")]
+            MappedSelectExecutor::MySQL(exec) => MappedCollectFuture::MySQL(exec.collect::<C>()),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            MappedSelectExecutor::NotImplemented(_) => {
+                panic!("MappedSelectExecutor::collect is not implemented for this backend")
+            }
         }
     }
 
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
+    #[allow(unused_variables)]
     pub fn collect_with<C, F, M>(&self, f: F) -> ModelCollectWithFuture<'a, T, V, C, M, F>
     where
         T: 'static,
@@ -1007,6 +1055,24 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 exec.collect_with::<C, F, M>(f),
                 std::marker::PhantomData,
             ),
+            #[cfg(feature = "postgresql")]
+            MappedSelectExecutor::PostgreSQL(exec) => {
+                // PostgreSQL也支持collect_with，通过clone exec然后调用collect实现
+                let exec_clone = exec.clone_with_client();
+                let future = exec_clone.collect::<Vec<V>>();
+                ModelCollectWithFuture::PostgreSQLCollect(future, f, std::marker::PhantomData)
+            }
+            #[cfg(feature = "mysql")]
+            MappedSelectExecutor::MySQL(exec) => {
+                // MySQL也支持collect_with，通过clone exec然后调用collect实现
+                let exec_clone = exec.clone_with_pool();
+                let future = exec_clone.collect::<Vec<V>>();
+                ModelCollectWithFuture::MySQLCollect(future, f, std::marker::PhantomData)
+            }
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            MappedSelectExecutor::NotImplemented(_) => {
+                panic!("MappedSelectExecutor::collect_with is not implemented for this backend")
+            }
         }
     }
 }
@@ -1074,11 +1140,14 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
         match self {
             #[cfg(feature = "turso")]
             MappedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
-            // TODO: 实现 postgresql 和 mysql 后端
-            // #[cfg(feature = "postgresql")]
-            // MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            // #[cfg(feature = "mysql")]
-            // MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "postgresql")]
+            MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "mysql")]
+            MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            MappedCollectFuture::NotImplemented(_) => {
+                panic!("MappedCollectFuture is not implemented for this backend")
+            }
         }
     }
 }
@@ -1098,6 +1167,20 @@ where
         match self {
             #[cfg(feature = "turso")]
             ModelCollectWithFuture::Turso(future, _) => Box::pin(future.into_future()),
+            #[cfg(feature = "postgresql")]
+            ModelCollectWithFuture::PostgreSQLCollect(future, mapper, _) => Box::pin(async move {
+                let vec = future.await?;
+                Ok(vec.into_iter().map(mapper).collect())
+            }),
+            #[cfg(feature = "mysql")]
+            ModelCollectWithFuture::MySQLCollect(future, mapper, _) => Box::pin(async move {
+                let vec = future.await?;
+                Ok(vec.into_iter().map(mapper).collect())
+            }),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            ModelCollectWithFuture::NotImplemented(_) => {
+                panic!("ModelCollectWithFuture is not implemented for this backend")
+            }
         }
     }
 }

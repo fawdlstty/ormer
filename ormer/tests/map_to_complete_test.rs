@@ -1,4 +1,6 @@
-use ormer::{Database, DbType, Model};
+use ormer::Model;
+
+mod _test_common;
 
 // ==================== 测试Model定义 ====================
 
@@ -40,12 +42,13 @@ struct UserNameAge {
 
 // ==================== 测试用例 ====================
 
-#[tokio::test]
-async fn test_map_to_complete_usage() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_map_to_complete_usage_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("\n========== map_to 完整用法测试 ==========\n");
 
     // 创建内存数据库
-    let db = Database::connect(DbType::Turso, ":memory:").await?;
+    let db = _test_common::create_db_connection(config).await?;
 
     // 创建表
     db.create_table::<User>().await?;
@@ -260,5 +263,11 @@ async fn test_map_to_complete_usage() -> Result<(), Box<dyn std::error::Error>> 
 
     println!("========== 所有测试通过！==========\n");
 
+    // 清理测试表（先删除有外键的表）
+    db.drop_table::<Role>().await?;
+    db.drop_table::<User>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_map_to_complete_usage_impl);

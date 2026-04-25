@@ -90,16 +90,6 @@ impl Database {
 
     /// 创建表
     pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().await?;
-
-        if table_exists {
-            // 表已存在，验证表结构
-            self.validate_table_schema::<T>().await?;
-            // 结构匹配，无需创建
-            return Ok(());
-        }
-
         // 表不存在，创建新表
         let create_sql =
             crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::Turso);
@@ -110,6 +100,22 @@ impl Database {
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// 验证表结构是否与模型定义匹配
+    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+        // 检查表是否存在
+        let table_exists = self.check_table_exists::<T>().await?;
+
+        if !table_exists {
+            return Err(crate::Error::SchemaMismatch {
+                table: T::TABLE_NAME.to_string(),
+                reason: "Table does not exist".to_string(),
+            });
+        }
+
+        // 表已存在，验证表结构
+        self.validate_table_schema::<T>().await
     }
 
     /// 检查表是否存在
@@ -140,7 +146,7 @@ impl Database {
         }
     }
 
-    /// 验证表结构是否与模型定义匹配
+    /// 验证表结构是否与模型定义匹配（内部使用）
     async fn validate_table_schema<T: Model>(&self) -> Result<(), crate::Error> {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", T::TABLE_NAME);

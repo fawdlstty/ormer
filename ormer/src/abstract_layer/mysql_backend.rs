@@ -108,16 +108,6 @@ impl Database {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>(&mut conn).await?;
-
-        if table_exists {
-            // 表已存在，验证表结构
-            self.validate_table_schema::<T>(&mut conn).await?;
-            // 结构匹配，无需创建
-            return Ok(());
-        }
-
         // 表不存在，创建新表
         let create_sql =
             crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::MySQL);
@@ -129,6 +119,28 @@ impl Database {
         Ok(())
     }
 
+    /// 验证表结构是否与模型定义匹配
+    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        // 检查表是否存在
+        let table_exists = self.check_table_exists::<T>(&mut conn).await?;
+
+        if !table_exists {
+            return Err(crate::Error::SchemaMismatch {
+                table: T::TABLE_NAME.to_string(),
+                reason: "Table does not exist".to_string(),
+            });
+        }
+
+        // 表已存在，验证表结构
+        self.validate_table_schema::<T>(&mut conn).await
+    }
+
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(
         &self,
@@ -137,14 +149,14 @@ impl Database {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
 
         let result: Option<u64> = conn
-            .query_first(sql)
+            .exec_first(sql, (T::TABLE_NAME,))
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(result.unwrap_or(0) > 0)
     }
 
-    /// 验证表结构是否与模型定义匹配
+    /// 验证表结构是否与模型定义匹配（内部使用）
     async fn validate_table_schema<T: Model>(
         &self,
         conn: &mut mysql_async::Conn,
@@ -269,7 +281,14 @@ impl Database {
         // 标准化类型名称
         fn normalize(s: &str) -> String {
             let upper = s.to_uppercase();
-            match upper.as_str() {
+            // 提取基础类型名（去掉括号内的参数）
+            let base_type = if let Some(pos) = upper.find('(') {
+                &upper[..pos]
+            } else {
+                &upper[..]
+            };
+
+            match base_type {
                 // 整数类型
                 "TINYINT" => "TINYINT".to_string(),
                 "SMALLINT" => "SMALLINT".to_string(),
@@ -277,26 +296,32 @@ impl Database {
                 "INT" | "INTEGER" => "INT".to_string(),
                 "BIGINT" => "BIGINT".to_string(),
                 // 无符号整数
-                "TINYINT UNSIGNED" => "TINYINT UNSIGNED".to_string(),
-                "SMALLINT UNSIGNED" => "SMALLINT UNSIGNED".to_string(),
-                "MEDIUMINT UNSIGNED" => "MEDIUMINT UNSIGNED".to_string(),
-                "INT UNSIGNED" | "INTEGER UNSIGNED" => "INT UNSIGNED".to_string(),
-                "BIGINT UNSIGNED" => "BIGINT UNSIGNED".to_string(),
+                t if t.ends_with(" UNSIGNED") => {
+                    let unsigned_type = t.replace(" ", "");
+                    match unsigned_type.as_str() {
+                        "TINYINTUNSIGNED" => "TINYINT UNSIGNED".to_string(),
+                        "SMALLINTUNSIGNED" => "SMALLINT UNSIGNED".to_string(),
+                        "MEDIUMINTUNSIGNED" => "MEDIUMINT UNSIGNED".to_string(),
+                        "INTUNSIGNED" | "INTEGERUNSIGNED" => "INT UNSIGNED".to_string(),
+                        "BIGINTUNSIGNED" => "BIGINT UNSIGNED".to_string(),
+                        _ => t.to_string(),
+                    }
+                }
                 // 浮点类型
                 "FLOAT" => "FLOAT".to_string(),
-                "DOUBLE" | "DOUBLE PRECISION" => "DOUBLE".to_string(),
-                // 字符串类型
+                "DOUBLE" | "DOUBLEPRECISION" => "DOUBLE".to_string(),
+                // 字符串类型（忽略长度参数）
                 "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
                     "VARCHAR".to_string()
                 }
-                // 布尔类型
-                "TINYINT(1)" | "BOOL" | "BOOLEAN" => "TINYINT(1)".to_string(),
+                // 布尔类型（MySQL 使用 TINYINT(1) 存储布尔值）
+                "BOOL" | "BOOLEAN" => "TINYINT".to_string(),
                 // 字节类型
                 "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "VARBINARY" | "BINARY" => {
                     "BLOB".to_string()
                 }
                 // 其他
-                _ => upper,
+                _ => base_type.to_string(),
             }
         }
 
@@ -712,6 +737,99 @@ pub struct SelectExecutor<'a, T: Model> {
     _marker: PhantomData<T>,
 }
 
+/// 映射查询结果执行器
+pub struct MappedSelectExecutor<'a, T: Model, V> {
+    select: crate::query::builder::MappedSelect<T, V>,
+    pool: &'a Pool,
+    _marker: PhantomData<(T, V)>,
+}
+
+impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        MappedCollectFuture {
+            select: self.select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 克隆executor（保持相同的pool引用）
+    pub fn clone_with_pool(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// 映射查询收集Future
+pub struct MappedCollectFuture<'a, T: Model, V, C> {
+    select: crate::query::builder::MappedSelect<T, V>,
+    pool: &'a Pool,
+    _marker: PhantomData<(T, V, C)>,
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+
+            let mut conn =
+                self.pool.get_conn().await.map_err(|e| {
+                    crate::Error::Database(format!("Failed to get connection: {}", e))
+                })?;
+
+            // 将ormer::Value转换为mysql_async::Params
+            let mysql_params: Vec<mysql_async::Value> = params
+                .into_iter()
+                .map(|v| match v {
+                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
+                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
+                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
+                    crate::model::Value::Null => mysql_async::Value::NULL,
+                })
+                .collect();
+
+            let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
+                conn.query(&sql)
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            } else {
+                conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            };
+
+            let mut results = Vec::new();
+            for row in rows {
+                // 将行数据转换为Vec<Value>
+                let mut values = Vec::new();
+                for i in 0..row.columns_ref().len() {
+                    let value = convert_mysql_value(&row, i)?;
+                    values.push(value);
+                }
+
+                // 使用FromRowValues转换为V
+                let v = V::from_row_values(&values)?;
+                results.push(v);
+            }
+
+            Ok(results.into_iter().collect())
+        })
+    }
+}
+
 impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 添加 WHERE 条件
     pub fn filter<F>(self, f: F) -> Self
@@ -791,6 +909,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     ) -> RightJoinedSelectExecutor<'a, T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 映射查询结果到自定义类型
+    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    where
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        let mapped_select = self.select.map_to(f);
+        MappedSelectExecutor {
+            select: mapped_select,
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -970,19 +1102,42 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                 let value: Option<mysql_async::Value> = row.get(0);
                 let value = value.unwrap_or(mysql_async::Value::NULL);
 
+                // 调试输出
+                println!(
+                    "DEBUG MySQL aggregate raw value type: {:?}",
+                    std::mem::discriminant(&value)
+                );
+
                 // 将mysql_async::Value转换为ormer::Value
                 let ormer_value = match value {
                     mysql_async::Value::Int(i) => crate::model::Value::Integer(i),
                     mysql_async::Value::UInt(u) => crate::model::Value::Integer(u as i64),
                     mysql_async::Value::Float(f) => crate::model::Value::Real(f as f64),
                     mysql_async::Value::Double(d) => crate::model::Value::Real(d),
-                    mysql_async::Value::Bytes(b) => String::from_utf8(b)
-                        .map(|s| crate::model::Value::Text(s))
-                        .unwrap_or(crate::model::Value::Null),
+                    mysql_async::Value::Bytes(b) => {
+                        // 尝试将字节解析为数值（MySQL聚合函数可能返回字符串形式的数值）
+                        if let Ok(s) = String::from_utf8(b.clone()) {
+                            // 尝试解析为整数
+                            if let Ok(i) = s.parse::<i64>() {
+                                crate::model::Value::Integer(i)
+                            } else if let Ok(f) = s.parse::<f64>() {
+                                // 尝试解析为浮点数
+                                crate::model::Value::Real(f)
+                            } else {
+                                // 作为文本处理
+                                crate::model::Value::Text(s)
+                            }
+                        } else {
+                            crate::model::Value::Null
+                        }
+                    }
                     mysql_async::Value::Date(_, _, _, _, _, _, _)
                     | mysql_async::Value::Time(_, _, _, _, _, _) => crate::model::Value::Null,
                     mysql_async::Value::NULL => crate::model::Value::Null,
                 };
+
+                // 调试输出
+                println!("DEBUG MySQL aggregate ormer_value: {:?}", ormer_value);
 
                 // 使用 FromValue 转换为目标类型
                 R::from_value(&ormer_value)
@@ -2170,31 +2325,36 @@ fn convert_mysql_value(
     row: &mysql_async::Row,
     index: usize,
 ) -> Result<crate::model::Value, crate::Error> {
-    // 尝试整数类型
-    if let Some(v) = row.get::<Option<i64>, _>(index) {
-        return Ok(crate::model::Value::Integer(v.unwrap_or(0)));
-    }
+    use mysql_async::Value;
 
-    // 尝试字符串类型
-    if let Some(v) = row.get::<Option<String>, _>(index) {
-        return Ok(crate::model::Value::Text(v.unwrap_or_default()));
-    }
+    // 获取原始值
+    let value = row.get::<Option<Value>, _>(index).unwrap_or(None);
 
-    // 尝试浮点类型
-    if let Some(v) = row.get::<Option<f64>, _>(index) {
-        return Ok(crate::model::Value::Real(v.unwrap_or(0.0)));
+    match value {
+        Some(Value::NULL) | None => Ok(crate::model::Value::Null),
+        Some(Value::Int(i)) => Ok(crate::model::Value::Integer(i)),
+        Some(Value::UInt(u)) => Ok(crate::model::Value::Integer(u as i64)),
+        Some(Value::Float(f)) => Ok(crate::model::Value::Real(f as f64)),
+        Some(Value::Double(d)) => Ok(crate::model::Value::Real(d)),
+        Some(Value::Bytes(b)) => {
+            // 尝试将字节解析为数值（MySQL聚合函数可能返回字符串形式的数值）
+            if let Ok(s) = String::from_utf8(b.clone()) {
+                // 尝试解析为整数
+                if let Ok(i) = s.parse::<i64>() {
+                    Ok(crate::model::Value::Integer(i))
+                } else if let Ok(f) = s.parse::<f64>() {
+                    Ok(crate::model::Value::Real(f))
+                } else {
+                    Ok(crate::model::Value::Text(s))
+                }
+            } else {
+                // 如果不是UTF-8，尝试作为二进制数据处理（这里暂时返回空字符串）
+                Ok(crate::model::Value::Text(String::new()))
+            }
+        }
+        _ => Err(crate::Error::Database(format!(
+            "Unsupported MySQL value type at index {}",
+            index
+        ))),
     }
-
-    // 尝试布尔类型
-    if let Some(v) = row.get::<Option<bool>, _>(index) {
-        return Ok(if v.unwrap_or(false) {
-            crate::model::Value::Integer(1)
-        } else {
-            crate::model::Value::Integer(0)
-        });
-    }
-
-    Err(crate::Error::Database(format!(
-        "Unsupported column type at index {index}"
-    )))
 }

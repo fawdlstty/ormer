@@ -213,8 +213,15 @@ impl<T: Model, V> MappedSelect<T, V> {
 
     /// 生成 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        // 默认使用Turso格式用于调试
-        let (sql, _) = self.to_sql_with_params(DbType::Turso);
+        // 使用第一个可用的数据库类型用于调试
+        #[cfg(feature = "turso")]
+        let db_type = DbType::Turso;
+        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        let db_type = DbType::MySQL;
+
+        let (sql, _) = self.to_sql_with_params(db_type);
         sql
     }
 }
@@ -457,8 +464,15 @@ impl<T: Model> Select<T> {
 
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
-        // 默认使用Turso格式用于调试
-        let (sql, _) = self.to_sql_with_params(DbType::Turso);
+        // 使用第一个可用的数据库类型用于调试
+        #[cfg(feature = "turso")]
+        let db_type = DbType::Turso;
+        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        let db_type = DbType::MySQL;
+
+        let (sql, _) = self.to_sql_with_params(db_type);
         sql
     }
 
@@ -1155,7 +1169,14 @@ impl<T: ColumnValueType> IsInValues<T> for SubqueryParam {
 // 为 MappedSelect 实现 IsInValues（子查询）
 impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
     fn to_in_expr(self, column: String) -> WhereExpr {
+        // 使用第一个可用的数据库类型
+        #[cfg(feature = "turso")]
         let db_type = DbType::Turso;
+        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        let db_type = DbType::MySQL;
+
         let (sql, params) = self.to_sql_with_params(db_type);
         WhereExpr {
             inner: FilterExpr::InSubquery {

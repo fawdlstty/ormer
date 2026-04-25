@@ -1,8 +1,11 @@
-use ormer::{Database, DbType, Model};
+use ormer::{Database, Model};
+
+mod _test_common;
 
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 mod connection_pool_tests {
     use super::*;
+    use _test_common::DbConfig;
 
     // 为 Turso 测试创建临时数据库路径
     #[cfg(feature = "turso")]
@@ -32,9 +35,13 @@ mod connection_pool_tests {
     #[cfg(feature = "turso")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_creation_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // 连接池测试使用 Turso 内存数据库的文件版本
+        let config: DbConfig = (ormer::DbType::Turso, ":memory:");
+        let _ = _test_common::create_db_connection(&config).await?;
+
         // 创建连接池，min=0 表示创建时不建立连接
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // 最小连接数为 0
@@ -47,6 +54,9 @@ mod connection_pool_tests {
         // 验证连接可以使用
         conn.create_table::<PoolTestUser>().await?;
 
+        // 清理测试表
+        conn.drop_table::<PoolTestUser>().await?;
+
         // conn 离开作用域后自动归还
         Ok(())
     }
@@ -56,7 +66,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_insert_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..5) // min=0
@@ -92,6 +102,9 @@ mod connection_pool_tests {
         ])
         .await?;
 
+        // 清理测试表
+        conn.drop_table::<PoolTestUser>().await?;
+
         Ok(())
     }
 
@@ -100,7 +113,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_select_turso() -> Result<(), Box<dyn std::error::Error>> {
         let db_path = format!("/tmp/ormer_test_{}.db", std::process::id());
-        let pool = Database::create_pool(DbType::Turso, &db_path)
+        let pool = Database::create_pool(ormer::DbType::Turso, &db_path)
             .range(0..3) // min=0
             .build()
             .await?;
@@ -125,7 +138,7 @@ mod connection_pool_tests {
             .await?;
         }
 
-        // 查询数据
+        // 查询数据并清理测试表
         {
             let conn = pool.get().await?;
             let users = conn.select::<PoolTestUser>().collect::<Vec<_>>().await?;
@@ -133,6 +146,9 @@ mod connection_pool_tests {
             assert_eq!(users.len(), 2);
             assert_eq!(users[0].name, "Alice");
             assert_eq!(users[1].name, "Bob");
+
+            // 清理测试表
+            conn.drop_table::<PoolTestUser>().await?;
         }
 
         // 清理测试文件
@@ -146,7 +162,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_filter_select_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -180,6 +196,12 @@ mod connection_pool_tests {
             assert_eq!(users.len(), 3); // age >= 35 的有 3 个
         }
 
+        // 清理测试表 - 使用新连接删除表
+        {
+            let conn = pool.get().await?;
+            conn.drop_table::<PoolTestUser>().await?;
+        }
+
         Ok(())
     }
 
@@ -188,7 +210,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_update_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -234,6 +256,12 @@ mod connection_pool_tests {
             assert_eq!(users[0].age, 30);
         }
 
+        // 清理测试表 - 使用新连接删除表
+        {
+            let conn = pool.get().await?;
+            conn.drop_table::<PoolTestUser>().await?;
+        }
+
         Ok(())
     }
 
@@ -242,7 +270,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_delete_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -289,6 +317,12 @@ mod connection_pool_tests {
             assert_eq!(users[0].name, "Bob");
         }
 
+        // 清理测试表 - 使用新连接删除表
+        {
+            let conn = pool.get().await?;
+            conn.drop_table::<PoolTestUser>().await?;
+        }
+
         Ok(())
     }
 
@@ -297,7 +331,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_transaction_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -333,6 +367,9 @@ mod connection_pool_tests {
         let users = conn.select::<PoolTestUser>().collect::<Vec<_>>().await?;
         assert_eq!(users.len(), 2);
 
+        // 清理测试表
+        conn.drop_table::<PoolTestUser>().await?;
+
         Ok(())
     }
 
@@ -341,7 +378,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_aggregate_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -383,6 +420,12 @@ mod connection_pool_tests {
             assert_eq!(max, Some(45));
         }
 
+        // 清理测试表 - 使用新连接删除表
+        {
+            let conn = pool.get().await?;
+            conn.drop_table::<PoolTestUser>().await?;
+        }
+
         Ok(())
     }
 
@@ -391,7 +434,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_multiple_get_return_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..5) // min=0
@@ -437,7 +480,7 @@ mod connection_pool_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_exec_sql_turso() -> Result<(), Box<dyn std::error::Error>> {
         let pool = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..3) // min=0
@@ -445,6 +488,10 @@ mod connection_pool_tests {
         .await?;
 
         let conn = pool.get().await?;
+
+        // 先清理可能存在的旧表
+        let _ = conn.drop_table::<PoolTestUser>().await;
+
         conn.create_table::<PoolTestUser>().await?;
 
         // 执行原生插入 SQL
@@ -461,6 +508,9 @@ mod connection_pool_tests {
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].name, "Alice");
 
+        // 清理测试表
+        conn.drop_table::<PoolTestUser>().await?;
+
         Ok(())
     }
 
@@ -470,7 +520,7 @@ mod connection_pool_tests {
     async fn test_pool_range_config_turso() -> Result<(), Box<dyn std::error::Error>> {
         // 测试不同的范围配置
         let pool1 = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..2) // min=0
@@ -478,7 +528,7 @@ mod connection_pool_tests {
         .await?;
 
         let pool2 = Database::create_pool(
-            DbType::Turso,
+            ormer::DbType::Turso,
             &format!("/tmp/ormer_{}_{}.db", std::process::id(), line!()),
         )
         .range(0..10) // min=0
@@ -491,6 +541,10 @@ mod connection_pool_tests {
 
         let conn2 = pool2.get().await?;
         conn2.create_table::<PoolTestUser>().await?;
+
+        // 清理测试表 - 使用各自连接删除表（使用不同表名避免冲突）
+        conn1.drop_table::<PoolTestUser>().await?;
+        conn2.drop_table::<PoolTestUser>().await?;
 
         Ok(())
     }

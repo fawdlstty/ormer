@@ -13,10 +13,16 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             value: _,
         } => {
             match db_type {
+                #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
                     write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
                 }
-                DbType::Turso | DbType::MySQL => {
+                #[cfg(feature = "turso")]
+                DbType::Turso => {
+                    write!(sql, "{} {} ?", column, operator).unwrap();
+                }
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
             }
@@ -37,10 +43,16 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                     sql.push_str(", ");
                 }
                 match db_type {
+                    #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
                         write!(sql, "${}", param_idx).unwrap();
                     }
-                    DbType::Turso | DbType::MySQL => {
+                    #[cfg(feature = "turso")]
+                    DbType::Turso => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
                         sql.push('?');
                     }
                 }
@@ -90,10 +102,16 @@ pub fn format_filter_with_params(
             value,
         } => {
             match db_type {
+                #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
                     write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
                 }
-                DbType::Turso | DbType::MySQL => {
+                #[cfg(feature = "turso")]
+                DbType::Turso => {
+                    write!(sql, "{} {} ?", column, operator).unwrap();
+                }
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
             }
@@ -115,10 +133,16 @@ pub fn format_filter_with_params(
                     sql.push_str(", ");
                 }
                 match db_type {
+                    #[cfg(feature = "turso")]
+                    DbType::Turso => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
                         write!(sql, "${}", param_idx).unwrap();
                     }
-                    DbType::Turso | DbType::MySQL => {
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
                         sql.push('?');
                     }
                 }

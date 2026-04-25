@@ -1,4 +1,6 @@
-use ormer::{Database, DbType, Model};
+use ormer::Model;
+
+mod _test_common;
 
 #[derive(Debug, Model)]
 #[table = "test_users2"]
@@ -10,9 +12,10 @@ struct TestUser2 {
     email: Option<String>,
 }
 
-#[tokio::test]
-async fn test_step_by_step() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Turso, ":memory:").await?;
+async fn test_step_by_step_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
     db.create_table::<TestUser2>().await?;
 
     // insert
@@ -63,5 +66,10 @@ async fn test_step_by_step() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Combined query OK: {:?}", users);
 
+    // 清理测试表
+    db.drop_table::<TestUser2>().await?;
+
     Ok(())
 }
+
+test_on_all_dbs_result!(test_step_by_step_impl);

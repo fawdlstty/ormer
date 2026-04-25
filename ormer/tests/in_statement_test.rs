@@ -1,5 +1,7 @@
 use ormer::Model;
 
+mod _test_common;
+
 #[derive(Debug, Model)]
 #[table = "test_users"]
 struct TestUser {
@@ -9,8 +11,8 @@ struct TestUser {
     age: i32,
 }
 
-#[test]
-fn test_in_statement_i32() {
+async fn test_in_statement_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[i32] 类型
     let values: &[i32] = &[2, 4, 6, 7, 8];
     let sql = ormer::Select::<TestUser>::new()
@@ -22,8 +24,8 @@ fn test_in_statement_i32() {
     assert!(sql.contains("WHERE"));
 }
 
-#[test]
-fn test_in_statement_i32_ref() {
+async fn test_in_statement_i32_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&i32] 类型
     let v1: &i32 = &2;
     let v2: &i32 = &4;
@@ -37,8 +39,8 @@ fn test_in_statement_i32_ref() {
     assert!(sql.contains("age IN (?, ?, ?)"));
 }
 
-#[test]
-fn test_in_statement_string() {
+async fn test_in_statement_string_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[String] 类型
     let names: &[String] = &[
         "Alice".to_string(),
@@ -53,8 +55,8 @@ fn test_in_statement_string() {
     assert!(sql.contains("name IN (?, ?, ?)"));
 }
 
-#[test]
-fn test_in_statement_string_ref() {
+async fn test_in_statement_string_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&String] 类型
     let names: Vec<String> = vec!["Alice".to_string(), "Bob".to_string()];
     let name_refs: Vec<&String> = names.iter().collect();
@@ -67,8 +69,8 @@ fn test_in_statement_string_ref() {
     assert!(sql.contains("name IN (?, ?)"));
 }
 
-#[test]
-fn test_in_statement_str() {
+async fn test_in_statement_str_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&str] 类型
     let names: &[&str] = &["Alice", "Bob", "Charlie"];
     let sql = ormer::Select::<TestUser>::new()
@@ -79,8 +81,8 @@ fn test_in_statement_str() {
     assert!(sql.contains("name IN (?, ?, ?)"));
 }
 
-#[test]
-fn test_in_with_other_filters() {
+async fn test_in_with_other_filters_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 IN 与其他过滤器组合
     let values: &[i32] = &[20, 25, 30];
     let sql = ormer::Select::<TestUser>::new()
@@ -95,8 +97,8 @@ fn test_in_with_other_filters() {
     assert!(sql.contains("LIMIT 10"));
 }
 
-#[test]
-fn test_in_empty_array() {
+async fn test_in_empty_array_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试空数组
     let empty_vec: &[i32] = &[];
     let sql = ormer::Select::<TestUser>::new()
@@ -109,8 +111,8 @@ fn test_in_empty_array() {
 
 // ==================== Vec 类型测试 ====================
 
-#[test]
-fn test_in_vec_i32() {
+async fn test_in_vec_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &Vec<i32> 类型
     let values: Vec<i32> = vec![1, 2, 3, 4, 5];
     let sql = ormer::Select::<TestUser>::new()
@@ -121,8 +123,8 @@ fn test_in_vec_i32() {
     assert!(sql.contains("age IN (?, ?, ?, ?, ?)"));
 }
 
-#[test]
-fn test_in_vec_i32_ref() {
+async fn test_in_vec_i32_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &Vec<&i32> 类型
     let v1 = 10;
     let v2 = 20;
@@ -136,8 +138,8 @@ fn test_in_vec_i32_ref() {
     assert!(sql.contains("age IN (?, ?, ?)"));
 }
 
-#[test]
-fn test_in_vec_string() {
+async fn test_in_vec_string_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &Vec<String> 类型
     let names: Vec<String> = vec!["Alice".to_string(), "Bob".to_string()];
     let sql = ormer::Select::<TestUser>::new()
@@ -148,8 +150,8 @@ fn test_in_vec_string() {
     assert!(sql.contains("name IN (?, ?)"));
 }
 
-#[test]
-fn test_in_vec_string_ref() {
+async fn test_in_vec_string_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &Vec<&String> 类型
     let s1 = "Alice".to_string();
     let s2 = "Bob".to_string();
@@ -162,8 +164,8 @@ fn test_in_vec_string_ref() {
     assert!(sql.contains("name IN (?, ?)"));
 }
 
-#[test]
-fn test_in_vec_str() {
+async fn test_in_vec_str_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &Vec<&str> 类型
     let names: Vec<&str> = vec!["Alice", "Bob", "Charlie"];
     let sql = ormer::Select::<TestUser>::new()
@@ -176,8 +178,8 @@ fn test_in_vec_str() {
 
 // ==================== 数组类型测试 ====================
 
-#[test]
-fn test_in_array_i32() {
+async fn test_in_array_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[i32; N] 类型
     let values: &[i32; 4] = &[1, 2, 3, 4];
     let sql = ormer::Select::<TestUser>::new()
@@ -188,8 +190,8 @@ fn test_in_array_i32() {
     assert!(sql.contains("age IN (?, ?, ?, ?)"));
 }
 
-#[test]
-fn test_in_array_i32_ref() {
+async fn test_in_array_i32_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&i32; N] 类型
     let v1 = 100;
     let v2 = 200;
@@ -203,8 +205,8 @@ fn test_in_array_i32_ref() {
     assert!(sql.contains("age IN (?, ?, ?)"));
 }
 
-#[test]
-fn test_in_array_string() {
+async fn test_in_array_string_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[String; N] 类型
     let names: &[String; 2] = &["Alice".to_string(), "Bob".to_string()];
     let sql = ormer::Select::<TestUser>::new()
@@ -215,8 +217,8 @@ fn test_in_array_string() {
     assert!(sql.contains("name IN (?, ?)"));
 }
 
-#[test]
-fn test_in_array_string_ref() {
+async fn test_in_array_string_ref_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&String; N] 类型
     let s1 = "Alice".to_string();
     let s2 = "Bob".to_string();
@@ -229,8 +231,8 @@ fn test_in_array_string_ref() {
     assert!(sql.contains("name IN (?, ?)"));
 }
 
-#[test]
-fn test_in_array_str() {
+async fn test_in_array_str_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试 &[&str; N] 类型
     let names: &[&str; 3] = &["Alice", "Bob", "Charlie"];
     let sql = ormer::Select::<TestUser>::new()
@@ -243,8 +245,8 @@ fn test_in_array_str() {
 
 // ==================== 直接字面量测试 ====================
 
-#[test]
-fn test_in_literal_array_i32() {
+async fn test_in_literal_array_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试直接使用数组字面量 &[T; N]
     let sql = ormer::Select::<TestUser>::new()
         .filter(|p| {
@@ -257,8 +259,8 @@ fn test_in_literal_array_i32() {
     assert!(sql.contains("age IN (?, ?, ?, ?, ?)"));
 }
 
-#[test]
-fn test_in_literal_array_str() {
+async fn test_in_literal_array_str_impl(config: &_test_common::DbConfig) {
+    let _config = config; // 仅用于获取数据库类型
     // 测试直接使用 &str 数组字面量 &[&str; N]
     let sql = ormer::Select::<TestUser>::new()
         .filter(|p| {
@@ -270,3 +272,23 @@ fn test_in_literal_array_str() {
     println!("SQL: {}", sql);
     assert!(sql.contains("name IN (?, ?)"));
 }
+
+test_on_all_dbs!(test_in_statement_i32_impl);
+test_on_all_dbs!(test_in_statement_i32_ref_impl);
+test_on_all_dbs!(test_in_statement_string_impl);
+test_on_all_dbs!(test_in_statement_string_ref_impl);
+test_on_all_dbs!(test_in_statement_str_impl);
+test_on_all_dbs!(test_in_with_other_filters_impl);
+test_on_all_dbs!(test_in_empty_array_impl);
+test_on_all_dbs!(test_in_vec_i32_impl);
+test_on_all_dbs!(test_in_vec_i32_ref_impl);
+test_on_all_dbs!(test_in_vec_string_impl);
+test_on_all_dbs!(test_in_vec_string_ref_impl);
+test_on_all_dbs!(test_in_vec_str_impl);
+test_on_all_dbs!(test_in_array_i32_impl);
+test_on_all_dbs!(test_in_array_i32_ref_impl);
+test_on_all_dbs!(test_in_array_string_impl);
+test_on_all_dbs!(test_in_array_string_ref_impl);
+test_on_all_dbs!(test_in_array_str_impl);
+test_on_all_dbs!(test_in_literal_array_i32_impl);
+test_on_all_dbs!(test_in_literal_array_str_impl);
