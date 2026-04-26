@@ -1,55 +1,41 @@
-// 定义 User 模型
-#[derive(Debug, ormer::Model)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    #[index]
-    age: i32,
-    email: Option<String>,
-}
+// #[derive(Debug, ormer::Model)]
+// #[table = "users"]
+// struct User {
+//     #[primary(auto)]
+//     id: i32,
+//     #[unique]
+//     name: String,
+//     #[index]
+//     age: i32,
+//     email: Option<String>,
+// }
 
-#[derive(Debug, ormer::Model)]
-#[table = "roles"]
-struct Role {
-    #[primary]
-    id: i32,
-    #[foreign(User.id)]
-    #[unique(group = 1)]
-    uid: i32,
-    #[unique(group = 1)]
-    name: String,
-}
+// #[derive(Debug, ormer::Model)]
+// #[table = "roles"]
+// struct Role {
+//     #[primary]
+//     id: i32,
+//     #[foreign(User.id)]
+//     #[unique(group = 1)]
+//     uid: i32,
+//     #[unique(group = 1)]
+//     name: String,
+// }
+
+// #[derive(Debug, ormer::Model)]
+// #[table = "new_users"]
+// struct NewUser(User);
+
+// #[derive(Debug, ormer::Model)]
+// #[table = "new_roles"]
+// struct NewRole(Role);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // connect - 根据启用的特性选择数据库类型
-    #[cfg(feature = "turso")]
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+    // let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
 
-    #[cfg(all(feature = "postgresql", not(feature = "turso")))]
-    let db = ormer::Database::connect(
-        ormer::DbType::PostgreSQL,
-        "postgres://postgres:postgres@127.0.0.1/ormer_test",
-    )
-    .await?;
-
-    #[cfg(all(feature = "mysql", not(feature = "turso"), not(feature = "postgresql")))]
-    let db = ormer::Database::connect(
-        ormer::DbType::MySQL,
-        "mysql://root:root@127.0.0.1:3306/ormer_test",
-    )
-    .await?;
-
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
-    {
-        eprintln!("No database feature enabled. Please enable one of: turso, postgresql, mysql");
-        return Err("No database feature enabled".into());
-    }
-    db.create_table::<User>().await?;
-    db.create_table::<Role>().await?;
+    // db.create_table::<User>().execute().await?;
+    // db.create_table::<NewRole>().execute().await?;
 
     // let users = db.exec_table::<User>("SELECT * FROM users;").await?;
     // println!("query result: {users:?}");
@@ -245,8 +231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // //     .collect::<Vec<_>>()
     // //     .await?;
 
-    // drop table
-    db.drop_table::<User>().await?;
-    db.drop_table::<Role>().await?;
+    // // drop table
+    // db.drop_table::<User>().execute().await?;
+    // db.drop_table::<NewRole>().execute().await?;
     Ok(())
 }

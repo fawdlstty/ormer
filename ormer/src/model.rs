@@ -145,7 +145,16 @@ macro_rules! impl_insertable_for_ref_collections {
 
 /// 运行时动态生成 CREATE TABLE SQL
 pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbType) -> String {
-    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", T::TABLE_NAME);
+    generate_create_table_sql_with_name::<T>(db_type, None)
+}
+
+/// 生成 CREATE TABLE SQL 语句，支持自定义表名
+pub fn generate_create_table_sql_with_name<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+    table_name: Option<&str>,
+) -> String {
+    let table_name = table_name.unwrap_or(T::TABLE_NAME);
+    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
 
     for (i, column) in T::COLUMN_SCHEMA.iter().enumerate() {
         if i > 0 {
@@ -193,7 +202,7 @@ pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbTyp
     sql.push(')');
 
     // 添加索引
-    let index_sql = generate_indexes::<T>(db_type);
+    let index_sql = generate_indexes_with_name::<T>(db_type, table_name);
     if !index_sql.is_empty() {
         sql.push_str(";");
         sql.push_str(&index_sql);
@@ -231,18 +240,38 @@ fn generate_unique_constraints<T: Model>() -> Vec<String> {
 }
 
 /// 生成索引 SQL
-fn generate_indexes<T: Model>(_db_type: crate::abstract_layer::DbType) -> String {
+#[allow(dead_code)]
+fn generate_indexes<T: Model>(db_type: crate::abstract_layer::DbType) -> String {
+    generate_indexes_with_name::<T>(db_type, T::TABLE_NAME)
+}
+
+/// 生成索引 SQL，支持自定义表名
+fn generate_indexes_with_name<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+    table_name: &str,
+) -> String {
     let mut sqls = Vec::new();
+
+    // 检查是否为 MySQL 数据库（通过调试字符串）
+    let is_mysql = format!("{:?}", db_type).contains("MySQL");
 
     for column in T::COLUMN_SCHEMA.iter() {
         if column.is_indexed {
-            let index_name = format!("idx_{}_{}", T::TABLE_NAME, column.name);
-            sqls.push(format!(
-                "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
-                index_name,
-                T::TABLE_NAME,
-                column.name
-            ));
+            let index_name = format!("idx_{}_{}", table_name, column.name);
+            // MySQL 不支持 CREATE INDEX IF NOT EXISTS，需要特殊处理
+            let sql = if is_mysql {
+                format!(
+                    "CREATE INDEX {} ON {} ({})",
+                    index_name, table_name, column.name
+                )
+            } else {
+                // PostgreSQL 和 Turso (SQLite) 支持 IF NOT EXISTS
+                format!(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+                    index_name, table_name, column.name
+                )
+            };
+            sqls.push(sql);
         }
     }
 

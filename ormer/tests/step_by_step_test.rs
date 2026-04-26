@@ -1,22 +1,15 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "test_users2"]
-struct TestUser2 {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user!(TestUser2, "step_by_step_users_1");
 
 async fn test_step_by_step_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUser2>().await?;
+    db.create_table::<TestUser2>().execute().await?;
 
     // insert
     db.insert(&TestUser2 {
@@ -67,7 +60,7 @@ async fn test_step_by_step_impl(
     println!("Combined query OK: {:?}", users);
 
     // 清理测试表
-    db.drop_table::<TestUser2>().await?;
+    db.drop_table::<TestUser2>().execute().await?;
 
     Ok(())
 }

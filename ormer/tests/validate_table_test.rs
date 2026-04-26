@@ -1,17 +1,9 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-// 测试模型定义
-#[derive(Debug, Model)]
-#[table = "validate_test_users"]
-struct ValidateTestUser {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(ValidateTestUser, "validate_table_users_1");
 
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 mod validate_table_tests {
@@ -24,10 +16,10 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 先删除表（如果存在）
-        db.drop_table::<ValidateTestUser>().await.ok();
+        db.drop_table::<ValidateTestUser>().execute().await.ok();
 
         // 创建表
-        db.create_table::<ValidateTestUser>().await?;
+        db.create_table::<ValidateTestUser>().execute().await?;
 
         // 验证表结构应该成功
         db.validate_table::<ValidateTestUser>().await?;
@@ -35,7 +27,7 @@ mod validate_table_tests {
         println!("validate_table succeeded for existing table");
 
         // 清理
-        db.drop_table::<ValidateTestUser>().await?;
+        db.drop_table::<ValidateTestUser>().execute().await?;
 
         Ok(())
     }
@@ -46,7 +38,7 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 确保表不存在
-        db.drop_table::<ValidateTestUser>().await.ok();
+        db.drop_table::<ValidateTestUser>().execute().await.ok();
 
         // 验证不存在的表应该失败
         let result = db.validate_table::<ValidateTestUser>().await;
@@ -56,7 +48,7 @@ mod validate_table_tests {
         );
 
         if let Err(ormer::Error::SchemaMismatch { table, reason }) = result {
-            assert_eq!(table, "validate_test_users");
+            assert_eq!(table, "validate_table_users_1");
             assert!(
                 reason.contains("does not exist"),
                 "Error reason should mention table does not exist"
@@ -75,15 +67,15 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 先删除表（如果存在）
-        db.drop_table::<ValidateTestUser>().await?;
+        db.drop_table::<ValidateTestUser>().execute().await?;
 
         // 创建表（不应该进行验证）
-        db.create_table::<ValidateTestUser>().await?;
+        db.create_table::<ValidateTestUser>().execute().await?;
 
         println!("create_table succeeded without validation");
 
         // 清理
-        db.drop_table::<ValidateTestUser>().await?;
+        db.drop_table::<ValidateTestUser>().execute().await?;
 
         Ok(())
     }

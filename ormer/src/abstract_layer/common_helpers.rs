@@ -25,6 +25,11 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                 DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
+                #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                DbType::None => {
+                    // 当没有启用任何特性时，仅用于编译通过
+                    let _ = (column, operator);
+                }
             }
             *param_idx += 1;
         }
@@ -55,6 +60,8 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    DbType::None => {}
                 }
                 *param_idx += 1;
             }
@@ -114,6 +121,11 @@ pub fn format_filter_with_params(
                 DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
+                #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                DbType::None => {
+                    // 当没有启用任何特性时，仅用于编译通过
+                    let _ = (column, operator);
+                }
             }
             params.push(value.clone().into());
             *param_idx += 1;
@@ -145,6 +157,8 @@ pub fn format_filter_with_params(
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    DbType::None => {}
                 }
                 params.push(value.clone().into());
                 *param_idx += 1;

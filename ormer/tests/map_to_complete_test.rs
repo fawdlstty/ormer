@@ -1,44 +1,13 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
 // ==================== 测试Model定义 ====================
-
-#[derive(Debug, Model)]
-#[table = "users"]
-struct User {
-    #[primary]
-    id: i32,
-    name: String,
-    email: String,
-    age: i32,
-}
-
-#[derive(Debug, Model)]
-#[table = "roles"]
-struct Role {
-    #[primary]
-    id: i32,
-    user_id: i32,
-    role_name: String,
-}
-
-// 单字段Model - 用于测试collect_with转换
-#[derive(Debug, Model, PartialEq)]
-#[table = "user_ids"]
-struct UserId {
-    #[primary]
-    id: i32,
-}
-
-// 双字段Model - 用于测试collect_with转换
-#[derive(Debug, Model, PartialEq)]
-#[table = "user_name_age"]
-struct UserNameAge {
-    #[primary]
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_for_map_to!(User, "map_to_users_1");
+define_test_role_for_map_to!(Role, "map_to_roles_1");
+define_test_user_id_with_eq!(UserId, "map_to_user_ids_1");
+define_test_user_name_age!(UserNameAge, "map_to_user_name_age_1");
 
 // ==================== 测试用例 ====================
 
@@ -50,9 +19,13 @@ async fn test_map_to_complete_usage_impl(
     // 创建内存数据库
     let db = _test_common::create_db_connection(config).await?;
 
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<Role>().execute().await;
+    let _ = db.drop_table::<User>().execute().await;
+
     // 创建表
-    db.create_table::<User>().await?;
-    db.create_table::<Role>().await?;
+    db.create_table::<User>().execute().await?;
+    db.create_table::<Role>().execute().await?;
 
     // 插入测试数据
     db.insert(&User {
@@ -264,8 +237,8 @@ async fn test_map_to_complete_usage_impl(
     println!("========== 所有测试通过！==========\n");
 
     // 清理测试表（先删除有外键的表）
-    db.drop_table::<Role>().await?;
-    db.drop_table::<User>().await?;
+    db.drop_table::<Role>().execute().await?;
+    db.drop_table::<User>().execute().await?;
 
     Ok(())
 }

@@ -1,67 +1,14 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-// 定义测试模型 - 每个测试使用不同的表名避免并发冲突
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_count_users"]
-struct TestAggCountUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
-
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_sum_users"]
-struct TestAggSumUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
-
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_avg_users"]
-struct TestAggAvgUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
-
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_max_users"]
-struct TestAggMaxUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
-
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_min_users"]
-struct TestAggMinUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
-
-#[derive(Debug, Model, Clone)]
-#[table = "test_agg_filter_users"]
-struct TestAggFilterUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    score: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_with_score!(TestAggCountUser, "test_agg_count_users_1");
+define_test_user_with_score!(TestAggSumUser, "test_agg_sum_users_1");
+define_test_user_with_score!(TestAggAvgUser, "test_agg_avg_users_1");
+define_test_user_with_score!(TestAggMaxUser, "test_agg_max_users_1");
+define_test_user_with_score!(TestAggMinUser, "test_agg_min_users_1");
+define_test_user_with_score!(TestAggFilterUser, "test_agg_filter_users_1");
 
 /// 测试 COUNT 聚合函数
 async fn test_count_aggregate_impl(
@@ -69,8 +16,8 @@ async fn test_count_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggCountUser>().await;
-    db.create_table::<TestAggCountUser>().await?;
+    let _ = db.drop_table::<TestAggCountUser>().execute().await;
+    db.create_table::<TestAggCountUser>().execute().await?;
 
     db.insert(&TestAggCountUser {
         id: 1,
@@ -99,7 +46,7 @@ async fn test_count_aggregate_impl(
 
     assert_eq!(count, 3);
 
-    let _ = db.drop_table::<TestAggCountUser>().await;
+    let _ = db.drop_table::<TestAggCountUser>().execute().await;
 
     Ok(())
 }
@@ -110,8 +57,8 @@ async fn test_sum_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggSumUser>().await;
-    db.create_table::<TestAggSumUser>().await?;
+    let _ = db.drop_table::<TestAggSumUser>().execute().await;
+    db.create_table::<TestAggSumUser>().execute().await?;
 
     db.insert(&TestAggSumUser {
         id: 1,
@@ -140,7 +87,7 @@ async fn test_sum_aggregate_impl(
 
     assert_eq!(sum, Some(67)); // 20 + 25 + 22
 
-    db.drop_table::<TestAggSumUser>().await?;
+    db.drop_table::<TestAggSumUser>().execute().await?;
 
     Ok(())
 }
@@ -151,8 +98,8 @@ async fn test_avg_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggAvgUser>().await;
-    db.create_table::<TestAggAvgUser>().await?;
+    let _ = db.drop_table::<TestAggAvgUser>().execute().await;
+    db.create_table::<TestAggAvgUser>().execute().await?;
 
     db.insert(&TestAggAvgUser {
         id: 1,
@@ -181,7 +128,7 @@ async fn test_avg_aggregate_impl(
 
     assert!((avg.unwrap() - 85.0).abs() < 0.01);
 
-    db.drop_table::<TestAggAvgUser>().await?;
+    db.drop_table::<TestAggAvgUser>().execute().await?;
 
     Ok(())
 }
@@ -192,8 +139,8 @@ async fn test_max_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggMaxUser>().await;
-    db.create_table::<TestAggMaxUser>().await?;
+    let _ = db.drop_table::<TestAggMaxUser>().execute().await;
+    db.create_table::<TestAggMaxUser>().execute().await?;
 
     db.insert(&TestAggMaxUser {
         id: 1,
@@ -222,7 +169,7 @@ async fn test_max_aggregate_impl(
 
     assert_eq!(max, Some(25));
 
-    db.drop_table::<TestAggMaxUser>().await?;
+    db.drop_table::<TestAggMaxUser>().execute().await?;
 
     Ok(())
 }
@@ -233,8 +180,8 @@ async fn test_min_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggMinUser>().await;
-    db.create_table::<TestAggMinUser>().await?;
+    let _ = db.drop_table::<TestAggMinUser>().execute().await;
+    db.create_table::<TestAggMinUser>().execute().await?;
 
     db.insert(&TestAggMinUser {
         id: 1,
@@ -263,7 +210,7 @@ async fn test_min_aggregate_impl(
 
     assert_eq!(min, Some(20));
 
-    db.drop_table::<TestAggMinUser>().await?;
+    db.drop_table::<TestAggMinUser>().execute().await?;
 
     Ok(())
 }
@@ -274,8 +221,8 @@ async fn test_aggregate_with_filter_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggFilterUser>().await;
-    db.create_table::<TestAggFilterUser>().await?;
+    let _ = db.drop_table::<TestAggFilterUser>().execute().await;
+    db.create_table::<TestAggFilterUser>().execute().await?;
 
     db.insert(&TestAggFilterUser {
         id: 1,
@@ -317,7 +264,7 @@ async fn test_aggregate_with_filter_impl(
 
     assert_eq!(max, Some(92));
 
-    db.drop_table::<TestAggFilterUser>().await?;
+    db.drop_table::<TestAggFilterUser>().execute().await?;
 
     Ok(())
 }

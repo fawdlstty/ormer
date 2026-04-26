@@ -1,17 +1,11 @@
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::Model;
 
 mod _test_common;
 
-// 测试模型定义
-#[derive(Model)]
-#[table = "users"]
-struct TestUser {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(TestUser, "syntax_validation_users_1");
 
 #[cfg(test)]
 mod syntax_validation {
@@ -26,14 +20,14 @@ mod syntax_validation {
     async fn test_model_constants_impl(config: &_test_common::DbConfig) {
         let _config = config; // 仅用于获取数据库类型
         // 验证 Model trait 实现正确
-        assert_eq!(TestUser::TABLE_NAME, "users");
-        assert_eq!(TestUser::COLUMNS, &["id", "name", "age", "email"]);
+        assert_eq!(TestUser::TABLE_NAME, "syntax_validation_users_1");
+        assert_eq!(TestUser::COLUMNS, &["id", "name", "age"]);
     }
 
     async fn test_query_builder_creation_impl(config: &_test_common::DbConfig) {
         let query = TestUser::query();
         let sql = query.to_sql_with_params(config.0);
-        assert_eq!(sql.0, "SELECT id, name, age, email FROM users");
+        assert_eq!(sql.0, "SELECT id, name, age FROM syntax_validation_users_1");
     }
 
     async fn test_query_with_filter_impl(config: &_test_common::DbConfig) {
@@ -56,7 +50,7 @@ mod syntax_validation {
 
         let sql = TestUser::query().to_sql_with_params(config.0);
         assert!(sql.0.contains("SELECT"));
-        assert!(sql.0.contains("FROM users"));
+        assert!(sql.0.contains("FROM syntax_validation_users_1"));
     }
 
     async fn test_complex_query_impl(config: &_test_common::DbConfig) {
@@ -81,7 +75,7 @@ mod syntax_validation {
         // PostgreSQL 使用 $1, $2 等占位符
         // 这里验证基本结构
         assert!(sql.0.starts_with("SELECT"));
-        assert!(sql.0.contains("FROM users"));
+        assert!(sql.0.contains("FROM syntax_validation_users_1"));
     }
 
     test_on_all_dbs!(test_model_constants_impl);

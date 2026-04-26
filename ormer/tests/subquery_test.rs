@@ -1,25 +1,10 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "sq_users"]
-struct TestUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
-
-#[derive(Debug, Model)]
-#[table = "sq_roles"]
-struct TestRole {
-    #[primary(auto)]
-    id: i32,
-    #[foreign(TestUser)]
-    uid: i32,
-    name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_for_join!(TestUser, "test_subquery_users_1");
+define_test_role!(TestRole, "test_subquery_roles_1");
 
 // ==================== MappedSelect SQL 生成测试 ====================
 
@@ -32,7 +17,7 @@ async fn test_mapped_select_basic_impl(config: &_test_common::DbConfig) {
         .to_sql_with_params(config.0);
 
     println!("SQL: {}", sql.0);
-    assert!(sql.0.starts_with("SELECT id FROM sq_users"));
+    assert!(sql.0.starts_with("SELECT id FROM test_subquery_users_1"));
     assert!(sql.0.contains("WHERE name ="));
 }
 
@@ -45,7 +30,7 @@ fn test_mapped_select_different_column() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT uid FROM sq_roles"));
+    assert!(sql.starts_with("SELECT uid FROM test_subquery_roles_1"));
     assert!(sql.contains("WHERE name ="));
 }
 
@@ -55,7 +40,7 @@ fn test_mapped_select_without_filter() {
     let sql = ormer::Select::<TestUser>::new().map_to(|u| u.name).to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT name FROM sq_users"));
+    assert!(sql.starts_with("SELECT name FROM test_subquery_users_1"));
     assert!(!sql.contains("WHERE"));
 }
 
@@ -69,7 +54,7 @@ fn test_mapped_select_with_order_by() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT id FROM sq_users"));
+    assert!(sql.starts_with("SELECT id FROM test_subquery_users_1"));
     assert!(sql.contains("WHERE age >="));
     assert!(sql.contains("ORDER BY name ASC"));
 }
@@ -84,7 +69,7 @@ fn test_mapped_select_with_range() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT id FROM sq_users"));
+    assert!(sql.starts_with("SELECT id FROM test_subquery_users_1"));
     assert!(sql.contains("WHERE age >="));
     assert!(sql.contains("LIMIT 10"));
 }
@@ -99,7 +84,7 @@ fn test_mapped_select_with_order_and_range() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT name FROM sq_users"));
+    assert!(sql.starts_with("SELECT name FROM test_subquery_users_1"));
     assert!(sql.contains("ORDER BY age DESC"));
     assert!(sql.contains("LIMIT 10 OFFSET 5"));
 }
@@ -114,7 +99,7 @@ fn test_mapped_select_multiple_filters() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT id FROM sq_users"));
+    assert!(sql.starts_with("SELECT id FROM test_subquery_users_1"));
     assert!(sql.contains("name ="));
     assert!(sql.contains("age >="));
     assert!(sql.contains(" AND "));
@@ -167,7 +152,7 @@ fn test_subquery_sql_generation() {
     let subquery_sql = subquery.to_sql();
     println!("Subquery SQL: {}", subquery_sql);
 
-    assert!(subquery_sql.starts_with("SELECT uid FROM sq_roles"));
+    assert!(subquery_sql.starts_with("SELECT uid FROM test_subquery_roles_1"));
     assert!(subquery_sql.contains("WHERE name ="));
 }
 
@@ -182,7 +167,7 @@ fn test_subquery_sql_with_multiple_filters() {
     let subquery_sql = subquery.to_sql();
     println!("Subquery SQL: {}", subquery_sql);
 
-    assert!(subquery_sql.starts_with("SELECT uid FROM sq_roles"));
+    assert!(subquery_sql.starts_with("SELECT uid FROM test_subquery_roles_1"));
     assert!(subquery_sql.contains("name ="));
     assert!(subquery_sql.contains("uid >="));
     assert!(subquery_sql.contains(" AND "));
@@ -196,7 +181,7 @@ fn test_subquery_sql_without_filter() {
     let subquery_sql = subquery.to_sql();
     println!("Subquery SQL: {}", subquery_sql);
 
-    assert!(subquery_sql.starts_with("SELECT uid FROM sq_roles"));
+    assert!(subquery_sql.starts_with("SELECT uid FROM test_subquery_roles_1"));
     assert!(!subquery_sql.contains("WHERE"));
 }
 
@@ -212,7 +197,7 @@ fn test_subquery_sql_with_order_and_range() {
     let subquery_sql = subquery.to_sql();
     println!("Subquery SQL: {}", subquery_sql);
 
-    assert!(subquery_sql.starts_with("SELECT uid FROM sq_roles"));
+    assert!(subquery_sql.starts_with("SELECT uid FROM test_subquery_roles_1"));
     assert!(subquery_sql.contains("WHERE name ="));
     assert!(subquery_sql.contains("ORDER BY uid ASC"));
     assert!(subquery_sql.contains("LIMIT 10"));
@@ -229,7 +214,7 @@ fn test_mapped_select_string_field() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT name FROM sq_users"));
+    assert!(sql.starts_with("SELECT name FROM test_subquery_users_1"));
     assert!(sql.contains("WHERE age ="));
 }
 
@@ -242,7 +227,7 @@ fn test_mapped_select_age_field() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT age FROM sq_users"));
+    assert!(sql.starts_with("SELECT age FROM test_subquery_users_1"));
     assert!(sql.contains("WHERE name ="));
 }
 
@@ -283,7 +268,7 @@ fn test_mapped_select_complex_scenario() {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.starts_with("SELECT id FROM sq_users"));
+    assert!(sql.starts_with("SELECT id FROM test_subquery_users_1"));
     assert!(sql.contains("name ="));
     assert!(sql.contains("age >="));
     assert!(sql.contains("age <="));
@@ -306,5 +291,5 @@ fn test_subquery_for_in_clause() {
     // 验证生成的 SQL 适合作为 IN 子句的子查询
     assert!(sql.starts_with("SELECT"));
     assert!(sql.contains("uid"));
-    assert!(sql.contains("FROM sq_roles"));
+    assert!(sql.contains("FROM test_subquery_roles_1"));
 }

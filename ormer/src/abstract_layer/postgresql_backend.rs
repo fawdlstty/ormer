@@ -99,35 +99,20 @@ pub struct Database {
     connection_handle: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 
-impl Database {
-    /// 连接到 PostgreSQL 数据库
-    pub async fn connect(
-        _db_type: super::DbType,
-        connection_string: &str,
-    ) -> Result<Self, crate::Error> {
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+/// 创建表执行器
+pub struct CreateTableExecutor<'a, T: Model> {
+    client: &'a tokio_postgres::Client,
+    table_name: Option<String>,
+    _marker: std::marker::PhantomData<T>,
+}
 
-        // 在后台运行连接
-        let connection_handle = tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                // PostgreSQL connection error silently handled
-            }
-            Ok(())
-        });
-
-        Ok(Self {
-            client,
-            connection_handle,
-        })
-    }
-
-    /// 创建表
-    pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
+impl<'a, T: Model> CreateTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
         // 表不存在，创建新表
-        let create_sql =
-            crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::PostgreSQL);
+        let create_sql = crate::generate_create_table_sql_with_name::<T>(
+            crate::abstract_layer::DbType::PostgreSQL,
+            self.table_name.as_deref(),
+        );
 
         // 分离 CREATE TABLE 和 CREATE INDEX 语句
         let sql_parts: Vec<&str> = create_sql.split(';').collect();
@@ -145,6 +130,57 @@ impl Database {
         }
 
         Ok(())
+    }
+}
+
+/// 删除表执行器
+pub struct DropTableExecutor<'a, T: Model> {
+    client: &'a tokio_postgres::Client,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
+        self.client
+            .execute(&sql, &[])
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl Database {
+    /// 连接到 PostgreSQL 数据库
+    pub async fn connect(
+        _db_type: super::DbType,
+        connection_string: &str,
+    ) -> Result<Self, crate::Error> {
+        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        // 在后台运行连接
+        let connection_handle = tokio::spawn(async move {
+            if let Err(_e) = connection.await {
+                // PostgreSQL connection error silently handled
+            }
+            Ok(())
+        });
+
+        Ok(Self {
+            client,
+            connection_handle,
+        })
+    }
+
+    /// 创建表 - 返回执行器
+    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+        CreateTableExecutor {
+            client: &self.client,
+            table_name: None,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 验证表结构是否与模型定义匹配
@@ -517,14 +553,12 @@ impl Database {
         })
     }
 
-    /// 删除表
-    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
-        let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
-        self.client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-        Ok(())
+    /// 删除表 - 返回执行器
+    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+        DropTableExecutor {
+            client: &self.client,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 执行原生 SQL 查询并返回模型列表
@@ -663,10 +697,12 @@ impl<'a> Transaction<'a> {
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| crate::Error::Database(format!("db error: {}", e)))?;
+        self.client.execute(&sql, &param_refs).await.map_err(|e| {
+            crate::Error::Database(format!(
+                "Transaction insert_batch failed: {:?}, SQL: {}",
+                e, sql
+            ))
+        })?;
 
         Ok(())
     }
@@ -770,13 +806,13 @@ pub struct MappedSelectExecutor<'a, T: Model, V> {
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
     {
         MappedCollectFuture {
-            select: self.select,
+            select: self.select.clone(),
             client: self.client,
             _marker: PhantomData,
         }
@@ -838,6 +874,15 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 克隆executor（保持相同的client引用）
+    pub fn clone_with_client(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F>(self, f: F) -> Self
     where
@@ -936,9 +981,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<'a, T, C> {
+    pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<'a, T, C> {
         CollectFuture {
-            executor: self,
+            executor: self.clone_with_client(),
             _marker: PhantomData,
         }
     }
@@ -1427,32 +1472,51 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> Result<u64, crate::Error> {
-        let sql = self.build_sql();
+        let (sql, params) = self.build_sql_with_params();
+
+        // 获取列的rust_type信息
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let pg_params = values_to_params_with_types(&params, &rust_types)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p.as_ref()).collect();
 
         let result = self
             .client
-            .execute(&sql, &[])
+            .execute(&sql, &param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(result)
     }
 
+    #[allow(dead_code)]
     fn build_sql(&self) -> String {
+        let (sql, _) = self.build_sql_with_params();
+        sql
+    }
+
+    fn build_sql_with_params(&self) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut params = Vec::new();
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
-            let mut param_idx = 1;
+            let mut param_idx: usize = 1;
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter(filter, &mut sql, &mut param_idx, DbType::PostgreSQL);
+                common_helpers::format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    DbType::PostgreSQL,
+                );
             }
         }
 
-        sql
+        (sql, params)
     }
 }
 
@@ -2122,6 +2186,15 @@ impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model
 
 /// LeftJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的client引用）
+    pub fn clone_with_client(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2142,10 +2215,10 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     }
 
     pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
-        self,
+        &self,
     ) -> LeftJoinCollectFuture<'a, T, J> {
         LeftJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_client(),
             _marker: PhantomData,
         }
     }
@@ -2299,6 +2372,15 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
 /// InnerJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的client引用）
+    pub fn clone_with_client(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2318,9 +2400,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<'a, T, J> {
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<'a, T, J> {
         InnerJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_client(),
             _marker: PhantomData,
         }
     }
@@ -2456,6 +2538,15 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
 /// RightJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的client引用）
+    pub fn clone_with_client(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2476,10 +2567,10 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
-        self,
+        &self,
     ) -> RightJoinCollectFuture<'a, T, J> {
         RightJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_client(),
             _marker: PhantomData,
         }
     }

@@ -1,19 +1,16 @@
-#[derive(Debug, ormer::Model)]
-#[table = "test_roles"]
-struct TestRole {
-    #[primary]
-    id: i32,
-    name: String,
-}
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
+
+// 使用宏定义测试专用模型（唯一表名）
+define_test_role_simple!(TestRole, "test_insert_or_update_roles_1");
 
 async fn test_insert_or_update_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接数据库
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestRole>().await?;
+    db.create_table::<TestRole>().execute().await?;
 
     // 第一次插入
     db.insert_or_update(&TestRole {
@@ -46,7 +43,7 @@ async fn test_insert_or_update_impl(
     println!("\n测试通过！insert_or_update 方法在遇到重复记录时成功执行了更新操作");
 
     // 清理测试表
-    db.drop_table::<TestRole>().await?;
+    db.drop_table::<TestRole>().execute().await?;
 
     Ok(())
 }

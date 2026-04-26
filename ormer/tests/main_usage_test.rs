@@ -1,37 +1,18 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "test_users"]
-struct TestUser {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    #[index]
-    age: i32,
-    email: Option<String>,
-}
-
-#[derive(Debug, Model)]
-#[table = "test_roles"]
-struct TestRole {
-    #[primary]
-    id: i32,
-    #[unique(group = 1)]
-    uid: i32,
-    #[unique(group = 1)]
-    name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user!(TestUser, "test_main_users_1");
+define_test_role_with_unique_group!(TestRole, "test_main_roles_1");
 
 async fn test_main_rs_usage_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // connect
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUser>().await?;
-    db.create_table::<TestRole>().await?;
+    db.create_table::<TestUser>().execute().await?;
+    db.create_table::<TestRole>().execute().await?;
 
     // insert
     db.insert(&TestUser {
@@ -172,8 +153,8 @@ async fn test_main_rs_usage_impl(
     t.commit().await?;
 
     // drop table
-    db.drop_table::<TestUser>().await?;
-    db.drop_table::<TestRole>().await?;
+    db.drop_table::<TestUser>().execute().await?;
+    db.drop_table::<TestRole>().execute().await?;
 
     Ok(())
 }

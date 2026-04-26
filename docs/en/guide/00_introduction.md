@@ -1,30 +1,15 @@
-# Introduction to Ormer
+﻿# Introduction to Ormer
 
-Ormer is a minimal, high-performance Rust ORM framework focused on providing type-safe, compile-time optimized database operation experience.
+Ormer is a minimal, high-performance Rust ORM framework providing type-safe database operations.
 
 ## Core Features
 
-### 🎯 Type Safety
-- Compile-time type checking to avoid runtime errors
-- Field-level type inference
-- Strongly-typed query builder
+- **Type Safety**: Compile-time type checking, strongly-typed query builder
+- **High Performance**: Zero-cost abstraction, async runtime, connection pool support
+- **Multi-Database**: Turso/SQLite, PostgreSQL, MySQL
+- **Elegant API**: Chainable queries, macro-driven models, intuitive syntax
 
-### ⚡ High Performance
-- Built on Rust async runtime
-- Zero-cost abstraction, no runtime overhead
-- Connection pool management support
-
-### 🔧 Multi-Database Support
-- **Turso (libSQL/SQLite)** - Embedded database
-- **PostgreSQL** - Enterprise-grade relational database
-- **MySQL** - Popular open-source database
-
-### 📝 Elegant API Design
-- Chainable query building
-- Macro-driven model definition
-- Intuitive filtering and sorting syntax
-
-### 🔍 Rich Query Capabilities
+## Query Capabilities
 - Basic CRUD operations
 - Complex filter conditions (comparison, IN, LIKE, etc.)
 - Aggregate queries (COUNT, SUM, AVG, MAX, MIN)
@@ -39,22 +24,9 @@ Ormer is a minimal, high-performance Rust ORM framework focused on providing typ
 - Query, insert, update, delete within transactions
 - Commit and rollback control
 
-## Design Philosophy
 
-Ormer's design philosophy is **"simple but not simplistic"**:
 
-1. **Compile-time Optimization**: Catch errors at compile time rather than runtime
-2. **Type Safety**: Leverage Rust's type system to ensure correctness of data operations
-3. **Minimal API**: Complete the most common operations with the least code
-4. **Extensibility**: Support custom extensions through trait system
 
-## Use Cases
-
-- Web application backend development
-- Data-intensive applications
-- Microservice architecture
-- Scenarios requiring high-performance database operations
-- Projects with strict type safety requirements
 
 
 ## Quick Preview
@@ -78,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(DbType::Turso, "file:test.db").await?;
     
     // Create table
-    db.create_table::<User>().await?;
+    db.create_table::<User>().execute().await?;
     
     // Insert data
     db.insert(&User {
@@ -101,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // Cleanup
-    db.drop_table::<User>().await?;
+    db.drop_table::<User>().execute().await?;
     
     Ok(())
 }

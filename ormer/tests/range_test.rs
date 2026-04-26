@@ -1,27 +1,12 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::query::builder::Select;
 
 mod _test_common;
 
-// 定义测试用的 User 模型
-#[derive(Debug, Model)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
-
-// 定义测试用的 Role 模型
-#[derive(Debug, Model)]
-#[table = "roles"]
-struct Role {
-    #[primary]
-    id: i32,
-    uid: i32,
-    name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_for_join!(User, "test_range_users_1");
+define_test_role!(Role, "test_range_roles_1");
 
 async fn test_basic_range_impl(config: &_test_common::DbConfig) {
     // 测试 range(0..10)

@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,7 +14,7 @@ readme = "../README.md"
 exclude = ["src/main.rs"]
 
 [dependencies]
-ormer-derive = { version = "0.1.4", path = "../ormer-derive" }
+ormer-derive = { version = "0.1.5", path = "../ormer-derive" }
 thiserror = "1.0"
 async-trait = "0.1"
 tokio = { version = "1.52.1", features = ["full"] }
@@ -28,15 +28,8 @@ paste = "1.0"
 [dev-dependencies]
 paste = "1.0"
 
-[[test]]
-name = "aggregate_test"
-harness = true
-
-[lib]
-doctest = false
-
 [features]
-default = ["turso"]
+default = []
 full = ["turso", "postgresql", "mysql"]
 turso = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types"]

@@ -1,22 +1,13 @@
-# Quick Start
-
-This guide will help you get started with Ormer in 5 minutes.
+﻿# Quick Start
 
 ## Requirements
 
 - Rust 1.70+
-- Cargo package manager
+- Cargo
 
 ## Installation
 
-### 1. Create a New Project
-
-```bash
-cargo new my_project
-cd my_project
-```
-
-### 2. Add Dependencies
+### Add Dependencies
 
 Add Ormer dependency and async runtime to `Cargo.toml`:
 
@@ -26,23 +17,14 @@ ormer = { version = "0.1", features = ["turso"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-**Choose Database Features:**
+**Database Features:**
+- `turso` - Turso/libSQL/SQLite
+- `postgresql` - PostgreSQL
+- `mysql` - MySQL
 
-- `turso` - Turso/libSQL/SQLite database
-- `postgresql` - PostgreSQL database
-- `mysql` - MySQL database
 
-You can enable multiple database features simultaneously:
 
-```toml
-ormer = { version = "0.1", features = ["turso", "postgresql"] }
-```
-
-## Your First Ormer Program
-
-### Complete Example
-
-Create `src/main.rs`:
+## Complete Example
 
 ```rust
 use ormer::{Database, DbType, Model};
@@ -64,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(DbType::Turso, "file:test.db").await?;
     
     // 3. Create table
-    db.create_table::<User>().await?;
+    db.create_table::<User>().execute().await?;
     
     // 4. Insert data
     db.insert(&User {
@@ -95,23 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // 7. Cleanup
-    db.drop_table::<User>().await?;
+    db.drop_table::<User>().execute().await?;
     
     Ok(())
 }
 ```
 
-### Run the Program
-
-```bash
-cargo run
-```
-
-**Output:**
-```
-User: Alice (age: 25)
-User: Bob (age: 30)
-```
+Run: `cargo run`
 
 ## Core Operations Overview
 

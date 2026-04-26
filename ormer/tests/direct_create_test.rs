@@ -1,15 +1,11 @@
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::Model;
 
 mod _test_common;
 
-#[derive(Debug, Model, Clone)]
-#[table = "test_direct_users"]
-struct TestDirectUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_direct!(TestDirectUser, "test_direct_users_1");
 
 async fn test_direct_create_table_impl(
     config: &_test_common::DbConfig,
@@ -17,7 +13,7 @@ async fn test_direct_create_table_impl(
     let db = _test_common::create_db_connection(config).await?;
 
     println!("Creating table...");
-    db.create_table::<TestDirectUser>().await?;
+    db.create_table::<TestDirectUser>().execute().await?;
     println!("Table created successfully!");
 
     // 打印 INSERT SQL
@@ -49,7 +45,7 @@ async fn test_direct_create_table_impl(
     println!("Users: {:?}", users);
 
     // 清理测试表
-    db.drop_table::<TestDirectUser>().await?;
+    db.drop_table::<TestDirectUser>().execute().await?;
 
     Ok(())
 }

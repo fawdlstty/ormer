@@ -1,25 +1,10 @@
-# Data Operations
+﻿# Data Operations
 
-This document details Ormer's CRUD (Create, Read, Update, Delete) operations.
-
-## Insert Data (Create)
+## Insert (Create)
 
 ### Single Insert
 
-Use the `insert()` method to insert a single record:
-
 ```rust
-#[derive(Debug, Model)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
-
-// Insert single record
 db.insert(&User {
     id: 1,
     name: "Alice".to_string(),
@@ -30,138 +15,44 @@ db.insert(&User {
 
 ### Batch Insert
 
-#### Using Vec
-
 ```rust
-let users = vec![
-    User {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 25,
-        email: None,
-    },
-    User {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 30,
-        email: Some("bob@example.com".to_string()),
-    },
-    User {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 35,
-        email: Some("charlie@example.com".to_string()),
-    },
-];
+// Vec
+db.insert(&vec![user1, user2, user3]).await?;
 
-db.insert(&users).await?;
+// Array
+db.insert(&[user1, user2]).await?;
 ```
 
-#### Using Array
+### Insert or Update
 
 ```rust
-db.insert(&[
-    User { id: 1, name: "Alice".to_string(), age: 25, email: None },
-    User { id: 2, name: "Bob".to_string(), age: 30, email: None },
-]).await?;
+db.insert_or_update(&user).await?;
+db.insert_or_update(&vec![user1, user2]).await?;
 ```
 
-#### Using Slice
+## Read (Query)
 
 ```rust
-let users = vec![/* ... */];
-db.insert(&users[..]).await?;
-```
+// Query all
+let all: Vec<User> = db.select::<User>().collect().await?;
 
-### Insert or Update (Upsert)
-
-Automatically update existing records when encountering duplicate keys:
-
-```rust
-// First insert
-db.insert_or_update(&User {
-    id: 1,
-    name: "Alice".to_string(),
-    age: 25,
-    email: Some("alice@example.com".to_string()),
-}).await?;
-
-// Update existing record
-db.insert_or_update(&User {
-    id: 1,  // Same ID
-    name: "Alice Smith".to_string(),  // Update name
-    age: 26,  // Update age
-    email: Some("alice.smith@example.com".to_string()),
-}).await?;
-```
-
-Batch insert or update:
-
-```rust
-db.insert_or_update(&vec![
-    User { id: 1, name: "Alice".to_string(), age: 25, email: None },
-    User { id: 2, name: "Bob".to_string(), age: 30, email: None },
-]).await?;
-```
-
-## Read Data (Read)
-
-### Query All Records
-
-```rust
-let all_users: Vec<User> = db
-    .select::<User>()
-    .collect::<Vec<_>>()
-    .await?;
-```
-
-### Conditional Query
-
-See [Query Builder Documentation](05_query_builder.md) for details.
-
-Basic example:
-
-```rust
-// Users aged 18 or older
+// Conditional query
 let adults: Vec<User> = db
     .select::<User>()
     .filter(|u| u.age.ge(18))
     .collect()
     .await?;
 
-// Name match
-let alice: Vec<User> = db
-    .select::<User>()
-    .filter(|u| u.name.eq("Alice".to_string()))
-    .collect()
-    .await?;
-```
-
-### Sorting and Pagination
-
-```rust
-// Sort by name ascending, get first 10
-let users: Vec<User> = db
+// Sort and paginate
+let page: Vec<User> = db
     .select::<User>()
     .order_by(|u| u.name.asc())
     .range(0..10)
     .collect()
     .await?;
-
-// Sort by age descending, paginated
-let page2: Vec<User> = db
-    .select::<User>()
-    .order_by_desc(|u| u.age)
-    .range(10..20)  // Page 2 (10 per page)
-    .collect()
-    .await?;
 ```
 
-## Update Data (Update)
-
-Use the `update()` method to update records:
-
-### Basic Update
+## Update
 
 ```rust
 let count = db
@@ -171,107 +62,51 @@ let count = db
     .execute()
     .await?;
 
-println!("Updated {} rows", count);
-```
-
-### Multiple Fields Update
-
-```rust
-let count = db
-    .update::<User>()
+// Multiple fields
+db.update::<User>()
     .filter(|u| u.id.eq(1))
-    .set(|u| u.name, "Alice Smith".to_string())
+    .set(|u| u.name, "New Name".to_string())
     .set(|u| u.age, 26)
-    .set(|u| u.email, Some("alice.smith@example.com".to_string()))
     .execute()
     .await?;
 ```
 
-### Conditional Update
+## Delete
 
 ```rust
-// Update all users under 18
-let count = db
-    .update::<User>()
-    .filter(|u| u.age.lt(18))
-    .set(|u| u.name, "Minor".to_string())
-    .execute()
-    .await?;
-```
-
-## Delete Data (Delete)
-
-Use the `delete()` method to delete records:
-
-### Conditional Delete
-
-```rust
+// Conditional delete
 let count = db
     .delete::<User>()
     .filter(|u| u.age.lt(18))
     .execute()
     .await?;
 
-println!("Deleted {} rows", count);
-```
-
-### Delete Specific Record
-
-```rust
-let count = db
-    .delete::<User>()
-    .filter(|u| u.id.eq(1))
-    .execute()
-    .await?;
-```
-
-### Delete All Records
-
-⚠️ **Warning**: This will delete all data in the table!
-
-```rust
-let count = db
-    .delete::<User>()
-    .execute()
-    .await?;
+// Delete all (dangerous!)
+db.delete::<User>().execute().await?;
 ```
 
 ## Table Management
 
-### Create Table
-
 ```rust
-db.create_table::<User>().await?;
+// Create table
+db.create_table::<User>().execute().await?;
+
+// Drop table
+db.drop_table::<User>().execute().await?;
 ```
 
-This generates a `CREATE TABLE IF NOT EXISTS` SQL statement.
-
-### Drop Table
+## Raw SQL
 
 ```rust
-db.drop_table::<User>().await?;
-```
-
-Generates a `DROP TABLE IF EXISTS` SQL statement.
-
-## Execute Raw SQL
-
-### Query and Return Models
-
-```rust
+// Query returning models
 let users: Vec<User> = db
     .exec_table::<User>("SELECT * FROM users WHERE age >= 18")
     .await?;
-```
 
-### Execute Non-Query SQL
-
-```rust
-let affected_rows = db
+// Execute non-query
+let affected = db
     .exec_non_query("UPDATE users SET name = 'Test' WHERE id = 1")
     .await?;
-
-println!("Affected {} rows", affected_rows);
 ```
 
 ## Complete Example
@@ -292,9 +127,9 @@ struct User {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(DbType::Turso, "file:test.db").await?;
-    db.create_table::<User>().await?;
+    db.create_table::<User>().execute().await?;
     
-    // 1. Insert data
+    // Insert
     db.insert(&User {
         id: 1,
         name: "Alice".to_string(),
@@ -302,83 +137,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         email: Some("alice@example.com".to_string()),
     }).await?;
     
+    // Batch insert
     db.insert(&vec![
         User { id: 2, name: "Bob".to_string(), age: 30, email: None },
         User { id: 3, name: "Charlie".to_string(), age: 35, email: None },
     ]).await?;
     
-    // 2. Query data
-    let all_users: Vec<User> = db.select::<User>().collect().await?;
-    println!("All users: {:?}", all_users);
+    // Query
+    let all: Vec<User> = db.select::<User>().collect().await?;
     
-    // 3. Update data
+    // Update
     db.update::<User>()
         .filter(|u| u.id.eq(1))
         .set(|u| u.age, 26)
         .execute()
         .await?;
     
-    // 4. Delete data
+    // Delete
     db.delete::<User>()
         .filter(|u| u.id.eq(3))
         .execute()
         .await?;
     
-    // 5. Cleanup
-    db.drop_table::<User>().await?;
-    
+    db.drop_table::<User>().execute().await?;
     Ok(())
 }
 ```
 
-## Best Practices
+## Performance Tips
 
-### 1. Batch Operations Over Loops
+### Batch Operations
+
+Batch insert is more efficient than individual inserts:
 
 ```rust
-// ✅ Recommended: Batch insert
+// Batch insert
 db.insert(&users).await?;
-
-// ❌ Avoid: Loop insert
-for user in &users {
-    db.insert(user).await?;  // Slow!
-}
 ```
 
-### 2. Use Transactions for Consistency
+### Transactions
+
+Multiple related operations can use transactions for consistency:
 
 ```rust
 let mut txn = db.begin().await?;
-
 txn.insert(&user1).await?;
 txn.insert(&user2).await?;
-
 txn.commit().await?;
 ```
 
-### 3. Set Filter Conditions Properly
+### Delete Operations
+
+It's recommended to add filter conditions for delete operations:
 
 ```rust
-// ✅ Explicitly specify conditions
+// Conditional delete
 db.delete::<User>()
     .filter(|u| u.id.eq(1))
     .execute()
     .await?;
-
-// ❌ Dangerous: Forgot filter condition
-db.delete::<User>().execute().await?;  // Deletes all!
-```
-
-### 4. Check Operation Results
-
-```rust
-let count = db.update::<User>()
-    .filter(|u| u.id.eq(1))
-    .set(|u| u.name, "New Name".to_string())
-    .execute()
-    .await?;
-
-if count == 0 {
-    println!("No rows updated");
-}
 ```

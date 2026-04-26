@@ -1,22 +1,10 @@
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 mod _test_common;
 
-#[derive(Debug, ormer::Model)]
-#[table = "test_users_batch_1"]
-struct TestUser1 {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "test_users_batch_2"]
-struct TestUser2 {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(TestUser1, "test_insert_batch_users_1");
+define_test_user_simple!(TestUser2, "test_insert_batch_users_2");
 
 async fn test_insert_single_and_batch_impl(
     config: &_test_common::DbConfig,
@@ -25,9 +13,9 @@ async fn test_insert_single_and_batch_impl(
     let db = _test_common::create_db_connection(config).await?;
 
     // 先删除表（如果存在）
-    let _ = db.drop_table::<TestUser1>().await;
+    let _ = db.drop_table::<TestUser1>().execute().await;
 
-    db.create_table::<TestUser1>().await?;
+    db.create_table::<TestUser1>().execute().await?;
 
     // 测试插入单个对象
     db.insert(&TestUser1 {
@@ -89,7 +77,7 @@ async fn test_insert_single_and_batch_impl(
     println!("\n测试通过！insert 方法支持单个对象和数组");
 
     // 清理测试表
-    db.drop_table::<TestUser1>().await?;
+    db.drop_table::<TestUser1>().execute().await?;
 
     Ok(())
 }
@@ -101,9 +89,9 @@ async fn test_insert_or_update_single_and_batch_impl(
     let db = _test_common::create_db_connection(config).await?;
 
     // 先删除表（如果存在）
-    let _ = db.drop_table::<TestUser2>().await;
+    let _ = db.drop_table::<TestUser2>().execute().await;
 
-    db.create_table::<TestUser2>().await?;
+    db.create_table::<TestUser2>().execute().await?;
 
     // 测试插入或更新单个对象
     db.insert_or_update(&TestUser2 {
@@ -168,7 +156,7 @@ async fn test_insert_or_update_single_and_batch_impl(
     println!("\n测试通过！insert_or_update 方法支持单个对象和数组");
 
     // 清理测试表
-    db.drop_table::<TestUser2>().await?;
+    db.drop_table::<TestUser2>().execute().await?;
 
     Ok(())
 }

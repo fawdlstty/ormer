@@ -24,6 +24,58 @@ pub enum Database {
     MySQL(mysql_backend::Database),
 }
 
+/// 统一的 CreateTableExecutor 枚举
+pub enum CreateTableExecutor<'a, T: Model> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::CreateTableExecutor<'a, T>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::CreateTableExecutor<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::CreateTableExecutor<'a, T>),
+}
+
+impl<'a, T: Model> CreateTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            CreateTableExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            CreateTableExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            CreateTableExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
+/// 统一的 DropTableExecutor 枚举
+pub enum DropTableExecutor<'a, T: Model> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::DropTableExecutor<'a, T>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::DropTableExecutor<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::DropTableExecutor<'a, T>),
+}
+
+impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            DropTableExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            DropTableExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            DropTableExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
 impl Database {
     /// 连接到数据库,根据 DbType 选择后端
     pub async fn connect(
@@ -49,15 +101,17 @@ impl Database {
         }
     }
 
-    /// 创建表
-    pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
+    /// 创建表 - 返回执行器
+    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         match self {
             #[cfg(feature = "turso")]
-            Database::Turso(db) => db.create_table::<T>().await,
+            Database::Turso(db) => {
+                CreateTableExecutor::Turso(db.create_table::<T>(), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.create_table::<T>().await,
+            Database::PostgreSQL(db) => CreateTableExecutor::PostgreSQL(db.create_table::<T>()),
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.create_table::<T>().await,
+            Database::MySQL(db) => CreateTableExecutor::MySQL(db.create_table::<T>()),
         }
     }
 
@@ -179,15 +233,17 @@ impl Database {
         }
     }
 
-    /// 删除表
-    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
+    /// 删除表 - 返回执行器
+    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
         match self {
             #[cfg(feature = "turso")]
-            Database::Turso(db) => db.drop_table::<T>().await,
+            Database::Turso(db) => {
+                DropTableExecutor::Turso(db.drop_table::<T>(), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.drop_table::<T>().await,
+            Database::PostgreSQL(db) => DropTableExecutor::PostgreSQL(db.drop_table::<T>()),
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.drop_table::<T>().await,
+            Database::MySQL(db) => DropTableExecutor::MySQL(db.drop_table::<T>()),
         }
     }
 
@@ -370,16 +426,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<'a, T, C> {
+    pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<'a, T, C> {
         match self {
             #[cfg(feature = "turso")]
             SelectExecutor::Turso(exec, _) => {
-                CollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                CollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => CollectFuture::PostgreSQL(exec.collect::<C>()),
+            SelectExecutor::PostgreSQL(exec) => {
+                CollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
+            }
             #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => CollectFuture::MySQL(exec.collect::<C>()),
+            SelectExecutor::MySQL(exec) => {
+                CollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
+            }
         }
     }
 
@@ -789,7 +849,7 @@ crate::impl_unified_join_executor!(LeftJoinedSelectExecutor, std::marker::Phanto
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
-        self,
+        &self,
     ) -> LeftJoinCollectFuture<'a, T, J>
     where
         T: 'static,
@@ -798,15 +858,15 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
         match self {
             #[cfg(feature = "turso")]
             LeftJoinedSelectExecutor::Turso(exec, _) => {
-                LeftJoinCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                LeftJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             LeftJoinedSelectExecutor::PostgreSQL(exec) => {
-                LeftJoinCollectFuture::PostgreSQL(exec.collect::<C>())
+                LeftJoinCollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
             }
             #[cfg(feature = "mysql")]
             LeftJoinedSelectExecutor::MySQL(exec) => {
-                LeftJoinCollectFuture::MySQL(exec.collect::<C>())
+                LeftJoinCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
             }
         }
     }
@@ -824,7 +884,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 crate::impl_unified_join_executor!(InnerJoinedSelectExecutor, std::marker::PhantomData);
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
-    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<'a, T, J>
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<'a, T, J>
     where
         T: 'static,
         J: 'static,
@@ -832,15 +892,15 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         match self {
             #[cfg(feature = "turso")]
             InnerJoinedSelectExecutor::Turso(exec, _) => {
-                InnerJoinCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                InnerJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             InnerJoinedSelectExecutor::PostgreSQL(exec) => {
-                InnerJoinCollectFuture::PostgreSQL(exec.collect::<C>())
+                InnerJoinCollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
             }
             #[cfg(feature = "mysql")]
             InnerJoinedSelectExecutor::MySQL(exec) => {
-                InnerJoinCollectFuture::MySQL(exec.collect::<C>())
+                InnerJoinCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
             }
         }
     }
@@ -859,7 +919,7 @@ crate::impl_unified_join_executor!(RightJoinedSelectExecutor, std::marker::Phant
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
-        self,
+        &self,
     ) -> RightJoinCollectFuture<'a, T, J>
     where
         T: 'static,
@@ -868,15 +928,15 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         match self {
             #[cfg(feature = "turso")]
             RightJoinedSelectExecutor::Turso(exec, _) => {
-                RightJoinCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                RightJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             RightJoinedSelectExecutor::PostgreSQL(exec) => {
-                RightJoinCollectFuture::PostgreSQL(exec.collect::<C>())
+                RightJoinCollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
             }
             #[cfg(feature = "mysql")]
             RightJoinedSelectExecutor::MySQL(exec) => {
-                RightJoinCollectFuture::MySQL(exec.collect::<C>())
+                RightJoinCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
             }
         }
     }
@@ -932,9 +992,8 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
                 MappedSelectExecutor::Turso(exec.clone(), *phantom)
             }
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(_exec) => {
-                // PostgreSQL MappedSelectExecutor不能clone，因为client是引用
-                panic!("Cannot clone PostgreSQL MappedSelectExecutor")
+            MappedSelectExecutor::PostgreSQL(exec) => {
+                MappedSelectExecutor::PostgreSQL(exec.clone_with_client())
             }
             #[cfg(feature = "mysql")]
             MappedSelectExecutor::MySQL(exec) => {
@@ -1013,7 +1072,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
-    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -1022,14 +1081,16 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         match self {
             #[cfg(feature = "turso")]
             MappedSelectExecutor::Turso(exec, _) => {
-                MappedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+                MappedCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             MappedSelectExecutor::PostgreSQL(exec) => {
-                MappedCollectFuture::PostgreSQL(exec.collect::<C>())
+                MappedCollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
             }
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => MappedCollectFuture::MySQL(exec.collect::<C>()),
+            MappedSelectExecutor::MySQL(exec) => {
+                MappedCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
+            }
             #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
             MappedSelectExecutor::NotImplemented(_) => {
                 panic!("MappedSelectExecutor::collect is not implemented for this backend")

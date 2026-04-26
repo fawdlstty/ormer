@@ -9,11 +9,18 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 提取表名
     let table_name = extract_table_name(&input);
 
-    // 提取字段
+    // 检查是否为元组结构体（用于包装现有模型）
+    let is_tuple_struct = matches!(&input.data, syn::Data::Struct(data) if matches!(&data.fields, syn::Fields::Unnamed(_)));
+
+    if is_tuple_struct {
+        return derive_model_tuple_wrapper(&input, name, &where_name, table_name);
+    }
+
+    // 提取字段（普通命名字段结构体）
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("Model must have named fields"),
+            _ => panic!("Model must have named fields or be a tuple struct wrapper"),
         },
         _ => panic!("Model must be a struct"),
     };
@@ -212,6 +219,98 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             pub fn query() -> ::ormer::Select<Self> {
                 ::ormer::Select::new()
+            }
+        }
+    }
+}
+
+/// 为元组结构体包装模型生成实现（例如：struct NewUser(User);）
+fn derive_model_tuple_wrapper(
+    input: &DeriveInput,
+    name: &syn::Ident,
+    _where_name: &syn::Ident,
+    table_name: String,
+) -> TokenStream {
+    // 提取元组结构体中的内部类型
+    let inner_type = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Unnamed(fields) => {
+                if fields.unnamed.len() != 1 {
+                    panic!("Tuple struct wrapper must have exactly one field");
+                }
+                &fields.unnamed[0].ty
+            }
+            _ => panic!("Expected unnamed fields"),
+        },
+        _ => panic!("Expected struct"),
+    };
+
+    // 生成代码：元组结构体包装器将委托给内部类型的所有 Model 功能，但使用自定义表名
+    quote! {
+        impl ::ormer::Model for #name {
+            const TABLE_NAME: &'static str = #table_name;
+            const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = <#inner_type as ::ormer::Model>::COLUMN_SCHEMA;
+
+            type QueryBuilder = ::ormer::Select<Self>;
+            type Where = <#inner_type as ::ormer::Model>::Where;
+
+            fn query() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn select() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn from_row(row: &::ormer::Row) -> Result<Self, ::ormer::Error> {
+                let inner = <#inner_type as ::ormer::Model>::from_row(row)?;
+                Ok(#name(inner))
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> Result<Self, ::ormer::Error> {
+                let inner = <#inner_type as ::ormer::Model>::from_row_values(values)?;
+                Ok(#name(inner))
+            }
+
+            fn field_values(&self) -> Vec<::ormer::Value> {
+                self.0.field_values()
+            }
+
+            fn primary_key_column() -> &'static str {
+                <#inner_type as ::ormer::Model>::primary_key_column()
+            }
+
+            fn primary_key_value(&self) -> ::ormer::Value {
+                self.0.primary_key_value()
+            }
+        }
+
+        // 生成 inherent 方法
+        impl #name {
+            pub fn select() -> ::ormer::Select<Self> {
+                ::ormer::Select::new()
+            }
+
+            pub fn query() -> ::ormer::Select<Self> {
+                ::ormer::Select::new()
+            }
+        }
+
+        // 为包装器类型实现 Into<InnerType> 和 From<InnerType>
+        impl From<#inner_type> for #name {
+            fn from(inner: #inner_type) -> Self {
+                #name(inner)
+            }
+        }
+
+        impl #name {
+            pub fn into_inner(self) -> #inner_type {
+                self.0
+            }
+
+            pub fn inner(&self) -> &#inner_type {
+                &self.0
             }
         }
     }

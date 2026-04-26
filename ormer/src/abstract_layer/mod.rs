@@ -1,5 +1,6 @@
 /// 数据库抽象层模块
 /// 根据运行时指定的数据库类型选择对应的数据库后端
+#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 use crate::model::DbBackendTypeMapper;
 
 #[cfg(feature = "turso")]
@@ -34,41 +35,49 @@ pub enum DbType {
     /// MySQL 数据库
     #[cfg(feature = "mysql")]
     MySQL,
+    /// 空变体，当没有启用任何特性时使用（仅用于编译通过）
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    None,
 }
 
 impl DbType {
     /// 根据 Rust 类型和数据库类型获取 SQL 类型
     pub fn sql_type(
         &self,
-        rust_type: &str,
-        is_primary: bool,
-        is_auto_increment: bool,
-        is_nullable: bool,
+        _rust_type: &str,
+        _is_primary: bool,
+        _is_auto_increment: bool,
+        _is_nullable: bool,
     ) -> String {
         match self {
             #[cfg(feature = "turso")]
             DbType::Turso => crate::abstract_layer::turso_backend::TursoTypeMapper::sql_type(
-                rust_type,
-                is_primary,
-                is_auto_increment,
-                is_nullable,
+                _rust_type,
+                _is_primary,
+                _is_auto_increment,
+                _is_nullable,
             ),
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
                 crate::abstract_layer::postgresql_backend::PostgreSQLTypeMapper::sql_type(
-                    rust_type,
-                    is_primary,
-                    is_auto_increment,
-                    is_nullable,
+                    _rust_type,
+                    _is_primary,
+                    _is_auto_increment,
+                    _is_nullable,
                 )
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => crate::abstract_layer::mysql_backend::MySQLTypeMapper::sql_type(
-                rust_type,
-                is_primary,
-                is_auto_increment,
-                is_nullable,
+                _rust_type,
+                _is_primary,
+                _is_auto_increment,
+                _is_nullable,
             ),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            DbType::None => {
+                // 当没有启用任何特性时，返回空字符串（仅用于编译通过）
+                String::new()
+            }
         }
     }
 }
@@ -78,9 +87,10 @@ impl DbType {
 mod unified;
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 pub use unified::{
-    AggregateFuture, CollectFuture, Database, DeleteExecutor, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, Transaction, UpdateExecutor,
+    AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
+    DropTableExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
+    MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
+    SelectExecutor, Transaction, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出

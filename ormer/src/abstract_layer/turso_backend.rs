@@ -72,6 +72,49 @@ pub struct Database {
     conn: Arc<turso::Connection>,
 }
 
+/// 创建表执行器
+pub struct CreateTableExecutor<'a, T: Model> {
+    db: &'a Database,
+    table_name: Option<String>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Model> CreateTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        // 表不存在，创建新表
+        let create_sql = crate::generate_create_table_sql_with_name::<T>(
+            crate::abstract_layer::DbType::Turso,
+            self.table_name.as_deref(),
+        );
+
+        self.db
+            .conn
+            .execute(&create_sql, ())
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// 删除表执行器（基于Model）
+pub struct DropTableExecutor<'a, T: Model> {
+    db: &'a Database,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        self.db
+            .conn
+            .execute(&sql, ())
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
 impl Database {
     /// 连接到 Turso 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> Result<Self, crate::Error> {
@@ -88,18 +131,13 @@ impl Database {
         Ok(Self { conn })
     }
 
-    /// 创建表
-    pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
-        // 表不存在，创建新表
-        let create_sql =
-            crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::Turso);
-
-        self.conn
-            .execute(&create_sql, ())
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-
-        Ok(())
+    /// 创建表 - 返回执行器
+    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+        CreateTableExecutor {
+            db: self,
+            table_name: None,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 验证表结构是否与模型定义匹配
@@ -452,14 +490,12 @@ impl Database {
         })
     }
 
-    /// 删除表
-    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        self.conn
-            .execute(&sql, ())
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-        Ok(())
+    /// 删除表 - 返回执行器
+    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+        DropTableExecutor {
+            db: self,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 执行原生 SQL 查询并返回模型列表
@@ -669,11 +705,31 @@ pub struct SelectExecutor<T: Model> {
     _marker: PhantomData<T>,
 }
 
+impl<T: Model> Clone for SelectExecutor<T> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// LEFT JOIN 查询执行器
 pub struct LeftJoinedSelectExecutor<T: Model, J: Model> {
     select: LeftJoinedSelect<T, J>,
     conn: Arc<turso::Connection>,
     _marker: PhantomData<(T, J)>,
+}
+
+impl<T: Model, J: Model> Clone for LeftJoinedSelectExecutor<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// INNER JOIN 查询执行器
@@ -683,11 +739,31 @@ pub struct InnerJoinedSelectExecutor<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
+impl<T: Model, J: Model> Clone for InnerJoinedSelectExecutor<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// RIGHT JOIN 查询执行器
 pub struct RightJoinedSelectExecutor<T: Model, J: Model> {
     select: RightJoinedSelect<T, J>,
     conn: Arc<turso::Connection>,
     _marker: PhantomData<(T, J)>,
+}
+
+impl<T: Model, J: Model> Clone for RightJoinedSelectExecutor<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// Related 查询执行器（支持多表关联查询）
@@ -785,9 +861,9 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<T, C> {
+    pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<T, C> {
         CollectFuture {
-            executor: self,
+            executor: self.clone(),
             _marker: PhantomData,
         }
     }
@@ -938,8 +1014,12 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(self) -> LeftJoinCollectFuture<T, J> {
-        LeftJoinCollectFuture { executor: self }
+    pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
+        &self,
+    ) -> LeftJoinCollectFuture<T, J> {
+        LeftJoinCollectFuture {
+            executor: self.clone(),
+        }
     }
 
     pub fn exec(self) -> LeftJoinCollectFuture<T, J>
@@ -1047,12 +1127,14 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         InnerJoinCollectFuture { executor: self }
     }
 
-    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<T, J>
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<T, J>
     where
         T: 'static,
         J: 'static,
     {
-        InnerJoinCollectFuture { executor: self }
+        InnerJoinCollectFuture {
+            executor: self.clone(),
+        }
     }
 
     async fn collect_inner(self) -> Result<Vec<(T, J)>, crate::Error> {
@@ -1132,12 +1214,14 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         RightJoinCollectFuture { executor: self }
     }
 
-    pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(self) -> RightJoinCollectFuture<T, J>
+    pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(&self) -> RightJoinCollectFuture<T, J>
     where
         T: 'static,
         J: 'static,
     {
-        RightJoinCollectFuture { executor: self }
+        RightJoinCollectFuture {
+            executor: self.clone(),
+        }
     }
 
     async fn collect_inner(self) -> Result<Vec<(Option<T>, J)>, crate::Error> {

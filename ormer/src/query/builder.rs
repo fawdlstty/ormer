@@ -49,6 +49,18 @@ pub struct Select<T: Model> {
     _marker: PhantomData<T>,
 }
 
+impl<T: Model> Clone for Select<T> {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// RelatedSelect - 关联查询结构体(支持2表查询)
 pub struct RelatedSelect<T: Model, R: Model> {
     filters: Vec<FilterExpr>,
@@ -220,6 +232,8 @@ impl<T: Model, V> MappedSelect<T, V> {
         let db_type = DbType::PostgreSQL;
         #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
         let db_type = DbType::MySQL;
+        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -471,6 +485,8 @@ impl<T: Model> Select<T> {
         let db_type = DbType::PostgreSQL;
         #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
         let db_type = DbType::MySQL;
+        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -1176,6 +1192,8 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
         let db_type = DbType::PostgreSQL;
         #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
         let db_type = DbType::MySQL;
+        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        let db_type = DbType::None;
 
         let (sql, params) = self.to_sql_with_params(db_type);
         WhereExpr {
@@ -1486,6 +1504,21 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
+impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            join_table: self.join_table.clone(),
+            join_alias: self.join_alias.clone(),
+            on_condition: self.on_condition.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// INNER JOIN 查询结构体
 #[allow(dead_code)]
 pub struct InnerJoinedSelect<T: Model, J: Model> {
@@ -1499,6 +1532,21 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
+impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            join_table: self.join_table.clone(),
+            join_alias: self.join_alias.clone(),
+            on_condition: self.on_condition.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
 /// RIGHT JOIN 查询结构体
 #[allow(dead_code)]
 pub struct RightJoinedSelect<T: Model, J: Model> {
@@ -1510,6 +1558,21 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     join_alias: String,
     on_condition: FilterExpr,
     _marker: PhantomData<(T, J)>,
+}
+
+impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
+    fn clone(&self) -> Self {
+        Self {
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            join_table: self.join_table.clone(),
+            join_alias: self.join_alias.clone(),
+            on_condition: self.on_condition.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T: Model> Select<T> {

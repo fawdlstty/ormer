@@ -1,24 +1,10 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "verify_users"]
-struct VerifyUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-}
-
-#[derive(Debug, Model)]
-#[table = "verify_roles"]
-struct VerifyRole {
-    #[primary]
-    id: i32,
-    #[foreign(VerifyUser)]
-    user_id: i32,
-    role_name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_for_fk!(VerifyUser, "verify_fk_users_1");
+define_test_role_for_fk!(VerifyRole, "verify_fk_roles_1", VerifyUser);
 
 async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
     // 验证生成的 CREATE TABLE SQL 包含外键约束
@@ -32,7 +18,7 @@ async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
         "SQL should contain FOREIGN KEY constraint"
     );
     assert!(
-        sql.contains("verify_user"),
+        sql.contains("verify_fk_users_1"),
         "SQL should reference the correct table"
     );
     assert!(
@@ -40,9 +26,9 @@ async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
         "SQL should reference the correct column"
     );
 
-    // 验证完整的约束语句（注意：VerifyUser 的表名是 verify_users）
+    // 验证完整的约束语句（注意：VerifyUser 的表名是 verify_fk_users_1）
     assert!(
-        sql.contains("FOREIGN KEY (user_id) REFERENCES verify_users (id)"),
+        sql.contains("FOREIGN KEY (user_id) REFERENCES verify_fk_users_1 (id)"),
         "SQL should contain the complete foreign key constraint"
     );
 

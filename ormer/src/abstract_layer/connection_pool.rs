@@ -6,6 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{Mutex, Semaphore};
 
+// 导入统一的执行器类型
+#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+use super::unified::{CreateTableExecutor, DropTableExecutor};
+
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "turso")]
 use super::turso_backend;
@@ -341,15 +345,19 @@ impl<'a> PooledConnection<'a> {
         self.connection.as_ref().expect("Connection already taken")
     }
 
-    /// 创建表
-    pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
+    /// 创建表 - 返回执行器
+    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.create_table::<T>().await,
+            ConnectionWrapper::Turso(db) => {
+                CreateTableExecutor::Turso(db.create_table::<T>(), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.create_table::<T>().await,
+            ConnectionWrapper::PostgreSQL(db) => {
+                CreateTableExecutor::PostgreSQL(db.create_table::<T>())
+            }
             #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.create_table::<T>().await,
+            ConnectionWrapper::MySQL(db) => CreateTableExecutor::MySQL(db.create_table::<T>()),
         }
     }
 
@@ -483,15 +491,19 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
-    /// 删除表
-    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
+    /// 删除表 - 返回执行器
+    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.drop_table::<T>().await,
+            ConnectionWrapper::Turso(db) => {
+                DropTableExecutor::Turso(db.drop_table::<T>(), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.drop_table::<T>().await,
+            ConnectionWrapper::PostgreSQL(db) => {
+                DropTableExecutor::PostgreSQL(db.drop_table::<T>())
+            }
             #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.drop_table::<T>().await,
+            ConnectionWrapper::MySQL(db) => DropTableExecutor::MySQL(db.drop_table::<T>()),
         }
     }
 

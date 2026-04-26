@@ -1,15 +1,9 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "test_users"]
-struct TestUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_direct!(TestUser, "test_in_stmt_users_1");
 
 async fn test_in_statement_i32_impl(config: &_test_common::DbConfig) {
     let _config = config; // 仅用于获取数据库类型

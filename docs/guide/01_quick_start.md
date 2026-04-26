@@ -1,22 +1,13 @@
-# 快速开始
-
-本指南将帮助你在 5 分钟内快速上手 Ormer。
+﻿# 快速开始
 
 ## 环境要求
 
-- Rust 1.70+ 
-- Cargo 包管理器
+- Rust 1.70+
+- Cargo
 
 ## 安装
 
-### 1. 创建新项目
-
-```bash
-cargo new my_project
-cd my_project
-```
-
-### 2. 添加依赖
+### 添加依赖
 
 在 `Cargo.toml` 中添加 Ormer 依赖和异步运行时:
 
@@ -26,23 +17,14 @@ ormer = { version = "0.1", features = ["turso"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-**选择数据库特性:**
+**数据库特性:**
+- `turso` - Turso/libSQL/SQLite
+- `postgresql` - PostgreSQL
+- `mysql` - MySQL
 
-- `turso` - Turso/libSQL/SQLite 数据库
-- `postgresql` - PostgreSQL 数据库  
-- `mysql` - MySQL 数据库
 
-你可以同时启用多个数据库特性:
 
-```toml
-ormer = { version = "0.1", features = ["turso", "postgresql"] }
-```
-
-## 第一个 Ormer 程序
-
-### 完整示例
-
-创建 `src/main.rs`:
+## 完整示例
 
 ```rust
 use ormer::{Database, DbType, Model};
@@ -64,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(DbType::Turso, "file:test.db").await?;
     
     // 3. 创建表
-    db.create_table::<User>().await?;
+    db.create_table::<User>().execute().await?;
     
     // 4. 插入数据
     db.insert(&User {
@@ -95,23 +77,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     // 7. 清理
-    db.drop_table::<User>().await?;
+    db.drop_table::<User>().execute().await?;
     
     Ok(())
 }
 ```
 
-### 运行程序
-
-```bash
-cargo run
-```
-
-**输出:**
-```
-User: Alice (age: 25)
-User: Bob (age: 30)
-```
+运行: `cargo run`
 
 ## 核心操作速览
 

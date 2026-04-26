@@ -68,26 +68,46 @@ impl FilterFormatter {
                 value,
             } => {
                 let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
+                    format!("{}", prefix)
                 } else {
-                    column.clone()
+                    String::new()
                 };
 
                 match self.db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
                         use std::fmt::Write;
-                        write!(sql, "{} {} ${}", col_name, operator, param_idx).unwrap();
+                        let full_col_name = if !col_name.is_empty() {
+                            format!("{}.{}", col_name, column)
+                        } else {
+                            column.clone()
+                        };
+                        write!(sql, "{} {} ${}", full_col_name, operator, param_idx).unwrap();
                     }
                     #[cfg(feature = "turso")]
                     DbType::Turso => {
                         use std::fmt::Write;
-                        write!(sql, "{} {} ?", col_name, operator).unwrap();
+                        let full_col_name = if !col_name.is_empty() {
+                            format!("{}.{}", col_name, column)
+                        } else {
+                            column.clone()
+                        };
+                        write!(sql, "{} {} ?", full_col_name, operator).unwrap();
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
                         use std::fmt::Write;
-                        write!(sql, "{} {} ?", col_name, operator).unwrap();
+                        let full_col_name = if !col_name.is_empty() {
+                            format!("{}.{}", col_name, column)
+                        } else {
+                            column.clone()
+                        };
+                        write!(sql, "{} {} ?", full_col_name, operator).unwrap();
+                    }
+                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    DbType::None => {
+                        // 当没有启用任何特性时，仅用于编译通过
+                        let _ = (column, operator, col_name);
                     }
                 }
                 // 转换 filter Value 到 ormer Value
@@ -142,6 +162,12 @@ impl FilterFormatter {
                         DbType::MySQL => {
                             sql.push('?');
                         }
+                        #[cfg(not(any(
+                            feature = "turso",
+                            feature = "postgresql",
+                            feature = "mysql"
+                        )))]
+                        DbType::None => {}
                     }
                     // 转换 filter Value 到 ormer Value
                     let ormer_value = Self::convert_filter_value(value);

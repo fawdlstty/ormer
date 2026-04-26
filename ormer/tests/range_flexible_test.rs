@@ -1,17 +1,11 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::query::builder::Select;
 
 mod _test_common;
 
-// 定义测试用的 User 模型
-#[derive(Debug, Model)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_for_range!(User, "range_flexible_users_1");
 
 async fn test_range_full_impl(config: &_test_common::DbConfig) {
     // 测试完整范围 range(10..20) - 既有 offset 也有 limit

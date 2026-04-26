@@ -1,32 +1,13 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "test_users"]
-struct TestUser {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-}
-
-#[derive(Debug, Model)]
-#[table = "test_roles"]
-struct TestRole {
-    #[primary]
-    id: i32,
-    user_id: i32,
-    role_name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(TestUser, "test_collect_users_1");
+define_test_role_for_collect!(TestRole, "test_collect_roles_1");
 
 // 单字段Model，用于测试collect_with
-#[derive(Debug, Model)]
-#[table = "user_ids"]
-struct UserId {
-    #[primary]
-    id: i32,
-}
+define_test_user_id!(UserId, "test_collect_user_ids_1");
 
 async fn test_collect_with_impl(
     config: &_test_common::DbConfig,
@@ -36,13 +17,13 @@ async fn test_collect_with_impl(
     println!("[TEST] Created database connection");
 
     // 先删除表（如果存在）
-    let _ = db.drop_table::<TestRole>().await;
-    let _ = db.drop_table::<TestUser>().await;
+    let _ = db.drop_table::<TestRole>().execute().await;
+    let _ = db.drop_table::<TestUser>().execute().await;
 
     // 创建表
-    db.create_table::<TestUser>().await?;
+    db.create_table::<TestUser>().execute().await?;
     println!("[TEST] Created TestUser table");
-    db.create_table::<TestRole>().await?;
+    db.create_table::<TestRole>().execute().await?;
     println!("[TEST] Created TestRole table");
 
     // 插入测试数据
@@ -129,8 +110,8 @@ async fn test_collect_with_impl(
     println!("\n✅ All tests passed!");
 
     // 清理测试表
-    db.drop_table::<TestRole>().await?;
-    db.drop_table::<TestUser>().await?;
+    db.drop_table::<TestRole>().execute().await?;
+    db.drop_table::<TestUser>().execute().await?;
 
     Ok(())
 }

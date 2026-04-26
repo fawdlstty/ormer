@@ -1,35 +1,34 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-// 定义测试模型
-#[derive(Debug, Model, Clone)]
-#[table = "test_users_join"]
-struct TestUserJoin {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    age: i32,
-}
+// 为每个测试使用唯一的表名，避免并发测试冲突
+define_test_user_for_join!(TestUserJoin, "test_join_users_1");
+define_test_role_for_join!(TestRoleJoin, "test_join_roles_1");
 
-#[derive(Debug, Model, Clone)]
-#[table = "test_roles_join"]
-struct TestRoleJoin {
-    #[primary]
-    id: i32,
-    #[index]
-    uid: i32,
-    role_name: String,
-}
+#[cfg(not(feature = "turso"))]
+define_test_user_for_join!(TestUserJoin2, "test_join_users_2");
+#[cfg(not(feature = "turso"))]
+define_test_role_for_join!(TestRoleJoin2, "test_join_roles_2");
+
+define_test_user_for_join!(TestUserJoin3, "test_join_users_3");
+define_test_role_for_join!(TestRoleJoin3, "test_join_roles_3");
+
+define_test_user_for_join!(TestUserJoin4, "test_join_users_4");
+define_test_role_for_join!(TestRoleJoin4, "test_join_roles_4");
 
 /// 测试 INNER JOIN 查询
 async fn test_inner_join_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserJoin>().await?;
-    db.create_table::<TestRoleJoin>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleJoin>().execute().await;
+    let _ = db.drop_table::<TestUserJoin>().execute().await;
+
+    db.create_table::<TestUserJoin>().execute().await?;
+    db.create_table::<TestRoleJoin>().execute().await?;
 
     // 插入测试数据
     db.insert(&TestUserJoin {
@@ -68,8 +67,8 @@ async fn test_inner_join_impl(
     println!("✓ Inner join test passed: {} records", user_roles.len());
 
     // 清理测试表（先删除有外键的表）
-    db.drop_table::<TestRoleJoin>().await?;
-    db.drop_table::<TestUserJoin>().await?;
+    db.drop_table::<TestRoleJoin>().execute().await?;
+    db.drop_table::<TestUserJoin>().execute().await?;
 
     Ok(())
 }
@@ -81,11 +80,16 @@ async fn test_right_join_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserJoin>().await?;
-    db.create_table::<TestRoleJoin>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleJoin2>().execute().await;
+    let _ = db.drop_table::<TestUserJoin2>().execute().await;
+
+    db.create_table::<TestUserJoin2>().execute().await?;
+    db.create_table::<TestRoleJoin2>().execute().await?;
 
     // 插入测试数据
-    db.insert(&TestUserJoin {
+    db.insert(&TestUserJoin2 {
         id: 1,
         name: "Alice".to_string(),
         age: 25,
@@ -94,13 +98,13 @@ async fn test_right_join_impl(
     // Bob 没有插入
 
     // 插入角色,包括一个没有对应用户的角色
-    db.insert(&TestRoleJoin {
+    db.insert(&TestRoleJoin2 {
         id: 1,
         uid: 1,
         role_name: "admin".to_string(),
     })
     .await?;
-    db.insert(&TestRoleJoin {
+    db.insert(&TestRoleJoin2 {
         id: 2,
         uid: 99, // 这个 uid 没有对应的用户
         role_name: "orphan_role".to_string(),
@@ -108,9 +112,9 @@ async fn test_right_join_impl(
     .await?;
 
     // 测试 RIGHT JOIN - 返回所有角色,即使没有匹配的用户
-    let user_roles: Vec<(Option<TestUserJoin>, TestRoleJoin)> = db
-        .select::<TestUserJoin>()
-        .right_join::<TestRoleJoin>(|u, r| u.id.eq(r.uid))
+    let user_roles: Vec<(Option<TestUserJoin2>, TestRoleJoin2)> = db
+        .select::<TestUserJoin2>()
+        .right_join::<TestRoleJoin2>(|u, r| u.id.eq(r.uid))
         .collect::<Vec<_>>()
         .await?;
 
@@ -135,8 +139,8 @@ async fn test_right_join_impl(
     println!("✓ Right join test passed: {} records", user_roles.len());
 
     // 清理测试表(先删除有外键的表)
-    db.drop_table::<TestRoleJoin>().await?;
-    db.drop_table::<TestUserJoin>().await?;
+    db.drop_table::<TestRoleJoin2>().execute().await?;
+    db.drop_table::<TestUserJoin2>().execute().await?;
 
     Ok(())
 }
@@ -155,17 +159,22 @@ async fn test_left_join_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserJoin>().await?;
-    db.create_table::<TestRoleJoin>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleJoin3>().execute().await;
+    let _ = db.drop_table::<TestUserJoin3>().execute().await;
+
+    db.create_table::<TestUserJoin3>().execute().await?;
+    db.create_table::<TestRoleJoin3>().execute().await?;
 
     // 插入测试数据
-    db.insert(&TestUserJoin {
+    db.insert(&TestUserJoin3 {
         id: 1,
         name: "Alice".to_string(),
         age: 25,
     })
     .await?;
-    db.insert(&TestUserJoin {
+    db.insert(&TestUserJoin3 {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
@@ -173,7 +182,7 @@ async fn test_left_join_impl(
     .await?;
 
     // 只为 Alice 插入角色
-    db.insert(&TestRoleJoin {
+    db.insert(&TestRoleJoin3 {
         id: 1,
         uid: 1,
         role_name: "admin".to_string(),
@@ -181,9 +190,9 @@ async fn test_left_join_impl(
     .await?;
 
     // 测试 LEFT JOIN - 返回所有用户，即使没有角色
-    let user_roles: Vec<(TestUserJoin, Option<TestRoleJoin>)> = db
-        .select::<TestUserJoin>()
-        .left_join::<TestRoleJoin>(|u, r| u.id.eq(r.uid))
+    let user_roles: Vec<(TestUserJoin3, Option<TestRoleJoin3>)> = db
+        .select::<TestUserJoin3>()
+        .left_join::<TestRoleJoin3>(|u, r| u.id.eq(r.uid))
         .collect::<Vec<_>>()
         .await?;
 
@@ -211,8 +220,8 @@ async fn test_left_join_impl(
     println!("✓ Left join test passed: {} records", user_roles.len());
 
     // 清理测试表（先删除有外键的表）
-    db.drop_table::<TestRoleJoin>().await?;
-    db.drop_table::<TestUserJoin>().await?;
+    db.drop_table::<TestRoleJoin3>().execute().await?;
+    db.drop_table::<TestUserJoin3>().execute().await?;
 
     Ok(())
 }
@@ -222,30 +231,35 @@ async fn test_inner_join_with_filter_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserJoin>().await?;
-    db.create_table::<TestRoleJoin>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleJoin4>().execute().await;
+    let _ = db.drop_table::<TestUserJoin4>().execute().await;
+
+    db.create_table::<TestUserJoin4>().execute().await?;
+    db.create_table::<TestRoleJoin4>().execute().await?;
 
     // 插入测试数据
-    db.insert(&TestUserJoin {
+    db.insert(&TestUserJoin4 {
         id: 1,
         name: "Alice".to_string(),
         age: 25,
     })
     .await?;
-    db.insert(&TestUserJoin {
+    db.insert(&TestUserJoin4 {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
     })
     .await?;
 
-    db.insert(&TestRoleJoin {
+    db.insert(&TestRoleJoin4 {
         id: 1,
         uid: 1,
         role_name: "admin".to_string(),
     })
     .await?;
-    db.insert(&TestRoleJoin {
+    db.insert(&TestRoleJoin4 {
         id: 2,
         uid: 2,
         role_name: "user".to_string(),
@@ -253,9 +267,9 @@ async fn test_inner_join_with_filter_impl(
     .await?;
 
     // 测试带 range 的 INNER JOIN
-    let user_roles: Vec<(TestUserJoin, TestRoleJoin)> = db
-        .select::<TestUserJoin>()
-        .inner_join::<TestRoleJoin>(|u, r| u.id.eq(r.uid))
+    let user_roles: Vec<(TestUserJoin4, TestRoleJoin4)> = db
+        .select::<TestUserJoin4>()
+        .inner_join::<TestRoleJoin4>(|u, r| u.id.eq(r.uid))
         .range(..1)
         .collect::<Vec<_>>()
         .await?;
@@ -268,8 +282,8 @@ async fn test_inner_join_with_filter_impl(
     );
 
     // 清理测试表（先删除有外键的表）
-    db.drop_table::<TestRoleJoin>().await?;
-    db.drop_table::<TestUserJoin>().await?;
+    db.drop_table::<TestRoleJoin4>().execute().await?;
+    db.drop_table::<TestUserJoin4>().execute().await?;
 
     Ok(())
 }

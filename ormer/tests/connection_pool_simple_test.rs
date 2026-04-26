@@ -1,14 +1,11 @@
-use ormer::{Database, Model};
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
+use ormer::Database;
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "simple_users"]
-struct SimpleUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_minimal!(SimpleUser, "test_pool_simple_users_1");
 
 /// 测试连接池基本创建和获取
 async fn test_pool_basic_impl(
@@ -17,10 +14,21 @@ async fn test_pool_basic_impl(
     println!("Creating connection pool...");
 
     // 创建连接池（不设置 min_idle，避免初始连接）
-    let pool = Database::create_pool(config.0, config.1)
-        .range(0..3) // min=0, 不会立即创建连接
-        .build()
-        .await?;
+    // Turso 后端限制最大连接数为 1，其他数据库可以使用更大的连接池
+    let pool = match config.0 {
+        ormer::DbType::Turso => {
+            Database::create_pool(config.0, config.1)
+                .range(0..1) // Turso: max=1
+                .build()
+                .await?
+        }
+        _ => {
+            Database::create_pool(config.0, config.1)
+                .range(0..3) // 其他数据库: max=3
+                .build()
+                .await?
+        }
+    };
 
     println!("Pool created successfully");
 
@@ -30,7 +38,7 @@ async fn test_pool_basic_impl(
     println!("Connection acquired");
 
     // 创建表
-    conn.create_table::<SimpleUser>().await?;
+    conn.create_table::<SimpleUser>().execute().await?;
     println!("Table created");
 
     // 插入数据
@@ -51,7 +59,7 @@ async fn test_pool_basic_impl(
     println!("Test passed!");
 
     // 清理测试表
-    conn.drop_table::<SimpleUser>().await?;
+    conn.drop_table::<SimpleUser>().execute().await?;
 
     Ok(())
 }

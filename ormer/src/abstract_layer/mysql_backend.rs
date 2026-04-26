@@ -85,6 +85,58 @@ pub struct Database {
     pool: Pool,
 }
 
+/// 创建表执行器
+pub struct CreateTableExecutor<'a, T: Model> {
+    pool: &'a Pool,
+    table_name: Option<String>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Model> CreateTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        // 表不存在，创建新表
+        let create_sql = crate::generate_create_table_sql_with_name::<T>(
+            crate::abstract_layer::DbType::MySQL,
+            self.table_name.as_deref(),
+        );
+
+        conn.query_drop(&create_sql)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// 删除表执行器
+pub struct DropTableExecutor<'a, T: Model> {
+    pool: &'a Pool,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        conn.query_drop(&sql)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
 impl Database {
     /// 连接到 MySQL 数据库
     pub async fn connect(
@@ -100,23 +152,13 @@ impl Database {
         Ok(Self { pool })
     }
 
-    /// 创建表
-    pub async fn create_table<T: Model>(&self) -> Result<(), crate::Error> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-
-        // 表不存在，创建新表
-        let create_sql =
-            crate::generate_create_table_sql::<T>(crate::abstract_layer::DbType::MySQL);
-
-        conn.query_drop(&create_sql)
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-
-        Ok(())
+    /// 创建表 - 返回执行器
+    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+        CreateTableExecutor {
+            pool: &self.pool,
+            table_name: None,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 验证表结构是否与模型定义匹配
@@ -489,20 +531,12 @@ impl Database {
         })
     }
 
-    /// 删除表
-    pub async fn drop_table<T: Model>(&self) -> Result<(), crate::Error> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-
-        conn.query_drop(&sql)
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
-
-        Ok(())
+    /// 删除表 - 返回执行器
+    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+        DropTableExecutor {
+            pool: &self.pool,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 执行原生 SQL 查询并返回模型列表
@@ -746,13 +780,13 @@ pub struct MappedSelectExecutor<'a, T: Model, V> {
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
     {
         MappedCollectFuture {
-            select: self.select,
+            select: self.select.clone(),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -831,6 +865,15 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 克隆executor（保持相同的pool引用）
+    pub fn clone_with_pool(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F>(self, f: F) -> Self
     where
@@ -929,9 +972,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<'a, T, C> {
+    pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<'a, T, C> {
         CollectFuture {
-            executor: self,
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }
@@ -1182,27 +1225,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                // 根据列的类型获取值
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" => {
-                        let v: i64 = row.get(i).unwrap_or(0);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(i).unwrap_or(String::new());
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(i).unwrap_or(0.0);
-                        crate::model::Value::Real(v)
-                    }
-                    _ => {
-                        return Err(crate::Error::Database(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = convert_mysql_value(&row, i)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -1236,7 +1259,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> Result<u64, crate::Error> {
-        let sql = self.build_sql();
+        let (sql, params) = self.build_sql_with_params();
 
         let mut conn = self
             .pool
@@ -1244,29 +1267,44 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        let result = conn
-            .query_iter(&sql)
+        let mysql_params = values_to_params(&params)?;
+
+        // 使用 exec 执行 SQL，然后通过 last_insert_id 和 affected_rows 获取结果
+        conn.exec_drop(&sql, mysql_params)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        Ok(result.affected_rows())
+        Ok(conn.affected_rows())
     }
 
+    #[allow(dead_code)]
     fn build_sql(&self) -> String {
+        let (sql, _) = self.build_sql_with_params();
+        sql
+    }
+
+    fn build_sql_with_params(&self) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut params = Vec::new();
 
         if !self.filters.is_empty() {
             sql.push_str(" WHERE ");
-            let mut param_idx = 1;
+            let mut param_idx: usize = 1;
             for (i, filter) in self.filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter(filter, &mut sql, &mut param_idx, DbType::MySQL);
+                common_helpers::format_filter_with_params(
+                    filter,
+                    &mut sql,
+                    &mut param_idx,
+                    &mut params,
+                    DbType::MySQL,
+                );
             }
         }
 
-        sql
+        (sql, params)
     }
 }
 
@@ -1883,6 +1921,15 @@ impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model
 
 /// LeftJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的pool引用）
+    pub fn clone_with_pool(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -1903,10 +1950,10 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     }
 
     pub fn collect<C: FromIterator<(T, Option<J>)> + 'static>(
-        self,
+        &self,
     ) -> LeftJoinCollectFuture<'a, T, J> {
         LeftJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }
@@ -1992,25 +2039,40 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                 let rust_type = J::COLUMN_SCHEMA[i].rust_type;
                 let ormer_value = match rust_type {
                     "i32" | "i64" | "u32" | "u64" => {
-                        let v: i64 = row.get(idx).unwrap_or(0);
-                        if v != 0 {
-                            j_is_null = false;
+                        // 先检查是否为 NULL
+                        match row.get_opt::<i64, usize>(idx) {
+                            None | Some(Err(_)) => crate::model::Value::Integer(0),
+                            Some(Ok(v)) => {
+                                if v != 0 {
+                                    j_is_null = false;
+                                }
+                                crate::model::Value::Integer(v)
+                            }
                         }
-                        crate::model::Value::Integer(v)
                     }
                     "String" => {
-                        let v: String = row.get(idx).unwrap_or(String::new());
-                        if !v.is_empty() {
-                            j_is_null = false;
+                        // 先检查是否为 NULL
+                        match row.get_opt::<String, usize>(idx) {
+                            None | Some(Err(_)) => crate::model::Value::Text(String::new()),
+                            Some(Ok(v)) => {
+                                if !v.is_empty() {
+                                    j_is_null = false;
+                                }
+                                crate::model::Value::Text(v)
+                            }
                         }
-                        crate::model::Value::Text(v)
                     }
                     "f32" | "f64" => {
-                        let v: f64 = row.get(idx).unwrap_or(0.0);
-                        if v != 0.0 {
-                            j_is_null = false;
+                        // 先检查是否为 NULL
+                        match row.get_opt::<f64, usize>(idx) {
+                            None | Some(Err(_)) => crate::model::Value::Real(0.0),
+                            Some(Ok(v)) => {
+                                if v != 0.0 {
+                                    j_is_null = false;
+                                }
+                                crate::model::Value::Real(v)
+                            }
                         }
-                        crate::model::Value::Real(v)
                     }
                     _ => {
                         return Err(crate::Error::Database(format!(
@@ -2035,6 +2097,15 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
 /// InnerJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的pool引用）
+    pub fn clone_with_pool(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2054,9 +2125,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn collect<C: FromIterator<(T, J)> + 'static>(self) -> InnerJoinCollectFuture<'a, T, J> {
+    pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<'a, T, J> {
         InnerJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }
@@ -2170,6 +2241,15 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
 /// RightJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
+    /// 克隆executor（保持相同的pool引用）
+    pub fn clone_with_pool(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn filter<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2190,10 +2270,10 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
-        self,
+        &self,
     ) -> RightJoinCollectFuture<'a, T, J> {
         RightJoinCollectFuture {
-            executor: self,
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }

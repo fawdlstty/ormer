@@ -1,19 +1,14 @@
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::Model;
 
 mod _test_common;
 
-#[derive(Debug, Model)]
-#[table = "test_users"]
-struct TestUser {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(TestUser, "schema_validation_users_1");
 
 #[derive(Debug, Model)]
-#[table = "test_users"]
+#[table = "schema_validation_users_different_1"]
 struct TestUserDifferent {
     #[primary]
     id: i32,
@@ -24,7 +19,7 @@ struct TestUserDifferent {
 }
 
 #[derive(Debug, Model)]
-#[table = "test_users"]
+#[table = "schema_validation_users_missing_1"]
 struct TestUserMissingColumn {
     #[primary]
     id: i32,
@@ -42,36 +37,44 @@ async fn test_schema_validation_impl(
 
     // 测试 1: 首次创建表（应该成功）
     println!("测试 1: 首次创建表");
-    match db.create_table::<TestUser>().await {
+    match db.create_table::<TestUser>().execute().await {
         Ok(_) => println!("✓ 表创建成功\n"),
         Err(e) => println!("✗ 表创建失败: {e}\n"),
     }
 
     // 测试 2: 再次创建相同结构的表（应该成功，因为结构匹配）
     println!("测试 2: 再次创建相同结构的表");
-    match db.create_table::<TestUser>().await {
+    match db.create_table::<TestUser>().execute().await {
         Ok(_) => println!("✓ 表结构验证通过（表已存在但结构匹配）\n"),
         Err(e) => println!("✗ 表结构验证失败: {e}\n"),
     }
 
     // 测试 3: 尝试用不同的表结构创建（应该失败）
     println!("测试 3: 尝试用不同的表结构创建");
-    match db.create_table::<TestUserDifferent>().await {
-        Ok(_) => println!("✗ 应该失败但却成功了\n"),
+    match db.create_table::<TestUserDifferent>().execute().await {
+        Ok(_) => {
+            println!("✗ 应该失败但却成功了\n");
+            // 如果意外成功，清理该表
+            db.drop_table::<TestUserDifferent>().execute().await?;
+        }
         Err(e) => println!("✓ 正确检测到表结构不匹配: {e}\n"),
     }
 
     // 测试 4: 尝试用缺少列的表结构创建（应该失败）
     println!("测试 4: 尝试用缺少列的表结构创建");
-    match db.create_table::<TestUserMissingColumn>().await {
-        Ok(_) => println!("✗ 应该失败但却成功了\n"),
+    match db.create_table::<TestUserMissingColumn>().execute().await {
+        Ok(_) => {
+            println!("✗ 应该失败但却成功了\n");
+            // 如果意外成功，清理该表
+            db.drop_table::<TestUserMissingColumn>().execute().await?;
+        }
         Err(e) => println!("✓ 正确检测到表结构不匹配: {e}\n"),
     }
 
     println!("=== 测试完成 ===");
 
     // 清理测试表
-    db.drop_table::<TestUser>().await?;
+    db.drop_table::<TestUser>().execute().await?;
 
     Ok(())
 }

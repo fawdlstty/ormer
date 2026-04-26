@@ -1,21 +1,15 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-#[derive(Debug, Model, Clone)]
-#[table = "test_sql_users"]
-struct TestSqlUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    age: i32,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_direct!(TestSqlUser, "test_sql_users_1");
 
 async fn test_print_aggregate_sql_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestSqlUser>().await?;
+    db.create_table::<TestSqlUser>().execute().await?;
 
     // 测试不带filter的聚合 - 直接从 Select 获取 AggregateSelect
     let select1 = ormer::query::builder::Select::<TestSqlUser>::new();
@@ -40,7 +34,7 @@ async fn test_print_aggregate_sql_impl(
     println!("MAX params: {:?}", params3);
 
     // 清理测试表
-    db.drop_table::<TestSqlUser>().await?;
+    db.drop_table::<TestSqlUser>().execute().await?;
 
     Ok(())
 }

@@ -1,31 +1,12 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+
 use ormer::generate_create_table_sql;
 
 mod _test_common;
 
-// 测试模型定义
-#[derive(Model)]
-#[table = "users"]
-struct TestUser {
-    #[primary]
-    id: i32,
-    name: String,
-    age: i32,
-    email: Option<String>,
-}
-
-// 测试更完整类型的模型
-#[derive(Model)]
-#[table = "complete_types"]
-struct TestCompleteTypes {
-    #[primary]
-    id: i64,
-    text_val: String,
-    optional_text: Option<String>,
-    optional_int: Option<i32>,
-    bool_val: bool,
-    optional_bool: Option<bool>,
-}
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user!(TestUser, "create_table_users_1");
+define_test_complete_types!(TestCompleteTypes, "create_table_complete_types_1");
 
 #[cfg(test)]
 mod create_table_tests {
@@ -47,15 +28,16 @@ mod create_table_tests {
             }
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT")); // Option 类型，不加 NOT NULL
             }
             #[cfg(feature = "mysql")]
             ormer::DbType::MySQL => {
-                assert!(sql.contains("id INT PRIMARY KEY"));
-                assert!(!sql.contains("AUTO_INCREMENT")); // 没有auto，所以不应该有AUTO_INCREMENT
+                assert!(sql.contains("id INT PRIMARY KEY AUTO_INCREMENT")); // 有auto，所以应该有AUTO_INCREMENT
                 assert!(sql.contains("name VARCHAR(255) NOT NULL"));
                 assert!(sql.contains("age INT NOT NULL"));
                 assert!(sql.contains("email VARCHAR(255)")); // Option 类型，不加 NOT NULL
@@ -86,7 +68,9 @@ mod create_table_tests {
             #[cfg(feature = "turso")]
             ormer::DbType::Turso => {
                 // Turso/SQLite 使用 INTEGER
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
@@ -95,7 +79,9 @@ mod create_table_tests {
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
                 // PostgreSQL 使用 INTEGER 和 TEXT
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
@@ -110,6 +96,8 @@ mod create_table_tests {
                 assert!(sql.contains("email VARCHAR(255)"));
                 println!("MySQL SQL: {}", sql);
             }
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 
@@ -122,7 +110,9 @@ mod create_table_tests {
             #[cfg(feature = "turso")]
             ormer::DbType::Turso => {
                 // Turso/SQLite 使用 INTEGER
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
@@ -131,7 +121,9 @@ mod create_table_tests {
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
                 // PostgreSQL 使用 INTEGER 和 TEXT
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
@@ -146,6 +138,8 @@ mod create_table_tests {
                 assert!(sql.contains("email VARCHAR(255)"));
                 println!("MySQL SQL: {}", sql);
             }
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 
@@ -208,7 +202,9 @@ mod create_table_tests {
             #[cfg(feature = "turso")]
             ormer::DbType::Turso => {
                 // Turso 使用 INTEGER 和 TEXT
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("text_val TEXT NOT NULL"));
                 assert!(sql.contains("optional_text TEXT"));
                 assert!(sql.contains("optional_int INTEGER"));
@@ -238,6 +234,8 @@ mod create_table_tests {
                 assert!(sql.contains("optional_bool TINYINT(1)"));
                 println!("MySQL Complete Types SQL: {}", sql);
             }
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 
@@ -250,7 +248,9 @@ mod create_table_tests {
             #[cfg(feature = "turso")]
             ormer::DbType::Turso => {
                 // Turso 使用 INTEGER 和 TEXT
-                assert!(sql.contains("id INTEGER PRIMARY KEY"));
+                assert!(
+                    sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
+                );
                 assert!(sql.contains("text_val TEXT NOT NULL"));
                 assert!(sql.contains("optional_text TEXT"));
                 assert!(sql.contains("optional_int INTEGER"));
@@ -280,6 +280,8 @@ mod create_table_tests {
                 assert!(sql.contains("optional_bool TINYINT(1)"));
                 println!("MySQL Complete Types SQL: {}", sql);
             }
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 

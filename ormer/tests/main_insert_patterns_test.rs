@@ -1,38 +1,36 @@
-use ormer::Model;
+#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
-// 定义与 main.rs 相同的测试模型
-#[derive(Debug, Model, Clone)]
-#[table = "test_users_insert"]
-struct TestUserInsert {
-    #[primary(auto)]
-    id: i32,
-    #[unique]
-    name: String,
-    #[index]
-    age: i32,
-    email: Option<String>,
-}
+// 为每个测试使用唯一的表名，避免并发测试冲突
+define_test_user!(TestUserInsert, "test_users_insert_1");
+define_test_role_with_unique_group!(TestRoleInsert, "test_roles_insert_1");
 
-#[derive(Debug, Model, Clone)]
-#[table = "test_roles_insert"]
-struct TestRoleInsert {
-    #[primary]
-    id: i32,
-    #[unique(group = 1)]
-    uid: i32,
-    #[unique(group = 1)]
-    name: String,
-}
+#[allow(dead_code)]
+define_test_user!(TestUserInsert2, "test_users_insert_2");
+#[allow(dead_code)]
+define_test_role_with_unique_group!(TestRoleInsert2, "test_roles_insert_2");
+
+#[allow(dead_code)]
+define_test_user!(TestUserInsert3, "test_users_insert_3");
+define_test_role_with_unique_group!(TestRoleInsert3, "test_roles_insert_3");
+
+#[allow(dead_code)]
+define_test_user!(TestUserInsert4, "test_users_insert_4");
+define_test_role_with_unique_group!(TestRoleInsert4, "test_roles_insert_4");
 
 /// 测试所有 insert 调用方式（基于 main.rs 的用法）
 async fn test_all_insert_patterns_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserInsert>().await?;
-    db.create_table::<TestRoleInsert>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleInsert>().execute().await;
+    let _ = db.drop_table::<TestUserInsert>().execute().await;
+
+    db.create_table::<TestUserInsert>().execute().await?;
+    db.create_table::<TestRoleInsert>().execute().await?;
 
     // 1. 插入单个对象引用 &T
     db.insert(&TestUserInsert {
@@ -128,8 +126,8 @@ async fn test_all_insert_patterns_impl(
     println!("所有 insert 用法测试通过！");
 
     // 清理测试表（先删除有外键的表）
-    db.drop_table::<TestRoleInsert>().await?;
-    db.drop_table::<TestUserInsert>().await?;
+    db.drop_table::<TestRoleInsert>().execute().await?;
+    db.drop_table::<TestUserInsert>().execute().await?;
 
     Ok(())
 }
@@ -139,23 +137,27 @@ async fn test_batch_insert_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestUserInsert>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestUserInsert2>().execute().await;
+
+    db.create_table::<TestUserInsert2>().execute().await?;
 
     // 批量插入多个用户
     db.insert(&vec![
-        TestUserInsert {
+        TestUserInsert2 {
             id: 1,
             name: "User1".to_string(),
             age: 20,
             email: Some("user1@example.com".to_string()),
         },
-        TestUserInsert {
+        TestUserInsert2 {
             id: 2,
             name: "User2".to_string(),
             age: 25,
             email: Some("user2@example.com".to_string()),
         },
-        TestUserInsert {
+        TestUserInsert2 {
             id: 3,
             name: "User3".to_string(),
             age: 30,
@@ -164,7 +166,7 @@ async fn test_batch_insert_impl(
     ])
     .await?;
 
-    let users: Vec<TestUserInsert> = db.select::<TestUserInsert>().collect::<Vec<_>>().await?;
+    let users: Vec<TestUserInsert2> = db.select::<TestUserInsert2>().collect::<Vec<_>>().await?;
 
     assert_eq!(users.len(), 3);
     assert_eq!(users[0].name, "User1");
@@ -174,7 +176,7 @@ async fn test_batch_insert_impl(
     println!("批量插入测试通过！");
 
     // 清理测试表
-    db.drop_table::<TestUserInsert>().await?;
+    db.drop_table::<TestUserInsert2>().execute().await?;
 
     Ok(())
 }
@@ -184,10 +186,14 @@ async fn test_insert_or_update_patterns_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestRoleInsert>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleInsert3>().execute().await;
+
+    db.create_table::<TestRoleInsert3>().execute().await?;
 
     // 1. 插入或更新单个对象引用 &T
-    db.insert_or_update(&TestRoleInsert {
+    db.insert_or_update(&TestRoleInsert3 {
         id: 1,
         uid: 1,
         name: "admin".to_string(),
@@ -195,7 +201,7 @@ async fn test_insert_or_update_patterns_impl(
     .await?;
 
     // 2. 插入或更新 Vec<T> 的引用 &vec![T {...}]
-    db.insert_or_update(&vec![TestRoleInsert {
+    db.insert_or_update(&vec![TestRoleInsert3 {
         id: 2,
         uid: 2,
         name: "editor".to_string(),
@@ -203,7 +209,7 @@ async fn test_insert_or_update_patterns_impl(
     .await?;
 
     // 3. 插入或更新数组引用 &[T; N]
-    db.insert_or_update(&[TestRoleInsert {
+    db.insert_or_update(&[TestRoleInsert3 {
         id: 3,
         uid: 3,
         name: "viewer".to_string(),
@@ -212,7 +218,7 @@ async fn test_insert_or_update_patterns_impl(
 
     // 4. 插入或更新数组切片 &[T; N][..]
     db.insert_or_update(
-        &[TestRoleInsert {
+        &[TestRoleInsert3 {
             id: 4,
             uid: 4,
             name: "guest".to_string(),
@@ -221,7 +227,7 @@ async fn test_insert_or_update_patterns_impl(
     .await?;
 
     // 验证所有数据插入成功
-    let roles: Vec<TestRoleInsert> = db.select::<TestRoleInsert>().collect::<Vec<_>>().await?;
+    let roles: Vec<TestRoleInsert3> = db.select::<TestRoleInsert3>().collect::<Vec<_>>().await?;
 
     assert_eq!(roles.len(), 4);
 
@@ -235,7 +241,7 @@ async fn test_insert_or_update_patterns_impl(
     println!("所有 insert_or_update 用法测试通过！");
 
     // 清理测试表
-    db.drop_table::<TestRoleInsert>().await?;
+    db.drop_table::<TestRoleInsert3>().execute().await?;
 
     Ok(())
 }
@@ -245,10 +251,14 @@ async fn test_insert_or_update_update_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
-    db.create_table::<TestRoleInsert>().await?;
+
+    // 清理可能存在的旧表
+    let _ = db.drop_table::<TestRoleInsert4>().execute().await;
+
+    db.create_table::<TestRoleInsert4>().execute().await?;
 
     // 第一次插入
-    db.insert_or_update(&TestRoleInsert {
+    db.insert_or_update(&TestRoleInsert4 {
         id: 1,
         uid: 1,
         name: "admin".to_string(),
@@ -256,21 +266,21 @@ async fn test_insert_or_update_update_impl(
     .await?;
 
     // 使用 insert_or_update 更新同一条记录
-    db.insert_or_update(&TestRoleInsert {
+    db.insert_or_update(&TestRoleInsert4 {
         id: 1,
         uid: 1,
         name: "super_admin".to_string(),
     })
     .await?;
 
-    let roles: Vec<TestRoleInsert> = db.select::<TestRoleInsert>().collect::<Vec<_>>().await?;
+    let roles: Vec<TestRoleInsert4> = db.select::<TestRoleInsert4>().collect::<Vec<_>>().await?;
     assert_eq!(roles.len(), 1);
     assert_eq!(roles[0].name, "super_admin");
 
     println!("insert_or_update 更新功能测试通过！");
 
     // 清理测试表
-    db.drop_table::<TestRoleInsert>().await?;
+    db.drop_table::<TestRoleInsert4>().execute().await?;
 
     Ok(())
 }
