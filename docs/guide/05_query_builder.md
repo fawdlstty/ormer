@@ -69,6 +69,49 @@ let user: Vec<User> = db
 .range(10..)     // 从第10条开始
 ```
 
+## 流式查询 (stream)
+
+当需要处理大量数据时，流式查询可以逐行获取结果，避免一次性加载到内存：
+
+```rust
+// 基础流式查询
+let mut stream = db
+    .select::<User>()
+    .filter(|u| u.age.ge(18))
+    .stream()
+    .into_iter()
+    .await?;
+
+while let Some(user_result) = stream.next().await {
+    let user = user_result?;
+    println!("{:?}", user);
+}
+```
+
+### 流式查询特点
+
+- **内存友好**: 逐行获取数据，适合大数据集查询
+- **异步迭代**: 支持异步逐行处理，不会阻塞线程
+- **支持所有查询选项**: 可配合 filter、order_by、range 等使用
+
+### 带过滤和排序的流式查询
+
+```rust
+let mut stream = db
+    .select::<User>()
+    .filter(|u| u.age.ge(18))
+    .order_by_desc(|u| u.age)
+    .range(0..100)
+    .stream()
+    .into_iter()
+    .await?;
+
+while let Some(user_result) = stream.next().await {
+    let user = user_result?;
+    // 处理每一行数据
+}
+```
+
 ## 字段投影 (map_to)
 
 ```rust

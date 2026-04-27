@@ -29,6 +29,95 @@ let adult_count: usize = db
     .await?;
 ```
 
+## GROUP BY 和 HAVING 查询
+
+### 基础分组
+
+```rust
+use ormer::Select;
+
+// 统计每个年龄段的用户数量
+let sql = Select::<User>::new()
+    .select_column(|u| u.id.count())
+    .group_by(|u| u.age)
+    .to_sql();
+
+// 生成 SQL: SELECT COUNT(id) FROM users GROUP BY age
+```
+
+### 多字段选择 + 分组
+
+```rust
+// 选择部门和用户数量
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.id.count()))
+    .group_by(|u| u.department)
+    .to_sql();
+
+// 生成 SQL: SELECT department, COUNT(id) FROM users GROUP BY department
+```
+
+### HAVING 条件过滤
+
+```rust
+// 统计用户数量大于 5 的部门
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.id.count()))
+    .group_by(|u| u.department)
+    .having(|u| u.id.count().gt(5))
+    .to_sql();
+
+// 生成 SQL: SELECT department, COUNT(id) FROM users GROUP BY department HAVING COUNT(id) > ?
+```
+
+### 多字段分组
+
+```rust
+// 按部门和年龄分组，统计每组的数量和平均分
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.age, u.id.count(), u.score.avg()))
+    .group_by(|u| (u.department, u.age))
+    .to_sql();
+
+// 生成 SQL: SELECT department, age, COUNT(id), AVG(score) FROM users GROUP BY department, age
+```
+
+### 完整查询：WHERE + GROUP BY + HAVING + ORDER BY + LIMIT
+
+```rust
+let sql = Select::<User>::new()
+    .filter(|u| u.age.ge(18))
+    .select_column(|u| (u.department, u.id.count(), u.score.avg()))
+    .group_by(|u| u.department)
+    .having(|u| u.id.count().gt(0))
+    .order_by(|u| u.department)
+    .range(0..10)
+    .to_sql();
+
+// 生成 SQL:
+// SELECT department, COUNT(id), AVG(score)
+// FROM users
+// WHERE age >= ?
+// GROUP BY department
+// HAVING COUNT(id) > ?
+// ORDER BY department ASC
+// LIMIT 10
+```
+
+### 支持的聚合函数
+
+- `count()` - 计数，返回 `usize`
+- `sum()` - 求和，返回原类型（数值类型）
+- `avg()` - 平均值，返回 `f64`
+- `max()` - 最大值，返回原类型（数值类型）
+- `min()` - 最小值，返回原类型（数值类型）
+
+### 注意事项
+
+- `group_by()` 方法可以在 `having()` 之前或之后调用，但推荐先 `group_by()` 后 `having()`
+- `filter()` 添加的是 WHERE 条件（分组前过滤），`having()` 添加的是 HAVING 条件（分组后过滤）
+- 所有聚合函数生成的 SQL 使用参数化查询，保证安全性
+
 ## JOIN 查询
 
 ```rust

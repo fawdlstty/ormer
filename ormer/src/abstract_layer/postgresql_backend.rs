@@ -1,9 +1,9 @@
+use super::common::common_helpers;
 use crate::abstract_layer::DbType;
-use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
-    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
-    RightJoinedSelect, Select, WhereExpr,
+    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
+    RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
@@ -24,7 +24,19 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
         is_primary: bool,
         is_auto_increment: bool,
         is_nullable: bool,
+        enum_variants: Option<&[&str]>,
     ) -> String {
+        // PostgreSQL 支持 ENUM 类型
+        if enum_variants.is_some() {
+            // 使用 rust_type 作为 ENUM 类型名（需要小蛇形命名）
+            let enum_name = to_snake_case(rust_type);
+            return format!(
+                "{}{}",
+                enum_name,
+                if !is_nullable { " NOT NULL" } else { "" }
+            );
+        }
+
         // 首先处理主键类型（主键自动 NOT NULL）
         if is_primary {
             if is_auto_increment {
@@ -92,6 +104,22 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
     }
 }
 
+/// 将驼峰命名转换为蛇形命名
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap());
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// PostgreSQL 数据库连接封装
 #[allow(dead_code)]
 pub struct Database {
@@ -108,6 +136,27 @@ pub struct CreateTableExecutor<'a, T: Model> {
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
     pub async fn execute(self) -> Result<(), crate::Error> {
+        // 先创建所有需要的 ENUM 类型
+        for column in T::COLUMN_SCHEMA.iter() {
+            if let Some(variants) = column.enum_variants {
+                let enum_name = to_snake_case(column.rust_type);
+                let variants_str = variants
+                    .iter()
+                    .map(|v| format!("'{}'", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let create_enum_sql = format!(
+                    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN CREATE TYPE {} AS ENUM ({}); END IF; END $$",
+                    enum_name, enum_name, variants_str
+                );
+
+                self.client
+                    .execute(&create_enum_sql, &[])
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+            }
+        }
+
         // 表不存在，创建新表
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::PostgreSQL,
@@ -288,6 +337,7 @@ impl Database {
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
+                expected_col.enum_variants,
             );
 
             // 对于类型比较，我们需要提取基础类型（不包含 SERIAL, PRIMARY KEY, NOT NULL 等约束）
@@ -314,6 +364,7 @@ impl Database {
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
+                    expected_col.enum_variants,
                 );
                 // 去掉 " NOT NULL" 后缀
                 full_type.replace(" NOT NULL", "")
@@ -404,27 +455,31 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
 
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let (sql, _) = common_helpers::build_batch_insert_sql_postgresql_with_columns(
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
+        let mut param_idx = 1;
 
-        for model in models.iter() {
-            let values = model.insert_values();
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+
+            let values = model.field_values();
             all_values.extend(values);
         }
 
         // 获取列的rust类型信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
-            .collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -447,13 +502,12 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
         let mut param_idx = 1;
 
@@ -468,14 +522,14 @@ impl Database {
             sql.push_str(&format!("({})", placeholders.join(", ")));
             param_idx += col_count;
 
-            let values = model.insert_values();
+            let values = model.field_values();
             all_values.extend(values);
         }
 
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in columns.iter() {
+        for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -487,11 +541,7 @@ impl Database {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
-            .collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -508,6 +558,15 @@ impl Database {
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
+            client: &self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
             client: &self.client,
             _marker: PhantomData,
         }
@@ -650,6 +709,15 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
@@ -687,17 +755,14 @@ impl<'a> Transaction<'a> {
 
         let columns = T::insert_columns();
         let (sql, _) =
-            crate::abstract_layer::common_helpers::build_batch_insert_sql_postgresql_with_columns(
+            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
                 T::TABLE_NAME,
                 &columns,
                 models.len(),
             );
-        let all_values =
-            crate::abstract_layer::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                T,
-            >(models);
+        let all_values = super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(models);
 
-        // 获取列的rust_type信息
+        // 获取列的rust_type信息（排除自增主键）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
@@ -727,13 +792,12 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
         let mut param_idx = 1;
 
@@ -748,14 +812,14 @@ impl<'a> Transaction<'a> {
             sql.push_str(&format!("({})", placeholders.join(", ")));
             param_idx += col_count;
 
-            let values = model.insert_values();
+            let values = model.field_values();
             all_values.extend(values);
         }
 
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in columns.iter() {
+        for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -767,11 +831,7 @@ impl<'a> Transaction<'a> {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
-            .collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -816,6 +876,13 @@ pub struct SelectExecutor<'a, T: Model> {
 /// 映射查询结果执行器
 pub struct MappedSelectExecutor<'a, T: Model, V> {
     select: crate::query::builder::MappedSelect<T, V>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<(T, V)>,
+}
+
+/// 分组聚合查询执行器
+pub struct GroupedSelectExecutor<'a, T: Model, V> {
+    select: GroupedSelect<T, V>,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<(T, V)>,
 }
@@ -991,6 +1058,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
             select: mapped_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 选择列（支持聚合函数）- 转换为分组查询
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    where
+        F: FnOnce(T::Where) -> V,
+        V: crate::query::builder::SelectColumnResult,
+    {
+        let grouped_select = self.select.select_column(f);
+        GroupedSelectExecutor {
+            select: grouped_select,
             client: self.client,
             _marker: PhantomData,
         }
@@ -1722,13 +1803,9 @@ fn values_to_params(
     for value in values {
         let param: Box<dyn tokio_postgres::types::ToSql + Sync> = match value {
             crate::model::Value::Integer(v) => {
-                // PostgreSQL INTEGER (Int4) 是 32 位，需要将 i64 转换为 i32
-                // 如果值超出 i32 范围，则使用 i64 (Int8/BIGINT)
-                if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
-                } else {
-                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
-                }
+                // 统一使用 i64 以支持与 BIGINT（如 COUNT 函数返回值）的比较
+                // PostgreSQL 8.2+ 支持 INTEGER 与 BIGINT 的自动转换
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
             }
             crate::model::Value::Text(v) => {
                 Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
@@ -1753,6 +1830,204 @@ pub struct RelatedSelectExecutor<'a, T: Model, R: Model> {
     select: RelatedSelect<T, R>,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<(T, R)>,
+}
+
+/// SelectStream - 流式查询执行器 (PostgreSQL)
+pub struct SelectStream<'a, T: Model> {
+    select: Select<T>,
+    client: &'a tokio_postgres::Client,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 创建流式查询执行器
+    pub fn stream(self) -> SelectStream<'a, T> {
+        SelectStream {
+            select: self.select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Model + 'static> SelectStream<'a, T> {
+    /// 返回异步迭代器  
+    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+        let pg_params = values_to_params(&params)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            pg_params.iter().map(|p| p.as_ref()).collect();
+
+        // 使用 query_raw 获取 RowStream
+        let row_stream = self
+            .client
+            .query_raw(&sql, param_refs)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(SelectStreamIterator {
+            row_stream: Box::pin(row_stream),
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// SelectStreamIterator - 流式查询迭代器 (PostgreSQL)
+pub struct SelectStreamIterator<'a, T: Model> {
+    row_stream: std::pin::Pin<Box<tokio_postgres::RowStream>>,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
+    /// 获取下一行数据
+    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+        use futures::StreamExt;
+
+        match self.row_stream.next().await {
+            Some(Ok(row)) => {
+                // 解析行数据为 Model
+                let mut data = HashMap::new();
+                for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                    let column_info = &T::COLUMN_SCHEMA[i];
+                    let rust_type = column_info.rust_type;
+                    let is_nullable = column_info.is_nullable;
+
+                    let ormer_value = if is_nullable {
+                        use tokio_postgres::types::Type;
+                        let pg_type = row.columns()[i].type_();
+
+                        match *pg_type {
+                            Type::INT2 => {
+                                let v: Option<i16> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Integer(val as i64),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::INT4 => {
+                                let v: Option<i32> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Integer(val as i64),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::INT8 => {
+                                let v: Option<i64> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Integer(val),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::TEXT | Type::VARCHAR => {
+                                let v: Option<String> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Text(val),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::FLOAT4 => {
+                                let v: Option<f32> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Real(val as f64),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::FLOAT8 => {
+                                let v: Option<f64> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Real(val),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            Type::BOOL => {
+                                let v: Option<bool> = row.get(i);
+                                match v {
+                                    Some(true) => crate::model::Value::Integer(1),
+                                    Some(false) => crate::model::Value::Integer(0),
+                                    None => crate::model::Value::Null,
+                                }
+                            }
+                            _ => match rust_type {
+                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
+                                    let v: Option<i64> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Integer(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "String" => {
+                                    let v: Option<String> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Text(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "f32" | "f64" => {
+                                    let v: Option<f64> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Real(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "bool" => {
+                                    let v: Option<bool> = row.get(i);
+                                    match v {
+                                        Some(true) => crate::model::Value::Integer(1),
+                                        Some(false) => crate::model::Value::Integer(0),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                _ => {
+                                    return Some(Err(crate::Error::Database(format!(
+                                        "Unsupported nullable column type: {rust_type}"
+                                    ))));
+                                }
+                            },
+                        }
+                    } else {
+                        // 非空类型处理 (简化版,与collect_inner类似)
+                        match rust_type {
+                            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                                let v: i32 = row.get(i);
+                                crate::model::Value::Integer(v as i64)
+                            }
+                            "i64" | "u64" => {
+                                let v: i64 = row.get(i);
+                                crate::model::Value::Integer(v)
+                            }
+                            "String" => {
+                                let v: String = row.get(i);
+                                crate::model::Value::Text(v)
+                            }
+                            "f32" | "f64" => {
+                                let v: f64 = row.get(i);
+                                crate::model::Value::Real(v)
+                            }
+                            "bool" => {
+                                let v: bool = row.get(i);
+                                if v {
+                                    crate::model::Value::Integer(1)
+                                } else {
+                                    crate::model::Value::Integer(0)
+                                }
+                            }
+                            _ => {
+                                return Some(Err(crate::Error::Database(format!(
+                                    "Unsupported column type: {rust_type}"
+                                ))));
+                            }
+                        }
+                    };
+
+                    data.insert(col_name.to_string(), ormer_value);
+                }
+                let ormer_row = crate::model::Row::new(data);
+                Some(T::from_row(&ormer_row))
+            }
+            Some(Err(e)) => Some(Err(crate::Error::Database(e.to_string()))),
+            None => None,
+        }
+    }
 }
 
 impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
@@ -2606,6 +2881,12 @@ pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
+/// Grouped Collect future（分组聚合查询）
+pub struct GroupedCollectFuture<'a, T: Model, V, C> {
+    executor: GroupedSelectExecutor<'a, T, V>,
+    _marker: PhantomData<(T, V, C)>,
+}
+
 impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
@@ -2817,4 +3098,97 @@ fn convert_postgres_value(
         "Unsupported column type {:?} at index {}",
         col_type, index
     )))
+}
+
+impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        GroupedCollectFuture {
+            executor: GroupedSelectExecutor {
+                select: self.select.clone(),
+                client: self.client,
+                _marker: PhantomData,
+            },
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        Self {
+            select: self.select.group_by(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.having(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.executor.select.build_sql(DbType::PostgreSQL);
+            let pg_params = values_to_params(&params)?;
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                pg_params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = self
+                .executor
+                .client
+                .query(&sql, &param_refs)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+            let mut results = Vec::new();
+            let column_count = self.executor.select.column_count();
+            for row in rows {
+                let mut values = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let value = convert_postgres_value(&row, i)?;
+                    values.push(value);
+                }
+
+                let v = V::from_row_values(&values)?;
+                results.push(v);
+            }
+
+            Ok(results.into_iter().collect())
+        })
+    }
 }

@@ -1,9 +1,9 @@
+use super::common::common_helpers;
 use crate::abstract_layer::DbType;
-use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
-    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, RelatedSelect,
-    RightJoinedSelect, Select, WhereExpr,
+    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
+    RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
 use mysql_async::Pool;
@@ -20,7 +20,22 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
         is_primary: bool,
         is_auto_increment: bool,
         is_nullable: bool,
+        enum_variants: Option<&[&str]>,
     ) -> String {
+        // MySQL 支持 ENUM 类型
+        if let Some(variants) = enum_variants {
+            let variants_str = variants
+                .iter()
+                .map(|v| format!("'{}'", v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut sql_type = format!("ENUM({})", variants_str);
+            if !is_nullable {
+                sql_type.push_str(" NOT NULL");
+            }
+            return sql_type;
+        }
+
         // 首先处理主键类型
         if is_primary {
             let int_type = match rust_type {
@@ -265,6 +280,7 @@ impl Database {
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
+                expected_col.enum_variants,
             );
 
             // 对于类型比较，我们需要提取基础类型（不包含 AUTO_INCREMENT, PRIMARY KEY, NOT NULL 等约束）
@@ -283,6 +299,7 @@ impl Database {
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
+                    expected_col.enum_variants,
                 );
                 // 去掉 " NOT NULL" 后缀
                 full_type.replace(" NOT NULL", "")
@@ -392,18 +409,22 @@ impl Database {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        let columns = T::insert_columns();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
 
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
 
-        for model in models.iter() {
-            let values = model.insert_values();
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
             all_values.extend(values);
         }
 
@@ -431,13 +452,11 @@ impl Database {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
-        let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -448,17 +467,14 @@ impl Database {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.insert_values();
+            let values = model.field_values();
             all_values.extend(values);
         }
 
         // 添加 ON DUPLICATE KEY UPDATE 子句
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
         let mut first = true;
-        for col_name in columns.iter() {
-            if col_name == &primary_key {
-                continue; // 跳过主键
-            }
+        for col_name in T::COLUMNS.iter() {
             if !first {
                 sql.push_str(", ");
             }
@@ -479,6 +495,15 @@ impl Database {
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
+            pool: &self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
             pool: &self.pool,
             _marker: PhantomData,
         }
@@ -645,6 +670,15 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
@@ -681,15 +715,15 @@ impl<'a> Transaction<'a> {
         }
 
         let columns = T::insert_columns();
-        let (sql, _) = crate::abstract_layer::common_helpers::build_batch_insert_sql_with_columns(
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             T::TABLE_NAME,
             &columns,
             models.len(),
         );
         let all_values =
-            crate::abstract_layer::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                T,
-            >(models);
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
         let params = values_to_params(&all_values)?;
 
         self.conn
@@ -709,13 +743,11 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
-        let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -726,17 +758,14 @@ impl<'a> Transaction<'a> {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.insert_values();
+            let values = model.field_values();
             all_values.extend(values);
         }
 
         // 添加 ON DUPLICATE KEY UPDATE 子句
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
         let mut first = true;
-        for col_name in columns.iter() {
-            if col_name == &primary_key {
-                continue; // 跳过主键
-            }
+        for col_name in T::COLUMNS.iter() {
             if !first {
                 sql.push_str(", ");
             }
@@ -786,6 +815,13 @@ pub struct SelectExecutor<'a, T: Model> {
 /// 映射查询结果执行器
 pub struct MappedSelectExecutor<'a, T: Model, V> {
     select: crate::query::builder::MappedSelect<T, V>,
+    pool: &'a Pool,
+    _marker: PhantomData<(T, V)>,
+}
+
+/// 分组聚合查询执行器
+pub struct GroupedSelectExecutor<'a, T: Model, V> {
+    select: GroupedSelect<T, V>,
     pool: &'a Pool,
     _marker: PhantomData<(T, V)>,
 }
@@ -978,6 +1014,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
             select: mapped_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 选择列（支持聚合函数）- 转换为分组查询
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    where
+        F: FnOnce(T::Where) -> V,
+        V: crate::query::builder::SelectColumnResult,
+    {
+        let grouped_select = self.select.select_column(f);
+        GroupedSelectExecutor {
+            select: grouped_select,
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1452,6 +1502,156 @@ pub struct RelatedSelectExecutor<'a, T: Model, R: Model> {
     select: RelatedSelect<T, R>,
     pool: &'a Pool,
     _marker: PhantomData<(T, R)>,
+}
+
+/// SelectStream - 流式查询执行器 (MySQL)
+pub struct SelectStream<'a, T: Model> {
+    select: Select<T>,
+    pool: &'a Pool,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 创建流式查询执行器
+    pub fn stream(self) -> SelectStream<'a, T> {
+        SelectStream {
+            select: self.select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Model + 'static> SelectStream<'a, T> {
+    /// 返回异步迭代器
+    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+
+        let mysql_params: Vec<mysql_async::Value> = params
+            .iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(n) => mysql_async::Value::Int(*n),
+                crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
+                crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
+                crate::model::Value::Null => mysql_async::Value::NULL,
+            })
+            .collect();
+
+        // 从连接池获取连接并执行查询
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+
+        // 执行查询获取行数据 (MySQL不支持真正的流式查询,使用exec获取所有结果)
+        let rows: Vec<mysql_async::Row> = conn
+            .exec(&sql, mysql_params)
+            .await
+            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+
+        Ok(SelectStreamIterator {
+            rows,
+            index: 0,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// SelectStreamIterator - 流式查询迭代器 (MySQL)
+pub struct SelectStreamIterator<'a, T: Model> {
+    rows: Vec<mysql_async::Row>,
+    index: usize,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
+    /// 获取下一行数据 (模拟流式)
+    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+        if self.index >= self.rows.len() {
+            return None;
+        }
+
+        let row = &self.rows[self.index];
+        self.index += 1;
+
+        // 解析行数据为 Model (与collect_inner类似)
+        let mut data = HashMap::new();
+        for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            let column_info = &T::COLUMN_SCHEMA[i];
+            let rust_type = column_info.rust_type;
+            let is_nullable = column_info.is_nullable;
+
+            let ormer_value = if is_nullable {
+                // 可空类型处理 - 直接使用 match 处理 Option<Result<...>>
+                match rust_type {
+                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                        match row.get_opt::<i32, usize>(i) {
+                            Some(Ok(val)) => crate::model::Value::Integer(val as i64),
+                            _ => crate::model::Value::Null,
+                        }
+                    }
+                    "i64" | "u64" => match row.get_opt::<i64, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Integer(val),
+                        _ => crate::model::Value::Null,
+                    },
+                    "String" => match row.get_opt::<String, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Text(val),
+                        _ => crate::model::Value::Null,
+                    },
+                    "f32" | "f64" => match row.get_opt::<f64, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Real(val),
+                        _ => crate::model::Value::Null,
+                    },
+                    "bool" => match row.get_opt::<u8, usize>(i) {
+                        Some(Ok(1)) => crate::model::Value::Integer(1),
+                        Some(Ok(0)) => crate::model::Value::Integer(0),
+                        _ => crate::model::Value::Null,
+                    },
+                    _ => {
+                        return Some(Err(crate::Error::Database(format!(
+                            "Unsupported nullable column type: {rust_type}"
+                        ))));
+                    }
+                }
+            } else {
+                // 非空类型处理 (简化版)
+                match rust_type {
+                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                        match row.get_opt::<i32, usize>(i) {
+                            Some(Ok(val)) => crate::model::Value::Integer(val as i64),
+                            _ => crate::model::Value::Integer(0),
+                        }
+                    }
+                    "i64" | "u64" => match row.get_opt::<i64, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Integer(val),
+                        _ => crate::model::Value::Integer(0),
+                    },
+                    "String" => match row.get_opt::<String, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Text(val),
+                        _ => crate::model::Value::Text(String::new()),
+                    },
+                    "f32" | "f64" => match row.get_opt::<f64, usize>(i) {
+                        Some(Ok(val)) => crate::model::Value::Real(val),
+                        _ => crate::model::Value::Real(0.0),
+                    },
+                    "bool" => match row.get_opt::<u8, usize>(i) {
+                        Some(Ok(1)) => crate::model::Value::Integer(1),
+                        _ => crate::model::Value::Integer(0),
+                    },
+                    _ => {
+                        return Some(Err(crate::Error::Database(format!(
+                            "Unsupported column type: {rust_type}"
+                        ))));
+                    }
+                }
+            };
+
+            data.insert(col_name.to_string(), ormer_value);
+        }
+        let ormer_row = crate::model::Row::new(data);
+        Some(T::from_row(&ormer_row))
+    }
 }
 
 impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
@@ -2305,6 +2505,12 @@ pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
+/// Grouped Collect future（分组聚合查询）
+pub struct GroupedCollectFuture<'a, T: Model, V, C> {
+    executor: GroupedSelectExecutor<'a, T, V>,
+    _marker: PhantomData<(T, V, C)>,
+}
+
 impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
@@ -2448,5 +2654,114 @@ fn convert_mysql_value(
             "Unsupported MySQL value type at index {}",
             index
         ))),
+    }
+}
+
+impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        GroupedCollectFuture {
+            executor: GroupedSelectExecutor {
+                select: self.select.clone(),
+                pool: self.pool,
+                _marker: PhantomData,
+            },
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        Self {
+            select: self.select.group_by(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.having(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let (sql, params) = self.executor.select.build_sql(DbType::MySQL);
+
+            let mut conn =
+                self.executor.pool.get_conn().await.map_err(|e| {
+                    crate::Error::Database(format!("Failed to get connection: {}", e))
+                })?;
+
+            // 将ormer::Value转换为mysql_async::Params
+            let mysql_params: Vec<mysql_async::Value> = params
+                .into_iter()
+                .map(|v| match v {
+                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
+                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
+                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
+                    crate::model::Value::Null => mysql_async::Value::NULL,
+                })
+                .collect();
+
+            let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
+                conn.query(&sql)
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            } else {
+                conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
+                    .await
+                    .map_err(|e| crate::Error::Database(e.to_string()))?
+            };
+
+            let mut results = Vec::new();
+            let column_count = self.executor.select.column_count();
+            for row in rows {
+                let mut values = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let value = convert_mysql_value(&row, i)?;
+                    values.push(value);
+                }
+
+                let v = V::from_row_values(&values)?;
+                results.push(v);
+            }
+
+            Ok(results.into_iter().collect())
+        })
     }
 }

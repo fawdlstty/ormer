@@ -11,6 +11,7 @@ pub struct ColumnSchema {
     pub unique_group: Option<i32>, // None表示不唯一，Some(group_id)表示属于哪个唯一键组
     pub is_indexed: bool,
     pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
+    pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
 }
 
 /// 外键信息
@@ -40,6 +41,7 @@ pub trait DbBackendTypeMapper {
         is_primary: bool,
         is_auto_increment: bool,
         is_nullable: bool,
+        enum_variants: Option<&[&str]>,
     ) -> String;
 }
 
@@ -60,14 +62,28 @@ pub trait Model: Sized {
     /// 获取字段值 (用于 INSERT/UPDATE)
     fn field_values(&self) -> Vec<Value>;
 
-    /// 获取主键字段名 (用于 UPDATE/DELETE)
-    fn primary_key_column() -> &'static str;
+    /// 获取主键字段名列表 (用于 UPDATE/DELETE，支持复合主键)
+    fn primary_key_columns() -> &'static [&'static str] {
+        // 默认实现：返回单个主键，保持向后兼容
+        const PRIMARY_KEY: &[&str] = &[""];
+        PRIMARY_KEY
+    }
 
-    /// 获取主键值
-    fn primary_key_value(&self) -> Value;
+    /// 获取主键值列表 (支持复合主键)
+    fn primary_key_values(&self) -> Vec<Value> {
+        // 默认实现：返回单个主键值，保持向后兼容
+        vec![self.primary_key_value()]
+    }
 
-    /// 判断主键是否为自增
-    fn is_primary_auto_increment() -> bool;
+    /// 获取主键字段名 (用于 UPDATE/DELETE，已废弃，请使用 primary_key_columns)
+    fn primary_key_column() -> &'static str {
+        ""
+    }
+
+    /// 获取主键值 (已废弃，请使用 primary_key_values)
+    fn primary_key_value(&self) -> Value {
+        Value::Null
+    }
 
     /// 获取需要插入的列名（排除自增主键）
     fn insert_columns() -> Vec<&'static str> {
@@ -96,6 +112,81 @@ pub trait Model: Sized {
             .collect()
     }
 }
+
+/// 枚举类型提供者 trait (可选实现)
+/// 如果类型实现了此 trait,则会被识别为枚举类型并生成 ENUM SQL
+pub trait ModelEnumProvider {
+    /// 获取枚举的所有变体名称
+    fn enum_variants() -> Option<&'static [&'static str]>;
+}
+
+/// ModelEnum trait - 用于标记枚举类型 (由派生宏自动实现)
+pub trait ModelEnum: ModelEnumProvider {
+    /// 获取枚举的所有变体名称  
+    const VARIANTS: &'static [&'static str];
+
+    /// 获取当前变体的名称
+    fn name(&self) -> &'static str;
+
+    /// 从名称构造枚举值
+    fn from_name(name: &str) -> Result<Self, Error>
+    where
+        Self: Sized;
+}
+
+/// 为 Option<T> 实现 ModelEnumProvider (如果 T 实现了 ModelEnum)
+impl<T: ModelEnum> ModelEnumProvider for Option<T> {
+    fn enum_variants() -> Option<&'static [&'static str]> {
+        Some(T::VARIANTS)
+    }
+}
+
+// 为 Option<T> where T: ModelEnum 实现 From<Option<T>> for Value
+impl<T: ModelEnum> From<Option<T>> for Value {
+    fn from(v: Option<T>) -> Self {
+        match v {
+            Some(enum_val) => Value::Text(enum_val.name().to_string()),
+            None => Value::Null,
+        }
+    }
+}
+
+// 为 Option<T> where T: ModelEnum 实现 FromValue
+impl<T: ModelEnum> FromValue for Option<T> {
+    fn from_value(value: &Value) -> Result<Self, Error> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Text(s) => {
+                // 使用 ModelEnum::from_name 构造枚举值
+                match T::from_name(s) {
+                    Ok(enum_val) => Ok(Some(enum_val)),
+                    Err(_) => Err(Error::TypeMismatch(format!("Unknown enum variant: {}", s))),
+                }
+            }
+            _ => Err(Error::TypeMismatch(format!(
+                "Expected Text value for Option<{}>",
+                std::any::type_name::<T>()
+            ))),
+        }
+    }
+}
+
+// 为常见非枚举类型实现 ModelEnumProvider，返回 None
+macro_rules! impl_enum_provider_for_non_enum {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl ModelEnumProvider for $t {
+                fn enum_variants() -> Option<&'static [&'static str]> {
+                    None
+                }
+            }
+        )*
+    };
+}
+
+impl_enum_provider_for_non_enum!(
+    i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64, bool, String, &str,
+);
 
 /// 用于 insert/insert_or_update 的参数类型 trait
 pub trait Insertable {
@@ -191,12 +282,28 @@ pub fn generate_create_table_sql_with_name<T: Model>(
             sql.push_str(", ");
         }
 
-        let sql_type = db_type.sql_type(
-            column.rust_type,
-            column.is_primary,
-            column.is_auto_increment,
-            column.is_nullable,
-        );
+        // 检查是否有复合主键（多个主键字段）
+        let primary_key_count = T::COLUMN_SCHEMA.iter().filter(|c| c.is_primary).count();
+        let is_composite_primary = primary_key_count > 1;
+
+        // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
+        let sql_type = if is_composite_primary && column.is_primary {
+            db_type.sql_type(
+                column.rust_type,
+                false, // 不在列级别标记为主键
+                column.is_auto_increment,
+                column.is_nullable,
+                column.enum_variants,
+            )
+        } else {
+            db_type.sql_type(
+                column.rust_type,
+                column.is_primary,
+                column.is_auto_increment,
+                column.is_nullable,
+                column.enum_variants,
+            )
+        };
 
         sql.push_str(&format!("{} {sql_type}", column.name));
 
@@ -220,6 +327,13 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     if !foreign_key_constraints.is_empty() {
         sql.push_str(", ");
         sql.push_str(&foreign_key_constraints.join(", "));
+    }
+
+    // 添加复合主键约束（如果有多个主键字段）
+    let composite_primary_constraint = generate_composite_primary_key_constraint::<T>();
+    if !composite_primary_constraint.is_empty() {
+        sql.push_str(", ");
+        sql.push_str(&composite_primary_constraint);
     }
 
     // 添加联合 UNIQUE 约束
@@ -323,6 +437,23 @@ fn generate_foreign_key_constraints<T: Model>() -> Vec<String> {
     }
 
     constraints
+}
+
+/// 生成复合主键约束 SQL
+fn generate_composite_primary_key_constraint<T: Model>() -> String {
+    let primary_keys: Vec<&str> = T::COLUMN_SCHEMA
+        .iter()
+        .filter(|c| c.is_primary)
+        .map(|c| c.name)
+        .collect();
+
+    if primary_keys.len() > 1 {
+        // 复合主键：PRIMARY KEY (col1, col2, ...)
+        format!("PRIMARY KEY ({})", primary_keys.join(", "))
+    } else {
+        // 单主键或无主键：不需要表级约束
+        String::new()
+    }
 }
 
 /// 数据库行抽象

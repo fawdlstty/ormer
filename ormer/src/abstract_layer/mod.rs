@@ -12,16 +12,8 @@ pub mod postgresql_backend;
 #[cfg(feature = "mysql")]
 pub mod mysql_backend;
 
-/// 连接池模块 - 当启用任一数据库 feature 时可用
-#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
-pub mod connection_pool;
-
-/// 公共辅助函数模块
-pub mod common_helpers;
-
-/// 宏定义模块 - 用于减少重复代码
-#[macro_use]
-pub mod macros;
+/// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
+pub mod common;
 
 /// 数据库类型枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +40,7 @@ impl DbType {
         _is_primary: bool,
         _is_auto_increment: bool,
         _is_nullable: bool,
+        _enum_variants: Option<&[&str]>,
     ) -> String {
         match self {
             #[cfg(feature = "turso")]
@@ -56,6 +49,7 @@ impl DbType {
                 _is_primary,
                 _is_auto_increment,
                 _is_nullable,
+                _enum_variants,
             ),
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
@@ -64,6 +58,7 @@ impl DbType {
                     _is_primary,
                     _is_auto_increment,
                     _is_nullable,
+                    _enum_variants,
                 )
             }
             #[cfg(feature = "mysql")]
@@ -72,6 +67,7 @@ impl DbType {
                 _is_primary,
                 _is_auto_increment,
                 _is_nullable,
+                _enum_variants,
             ),
             #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
             DbType::None => {
@@ -82,17 +78,16 @@ impl DbType {
     }
 }
 
-// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
+// 统一使用 common 模块提供接口，当启用任一数据库 feature 时可用
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
-mod unified;
-#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
-pub use unified::{
+pub use common::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DropTableExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
-    MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
-    SelectExecutor, Transaction, UpdateExecutor,
+    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, SelectStream,
+    SelectStreamIterator, Transaction, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
-pub use connection_pool::{ConnectionPool, PooledConnection};
+pub use common::{ConnectionPool, PooledConnection};

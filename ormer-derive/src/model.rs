@@ -25,10 +25,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         _ => panic!("Model must be a struct"),
     };
 
-    // 提取主键字段及自增信息
-    let primary_key_info = fields
+    // 提取主键字段列表（支持复合主键）
+    let primary_keys: Vec<_> = fields
         .iter()
-        .find_map(|f| {
+        .filter_map(|f| {
             for attr in &f.attrs {
                 if attr.path().is_ident("primary") {
                     let field_name = f.ident.as_ref().unwrap().clone();
@@ -43,10 +43,38 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
             None
         })
-        .expect("Model must have a #[primary] field");
+        .collect();
 
-    let primary_key_field = primary_key_info.0;
-    let is_auto_increment = primary_key_info.1;
+    // 至少需要一个主键
+    if primary_keys.is_empty() {
+        panic!("Model must have at least one #[primary] field");
+    }
+
+    // 检查是否有多个主键且标记了 auto（只有第一个主键可以是 auto）
+    let auto_count = primary_keys.iter().filter(|(_, is_auto)| *is_auto).count();
+    if auto_count > 1 {
+        panic!("Only one primary key field can have #[primary(auto)]");
+    }
+
+    // 获取第一个主键（用于向后兼容）
+    let primary_key_field = &primary_keys[0].0;
+    let is_auto_increment = primary_keys[0].1;
+
+    // 生成主键列名列表（支持复合主键）
+    let primary_key_field_names: Vec<_> = primary_keys
+        .iter()
+        .map(|(field_name, _)| {
+            quote! { stringify!(#field_name) }
+        })
+        .collect();
+
+    // 生成主键值获取（支持复合主键）
+    let primary_key_values: Vec<_> = primary_keys
+        .iter()
+        .map(|(field_name, _)| {
+            quote! { ::ormer::Value::from(self.#field_name.clone()) }
+        })
+        .collect();
 
     // 生成字段名列表
     let field_names: Vec<String> = fields
@@ -93,6 +121,13 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 foreign 属性
         let foreign_key = extract_foreign_key(f);
 
+        // 对于枚举类型支持，我们无法在编译时检测类型是否实现了 ModelEnum，
+        // 因此采用简单策略：总是传递 None，数据库后端会根据 rust_type 字符串判断
+        // 如果未来需要支持，可以考虑使用 specialization 或宏魔法
+        let enum_variants = quote! {
+            None
+        };
+
         quote! {
             ::ormer::model::ColumnSchema {
                 name: stringify!(#field_name),
@@ -103,6 +138,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 unique_group: #unique_group,
                 is_indexed: #is_indexed,
                 foreign_key: #foreign_key,
+                enum_variants: #enum_variants,
             }
         }
     });
@@ -205,6 +241,15 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 ]
             }
 
+            fn primary_key_columns() -> &'static [&'static str] {
+                &[#(#primary_key_field_names),*]
+            }
+
+            fn primary_key_values(&self) -> Vec<::ormer::Value> {
+                vec![#(#primary_key_values),*]
+            }
+
+            // 保持向后兼容的旧方法（已废弃）
             fn primary_key_column() -> &'static str {
                 stringify!(#primary_key_field)
             }
@@ -282,6 +327,14 @@ fn derive_model_tuple_wrapper(
 
             fn field_values(&self) -> Vec<::ormer::Value> {
                 self.0.field_values()
+            }
+
+            fn primary_key_columns() -> &'static [&'static str] {
+                <#inner_type as ::ormer::Model>::primary_key_columns()
+            }
+
+            fn primary_key_values(&self) -> Vec<::ormer::Value> {
+                self.0.primary_key_values()
             }
 
             fn primary_key_column() -> &'static str {

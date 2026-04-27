@@ -1,9 +1,9 @@
+use super::common::common_helpers;
 use crate::abstract_layer::DbType;
-use crate::abstract_layer::common_helpers;
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
-    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect, MultiTableSelect,
-    RelatedSelect, RightJoinedSelect, Select, WhereExpr,
+    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect,
+    MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
@@ -24,7 +24,18 @@ impl DbBackendTypeMapper for TursoTypeMapper {
         is_primary: bool,
         is_auto_increment: bool,
         is_nullable: bool,
+        enum_variants: Option<&[&str]>,
     ) -> String {
+        // SQLite 不支持原生 ENUM,降级为 TEXT
+        if enum_variants.is_some() {
+            let base_type = "TEXT";
+            let mut sql_type = base_type.to_string();
+            if !is_nullable && !is_primary {
+                sql_type.push_str(" NOT NULL");
+            }
+            return sql_type;
+        }
+
         // 首先处理主键类型
         if is_primary {
             if is_auto_increment {
@@ -279,6 +290,7 @@ impl Database {
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
+                expected_col.enum_variants,
             );
 
             // 对于类型比较，我们需要提取基础类型（不包含约束）
@@ -301,6 +313,7 @@ impl Database {
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
+                    expected_col.enum_variants,
                 );
                 // 去掉 " NOT NULL" 后缀
                 full_type.replace(" NOT NULL", "")
@@ -370,19 +383,12 @@ impl Database {
             return Ok(());
         }
 
-        // 检查是否有自增主键，如果有则排除
-        let columns = T::insert_columns();
-
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
+        let (sql, _col_count) = common_helpers::build_batch_insert_sql::<T>(models.len());
         let mut all_params = Vec::new();
 
         for model in models.iter() {
-            let values = model.insert_values();
+            let values = model.field_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -404,13 +410,12 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -421,7 +426,7 @@ impl Database {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.insert_values();
+            let values = model.field_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -429,7 +434,7 @@ impl Database {
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in columns.iter() {
+        for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -452,6 +457,15 @@ impl Database {
     pub fn select<T: Model>(&self) -> SelectExecutor<T> {
         SelectExecutor {
             select: Select::<T>::new(),
+            conn: self.conn.clone(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
             conn: self.conn.clone(),
             _marker: PhantomData,
         }
@@ -601,6 +615,15 @@ impl Transaction {
         }
     }
 
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<T, V> {
+        GroupedSelectExecutor {
+            select: GroupedSelect::<T, V>::new(),
+            conn: self.conn.clone(),
+            _marker: PhantomData,
+        }
+    }
+
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
         DeleteExecutor {
@@ -637,16 +660,19 @@ impl Transaction {
         }
 
         let columns = T::insert_columns();
-        let (sql, _) = crate::abstract_layer::common_helpers::build_batch_insert_sql_with_columns(
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             T::TABLE_NAME,
             &columns,
             models.len(),
         );
         let all_values =
-            crate::abstract_layer::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                T,
-            >(models);
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
         let all_params = values_to_params(&all_values)?;
+
+        eprintln!("DEBUG [insert_or_update_batch]: SQL = {}", sql);
+        eprintln!("DEBUG [insert_or_update_batch]: params = {:?}", all_params);
 
         self.conn
             .execute(&sql, all_params)
@@ -665,13 +691,12 @@ impl Transaction {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_column();
-        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -682,7 +707,7 @@ impl Transaction {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.insert_values();
+            let values = model.field_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -690,7 +715,7 @@ impl Transaction {
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in columns.iter() {
+        for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -808,7 +833,24 @@ pub struct MappedSelectExecutor<T: Model, V> {
     _marker: PhantomData<(T, V)>,
 }
 
+/// Grouped 查询执行器（分组聚合查询）
+pub struct GroupedSelectExecutor<T: Model, V> {
+    select: GroupedSelect<T, V>,
+    conn: Arc<turso::Connection>,
+    _marker: PhantomData<(T, V)>,
+}
+
 impl<T: Model, V> Clone for MappedSelectExecutor<T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            select: self.select.clone(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model, V> Clone for GroupedSelectExecutor<T, V> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
@@ -867,6 +909,20 @@ impl<T: Model> SelectExecutor<T> {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
             select: mapped_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 选择列（支持聚合函数）- 转换为分组查询
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> V,
+        V: crate::query::builder::SelectColumnResult,
+    {
+        let grouped_select = self.select.select_column(f);
+        GroupedSelectExecutor {
+            select: grouped_select,
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -991,7 +1047,7 @@ impl<T: Model> SelectExecutor<T> {
         }
     }
 
-    /// 添加关联表查询（支持4个表）
+    /// 添加关联表查询(支持4个表)
     /// select::<User>().from4::<User, Role, Permission, Department>()
     pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
         self,
@@ -1001,6 +1057,15 @@ impl<T: Model> SelectExecutor<T> {
     {
         FourTableSelectExecutor {
             select: self.select.from4::<T2, R1, R2, R3>(),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 创建流式查询执行器
+    pub fn stream(self) -> SelectStream<T> {
+        SelectStream {
+            select: self.select,
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -1387,6 +1452,12 @@ pub struct InnerJoinCollectFuture<T: Model, J: Model> {
 /// RIGHT JOIN Collect future
 pub struct RightJoinCollectFuture<T: Model, J: Model> {
     executor: RightJoinedSelectExecutor<T, J>,
+}
+
+/// Grouped Collect future（分组聚合查询）
+pub struct GroupedCollectFuture<T: Model, V, C> {
+    executor: GroupedSelectExecutor<T, V>,
+    _marker: PhantomData<(T, V, C)>,
 }
 
 impl<T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
@@ -1909,5 +1980,201 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
         }
 
         Ok(results.into_iter().collect())
+    }
+}
+
+impl<T: Model, V> GroupedSelectExecutor<T, V> {
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        GroupedCollectFuture {
+            executor: self.clone(),
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        Self {
+            select: self.select.group_by(f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.having(f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+    {
+        Self {
+            select: self.select.filter(f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for GroupedCollectFuture<T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let results: Vec<V> = self.executor.collect_inner().await?;
+            Ok(results.into_iter().collect())
+        })
+    }
+}
+
+impl<T: Model, V> GroupedSelectExecutor<T, V> {
+    async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
+    where
+        V: crate::model::FromRowValues,
+    {
+        let (sql, params) = self.select.build_sql(DbType::Turso);
+
+        let turso_params: Vec<turso::Value> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => turso::Value::Integer(i),
+                crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Null => turso::Value::Null,
+            })
+            .collect();
+
+        let mut rows = if turso_params.is_empty() {
+            self.conn
+                .query(&sql, ())
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        } else {
+            self.conn
+                .query(&sql, turso_params)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        };
+
+        let mut results = Vec::new();
+
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?
+        {
+            // 获取行中的所有值（从 column_count 获取列数）
+            let column_count = self.select.column_count();
+            let mut values = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let value = row
+                    .get_value(i)
+                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                let ormer_value = convert_turso_value(&value)?;
+                values.push(ormer_value);
+            }
+
+            // 使用 FromRowValues 从多个值构建类型
+            let typed_value = V::from_row_values(&values)?;
+            results.push(typed_value);
+        }
+
+        Ok(results.into_iter().collect())
+    }
+}
+
+/// SelectStream - 流式查询执行器
+pub struct SelectStream<T: Model> {
+    select: Select<T>,
+    conn: Arc<turso::Connection>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Model + 'static> SelectStream<T> {
+    /// 返回异步迭代器
+    pub async fn into_iter(self) -> Result<SelectStreamIterator<T>, crate::Error> {
+        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+
+        // 将 ormer::Value 转换为 turso::Value
+        let turso_params: Vec<turso::Value> = params
+            .into_iter()
+            .map(|v| match v {
+                crate::model::Value::Integer(i) => turso::Value::Integer(i),
+                crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Null => turso::Value::Null,
+            })
+            .collect();
+
+        let rows = if turso_params.is_empty() {
+            self.conn
+                .query(&sql, ())
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        } else {
+            self.conn
+                .query(&sql, turso_params)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?
+        };
+
+        Ok(SelectStreamIterator {
+            rows,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// SelectStreamIterator - 流式查询迭代器
+pub struct SelectStreamIterator<T: Model> {
+    rows: turso::Rows,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Model + 'static> SelectStreamIterator<T> {
+    /// 获取下一行数据
+    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+        match self.rows.next().await {
+            Ok(Some(row)) => {
+                // 解析行数据为 Model
+                let mut data = HashMap::new();
+                for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                    match row.get_value(i) {
+                        Ok(value) => match convert_turso_value(&value) {
+                            Ok(ormer_value) => {
+                                data.insert(col_name.to_string(), ormer_value);
+                            }
+                            Err(e) => return Some(Err(e)),
+                        },
+                        Err(e) => return Some(Err(crate::Error::Database(e.to_string()))),
+                    }
+                }
+                let ormer_row = Row::new(data);
+                Some(T::from_row(&ormer_row))
+            }
+            Ok(None) => None,
+            Err(e) => Some(Err(crate::Error::Database(e.to_string()))),
+        }
     }
 }

@@ -20,8 +20,8 @@ struct User {
 ### Attributes
 
 - `#[table = "table_name"]` - Specifies the table name
-- `#[primary]` - Primary key
-- `#[primary(auto)]` - Auto-increment primary key
+- `#[primary]` - Primary key (supports composite primary keys)
+- `#[primary(auto)]` - Auto-increment primary key (only for single primary key or the first field of composite primary key)
 - `#[unique]` - Unique constraint (supports `group` parameter for composite unique)
 - `#[index]` - Index
 - `#[foreign(Type)]` - Foreign key relationship
@@ -110,6 +110,32 @@ struct User {
 
 All basic types can be wrapped with `Option<T>` for nullable fields.
 
+## Enum Types
+
+Define enum types with `#[derive(ModelEnum)]` and use them as model fields:
+
+```rust
+use ormer::{Model, ModelEnum};
+
+#[derive(Debug, Clone, ModelEnum, PartialEq)]
+enum UserStatus {
+    Active,
+    Inactive,
+    Banned,
+}
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    status: UserStatus,
+    name: String,
+}
+```
+
+Supports `Option<EnumType>` for nullable enum fields. Enum values are stored as text with automatic serialization and deserialization.
+
 ## Complete Example
 
 ```rust
@@ -151,6 +177,32 @@ struct Post {
     content: String,
 }
 ```
+
+## Composite Primary Keys
+
+Add `#[primary]` to multiple fields to define a composite primary key:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "user_roles"]
+struct UserRole {
+    #[primary]
+    user_id: i32,
+    #[primary]
+    role_id: i32,
+    assigned_at: String,
+}
+```
+
+Only the first primary key field can use `auto`:
+```rust
+#[primary(auto)]
+id: i32,
+#[primary]
+product_id: i32,
+```
+
+Use `primary_key_columns()` to get the list of primary key column names.
 
 ## Table Operations
 

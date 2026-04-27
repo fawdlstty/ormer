@@ -20,8 +20,8 @@ struct User {
 ### 属性
 
 - `#[table = "表名"]` - 指定表名
-- `#[primary]` - 主键
-- `#[primary(auto)]` - 自增主键
+- `#[primary]` - 主键（支持复合主键）
+- `#[primary(auto)]` - 自增主键（仅单主键或复合主键的第一个字段）
 - `#[unique]` - 唯一约束（支持 `group` 参数创建联合唯一）
 - `#[index]` - 索引
 - `#[foreign(Type)]` - 外键关系
@@ -110,6 +110,32 @@ struct User {
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
 
+## 枚举类型
+
+使用 `#[derive(ModelEnum)]` 定义枚举类型，可在模型中作为字段使用：
+
+```rust
+use ormer::{Model, ModelEnum};
+
+#[derive(Debug, Clone, ModelEnum, PartialEq)]
+enum UserStatus {
+    Active,
+    Inactive,
+    Banned,
+}
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    status: UserStatus,
+    name: String,
+}
+```
+
+支持 `Option<EnumType>` 表示可空枚举字段。枚举值存储为文本，自动完成序列化与反序列化。
+
 ## 完整示例
 
 ```rust
@@ -151,6 +177,32 @@ struct Post {
     content: String,
 }
 ```
+
+## 复合主键
+
+为多个字段添加 `#[primary]` 即可定义复合主键：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "user_roles"]
+struct UserRole {
+    #[primary]
+    user_id: i32,
+    #[primary]
+    role_id: i32,
+    assigned_at: String,
+}
+```
+
+只有第一个主键字段可使用 `auto`：
+```rust
+#[primary(auto)]
+id: i32,
+#[primary]
+product_id: i32,
+```
+
+通过 `primary_key_columns()` 获取主键列名列表。
 
 ## 表操作
 

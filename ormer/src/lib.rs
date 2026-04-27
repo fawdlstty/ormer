@@ -13,16 +13,16 @@ pub use abstract_layer::DbType;
 pub use abstract_layer::{
     ConnectionPool, CreateTableExecutor, Database, DeleteExecutor, DropTableExecutor,
     MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, PooledConnection,
-    Transaction,
+    SelectStream, SelectStreamIterator, Transaction,
 };
 pub use model::{
-    Error, FromRowValues, FromSingleValue, FromValue, Insertable, Model, Row, Value,
-    generate_create_table_sql, generate_create_table_sql_with_name,
+    Error, FromRowValues, FromSingleValue, FromValue, Insertable, Model, ModelEnum,
+    ModelEnumProvider, Row, Value, generate_create_table_sql, generate_create_table_sql_with_name,
 };
-pub use ormer_derive::Model;
+pub use ormer_derive::{Model, ModelEnum};
 pub use query::builder::{
-    AgeColumn, InnerJoinedSelect, IsInValue, IsInValues, LeftJoinedSelect, MapToResult,
-    MappedSelect, MultiTableSelect, NumericColumn, RelatedSelect, RightJoinedSelect, Select,
-    SubqueryParam, WhereColumn, WhereExpr,
+    AgeColumn, GroupByColumns, GroupedSelect, InnerJoinedSelect, IsInValue, IsInValues,
+    LeftJoinedSelect, MapToResult, MappedSelect, MultiTableSelect, NumericColumn, RelatedSelect,
+    RightJoinedSelect, Select, SelectColumnResult, SubqueryParam, WhereColumn, WhereExpr,
 };
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};

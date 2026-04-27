@@ -128,6 +128,34 @@ macro_rules! test_on_all_dbs_result {
     };
 }
 
+/// 宏：仅为 Turso 数据库生成测试（用于快速测试或有问题的功能）
+///
+/// 使用方法：
+/// ```rust
+/// test_on_turso_only!(my_test_fn);
+/// ```
+#[macro_export]
+#[cfg(feature = "turso")]
+macro_rules! test_on_turso_only {
+    ($test_fn:ident) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn [<test_on_turso_ $test_fn>]() {
+                let configs = $crate::_test_common::get_turso_config();
+
+                for (idx, config) in configs.iter().enumerate() {
+                    let db_type_name = "Turso";
+
+                    println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);
+
+                    // 调用实际的测试函数
+                    $test_fn(config).await;
+                }
+            }
+        }
+    };
+}
+
 // ==================== 公共测试模型宏定义 ====================
 // 用于在测试文件中快速定义具有唯一表名的测试模型
 

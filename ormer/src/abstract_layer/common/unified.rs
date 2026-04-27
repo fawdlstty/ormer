@@ -6,13 +6,13 @@ use crate::query::builder::WhereExpr;
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "turso")]
-use super::turso_backend;
+use super::super::turso_backend;
 
 #[cfg(feature = "postgresql")]
-use super::postgresql_backend;
+use super::super::postgresql_backend;
 
 #[cfg(feature = "mysql")]
-use super::mysql_backend;
+use super::super::mysql_backend;
 
 /// 统一的 Database 枚举
 pub enum Database {
@@ -79,22 +79,22 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
 impl Database {
     /// 连接到数据库,根据 DbType 选择后端
     pub async fn connect(
-        db_type: super::DbType,
+        db_type: super::super::DbType,
         connection_string: &str,
     ) -> Result<Self, crate::Error> {
         match db_type {
             #[cfg(feature = "turso")]
-            super::DbType::Turso => {
+            super::super::DbType::Turso => {
                 let db = turso_backend::Database::connect(db_type, connection_string).await?;
                 Ok(Database::Turso(db))
             }
             #[cfg(feature = "postgresql")]
-            super::DbType::PostgreSQL => {
+            super::super::DbType::PostgreSQL => {
                 let db = postgresql_backend::Database::connect(db_type, connection_string).await?;
                 Ok(Database::PostgreSQL(db))
             }
             #[cfg(feature = "mysql")]
-            super::DbType::MySQL => {
+            super::super::DbType::MySQL => {
                 let db = mysql_backend::Database::connect(db_type, connection_string).await?;
                 Ok(Database::MySQL(db))
             }
@@ -167,6 +167,22 @@ impl Database {
             Database::PostgreSQL(db) => SelectExecutor::PostgreSQL(db.select::<T>()),
             #[cfg(feature = "mysql")]
             Database::MySQL(db) => SelectExecutor::MySQL(db.select::<T>()),
+        }
+    }
+
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        match self {
+            #[cfg(feature = "turso")]
+            Database::Turso(db) => {
+                GroupedSelectExecutor::Turso(db.select_column::<T, V>(), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => {
+                GroupedSelectExecutor::PostgreSQL(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => GroupedSelectExecutor::MySQL(db.select_column::<T, V>()),
         }
     }
 
@@ -274,7 +290,7 @@ impl Database {
     /// 创建连接池
     #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
     pub fn create_pool(
-        db_type: super::DbType,
+        db_type: super::super::DbType,
         connection_string: &str,
     ) -> super::connection_pool::PoolBuilder {
         super::connection_pool::PoolBuilder::new(db_type, connection_string)
@@ -784,6 +800,22 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 创建分组聚合查询执行器
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        match self {
+            #[cfg(feature = "turso")]
+            Transaction::Turso(txn, _) => {
+                GroupedSelectExecutor::Turso(txn.select_column::<T, V>(), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => {
+                GroupedSelectExecutor::PostgreSQL(txn.select_column::<T, V>())
+            }
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(txn) => GroupedSelectExecutor::MySQL(txn.select_column::<T, V>()),
+        }
+    }
+
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         match self {
@@ -984,6 +1016,124 @@ pub enum MappedSelectExecutor<'a, T: Model, V> {
     NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
+/// 统一的 GroupedSelectExecutor 枚举
+pub enum GroupedSelectExecutor<'a, T: Model, V> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::GroupedSelectExecutor<T, V>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::GroupedSelectExecutor<'a, T, V>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::GroupedSelectExecutor<'a, T, V>),
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    NotImplemented(std::marker::PhantomData<&'a (T, V)>),
+}
+
+impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
+    /// 添加 GROUP BY 字段
+    #[allow(unused_variables)]
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            GroupedSelectExecutor::Turso(exec, _) => {
+                GroupedSelectExecutor::Turso(exec.group_by(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            GroupedSelectExecutor::PostgreSQL(exec) => {
+                GroupedSelectExecutor::PostgreSQL(exec.group_by(f))
+            }
+            #[cfg(feature = "mysql")]
+            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.group_by(f)),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            GroupedSelectExecutor::NotImplemented(_) => self,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    #[allow(unused_variables)]
+    pub fn having<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            GroupedSelectExecutor::Turso(exec, _) => {
+                GroupedSelectExecutor::Turso(exec.having(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            GroupedSelectExecutor::PostgreSQL(exec) => {
+                GroupedSelectExecutor::PostgreSQL(exec.having(f))
+            }
+            #[cfg(feature = "mysql")]
+            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.having(f)),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            GroupedSelectExecutor::NotImplemented(_) => self,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    #[allow(unused_variables)]
+    pub fn filter<F>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            GroupedSelectExecutor::Turso(exec, _) => {
+                GroupedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            GroupedSelectExecutor::PostgreSQL(exec) => {
+                GroupedSelectExecutor::PostgreSQL(exec.filter(f))
+            }
+            #[cfg(feature = "mysql")]
+            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.filter(f)),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            GroupedSelectExecutor::NotImplemented(_) => self,
+        }
+    }
+
+    /// 执行查询并收集结果
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+        C: FromIterator<V> + 'static,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            GroupedSelectExecutor::Turso(exec, _) => {
+                GroupedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            GroupedSelectExecutor::PostgreSQL(exec) => {
+                GroupedCollectFuture::PostgreSQL(exec.collect::<C>())
+            }
+            #[cfg(feature = "mysql")]
+            GroupedSelectExecutor::MySQL(exec) => GroupedCollectFuture::MySQL(exec.collect::<C>()),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            GroupedSelectExecutor::NotImplemented(_) => {
+                panic!("GroupedSelectExecutor::collect is not implemented for this backend")
+            }
+        }
+    }
+
+    /// 执行查询并返回 Vec<V>
+    pub fn exec(self) -> GroupedCollectFuture<'a, T, V, Vec<V>>
+    where
+        T: 'static,
+        V: crate::model::FromRowValues + 'static,
+    {
+        self.collect::<Vec<V>>()
+    }
+}
+
 impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         match self {
@@ -1020,6 +1170,43 @@ pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
+}
+
+/// 统一的 GroupedCollectFuture 枚举
+pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::GroupedCollectFuture<T, V, C>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::GroupedCollectFuture<'a, T, V, C>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::GroupedCollectFuture<'a, T, V, C>),
+    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
+}
+
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+{
+    type Output = Result<C, crate::Error>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match self {
+            #[cfg(feature = "turso")]
+            GroupedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
+            #[cfg(feature = "postgresql")]
+            GroupedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "mysql")]
+            GroupedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            GroupedCollectFuture::NotImplemented(_) => Box::pin(std::future::ready(Err(
+                crate::Error::Database("No database backend available".to_string()),
+            ))),
+        }
+    }
 }
 
 /// 统一的 ModelCollectWithFuture 枚举
@@ -1067,6 +1254,29 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => MappedSelectExecutor::MySQL(exec.map_to(f)),
             #[allow(unreachable_patterns)]
             _ => unreachable!("MappedSelectExecutor not implemented for this backend"),
+        }
+    }
+
+    /// 选择列（支持聚合函数）- 转换为分组查询
+    #[allow(unused_variables)]
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> V,
+        V: crate::query::builder::SelectColumnResult,
+    {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                GroupedSelectExecutor::Turso(exec.select_column(f), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                GroupedSelectExecutor::PostgreSQL(exec.select_column(f))
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.select_column(f)),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("GroupedSelectExecutor not implemented for this backend"),
         }
     }
 }
@@ -1242,6 +1452,91 @@ where
             ModelCollectWithFuture::NotImplemented(_) => {
                 panic!("ModelCollectWithFuture is not implemented for this backend")
             }
+        }
+    }
+}
+
+/// 统一的 SelectStream 枚举
+pub enum SelectStream<'a, T: Model> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::SelectStream<T>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::SelectStream<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::SelectStream<'a, T>),
+}
+
+impl<'a, T: Model> SelectExecutor<'a, T> {
+    /// 创建流式查询执行器
+    pub fn stream(self) -> SelectStream<'a, T> {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectExecutor::Turso(exec, _) => {
+                SelectStream::Turso(exec.stream(), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => SelectStream::PostgreSQL(exec.stream()),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectStream::MySQL(exec.stream()),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("SelectStream not implemented for this backend"),
+        }
+    }
+}
+
+/// 统一的 SelectStreamIterator 枚举
+pub enum SelectStreamIterator<'a, T: Model> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::SelectStreamIterator<T>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::SelectStreamIterator<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::SelectStreamIterator<'a, T>),
+}
+
+impl<'a, T: Model + 'static> SelectStream<'a, T> {
+    /// 返回异步迭代器
+    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectStream::Turso(stream, _) => {
+                let iter = stream.into_iter().await?;
+                Ok(SelectStreamIterator::Turso(iter, std::marker::PhantomData))
+            }
+            #[cfg(feature = "postgresql")]
+            SelectStream::PostgreSQL(stream) => {
+                let iter = stream.into_iter().await?;
+                Ok(SelectStreamIterator::PostgreSQL(iter))
+            }
+            #[cfg(feature = "mysql")]
+            SelectStream::MySQL(stream) => {
+                let iter = stream.into_iter().await?;
+                Ok(SelectStreamIterator::MySQL(iter))
+            }
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            _ => panic!("SelectStream is not implemented for this backend"),
+        }
+    }
+}
+
+impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
+    /// 获取下一行数据
+    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+        match self {
+            #[cfg(feature = "turso")]
+            SelectStreamIterator::Turso(iter, _) => iter.next().await,
+            #[cfg(feature = "postgresql")]
+            SelectStreamIterator::PostgreSQL(iter) => iter.next().await,
+            #[cfg(feature = "mysql")]
+            SelectStreamIterator::MySQL(iter) => iter.next().await,
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            _ => panic!("SelectStreamIterator is not implemented for this backend"),
         }
     }
 }

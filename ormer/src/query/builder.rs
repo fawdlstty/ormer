@@ -107,6 +107,19 @@ pub struct MappedSelect<T: Model, V> {
     _marker: PhantomData<(T, V)>,
 }
 
+/// GroupedSelect - 分组聚合查询结构体
+pub struct GroupedSelect<T: Model, V> {
+    column_names: Vec<String>,            // SELECT 的列（包含聚合函数）
+    aggregate_funcs: Vec<Option<String>>, // 聚合函数列表
+    group_by_columns: Vec<String>,        // GROUP BY 的列
+    having_filters: Vec<FilterExpr>,      // HAVING 条件
+    filters: Vec<FilterExpr>,             // WHERE 条件（分组前过滤）
+    order_by: Vec<OrderBy>,               // ORDER BY
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    _marker: PhantomData<(T, V)>,
+}
+
 impl<T: Model, V> Clone for MappedSelect<T, V> {
     fn clone(&self) -> Self {
         Self {
@@ -116,6 +129,38 @@ impl<T: Model, V> Clone for MappedSelect<T, V> {
             range_end: self.range_end,
             column_names: self.column_names.clone(),
             alias_names: self.alias_names.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model, V> Clone for GroupedSelect<T, V> {
+    fn clone(&self) -> Self {
+        Self {
+            column_names: self.column_names.clone(),
+            aggregate_funcs: self.aggregate_funcs.clone(),
+            group_by_columns: self.group_by_columns.clone(),
+            having_filters: self.having_filters.clone(),
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Model, V> Default for GroupedSelect<T, V> {
+    fn default() -> Self {
+        Self {
+            column_names: Vec::new(),
+            aggregate_funcs: Vec::new(),
+            group_by_columns: Vec::new(),
+            having_filters: Vec::new(),
+            filters: Vec::new(),
+            order_by: Vec::new(),
+            range_start: None,
+            range_end: None,
             _marker: PhantomData,
         }
     }
@@ -237,6 +282,212 @@ impl<T: Model, V> MappedSelect<T, V> {
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
+    }
+}
+
+impl<T: Model, V> GroupedSelect<T, V> {
+    /// 创建新的 GroupedSelect 实例
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 添加选择的列（支持聚合函数，链式调用）
+    pub fn select_column<F, V2>(self, f: F) -> GroupedSelect<T, V2>
+    where
+        F: FnOnce(<T as Model>::Where) -> V2,
+        V2: SelectColumnResult,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let result = f(where_obj);
+
+        // 创建新的 GroupedSelect，保留之前的列信息
+        GroupedSelect {
+            column_names: self
+                .column_names
+                .into_iter()
+                .chain(result.column_names())
+                .collect(),
+            aggregate_funcs: self
+                .aggregate_funcs
+                .into_iter()
+                .chain(result.aggregate_funcs())
+                .collect(),
+            group_by_columns: self.group_by_columns,
+            having_filters: self.having_filters,
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(mut self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: GroupByColumns,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let group_cols = f(where_obj);
+        self.group_by_columns = group_cols.column_names();
+        self
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> WhereExpr,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let expr = f(where_obj);
+        self.having_filters.push(expr.into());
+        self
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        let where_obj = T::Where::default();
+        let expr = f(where_obj);
+        self.filters.push(expr.into());
+        self
+    }
+
+    /// 添加排序
+    pub fn order_by<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> O,
+        O: Into<OrderBy>,
+    {
+        let where_obj = T::Where::default();
+        let order = f(where_obj).into();
+        self.order_by.push(order);
+        self
+    }
+
+    /// 添加降序排序
+    pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> O,
+        O: Into<OrderBy>,
+    {
+        let where_obj = T::Where::default();
+        let mut order = f(where_obj).into();
+        order.direction = crate::query::filter::OrderDirection::Desc;
+        self.order_by.push(order);
+        self
+    }
+
+    /// 设置范围
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
+        self
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        // SELECT 子句（处理聚合函数）
+        let columns = self
+            .column_names
+            .iter()
+            .zip(self.aggregate_funcs.iter())
+            .map(|(col, agg)| match agg {
+                Some(func) => format!("{}({})", func, col),
+                None => col.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME).unwrap();
+
+        // WHERE 子句（分组前过滤）
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let formatter = FilterFormatter::new(db_type);
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // GROUP BY 子句
+        if !self.group_by_columns.is_empty() {
+            sql.push_str(" GROUP BY ");
+            sql.push_str(&self.group_by_columns.join(", "));
+        }
+
+        // HAVING 子句（分组后过滤）
+        if !self.having_filters.is_empty() {
+            sql.push_str(" HAVING ");
+            let formatter = FilterFormatter::new(db_type);
+            for (i, filter) in self.having_filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // ORDER BY 子句
+        if !self.order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
+            sql.push_str(&order_strs.join(", "));
+        }
+
+        // LIMIT/OFFSET
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).unwrap();
+        }
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).unwrap();
+        }
+
+        (sql, params)
+    }
+
+    /// 生成 SQL（用于调试）
+    pub fn to_sql(&self) -> String {
+        // 使用第一个可用的数据库类型用于调试
+        #[cfg(feature = "turso")]
+        let db_type = DbType::Turso;
+        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        let db_type = DbType::MySQL;
+        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        let db_type = DbType::None;
+
+        let (sql, _) = self.to_sql_with_params(db_type);
+        sql
+    }
+
+    /// 生成 SQL（公共方法，供执行器使用）
+    pub fn build_sql(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        self.to_sql_with_params(db_type)
+    }
+
+    /// 获取列数（供执行器使用）
+    pub fn column_count(&self) -> usize {
+        self.column_names.len()
     }
 }
 
@@ -415,6 +666,28 @@ impl<T: Model> Select<T> {
             range_end: self.range_end,
             column_names: vec![column.column_name.to_string()],
             alias_names: Some(alias_names),
+            _marker: PhantomData,
+        }
+    }
+
+    /// 选择列（支持聚合函数）- 转换为分组查询
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelect<T, V>
+    where
+        F: FnOnce(<T as Model>::Where) -> V,
+        V: SelectColumnResult,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let result = f(where_obj);
+
+        GroupedSelect {
+            column_names: result.column_names(),
+            aggregate_funcs: result.aggregate_funcs(),
+            group_by_columns: Vec::new(),
+            having_filters: Vec::new(),
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
             _marker: PhantomData,
         }
     }
@@ -970,10 +1243,42 @@ pub trait MapToResult {
     fn column_names(&self) -> Vec<String>;
 }
 
+/// SelectColumnResult trait - 用于 select_column 方法的返回类型
+pub trait SelectColumnResult {
+    type Output;
+    fn column_names(&self) -> Vec<String>;
+    fn aggregate_funcs(&self) -> Vec<Option<String>>;
+}
+
+/// GroupByColumns trait - 用于 group_by 方法的返回类型
+pub trait GroupByColumns {
+    fn column_names(&self) -> Vec<String>;
+}
+
 // 为 TypedColumn 实现 MapToResult（单字段）
 impl<T> MapToResult for TypedColumn<T> {
     type Output = T;
 
+    fn column_names(&self) -> Vec<String> {
+        vec![self.column_name.to_string()]
+    }
+}
+
+// 为 TypedColumn 实现 SelectColumnResult（单字段）
+impl<T> SelectColumnResult for TypedColumn<T> {
+    type Output = T;
+
+    fn column_names(&self) -> Vec<String> {
+        vec![self.column_name.to_string()]
+    }
+
+    fn aggregate_funcs(&self) -> Vec<Option<String>> {
+        vec![self.aggregate_func.clone()]
+    }
+}
+
+// 为 TypedColumn 实现 GroupByColumns（单字段）
+impl<T> GroupByColumns for TypedColumn<T> {
     fn column_names(&self) -> Vec<String> {
         vec![self.column_name.to_string()]
     }
@@ -991,10 +1296,68 @@ impl<T1, T2> MapToResult for (TypedColumn<T1>, TypedColumn<T2>) {
     }
 }
 
+// 为二元组实现 SelectColumnResult
+impl<T1, T2> SelectColumnResult for (TypedColumn<T1>, TypedColumn<T2>) {
+    type Output = (T1, T2);
+
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+        ]
+    }
+
+    fn aggregate_funcs(&self) -> Vec<Option<String>> {
+        vec![self.0.aggregate_func.clone(), self.1.aggregate_func.clone()]
+    }
+}
+
+// 为二元组实现 GroupByColumns
+impl<T1, T2> GroupByColumns for (TypedColumn<T1>, TypedColumn<T2>) {
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+        ]
+    }
+}
+
 // 为三元组实现 MapToResult
 impl<T1, T2, T3> MapToResult for (TypedColumn<T1>, TypedColumn<T2>, TypedColumn<T3>) {
     type Output = (T1, T2, T3);
 
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+            self.2.column_name.to_string(),
+        ]
+    }
+}
+
+// 为三元组实现 SelectColumnResult
+impl<T1, T2, T3> SelectColumnResult for (TypedColumn<T1>, TypedColumn<T2>, TypedColumn<T3>) {
+    type Output = (T1, T2, T3);
+
+    fn column_names(&self) -> Vec<String> {
+        vec![
+            self.0.column_name.to_string(),
+            self.1.column_name.to_string(),
+            self.2.column_name.to_string(),
+        ]
+    }
+
+    fn aggregate_funcs(&self) -> Vec<Option<String>> {
+        vec![
+            self.0.aggregate_func.clone(),
+            self.1.aggregate_func.clone(),
+            self.2.aggregate_func.clone(),
+        ]
+    }
+}
+
+// 为三元组实现 GroupByColumns
+impl<T1, T2, T3> GroupByColumns for (TypedColumn<T1>, TypedColumn<T2>, TypedColumn<T3>) {
     fn column_names(&self) -> Vec<String> {
         vec![
             self.0.column_name.to_string(),
@@ -1209,6 +1572,7 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
 /// 类型化列代理 - 携带字段类型信息
 pub struct TypedColumn<T> {
     column_name: &'static str,
+    aggregate_func: Option<String>, // Some("COUNT"), Some("SUM"), etc.
     _marker: PhantomData<T>,
 }
 
@@ -1216,12 +1580,25 @@ impl<T> TypedColumn<T> {
     pub fn new(name: &'static str) -> Self {
         Self {
             column_name: name,
+            aggregate_func: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn with_aggregate(name: &'static str, func: String) -> Self {
+        Self {
+            column_name: name,
+            aggregate_func: Some(func),
             _marker: PhantomData,
         }
     }
 
     pub fn column_name(&self) -> &'static str {
         self.column_name
+    }
+
+    pub fn aggregate_func(&self) -> Option<&String> {
+        self.aggregate_func.as_ref()
     }
 
     /// 创建升序排序
@@ -1238,6 +1615,27 @@ impl<T> TypedColumn<T> {
 impl<T> From<TypedColumn<T>> for OrderBy {
     fn from(col: TypedColumn<T>) -> Self {
         OrderBy::asc(col.column_name.to_string())
+    }
+}
+
+impl<T: crate::model::FromValue> crate::model::FromRowValues for TypedColumn<T> {
+    fn from_row_values(values: &[crate::model::Value]) -> Result<Self, crate::Error> {
+        if values.is_empty() {
+            return Err(crate::Error::Database(
+                "Expected at least 1 value for TypedColumn".to_string(),
+            ));
+        }
+
+        // 从第一个值解析出实际的 T 类型
+        let _parsed = T::from_value(&values[0])?;
+
+        // 返回一个空的 TypedColumn（实际值已经被解析，这里只是为了满足类型系统）
+        // 注意：这个实现主要用于让类型系统通过，实际使用时应该直接使用 T 而不是 TypedColumn<T>
+        Ok(TypedColumn {
+            column_name: "",
+            aggregate_func: None,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -1312,9 +1710,14 @@ impl<T: ColumnValueType> TypedColumn<T> {
             T::supports_comparison(),
             "Type does not support comparison operations"
         );
+        let column_name = if let Some(ref func) = self.aggregate_func {
+            format!("{}({})", func, self.column_name)
+        } else {
+            self.column_name.to_string()
+        };
         WhereExpr {
             inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
+                column: column_name,
                 operator: ">=".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
@@ -1327,9 +1730,14 @@ impl<T: ColumnValueType> TypedColumn<T> {
             T::supports_comparison(),
             "Type does not support comparison operations"
         );
+        let column_name = if let Some(ref func) = self.aggregate_func {
+            format!("{}({})", func, self.column_name)
+        } else {
+            self.column_name.to_string()
+        };
         WhereExpr {
             inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
+                column: column_name,
                 operator: ">".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
@@ -1342,9 +1750,14 @@ impl<T: ColumnValueType> TypedColumn<T> {
             T::supports_comparison(),
             "Type does not support comparison operations"
         );
+        let column_name = if let Some(ref func) = self.aggregate_func {
+            format!("{}({})", func, self.column_name)
+        } else {
+            self.column_name.to_string()
+        };
         WhereExpr {
             inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
+                column: column_name,
                 operator: "<=".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
@@ -1357,13 +1770,55 @@ impl<T: ColumnValueType> TypedColumn<T> {
             T::supports_comparison(),
             "Type does not support comparison operations"
         );
+        let column_name = if let Some(ref func) = self.aggregate_func {
+            format!("{}({})", func, self.column_name)
+        } else {
+            self.column_name.to_string()
+        };
         WhereExpr {
             inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
+                column: column_name,
                 operator: "<".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
         }
+    }
+}
+
+// 为所有 TypedColumn 实现聚合方法
+impl<T: ColumnValueType + 'static> TypedColumn<T> {
+    /// COUNT 聚合 - 返回 usize
+    pub fn count(self) -> TypedColumn<usize> {
+        TypedColumn::with_aggregate(self.column_name, "COUNT".to_string())
+    }
+
+    /// SUM 聚合 - 返回相同类型
+    pub fn sum(self) -> TypedColumn<T>
+    where
+        T: AggregateResultType,
+    {
+        TypedColumn::with_aggregate(self.column_name, "SUM".to_string())
+    }
+
+    /// AVG 聚合 - 返回 f64
+    pub fn avg(self) -> TypedColumn<f64> {
+        TypedColumn::with_aggregate(self.column_name, "AVG".to_string())
+    }
+
+    /// MAX 聚合 - 返回相同类型
+    pub fn max(self) -> TypedColumn<T>
+    where
+        T: AggregateResultType,
+    {
+        TypedColumn::with_aggregate(self.column_name, "MAX".to_string())
+    }
+
+    /// MIN 聚合 - 返回相同类型
+    pub fn min(self) -> TypedColumn<T>
+    where
+        T: AggregateResultType,
+    {
+        TypedColumn::with_aggregate(self.column_name, "MIN".to_string())
     }
 }
 

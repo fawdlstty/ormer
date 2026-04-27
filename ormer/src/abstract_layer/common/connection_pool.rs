@@ -1,4 +1,4 @@
-use crate::abstract_layer::DbType;
+use super::super::DbType;
 use crate::model::Model;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -12,13 +12,13 @@ use super::unified::{CreateTableExecutor, DropTableExecutor};
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "turso")]
-use super::turso_backend;
+use super::super::turso_backend;
 
 #[cfg(feature = "postgresql")]
-use super::postgresql_backend;
+use super::super::postgresql_backend;
 
 #[cfg(feature = "mysql")]
-use super::mysql_backend;
+use super::super::mysql_backend;
 
 /// 连接包装器 - 包装各后端的 Database 实例
 enum ConnectionWrapper {

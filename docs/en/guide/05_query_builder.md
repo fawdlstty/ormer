@@ -69,6 +69,49 @@ let user: Vec<User> = db
 .range(10..)     // From 10 onwards
 ```
 
+## Streaming Queries (stream)
+
+When processing large datasets, streaming queries fetch results row by row, avoiding loading all data into memory at once:
+
+```rust
+// Basic streaming query
+let mut stream = db
+    .select::<User>()
+    .filter(|u| u.age.ge(18))
+    .stream()
+    .into_iter()
+    .await?;
+
+while let Some(user_result) = stream.next().await {
+    let user = user_result?;
+    println!("{:?}", user);
+}
+```
+
+### Streaming Query Features
+
+- **Memory Efficient**: Fetches data row by row, suitable for large datasets
+- **Async Iteration**: Supports async row-by-row processing without blocking threads
+- **Supports All Query Options**: Works with filter, order_by, range, etc.
+
+### Streaming Query with Filter and Sorting
+
+```rust
+let mut stream = db
+    .select::<User>()
+    .filter(|u| u.age.ge(18))
+    .order_by_desc(|u| u.age)
+    .range(0..100)
+    .stream()
+    .into_iter()
+    .await?;
+
+while let Some(user_result) = stream.next().await {
+    let user = user_result?;
+    // Process each row
+}
+```
+
 ## Field Projection (map_to)
 
 ```rust

@@ -29,6 +29,95 @@ let adult_count: usize = db
     .await?;
 ```
 
+## GROUP BY and HAVING Queries
+
+### Basic Grouping
+
+```rust
+use ormer::Select;
+
+// Count users by age group
+let sql = Select::<User>::new()
+    .select_column(|u| u.id.count())
+    .group_by(|u| u.age)
+    .to_sql();
+
+// Generated SQL: SELECT COUNT(id) FROM users GROUP BY age
+```
+
+### Multiple Columns + Grouping
+
+```rust
+// Select department and user count
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.id.count()))
+    .group_by(|u| u.department)
+    .to_sql();
+
+// Generated SQL: SELECT department, COUNT(id) FROM users GROUP BY department
+```
+
+### HAVING Condition Filter
+
+```rust
+// Count departments with more than 5 users
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.id.count()))
+    .group_by(|u| u.department)
+    .having(|u| u.id.count().gt(5))
+    .to_sql();
+
+// Generated SQL: SELECT department, COUNT(id) FROM users GROUP BY department HAVING COUNT(id) > ?
+```
+
+### Multi-Column Grouping
+
+```rust
+// Group by department and age, count and calculate average score
+let sql = Select::<User>::new()
+    .select_column(|u| (u.department, u.age, u.id.count(), u.score.avg()))
+    .group_by(|u| (u.department, u.age))
+    .to_sql();
+
+// Generated SQL: SELECT department, age, COUNT(id), AVG(score) FROM users GROUP BY department, age
+```
+
+### Complete Query: WHERE + GROUP BY + HAVING + ORDER BY + LIMIT
+
+```rust
+let sql = Select::<User>::new()
+    .filter(|u| u.age.ge(18))
+    .select_column(|u| (u.department, u.id.count(), u.score.avg()))
+    .group_by(|u| u.department)
+    .having(|u| u.id.count().gt(0))
+    .order_by(|u| u.department)
+    .range(0..10)
+    .to_sql();
+
+// Generated SQL:
+// SELECT department, COUNT(id), AVG(score)
+// FROM users
+// WHERE age >= ?
+// GROUP BY department
+// HAVING COUNT(id) > ?
+// ORDER BY department ASC
+// LIMIT 10
+```
+
+### Supported Aggregate Functions
+
+- `count()` - Count, returns `usize`
+- `sum()` - Sum, returns original type (numeric types)
+- `avg()` - Average, returns `f64`
+- `max()` - Maximum, returns original type (numeric types)
+- `min()` - Minimum, returns original type (numeric types)
+
+### Notes
+
+- `group_by()` can be called before or after `having()`, but it's recommended to call `group_by()` first
+- `filter()` adds WHERE conditions (pre-group filter), `having()` adds HAVING conditions (post-group filter)
+- All aggregate functions generate parameterized SQL queries for safety
+
 ## JOIN Queries
 
 ```rust

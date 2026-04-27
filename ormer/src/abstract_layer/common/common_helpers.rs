@@ -1,4 +1,4 @@
-use crate::abstract_layer::DbType;
+use super::super::DbType;
 use crate::model::{Model, Row, Value};
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
