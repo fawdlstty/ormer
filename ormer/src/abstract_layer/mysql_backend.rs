@@ -409,25 +409,16 @@ impl Database {
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
-        // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
+        let columns = T::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            T::TABLE_NAME,
+            &columns,
+            models.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
         let params = values_to_params(&all_values)?;
 
         conn.exec_drop(&sql, params)

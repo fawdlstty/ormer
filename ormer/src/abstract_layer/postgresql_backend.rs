@@ -455,31 +455,24 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
+        let (sql, _) =
+            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
+                T::TABLE_NAME,
+                &columns,
+                models.len(),
+            );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
 
-        // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        // 获取列的rust类型信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        // 获取列的rust_type信息（排除自增主键）
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -760,7 +753,10 @@ impl<'a> Transaction<'a> {
                 &columns,
                 models.len(),
             );
-        let all_values = super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(models);
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
 
         // 获取列的rust_type信息（排除自增主键）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA

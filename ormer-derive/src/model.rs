@@ -257,10 +257,6 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             fn primary_key_value(&self) -> ::ormer::Value {
                 ::ormer::Value::from(self.#primary_key_field.clone())
             }
-
-            fn is_primary_auto_increment() -> bool {
-                #is_auto_increment
-            }
         }
 
         // 生成 inherent 方法，使得不需要 import Model trait 也能调用
@@ -343,10 +339,6 @@ fn derive_model_tuple_wrapper(
 
             fn primary_key_value(&self) -> ::ormer::Value {
                 self.0.primary_key_value()
-            }
-
-            fn is_primary_auto_increment() -> bool {
-                <#inner_type as ::ormer::Model>::is_primary_auto_increment()
             }
         }
 
