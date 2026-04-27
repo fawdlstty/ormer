@@ -65,6 +65,36 @@ pub trait Model: Sized {
 
     /// 获取主键值
     fn primary_key_value(&self) -> Value;
+
+    /// 判断主键是否为自增
+    fn is_primary_auto_increment() -> bool;
+
+    /// 获取需要插入的列名（排除自增主键）
+    fn insert_columns() -> Vec<&'static str> {
+        Self::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.name)
+            .collect()
+    }
+
+    /// 获取需要插入的字段值（排除自增主键）
+    fn insert_values(&self) -> Vec<Value> {
+        let all_values = self.field_values();
+        Self::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .filter_map(|col| {
+                // 找到原始字段值中对应的索引
+                let original_idx = Self::COLUMNS.iter().position(|&c| c == col.name).unwrap();
+                if original_idx < all_values.len() {
+                    Some(all_values[original_idx].clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// 用于 insert/insert_or_update 的参数类型 trait

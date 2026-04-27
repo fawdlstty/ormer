@@ -404,31 +404,27 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
 
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let (sql, _) = common_helpers::build_batch_insert_sql_postgresql_with_columns(
+            T::TABLE_NAME,
+            &columns,
+            models.len(),
+        );
         let mut all_values = Vec::new();
-        let mut param_idx = 1;
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.field_values();
+        for model in models.iter() {
+            let values = model.insert_values();
             all_values.extend(values);
         }
 
         // 获取列的rust类型信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -451,12 +447,13 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
+        let col_count = columns.len();
         let primary_key = T::primary_key_column();
+        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
         let mut param_idx = 1;
 
@@ -471,14 +468,14 @@ impl Database {
             sql.push_str(&format!("({})", placeholders.join(", ")));
             param_idx += col_count;
 
-            let values = model.field_values();
+            let values = model.insert_values();
             all_values.extend(values);
         }
 
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in T::COLUMNS.iter() {
+        for col_name in columns.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -490,7 +487,11 @@ impl Database {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -684,14 +685,24 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let (sql, _) = crate::abstract_layer::common_helpers::build_batch_insert_sql_postgresql::<T>(
-            models.len(),
-        );
+        let columns = T::insert_columns();
+        let (sql, _) =
+            crate::abstract_layer::common_helpers::build_batch_insert_sql_postgresql_with_columns(
+                T::TABLE_NAME,
+                &columns,
+                models.len(),
+            );
         let all_values =
-            crate::abstract_layer::common_helpers::collect_batch_insert_values::<T>(models);
+            crate::abstract_layer::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                T,
+            >(models);
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -716,12 +727,13 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
+        let col_count = columns.len();
         let primary_key = T::primary_key_column();
+        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
         let mut all_values = Vec::new();
         let mut param_idx = 1;
 
@@ -736,14 +748,14 @@ impl<'a> Transaction<'a> {
             sql.push_str(&format!("({})", placeholders.join(", ")));
             param_idx += col_count;
 
-            let values = model.field_values();
+            let values = model.insert_values();
             all_values.extend(values);
         }
 
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in T::COLUMNS.iter() {
+        for col_name in columns.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -755,7 +767,11 @@ impl<'a> Transaction<'a> {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| p.as_ref()).collect();

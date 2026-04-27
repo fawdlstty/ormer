@@ -370,12 +370,19 @@ impl Database {
             return Ok(());
         }
 
+        // 检查是否有自增主键，如果有则排除
+        let columns = T::insert_columns();
+
         // 构建批量插入的 SQL: INSERT INTO table (cols) VALUES (...), (...), ...
-        let (sql, _col_count) = common_helpers::build_batch_insert_sql::<T>(models.len());
+        let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
+            T::TABLE_NAME,
+            &columns,
+            models.len(),
+        );
         let mut all_params = Vec::new();
 
         for model in models.iter() {
-            let values = model.field_values();
+            let values = model.insert_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -397,12 +404,13 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
+        let col_count = columns.len();
         let primary_key = T::primary_key_column();
+        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -413,7 +421,7 @@ impl Database {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.field_values();
+            let values = model.insert_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -421,7 +429,7 @@ impl Database {
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in T::COLUMNS.iter() {
+        for col_name in columns.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }
@@ -628,14 +636,17 @@ impl Transaction {
             return Ok(());
         }
 
-        let (sql, _) =
-            crate::abstract_layer::common_helpers::build_batch_insert_sql::<T>(models.len());
+        let columns = T::insert_columns();
+        let (sql, _) = crate::abstract_layer::common_helpers::build_batch_insert_sql_with_columns(
+            T::TABLE_NAME,
+            &columns,
+            models.len(),
+        );
         let all_values =
-            crate::abstract_layer::common_helpers::collect_batch_insert_values::<T>(models);
+            crate::abstract_layer::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                T,
+            >(models);
         let all_params = values_to_params(&all_values)?;
-
-        eprintln!("DEBUG [insert_or_update_batch]: SQL = {}", sql);
-        eprintln!("DEBUG [insert_or_update_batch]: params = {:?}", all_params);
 
         self.conn
             .execute(&sql, all_params)
@@ -654,12 +665,13 @@ impl Transaction {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
+        let columns = T::insert_columns();
+        let col_count = columns.len();
         let primary_key = T::primary_key_column();
+        let columns_str = columns.join(", ");
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns_str}) VALUES ", T::TABLE_NAME);
         let mut all_params = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -670,7 +682,7 @@ impl Transaction {
             let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
             sql.push_str(&format!("({})", placeholders.join(", ")));
 
-            let values = model.field_values();
+            let values = model.insert_values();
             let params = values_to_params(&values)?;
             all_params.extend(params);
         }
@@ -678,7 +690,7 @@ impl Transaction {
         // 添加 ON CONFLICT DO UPDATE 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
         let mut first = true;
-        for col_name in T::COLUMNS.iter() {
+        for col_name in columns.iter() {
             if col_name == &primary_key {
                 continue; // 跳过主键
             }

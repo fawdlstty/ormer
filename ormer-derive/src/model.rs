@@ -67,6 +67,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查是否是主键字段
         let is_primary = f.attrs.iter().any(|attr| attr.path().is_ident("primary"));
 
+        // 检查是否是自增主键（只有主键字段才可能是自增）
+        let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
+
         // 检查是否是 Option<T>
         let is_nullable = type_str.starts_with("Option <");
 
@@ -95,7 +98,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 name: stringify!(#field_name),
                 rust_type: #rust_type,
                 is_primary: #is_primary,
-                is_auto_increment: #is_auto_increment,
+                is_auto_increment: #field_is_auto_increment,
                 is_nullable: #is_nullable,
                 unique_group: #unique_group,
                 is_indexed: #is_indexed,
@@ -209,6 +212,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             fn primary_key_value(&self) -> ::ormer::Value {
                 ::ormer::Value::from(self.#primary_key_field.clone())
             }
+
+            fn is_primary_auto_increment() -> bool {
+                #is_auto_increment
+            }
         }
 
         // 生成 inherent 方法，使得不需要 import Model trait 也能调用
@@ -283,6 +290,10 @@ fn derive_model_tuple_wrapper(
 
             fn primary_key_value(&self) -> ::ormer::Value {
                 self.0.primary_key_value()
+            }
+
+            fn is_primary_auto_increment() -> bool {
+                <#inner_type as ::ormer::Model>::is_primary_auto_increment()
             }
         }
 

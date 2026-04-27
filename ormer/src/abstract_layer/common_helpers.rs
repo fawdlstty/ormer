@@ -268,6 +268,29 @@ pub fn build_batch_insert_sql<T: Model>(models_count: usize) -> (String, usize) 
     (sql, col_count)
 }
 
+/// 构建批量插入 SQL 的公共函数（使用自定义列名列表，排除自增主键）
+pub fn build_batch_insert_sql_with_columns(
+    table_name: &str,
+    columns: &[&str],
+    models_count: usize,
+) -> (String, usize) {
+    let columns_str = columns.join(", ");
+    let col_count = columns.len();
+
+    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
+
+    for idx in 0..models_count {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        sql.push_str(&format!("({})", placeholders.join(", ")));
+    }
+
+    (sql, col_count)
+}
+
 /// 构建批量插入 SQL（PostgreSQL 使用 $1, $2 占位符）
 pub fn build_batch_insert_sql_postgresql<T: Model>(models_count: usize) -> (String, usize) {
     let columns = T::COLUMNS.join(", ");
@@ -294,11 +317,51 @@ pub fn build_batch_insert_sql_postgresql<T: Model>(models_count: usize) -> (Stri
     (sql, col_count)
 }
 
+/// 构建批量插入 SQL（PostgreSQL 使用 $1, $2 占位符，使用自定义列名列表）
+pub fn build_batch_insert_sql_postgresql_with_columns(
+    table_name: &str,
+    columns: &[&str],
+    models_count: usize,
+) -> (String, usize) {
+    let columns_str = columns.join(", ");
+    let col_count = columns.len();
+
+    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
+    let mut param_idx = 1;
+
+    for idx in 0..models_count {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+
+        let placeholders: Vec<String> = (1..=col_count)
+            .map(|i| {
+                let idx = param_idx + i - 1;
+                format!("${}", idx)
+            })
+            .collect();
+        sql.push_str(&format!("({})", placeholders.join(", ")));
+        param_idx += col_count;
+    }
+
+    (sql, col_count)
+}
+
 /// 收集批量插入的所有模型值
 pub fn collect_batch_insert_values<T: Model>(models: &[&T]) -> Vec<Value> {
     let mut all_values = Vec::new();
     for model in models {
         let values = model.field_values();
+        all_values.extend(values);
+    }
+    all_values
+}
+
+/// 收集批量插入的所有模型值（排除自增主键）
+pub fn collect_batch_insert_values_with_auto_increment<T: Model>(models: &[&T]) -> Vec<Value> {
+    let mut all_values = Vec::new();
+    for model in models {
+        let values = model.insert_values();
         all_values.extend(values);
     }
     all_values
