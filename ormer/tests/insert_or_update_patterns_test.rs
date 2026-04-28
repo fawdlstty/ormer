@@ -1,4 +1,5 @@
 #![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![allow(dead_code)]
 
 mod _test_common;
 
@@ -7,7 +8,6 @@ define_test_user_simple!(TestUserIOU, "test_users_iou1_1");
 define_test_role_with_unique_group!(TestRoleIOU, "test_roles_iou1_1");
 define_test_user_simple!(TestUserIOU2, "test_users_iou2_1");
 define_test_user_simple!(TestUserIOU3, "test_users_iou3_1");
-#[allow(dead_code)]
 define_test_user_simple!(TestUserIOU4, "test_users_iou4_1");
 define_test_user_simple!(TestUserIOU5, "test_users_iou5_1");
 define_test_role_with_unique_group!(TestRoleIOU4, "test_roles_iou4_1");
@@ -31,6 +31,7 @@ async fn test_insert_or_update_all_patterns_impl(
         name: "Alice".to_string(),
         age: 18,
     })
+    .execute()
     .await?;
 
     // 2. 插入或更新 Vec<T> 的引用 &vec![T {...}]
@@ -39,6 +40,7 @@ async fn test_insert_or_update_all_patterns_impl(
         name: "Bob".to_string(),
         age: 20,
     }])
+    .execute()
     .await?;
 
     // 3. 插入或更新 Vec<T> 的引用 &vec![T {...}]
@@ -47,6 +49,7 @@ async fn test_insert_or_update_all_patterns_impl(
         name: "Charlie".to_string(),
         age: 22,
     }])
+    .execute()
     .await?;
 
     // 4. 插入或更新数组引用 &[T; N]
@@ -55,6 +58,7 @@ async fn test_insert_or_update_all_patterns_impl(
         name: "David".to_string(),
         age: 24,
     }])
+    .execute()
     .await?;
 
     // 5. 插入或更新数组引用 &[T; N]
@@ -63,6 +67,7 @@ async fn test_insert_or_update_all_patterns_impl(
         name: "Eve".to_string(),
         age: 26,
     }])
+    .execute()
     .await?;
 
     // 6. 插入或更新数组切片 &[T; N][..]
@@ -73,6 +78,7 @@ async fn test_insert_or_update_all_patterns_impl(
             age: 28,
         }][..],
     )
+    .execute()
     .await?;
 
     // 7. 插入或更新数组切片 &[T; N][..]
@@ -83,6 +89,7 @@ async fn test_insert_or_update_all_patterns_impl(
             age: 30,
         }][..],
     )
+    .execute()
     .await?;
 
     // 验证所有数据插入成功
@@ -123,6 +130,7 @@ async fn test_insert_or_update_update_behavior_impl(
         name: "Alice".to_string(),
         age: 18,
     })
+    .execute()
     .await?;
 
     let users: Vec<TestUserIOU2> = db.select::<TestUserIOU2>().collect::<Vec<_>>().await?;
@@ -136,6 +144,7 @@ async fn test_insert_or_update_update_behavior_impl(
         name: "Alice Updated".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
 
     let users: Vec<TestUserIOU2> = db.select::<TestUserIOU2>().collect::<Vec<_>>().await?;
@@ -180,6 +189,7 @@ async fn test_insert_or_update_batch_update_impl(
             age: 30,
         },
     ])
+    .execute()
     .await?;
 
     let users: Vec<TestUserIOU3> = db.select::<TestUserIOU3>().collect::<Vec<_>>().await?;
@@ -198,6 +208,7 @@ async fn test_insert_or_update_batch_update_impl(
             age: 35,
         },
     ])
+    .execute()
     .await?;
 
     let users: Vec<TestUserIOU3> = db.select::<TestUserIOU3>().collect::<Vec<_>>().await?;
@@ -243,6 +254,7 @@ async fn test_insert_or_update_with_array_impl(
         uid: 100,
         name: "admin".to_string(),
     }])
+    .execute()
     .await?;
 
     // 使用数组切片更新
@@ -253,6 +265,7 @@ async fn test_insert_or_update_with_array_impl(
             name: "super_admin".to_string(),
         }][..],
     )
+    .execute()
     .await?;
 
     let roles: Vec<TestRoleIOU4> = db.select::<TestRoleIOU4>().collect::<Vec<_>>().await?;
@@ -284,6 +297,7 @@ async fn test_insert_and_insert_or_update_mix_impl(
         name: "Alice".to_string(),
         age: 18,
     })
+    .execute()
     .await?;
 
     db.insert(&vec![TestUserIOU5 {
@@ -291,6 +305,7 @@ async fn test_insert_and_insert_or_update_mix_impl(
         name: "Bob".to_string(),
         age: 20,
     }])
+    .execute()
     .await?;
 
     // 使用 insert_or_update 更新
@@ -299,6 +314,7 @@ async fn test_insert_and_insert_or_update_mix_impl(
         name: "Alice Updated".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
 
     // 使用 insert_or_update 插入新记录
@@ -307,6 +323,7 @@ async fn test_insert_and_insert_or_update_mix_impl(
         name: "Charlie".to_string(),
         age: 22,
     }])
+    .execute()
     .await?;
 
     let users: Vec<TestUserIOU5> = db.select::<TestUserIOU5>().collect::<Vec<_>>().await?;

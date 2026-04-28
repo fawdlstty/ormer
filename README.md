@@ -21,17 +21,17 @@ An ORM framework with a usage style similar to Linq, supporting Turso(SQLite), P
 | Compile-time Checking | ✅ Strong typing | ⚠️ Partial | ✅ Strong typing | ✅ Strong typing |
 | Multi-Database Support | ✅ 3 databases | ✅ Multiple | ✅ Multiple | ✅ Multiple |
 | Migration System | ❌ Pending | ✅ Built-in | ✅ Built-in | ✅ Supported |
-| Streaming Queries | ❌ Pending | ✅ Supported | ❌ Not supported | ✅ Supported |
-| Complex Conditional Expressions | ❌ Pending | ✅ Supported | ✅ Supported | ✅ Supported |
-| JOIN Types | ⚠️ Basic | ✅ Complete | ✅ Complete | ✅ Complete |
-| Relationship Loading Strategy | ❌ Pending | ✅ Eager/Lazy | ✅ Supported | ✅ Supported |
-| Database Type Extensions | ❌ Pending | ✅ Rich | ✅ Rich | ✅ Rich |
-| Batch Operations | ⚠️ Partial | ✅ Complete | ✅ Complete | ✅ Complete |
-| Testing Support | ❌ Pending | ✅ Mock Database | ⚠️ Manual | ⚠️ Manual |
-| Hooks & Callbacks | ❌ Pending | ✅ Supported | ❌ Not supported | ✅ Supported |
+| Streaming Queries | ✅ Supported | ✅ Supported | ❌ Not supported | ✅ Supported |
+| Complex Conditional Expressions | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
+| JOIN Types | ✅ Complete | ✅ Complete | ✅ Complete | ✅ Complete |
+| Relationship Loading Strategy | ⚠️ Basic | ✅ Eager/Lazy | ✅ Supported | ✅ Supported |
+| Database Type Extensions | ✅ Rich | ✅ Rich | ✅ Rich | ✅ Rich |
+| Batch Operations | ✅ Complete | ✅ Complete | ✅ Complete | ✅ Complete |
+| Testing Support | ⚠️ Multi-db | ✅ Mock Database | ⚠️ Manual | ⚠️ Manual |
+| Hooks & Callbacks | ✅ Supported | ✅ Supported | ❌ Not supported | ✅ Supported |
 | Soft Delete | ❌ Pending | ✅ Supported | ❌ Not supported | ❌ Not supported |
-| Composite Primary Key | ❌ Pending | ✅ Supported | ✅ Supported | ✅ Supported |
-| Enum Types | ❌ Pending | ✅ Supported | ✅ Supported | ✅ Supported |
+| Composite Primary Key | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
+| Enum Types | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
 
 ### Developer Experience Comparison
 

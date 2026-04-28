@@ -137,16 +137,16 @@ let db = Database::connect(
 
 ```rust
 // 单条插入
-db.insert(&user).await?;
+db.insert(&user).execute().await?;
 
 // 批量插入 (Vec)
-db.insert(&vec![user1, user2, user3]).await?;
+db.insert(&vec![user1, user2, user3]).execute().await?;
 
 // 批量插入 (数组)
-db.insert(&[user1, user2]).await?;
+db.insert(&[user1, user2]).execute().await?;
 
 // 插入或更新
-db.insert_or_update(&user).await?;
+db.insert_or_update(&user).execute().await?;
 ```
 
 ### 查询数据

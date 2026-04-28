@@ -14,10 +14,11 @@ mod unified;
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    RelatedCollectFuture, RelatedSelectExecutor, SelectExecutor, SelectStream,
-    SelectStreamIterator, Transaction, UpdateExecutor,
+    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, InsertExecutor,
+    InsertOrUpdateExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
+    MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
+    SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
+    TransactionInsertOrUpdateExecutor, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出

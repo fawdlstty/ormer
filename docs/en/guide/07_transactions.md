@@ -19,8 +19,8 @@ txn.rollback().await?;
 
 ```rust
 let mut txn = db.begin().await?;
-txn.insert(&user1).await?;
-txn.insert(&user2).await?;
+txn.insert(&user1).execute().await?;
+txn.insert(&user2).execute().await?;
 txn.commit().await?;
 ```
 
@@ -28,7 +28,7 @@ txn.commit().await?;
 
 ```rust
 let mut txn = db.begin().await?;
-txn.insert(&user).await?;
+txn.insert(&user).execute().await?;
 
 // Can see uncommitted data in transaction
 let users: Vec<User> = txn.select::<User>().collect().await?;
@@ -65,7 +65,7 @@ txn.commit().await?;
 ```rust
 let mut txn = db.begin().await?;
 
-match txn.insert(&user2).await {
+match txn.insert(&user2).execute().await {
     Ok(_) => txn.commit().await?,
     Err(e) => {
         txn.rollback().await?;
@@ -93,8 +93,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::connect(DbType::Turso, "file:test.db").await?;
     db.create_table::<Account>().execute().await?;
     
-    db.insert(&Account { id: 1, name: "Alice".to_string(), balance: 1000.0 }).await?;
-    db.insert(&Account { id: 2, name: "Bob".to_string(), balance: 500.0 }).await?;
+    db.insert(&Account { id: 1, name: "Alice".to_string(), balance: 1000.0 })
+        .execute()
+        .await?;
+    db.insert(&Account { id: 2, name: "Bob".to_string(), balance: 500.0 })
+        .execute()
+        .await?;
     
     // Transfer
     let mut txn = db.begin().await?;

@@ -28,6 +28,7 @@ async fn test_exec_table_impl(
         age: 25,
         email: Some("alice@example.com".to_string()),
     })
+    .execute()
     .await?;
 
     db.insert(&ExecTestUser1 {
@@ -36,6 +37,7 @@ async fn test_exec_table_impl(
         age: 30,
         email: Some("bob@example.com".to_string()),
     })
+    .execute()
     .await?;
 
     db.insert(&ExecTestUser1 {
@@ -44,6 +46,7 @@ async fn test_exec_table_impl(
         age: 35,
         email: None,
     })
+    .execute()
     .await?;
 
     // 测试 exec_table - 查询所有用户
@@ -111,6 +114,7 @@ async fn test_exec_non_query_impl(
         age: 25,
         email: Some("alice@example.com".to_string()),
     })
+    .execute()
     .await?;
 
     db.insert(&ExecTestUser2 {
@@ -119,6 +123,7 @@ async fn test_exec_non_query_impl(
         age: 30,
         email: Some("bob@example.com".to_string()),
     })
+    .execute()
     .await?;
 
     db.insert(&ExecTestUser2 {
@@ -127,6 +132,7 @@ async fn test_exec_non_query_impl(
         age: 35,
         email: None,
     })
+    .execute()
     .await?;
 
     // 测试 exec_non_query - UPDATE 语句

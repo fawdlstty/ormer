@@ -34,6 +34,7 @@ async fn test_map_to_complete_usage_impl(
         email: "alice@example.com".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     db.insert(&User {
         id: 2,
@@ -41,6 +42,7 @@ async fn test_map_to_complete_usage_impl(
         email: "bob@example.com".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
     db.insert(&User {
         id: 3,
@@ -48,6 +50,7 @@ async fn test_map_to_complete_usage_impl(
         email: "charlie@example.com".to_string(),
         age: 35,
     })
+    .execute()
     .await?;
 
     db.insert(&Role {
@@ -55,18 +58,21 @@ async fn test_map_to_complete_usage_impl(
         user_id: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&Role {
         id: 2,
         user_id: 2,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&Role {
         id: 3,
         user_id: 3,
         role_name: "user".to_string(),
     })
+    .execute()
     .await?;
 
     // ==================== 测试1: 单字段映射 - 收集为基本类型 ====================

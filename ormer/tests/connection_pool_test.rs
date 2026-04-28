@@ -63,6 +63,7 @@ mod connection_pool_tests {
             age: 25,
             email: Some("alice@example.com".to_string()),
         })
+        .execute()
         .await?;
 
         // 插入多条记录
@@ -80,6 +81,7 @@ mod connection_pool_tests {
                 email: None,
             },
         ])
+        .execute()
         .await?;
 
         // 清理测试表
@@ -107,6 +109,7 @@ mod connection_pool_tests {
                 age: 25,
                 email: Some("alice@example.com".to_string()),
             })
+            .execute()
             .await?;
             conn.insert(&PoolTestUser {
                 id: 2,
@@ -114,6 +117,7 @@ mod connection_pool_tests {
                 age: 30,
                 email: Some("bob@example.com".to_string()),
             })
+            .execute()
             .await?;
 
             let users = conn.select::<PoolTestUser>().collect::<Vec<_>>().await?;
@@ -149,6 +153,7 @@ mod connection_pool_tests {
                     age: 20 + i * 5,
                     email: Some(format!("user{}@example.com", i)),
                 })
+                .execute()
                 .await?;
             }
 
@@ -187,6 +192,7 @@ mod connection_pool_tests {
                 age: 25,
                 email: Some("alice@example.com".to_string()),
             })
+            .execute()
             .await?;
 
             // 更新数据
@@ -235,6 +241,7 @@ mod connection_pool_tests {
                 age: 25,
                 email: None,
             })
+            .execute()
             .await?;
             conn.insert(&PoolTestUser {
                 id: 2,
@@ -242,6 +249,7 @@ mod connection_pool_tests {
                 age: 30,
                 email: None,
             })
+            .execute()
             .await?;
 
             // 删除数据
@@ -287,6 +295,7 @@ mod connection_pool_tests {
             age: 25,
             email: Some("alice@example.com".to_string()),
         })
+        .execute()
         .await?;
 
         txn.insert(&PoolTestUser {
@@ -295,6 +304,7 @@ mod connection_pool_tests {
             age: 30,
             email: Some("bob@example.com".to_string()),
         })
+        .execute()
         .await?;
 
         txn.commit().await?;
@@ -329,6 +339,7 @@ mod connection_pool_tests {
                     age: 20 + i * 5,
                     email: None,
                 })
+                .execute()
                 .await?;
             }
 
@@ -378,6 +389,7 @@ mod connection_pool_tests {
                 age: 25,
                 email: None,
             })
+            .execute()
             .await?;
 
             // 第三次：查询数据

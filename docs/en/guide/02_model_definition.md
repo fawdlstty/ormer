@@ -274,7 +274,7 @@ let archive_user = ArchiveUser(User {
     age: 30,
     email: Some("bob@example.com".to_string()),
 });
-db.insert(&archive_user).await?;
+db.insert(&archive_user).execute().await?;
 
 // Query archive table
 let archived: Vec<ArchiveUser> = db

@@ -106,7 +106,7 @@ async fn test_grouped_select_basic_impl(
     ];
 
     for user in users {
-        db.insert(&user).await?;
+        db.insert(&user).execute().await?;
     }
 
     // 执行分组聚合查询 - 按年龄分组，统计每组人数
@@ -168,7 +168,7 @@ async fn test_grouped_select_with_having_impl(
     ];
 
     for user in users {
-        db.insert(&user).await?;
+        db.insert(&user).execute().await?;
     }
 
     // 执行分组聚合查询，只返回用户数 >= 2 的年龄组
@@ -185,7 +185,7 @@ async fn test_grouped_select_with_having_impl(
     assert_eq!(count.len(), 1);
 
     // 清理
-    let _ = db.drop_table::<TestGroupedE2EUser>().execute().await;
+    let _ = db.drop_table::<TestGroupedE2EUserHaving>().execute().await;
 
     Ok(())
 }
@@ -236,7 +236,7 @@ async fn test_grouped_select_with_filter_impl(
     ];
 
     for user in users {
-        db.insert(&user).await?;
+        db.insert(&user).execute().await?;
     }
 
     // 执行分组聚合查询，只查询分数 > 80 的用户
@@ -255,7 +255,7 @@ async fn test_grouped_select_with_filter_impl(
     assert_eq!(count.len(), 2);
 
     // 清理
-    let _ = db.drop_table::<TestGroupedE2EUser>().execute().await;
+    let _ = db.drop_table::<TestGroupedE2EUserFilter>().execute().await;
 
     Ok(())
 }

@@ -18,6 +18,7 @@ async fn test_step_by_step_impl(
         age: 18,
         email: None,
     })
+    .execute()
     .await?;
     println!("Insert OK");
 

@@ -76,6 +76,58 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
+/// 统一的 InsertExecutor 枚举
+pub enum InsertExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::InsertExecutor<'a, I>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::InsertExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            InsertExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
+/// 统一的 InsertOrUpdateExecutor 枚举
+pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::InsertOrUpdateExecutor<'a, I>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::InsertOrUpdateExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::InsertOrUpdateExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            InsertOrUpdateExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
 impl Database {
     /// 连接到数据库,根据 DbType 选择后端
     pub async fn connect(
@@ -127,32 +179,37 @@ impl Database {
         }
     }
 
-    /// 插入记录
-    pub async fn insert<I: crate::model::Insertable>(&self, models: I) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
         match self {
             #[cfg(feature = "turso")]
-            Database::Turso(db) => db.insert_batch::<I::Model>(&refs).await,
+            Database::Turso(db) => {
+                InsertExecutor::Turso(db.insert::<I>(models), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.insert_batch::<I::Model>(&refs).await,
+            Database::PostgreSQL(db) => InsertExecutor::PostgreSQL(db.insert::<I>(models)),
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.insert_batch::<I::Model>(&refs).await,
+            Database::MySQL(db) => InsertExecutor::MySQL(db.insert::<I>(models)),
         }
     }
 
-    /// 插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update<I: crate::model::Insertable>(
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
         &self,
         models: I,
-    ) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
+    ) -> InsertOrUpdateExecutor<'_, I> {
         match self {
             #[cfg(feature = "turso")]
-            Database::Turso(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            Database::Turso(db) => InsertOrUpdateExecutor::Turso(
+                db.insert_or_update::<I>(models),
+                std::marker::PhantomData,
+            ),
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            Database::PostgreSQL(db) => {
+                InsertOrUpdateExecutor::PostgreSQL(db.insert_or_update::<I>(models))
+            }
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            Database::MySQL(db) => InsertOrUpdateExecutor::MySQL(db.insert_or_update::<I>(models)),
         }
     }
 
@@ -315,9 +372,9 @@ crate::impl_unified_select_executor_methods!(SelectExecutor, std::marker::Phanto
 impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
-    pub fn from<T2: Model, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
+    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -335,9 +392,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持3个表）
     /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
+    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -358,11 +415,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持4个表）
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
         self,
     ) -> FourTableSelectExecutor<'a, T, R1, R2, R3>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         match self {
             #[cfg(feature = "turso")]
@@ -761,6 +818,58 @@ pub enum Transaction<'a> {
     MySQL(mysql_backend::Transaction<'a>),
 }
 
+/// 事务中的插入执行器
+pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::TransactionInsertExecutor<'a, I>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::TransactionInsertExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::TransactionInsertExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            TransactionInsertExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
+/// 事务中的插入或更新执行器
+pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "turso")]
+    Turso(
+        turso_backend::TransactionInsertOrUpdateExecutor<'a, I>,
+        std::marker::PhantomData<&'a ()>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        match self {
+            #[cfg(feature = "turso")]
+            TransactionInsertOrUpdateExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            TransactionInsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
+        }
+    }
+}
+
 impl<'a> Transaction<'a> {
     /// 提交事务
     pub async fn commit(self) -> Result<(), crate::Error> {
@@ -844,35 +953,44 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// 插入记录
-    pub async fn insert<I: crate::model::Insertable>(
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
+    ) -> TransactionInsertExecutor<'_, I> {
         match self {
             #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => txn.insert_batch::<I::Model>(&refs).await,
+            Transaction::Turso(txn, _) => {
+                TransactionInsertExecutor::Turso(txn.insert::<I>(models), std::marker::PhantomData)
+            }
             #[cfg(feature = "postgresql")]
-            Transaction::PostgreSQL(txn) => txn.insert_batch::<I::Model>(&refs).await,
+            Transaction::PostgreSQL(txn) => {
+                TransactionInsertExecutor::PostgreSQL(txn.insert::<I>(models))
+            }
             #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => txn.insert_batch::<I::Model>(&refs).await,
+            Transaction::MySQL(txn) => TransactionInsertExecutor::MySQL(txn.insert::<I>(models)),
         }
     }
 
-    /// 插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update<I: crate::model::Insertable>(
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
+    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
         match self {
             #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => txn.insert_or_update_batch::<I::Model>(&refs).await,
+            Transaction::Turso(txn, _) => TransactionInsertOrUpdateExecutor::Turso(
+                txn.insert_or_update::<I>(models),
+                std::marker::PhantomData,
+            ),
             #[cfg(feature = "postgresql")]
-            Transaction::PostgreSQL(txn) => txn.insert_or_update_batch::<I::Model>(&refs).await,
+            Transaction::PostgreSQL(txn) => {
+                TransactionInsertOrUpdateExecutor::PostgreSQL(txn.insert_or_update::<I>(models))
+            }
             #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => txn.insert_or_update_batch::<I::Model>(&refs).await,
+            Transaction::MySQL(txn) => {
+                TransactionInsertOrUpdateExecutor::MySQL(txn.insert_or_update::<I>(models))
+            }
         }
     }
 }
@@ -1100,7 +1218,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
+    pub fn collect<C>(&self) -> GroupedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -1282,7 +1400,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -1354,9 +1472,14 @@ impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a
         match self {
             #[cfg(feature = "turso")]
             MappedSelectExecutor::Turso(exec, _) => exec.to_subquery_sql(),
-            // TODO: 实现 postgresql 和 mysql 后端
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("MappedSelectExecutor only implemented for Turso backend"),
+            #[cfg(feature = "postgresql")]
+            MappedSelectExecutor::PostgreSQL(exec) => exec.to_subquery_sql(),
+            #[cfg(feature = "mysql")]
+            MappedSelectExecutor::MySQL(exec) => exec.to_subquery_sql(),
+            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            MappedSelectExecutor::NotImplemented(_) => {
+                panic!("MappedSelectExecutor::to_subquery_sql is not implemented for this backend")
+            }
         }
     }
 }

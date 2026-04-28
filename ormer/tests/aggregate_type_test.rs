@@ -23,6 +23,7 @@ async fn test_aggregate_type_inference_impl(
         age: 20,
         score: 85.5,
     })
+    .execute()
     .await?;
 
     db.insert(&TestUser {
@@ -31,6 +32,7 @@ async fn test_aggregate_type_inference_impl(
         age: 25,
         score: 92.3,
     })
+    .execute()
     .await?;
 
     // 测试 MAX(age) - 编译期推断为 Option<i32>

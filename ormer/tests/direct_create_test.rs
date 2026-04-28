@@ -37,7 +37,9 @@ async fn test_direct_create_table_impl(
     println!("SQL length: {}", sql.len());
 
     // 插入一条数据测试
-    db.insert(&user).await?;
+    db.insert(&user)
+    .execute()
+    .await?;
     println!("Data inserted successfully!");
 
     // 查询

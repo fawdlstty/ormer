@@ -23,6 +23,7 @@ async fn test_insert_single_and_batch_impl(
         name: "Alice".to_string(),
         age: 20,
     })
+    .execute()
     .await?;
     println!("插入单个对象成功");
 
@@ -45,6 +46,7 @@ async fn test_insert_single_and_batch_impl(
             age: 30,
         },
     ])
+    .execute()
     .await?;
     println!("插入 Vec 成功");
 
@@ -66,7 +68,9 @@ async fn test_insert_single_and_batch_impl(
             age: 28,
         },
     ];
-    db.insert(&users_array).await?;
+    db.insert(&users_array)
+    .execute()
+    .await?;
     println!("插入数组切片成功");
 
     // 查询验证
@@ -99,6 +103,7 @@ async fn test_insert_or_update_single_and_batch_impl(
         name: "Alice".to_string(),
         age: 20,
     })
+    .execute()
     .await?;
     println!("第一次 insert_or_update 单个对象成功");
 
@@ -114,6 +119,7 @@ async fn test_insert_or_update_single_and_batch_impl(
         name: "Alice Updated".to_string(),
         age: 21,
     })
+    .execute()
     .await?;
     println!("第二次 insert_or_update 单个对象成功（更新操作）");
 
@@ -142,6 +148,7 @@ async fn test_insert_or_update_single_and_batch_impl(
             age: 30,
         },
     ])
+    .execute()
     .await?;
     println!("批量 insert_or_update 成功");
 

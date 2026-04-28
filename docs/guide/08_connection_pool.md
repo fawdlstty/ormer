@@ -41,7 +41,7 @@ let users: Vec<User> = conn.select::<User>().collect().await?;
 ```rust
 async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error::Error>> {
     let conn = pool.get().await?;
-    conn.insert(&user).await?;
+    conn.insert(&user).execute().await?;
     // conn 超出作用域后自动返回池
     Ok(())
 }
@@ -147,7 +147,7 @@ let db = Database::connect(DbType::PostgreSQL, db_url).await?;
 // ✅ 推荐 - 使用作用域
 {
     let conn = pool.get().await?;
-    conn.insert(&user).await?;
+    conn.insert(&user).execute().await?;
 } // 自动释放
 
 // ❌ 避免 - 长时间持有

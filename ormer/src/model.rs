@@ -102,7 +102,10 @@ pub trait Model: Sized {
             .filter(|col| !col.is_auto_increment)
             .filter_map(|col| {
                 // 找到原始字段值中对应的索引
-                let original_idx = Self::COLUMNS.iter().position(|&c| c == col.name).unwrap();
+                let original_idx = Self::COLUMNS
+                    .iter()
+                    .position(|&c| c == col.name)
+                    .expect("Column name in COLUMN_SCHEMA must exist in COLUMNS");
                 if original_idx < all_values.len() {
                     Some(all_values[original_idx].clone())
                 } else {
@@ -192,12 +195,17 @@ impl_enum_provider_for_non_enum!(
 pub trait Insertable {
     type Model: crate::model::Model;
     fn as_refs(&self) -> Vec<&Self::Model>;
+    fn as_refs_mut(&mut self) -> Vec<&mut Self::Model>;
 }
 
 impl<T: crate::model::Model> Insertable for &T {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         vec![*self]
+    }
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        // &T 无法提供 &mut T，返回空向量（仅在需要可变引用时会使用其他实现）
+        vec![]
     }
 }
 
@@ -206,12 +214,19 @@ impl<T: crate::model::Model> Insertable for Vec<T> {
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
     }
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        self.iter_mut().collect()
+    }
 }
 
 impl<T: crate::model::Model> Insertable for &Vec<T> {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
+    }
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        // &Vec<T> 无法提供 &mut T，返回空向量
+        vec![]
     }
 }
 
@@ -220,12 +235,20 @@ impl<T: crate::model::Model> Insertable for &[T] {
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
     }
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        // &[T] 无法提供 &mut T，返回空向量
+        vec![]
+    }
 }
 
 impl<T: crate::model::Model, const N: usize> Insertable for &[T; N] {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
+    }
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        // &[T; N] 无法提供 &mut T，返回空向量
+        vec![]
     }
 }
 
@@ -348,7 +371,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     // 添加索引
     let index_sql = generate_indexes_with_name::<T>(db_type, table_name);
     if !index_sql.is_empty() {
-        sql.push_str(";");
+        sql.push(';');
         sql.push_str(&index_sql);
     }
 
@@ -750,6 +773,18 @@ pub enum Error {
 
     #[error("Table schema mismatch for table '{table}': {reason}")]
     SchemaMismatch { table: String, reason: String },
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+
+    #[error("Transaction error: {0}")]
+    TransactionError(String),
+
+    #[error("Hook error: {0}")]
+    HookError(String),
 }
 
 // 使用宏生成 From<T> for Value 实现
@@ -850,3 +885,8 @@ impl From<crate::query::filter::Value> for Value {
         }
     }
 }
+
+// 重新导出钩子 traits 以保持向后兼容
+pub use crate::hooks::{
+    AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
+};

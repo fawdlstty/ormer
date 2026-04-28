@@ -1,55 +1,57 @@
-// #[derive(Debug, ormer::Model)]
-// #[table = "users"]
-// struct User {
-//     #[primary(auto)]
-//     id: i32,
-//     #[unique]
-//     name: String,
-//     #[index]
-//     age: i32,
-//     email: Option<String>,
-// }
+#[derive(Debug, ormer::Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    #[unique]
+    name: String,
+    #[index]
+    age: i32,
+    email: Option<String>,
+}
 
-// #[derive(Debug, ormer::Model)]
-// #[table = "roles"]
-// struct Role {
-//     #[primary]
-//     id: i32,
-//     #[foreign(User.id)]
-//     #[unique(group = 1)]
-//     uid: i32,
-//     #[unique(group = 1)]
-//     name: String,
-// }
+#[derive(Debug, ormer::Model)]
+#[table = "roles"]
+struct Role {
+    #[primary]
+    id: i32,
+    #[foreign(User.id)]
+    #[unique(group = 1)]
+    uid: i32,
+    #[unique(group = 1)]
+    name: String,
+}
 
-// #[derive(Debug, ormer::Model)]
-// #[table = "new_users"]
-// struct NewUser(User);
+#[derive(Debug, ormer::Model)]
+#[table = "new_users"]
+#[allow(dead_code)]
+struct NewUser(User);
 
-// #[derive(Debug, ormer::Model)]
-// #[table = "new_roles"]
-// struct NewRole(Role);
+#[derive(Debug, ormer::Model)]
+#[table = "new_roles"]
+struct NewRole(Role);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
 
-    // db.create_table::<User>().execute().await?;
-    // db.create_table::<NewRole>().execute().await?;
+    db.create_table::<User>().execute().await?;
+    db.create_table::<NewRole>().execute().await?;
 
     // let users = db.exec_table::<User>("SELECT * FROM users;").await?;
     // println!("query result: {users:?}");
     // let count = db.exec_non_query("UPDATE users SET age = 18;").await?;
     // println!("updated rows: {count}");
 
-    // // insert
-    // db.insert(&User {
-    //     id: 1,
-    //     name: "Alice".to_string(),
-    //     age: 18,
-    //     email: None,
-    // })
-    // .await?;
+    // insert
+    db.insert(&User {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 18,
+        email: None,
+    })
+    .execute()
+    .await?;
     // db.insert(&vec![User {
     //     id: 2,
     //     name: "Bob".to_string(),

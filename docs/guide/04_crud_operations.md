@@ -10,24 +10,34 @@ db.insert(&User {
     name: "Alice".to_string(),
     age: 25,
     email: Some("alice@example.com".to_string()),
-}).await?;
+})
+.execute()
+.await?;
 ```
 
 ### 批量插入
 
 ```rust
 // Vec
-db.insert(&vec![user1, user2, user3]).await?;
+db.insert(&vec![user1, user2, user3])
+    .execute()
+    .await?;
 
 // 数组
-db.insert(&[user1, user2]).await?;
+db.insert(&[user1, user2])
+    .execute()
+    .await?;
 ```
 
 ### 插入或更新
 
 ```rust
-db.insert_or_update(&user).await?;
-db.insert_or_update(&vec![user1, user2]).await?;
+db.insert_or_update(&user)
+    .execute()
+    .await?;
+db.insert_or_update(&vec![user1, user2])
+    .execute()
+    .await?;
 ```
 
 ## 查询 (Read)
@@ -135,13 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "Alice".to_string(),
         age: 25,
         email: Some("alice@example.com".to_string()),
-    }).await?;
+    })
+    .execute()
+    .await?;
     
     // 批量插入
     db.insert(&vec![
         User { id: 2, name: "Bob".to_string(), age: 30, email: None },
         User { id: 3, name: "Charlie".to_string(), age: 35, email: None },
-    ]).await?;
+    ])
+    .execute()
+    .await?;
     
     // 查询
     let all: Vec<User> = db.select::<User>().collect().await?;
@@ -172,7 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 // 批量插入
-db.insert(&users).await?;
+db.insert(&users)
+    .execute()
+    .await?;
 ```
 
 ### 事务
@@ -181,8 +197,12 @@ db.insert(&users).await?;
 
 ```rust
 let mut txn = db.begin().await?;
-txn.insert(&user1).await?;
-txn.insert(&user2).await?;
+txn.insert(&user1)
+    .execute()
+    .await?;
+txn.insert(&user2)
+    .execute()
+    .await?;
 txn.commit().await?;
 ```
 
@@ -197,3 +217,45 @@ db.delete::<User>()
     .execute()
     .await?;
 ```
+
+## 钩子系统 (Hooks)
+
+Ormer 提供了钩子系统，允许您在数据操作前后自动执行自定义逻辑。支持的钩子包括：
+
+- `BeforeInsert` / `AfterInsert` - 插入前后
+- `BeforeUpdate` / `AfterUpdate` - 更新前后
+- `BeforeDelete` / `AfterDelete` - 删除前后
+
+### 使用示例
+
+```rust
+use ormer::{Model, BeforeInsert, BeforeUpdate};
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait::async_trait]
+impl BeforeInsert for User {
+    async fn before_insert(&mut self) {
+        let now = chrono::Utc::now();
+        self.created_at = now;
+        self.updated_at = now;
+    }
+}
+
+#[async_trait::async_trait]
+impl BeforeUpdate for User {
+    async fn before_update(&mut self) {
+        self.updated_at = chrono::Utc::now();
+    }
+}
+```
+
+详细文档请参考：[钩子系统](09_hooks.md)

@@ -46,6 +46,7 @@ async fn test_pool_basic_impl(
         id: 1,
         name: "Alice".to_string(),
     })
+    .execute()
     .await?;
     println!("Data inserted");
 

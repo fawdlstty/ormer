@@ -25,6 +25,7 @@ async fn test_count_aggregate_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggCountUser {
         id: 2,
@@ -32,6 +33,7 @@ async fn test_count_aggregate_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggCountUser {
         id: 3,
@@ -39,6 +41,7 @@ async fn test_count_aggregate_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let count: usize = db.select::<TestAggCountUser>().count(|p| p.id).await?;
@@ -66,6 +69,7 @@ async fn test_sum_aggregate_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggSumUser {
         id: 2,
@@ -73,6 +77,7 @@ async fn test_sum_aggregate_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggSumUser {
         id: 3,
@@ -80,6 +85,7 @@ async fn test_sum_aggregate_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let sum: Option<i32> = db.select::<TestAggSumUser>().sum(|p| p.age).await?;
@@ -107,6 +113,7 @@ async fn test_avg_aggregate_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggAvgUser {
         id: 2,
@@ -114,6 +121,7 @@ async fn test_avg_aggregate_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggAvgUser {
         id: 3,
@@ -121,6 +129,7 @@ async fn test_avg_aggregate_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let avg: Option<f64> = db.select::<TestAggAvgUser>().avg(|p| p.score).await?;
@@ -148,6 +157,7 @@ async fn test_max_aggregate_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggMaxUser {
         id: 2,
@@ -155,6 +165,7 @@ async fn test_max_aggregate_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggMaxUser {
         id: 3,
@@ -162,6 +173,7 @@ async fn test_max_aggregate_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let max: Option<i32> = db.select::<TestAggMaxUser>().max(|p| p.age).await?;
@@ -189,6 +201,7 @@ async fn test_min_aggregate_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggMinUser {
         id: 2,
@@ -196,6 +209,7 @@ async fn test_min_aggregate_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggMinUser {
         id: 3,
@@ -203,6 +217,7 @@ async fn test_min_aggregate_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let min: Option<i32> = db.select::<TestAggMinUser>().min(|p| p.age).await?;
@@ -230,6 +245,7 @@ async fn test_aggregate_with_filter_impl(
         age: 20,
         score: 85,
     })
+    .execute()
     .await?;
     db.insert(&TestAggFilterUser {
         id: 2,
@@ -237,6 +253,7 @@ async fn test_aggregate_with_filter_impl(
         age: 25,
         score: 92,
     })
+    .execute()
     .await?;
     db.insert(&TestAggFilterUser {
         id: 3,
@@ -244,6 +261,7 @@ async fn test_aggregate_with_filter_impl(
         age: 22,
         score: 78,
     })
+    .execute()
     .await?;
 
     let count: usize = db

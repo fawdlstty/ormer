@@ -69,12 +69,14 @@ async fn test_drop_multiple_tables_impl(
         name: "Bob".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
 
     db.insert(&TestDropMultipleRole {
         id: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 删除所有表
@@ -109,6 +111,7 @@ async fn test_drop_table_and_recreate_impl(
         name: "Charlie".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
 
     db.insert(&TestDropRecreateUser {
@@ -116,6 +119,7 @@ async fn test_drop_table_and_recreate_impl(
         name: "Diana".to_string(),
         age: 28,
     })
+    .execute()
     .await?;
 
     // 查询验证数据存在

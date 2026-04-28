@@ -126,6 +126,34 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
+/// 插入执行器
+pub struct InsertExecutor<'a, I: crate::model::Insertable> {
+    db: &'a Database,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.db.insert_batch::<I::Model>(&refs).await
+    }
+}
+
+/// 插入或更新执行器
+pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    db: &'a Database,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.db.insert_or_update_batch::<I::Model>(&refs).await
+    }
+}
+
 impl Database {
     /// 连接到 Turso 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> Result<Self, crate::Error> {
@@ -367,14 +395,25 @@ impl Database {
         normalize(actual) == normalize(expected)
     }
 
-    /// 插入单条记录
-    pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
-        self.insert_batch::<T>(&[model]).await
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
+        InsertExecutor {
+            db: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    /// 插入或更新单条记录（遇到重复键时更新）
-    pub async fn insert_or_update<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
-        self.insert_or_update_batch::<T>(&[model]).await
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrUpdateExecutor<'_, I> {
+        InsertOrUpdateExecutor {
+            db: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 批量插入记录
@@ -442,7 +481,7 @@ impl Database {
         sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
         let mut first = true;
         for col_name in columns.iter() {
-            if primary_key_columns.contains(&col_name) {
+            if primary_key_columns.contains(col_name) {
                 continue; // 跳过主键
             }
             if !first {
@@ -582,6 +621,34 @@ pub struct Transaction {
     rolled_back: bool,
 }
 
+/// 事务中的插入执行器
+pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
+    txn: &'a mut Transaction,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.txn.insert_batch::<I::Model>(&refs).await
+    }
+}
+
+/// 事务中的插入或更新执行器
+pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    txn: &'a mut Transaction,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.txn.insert_or_update_batch::<I::Model>(&refs).await
+    }
+}
+
 impl Transaction {
     /// 提交事务
     pub async fn commit(mut self) -> Result<(), crate::Error> {
@@ -650,14 +717,28 @@ impl Transaction {
         }
     }
 
-    /// 插入单条记录
-    pub async fn insert<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
-        self.insert_batch::<T>(&[model]).await
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertExecutor<'_, I> {
+        TransactionInsertExecutor {
+            txn: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    /// 插入或更新单条记录（遇到重复键时更新）
-    pub async fn insert_or_update<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
-        self.insert_or_update_batch::<T>(&[model]).await
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
+        TransactionInsertOrUpdateExecutor {
+            txn: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 批量插入记录
@@ -725,7 +806,7 @@ impl Transaction {
         sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
         let mut first = true;
         for col_name in columns.iter() {
-            if primary_key_columns.contains(&col_name) {
+            if primary_key_columns.contains(col_name) {
                 continue; // 跳过主键
             }
             if !first {

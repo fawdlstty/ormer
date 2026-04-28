@@ -1,7 +1,6 @@
 /// 宏定义 - 用于减少重复代码
 ///
 /// 本文件包含用于生成重复代码模式的宏
-
 /// 为 JOIN Executor 生成通用的 filter/range 方法
 #[macro_export]
 macro_rules! impl_join_executor_methods {
@@ -776,7 +775,7 @@ macro_rules! impl_backend_related_executor_methods_with_lifetime {
 
 /// 示例用法 (在实际代码中使用):
 ///
-/// ```rust,ignore
+/// ```ignore
 /// // 在 turso_backend.rs 中:
 /// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<turso::Connection>);
 /// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<turso::Connection>);

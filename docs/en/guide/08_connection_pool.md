@@ -41,7 +41,7 @@ let users: Vec<User> = conn.select::<User>().collect().await?;
 ```rust
 async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error::Error>> {
     let conn = pool.get().await?;
-    conn.insert(&user).await?;
+    conn.insert(&user).execute().await?;
     // conn auto returns to pool when out of scope
     Ok(())
 }
@@ -147,7 +147,7 @@ let db = Database::connect(DbType::PostgreSQL, db_url).await?;
 // ✅ Recommended - use scope
 {
     let conn = pool.get().await?;
-    conn.insert(&user).await?;
+    conn.insert(&user).execute().await?;
 } // auto release
 
 // ❌ Avoid - hold too long

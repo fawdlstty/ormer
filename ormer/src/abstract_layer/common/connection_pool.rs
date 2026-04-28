@@ -10,6 +10,62 @@ use tokio::sync::{Mutex, Semaphore};
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 use super::unified::{CreateTableExecutor, DropTableExecutor};
 
+/// 连接池插入执行器
+pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
+    pooled_conn: &'a PooledConnection<'a>,
+    models: I,
+    _marker: PhantomData<I>,
+}
+
+impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        // 直接调用 PooledConnection 的 insert_batch 方法
+        let refs = self.models.as_refs();
+        match &self.pooled_conn.connection {
+            #[cfg(feature = "turso")]
+            Some(ConnectionWrapper::Turso(db)) => db.insert_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "postgresql")]
+            Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mysql")]
+            Some(ConnectionWrapper::MySQL(db)) => db.insert_batch::<I::Model>(&refs).await,
+            None => Err(crate::Error::Database(
+                "No connection available".to_string(),
+            )),
+        }
+    }
+}
+
+/// 连接池插入或更新执行器
+pub struct PooledInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    pooled_conn: &'a PooledConnection<'a>,
+    models: I,
+    _marker: PhantomData<I>,
+}
+
+impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        // 直接调用 PooledConnection 的 insert_or_update_batch 方法
+        let refs = self.models.as_refs();
+        match &self.pooled_conn.connection {
+            #[cfg(feature = "turso")]
+            Some(ConnectionWrapper::Turso(db)) => {
+                db.insert_or_update_batch::<I::Model>(&refs).await
+            }
+            #[cfg(feature = "postgresql")]
+            Some(ConnectionWrapper::PostgreSQL(db)) => {
+                db.insert_or_update_batch::<I::Model>(&refs).await
+            }
+            #[cfg(feature = "mysql")]
+            Some(ConnectionWrapper::MySQL(db)) => {
+                db.insert_or_update_batch::<I::Model>(&refs).await
+            }
+            None => Err(crate::Error::Database(
+                "No connection available".to_string(),
+            )),
+        }
+    }
+}
+
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "turso")]
 use super::super::turso_backend;
@@ -373,32 +429,24 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
-    /// 插入记录
-    pub async fn insert<I: crate::model::Insertable>(&self, models: I) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
-        match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.insert_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.insert_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.insert_batch::<I::Model>(&refs).await,
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(&self, models: I) -> PooledInsertExecutor<'_, I> {
+        PooledInsertExecutor {
+            pooled_conn: self,
+            models,
+            _marker: PhantomData,
         }
     }
 
-    /// 插入或更新记录
-    pub async fn insert_or_update<I: crate::model::Insertable>(
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
         &self,
         models: I,
-    ) -> Result<(), crate::Error> {
-        let refs = models.as_refs();
-        match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+    ) -> PooledInsertOrUpdateExecutor<'_, I> {
+        PooledInsertOrUpdateExecutor {
+            pooled_conn: self,
+            models,
+            _marker: PhantomData,
         }
     }
 
@@ -416,6 +464,11 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => super::unified::SelectExecutor::MySQL(db.select::<T>()),
         }
+    }
+
+    /// 创建流式查询执行器
+    pub fn stream<T: Model>(&self) -> super::unified::SelectStream<'_, T> {
+        self.select::<T>().stream()
     }
 
     /// 创建 Delete 执行器

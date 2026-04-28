@@ -35,7 +35,9 @@ async fn test_simple_transaction_commit_impl(
         id: None,
         name: "Test User".to_string(),
     };
-    txn.insert(&user).await?;
+    txn.insert(&user)
+    .execute()
+    .await?;
 
     // 提交
     txn.commit().await?;
@@ -85,7 +87,9 @@ async fn test_simple_transaction_rollback_impl(
         id: None,
         name: "Should Rollback".to_string(),
     };
-    txn.insert(&user).await?;
+    txn.insert(&user)
+    .execute()
+    .await?;
 
     // 回滚
     txn.rollback().await?;

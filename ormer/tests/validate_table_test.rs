@@ -2,8 +2,16 @@
 
 mod _test_common;
 
-// 使用宏定义测试专用模型（唯一表名）
-define_test_user_simple!(ValidateTestUser, "validate_table_users_1");
+// 使用宏定义测试专用模型（每个测试使用唯一表名）
+define_test_user_simple!(ValidateTestUserSuccess, "validate_table_success_users_1");
+define_test_user_simple!(
+    ValidateTestUserNotExists,
+    "validate_table_notexists_users_1"
+);
+define_test_user_simple!(
+    ValidateTestUserNoValidation,
+    "validate_table_novalidation_users_1"
+);
 
 #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
 mod validate_table_tests {
@@ -16,18 +24,23 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 先删除表（如果存在）
-        db.drop_table::<ValidateTestUser>().execute().await.ok();
+        db.drop_table::<ValidateTestUserSuccess>()
+            .execute()
+            .await
+            .ok();
 
         // 创建表
-        db.create_table::<ValidateTestUser>().execute().await?;
+        db.create_table::<ValidateTestUserSuccess>()
+            .execute()
+            .await?;
 
         // 验证表结构应该成功
-        db.validate_table::<ValidateTestUser>().await?;
+        db.validate_table::<ValidateTestUserSuccess>().await?;
 
         println!("validate_table succeeded for existing table");
 
         // 清理
-        db.drop_table::<ValidateTestUser>().execute().await?;
+        db.drop_table::<ValidateTestUserSuccess>().execute().await?;
 
         Ok(())
     }
@@ -38,17 +51,20 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 确保表不存在
-        db.drop_table::<ValidateTestUser>().execute().await.ok();
+        db.drop_table::<ValidateTestUserNotExists>()
+            .execute()
+            .await
+            .ok();
 
         // 验证不存在的表应该失败
-        let result = db.validate_table::<ValidateTestUser>().await;
+        let result = db.validate_table::<ValidateTestUserNotExists>().await;
         assert!(
             result.is_err(),
             "validate_table should fail for non-existent table"
         );
 
         if let Err(ormer::Error::SchemaMismatch { table, reason }) = result {
-            assert_eq!(table, "validate_table_users_1");
+            assert_eq!(table, "validate_table_notexists_users_1");
             assert!(
                 reason.contains("does not exist"),
                 "Error reason should mention table does not exist"
@@ -67,15 +83,21 @@ mod validate_table_tests {
         let db = create_db_connection(config).await?;
 
         // 先删除表（如果存在）
-        db.drop_table::<ValidateTestUser>().execute().await?;
+        db.drop_table::<ValidateTestUserNoValidation>()
+            .execute()
+            .await?;
 
         // 创建表（不应该进行验证）
-        db.create_table::<ValidateTestUser>().execute().await?;
+        db.create_table::<ValidateTestUserNoValidation>()
+            .execute()
+            .await?;
 
         println!("create_table succeeded without validation");
 
         // 清理
-        db.drop_table::<ValidateTestUser>().execute().await?;
+        db.drop_table::<ValidateTestUserNoValidation>()
+            .execute()
+            .await?;
 
         Ok(())
     }

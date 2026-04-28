@@ -6,17 +6,8 @@ mod _test_common;
 define_test_user!(TestUserInsert, "test_users_insert_1");
 define_test_role_with_unique_group!(TestRoleInsert, "test_roles_insert_1");
 
-#[allow(dead_code)]
 define_test_user!(TestUserInsert2, "test_users_insert_2");
-#[allow(dead_code)]
-define_test_role_with_unique_group!(TestRoleInsert2, "test_roles_insert_2");
-
-#[allow(dead_code)]
-define_test_user!(TestUserInsert3, "test_users_insert_3");
 define_test_role_with_unique_group!(TestRoleInsert3, "test_roles_insert_3");
-
-#[allow(dead_code)]
-define_test_user!(TestUserInsert4, "test_users_insert_4");
 define_test_role_with_unique_group!(TestRoleInsert4, "test_roles_insert_4");
 
 /// 测试所有 insert 调用方式（基于 main.rs 的用法）
@@ -39,6 +30,7 @@ async fn test_all_insert_patterns_impl(
         age: 18,
         email: None,
     })
+    .execute()
     .await?;
 
     // 2. 插入 Vec<T> 的引用 &vec![T {...}]
@@ -48,6 +40,7 @@ async fn test_all_insert_patterns_impl(
         age: 20,
         email: Some("bob@example.com".to_string()),
     }])
+    .execute()
     .await?;
 
     // 3. 插入 Vec<T> 的引用（原来是 &vec![&T {...}]，改为 &vec![T {...}]）
@@ -57,6 +50,7 @@ async fn test_all_insert_patterns_impl(
         age: 22,
         email: Some("charlie@example.com".to_string()),
     }])
+    .execute()
     .await?;
 
     // 4. 插入数组引用 &[T; N]
@@ -66,6 +60,7 @@ async fn test_all_insert_patterns_impl(
         age: 24,
         email: Some("david@example.com".to_string()),
     }])
+    .execute()
     .await?;
 
     // 5. 插入数组引用 &[T; N]
@@ -75,6 +70,7 @@ async fn test_all_insert_patterns_impl(
         age: 26,
         email: Some("eve@example.com".to_string()),
     }])
+    .execute()
     .await?;
 
     // 6. 插入数组切片 &[T; N][..]
@@ -86,6 +82,7 @@ async fn test_all_insert_patterns_impl(
             email: Some("frank@example.com".to_string()),
         }][..],
     )
+    .execute()
     .await?;
 
     // 7. 插入数组切片 &[T; N][..]
@@ -97,6 +94,7 @@ async fn test_all_insert_patterns_impl(
             email: Some("grace@example.com".to_string()),
         }][..],
     )
+    .execute()
     .await?;
 
     // 测试 insert_or_update
@@ -105,6 +103,7 @@ async fn test_all_insert_patterns_impl(
         uid: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 验证所有数据插入成功
@@ -164,6 +163,7 @@ async fn test_batch_insert_impl(
             email: None,
         },
     ])
+    .execute()
     .await?;
 
     let users: Vec<TestUserInsert2> = db.select::<TestUserInsert2>().collect::<Vec<_>>().await?;
@@ -198,6 +198,7 @@ async fn test_insert_or_update_patterns_impl(
         uid: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 2. 插入或更新 Vec<T> 的引用 &vec![T {...}]
@@ -206,6 +207,7 @@ async fn test_insert_or_update_patterns_impl(
         uid: 2,
         name: "editor".to_string(),
     }])
+    .execute()
     .await?;
 
     // 3. 插入或更新数组引用 &[T; N]
@@ -214,6 +216,7 @@ async fn test_insert_or_update_patterns_impl(
         uid: 3,
         name: "viewer".to_string(),
     }])
+    .execute()
     .await?;
 
     // 4. 插入或更新数组切片 &[T; N][..]
@@ -224,6 +227,7 @@ async fn test_insert_or_update_patterns_impl(
             name: "guest".to_string(),
         }][..],
     )
+    .execute()
     .await?;
 
     // 验证所有数据插入成功
@@ -263,6 +267,7 @@ async fn test_insert_or_update_update_impl(
         uid: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 使用 insert_or_update 更新同一条记录
@@ -271,6 +276,7 @@ async fn test_insert_or_update_update_impl(
         uid: 1,
         name: "super_admin".to_string(),
     })
+    .execute()
     .await?;
 
     let roles: Vec<TestRoleInsert4> = db.select::<TestRoleInsert4>().collect::<Vec<_>>().await?;

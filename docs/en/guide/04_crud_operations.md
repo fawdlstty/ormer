@@ -10,24 +10,34 @@ db.insert(&User {
     name: "Alice".to_string(),
     age: 25,
     email: Some("alice@example.com".to_string()),
-}).await?;
+})
+.execute()
+.await?;
 ```
 
 ### Batch Insert
 
 ```rust
 // Vec
-db.insert(&vec![user1, user2, user3]).await?;
+db.insert(&vec![user1, user2, user3])
+    .execute()
+    .await?;
 
 // Array
-db.insert(&[user1, user2]).await?;
+db.insert(&[user1, user2])
+    .execute()
+    .await?;
 ```
 
 ### Insert or Update
 
 ```rust
-db.insert_or_update(&user).await?;
-db.insert_or_update(&vec![user1, user2]).await?;
+db.insert_or_update(&user)
+    .execute()
+    .await?;
+db.insert_or_update(&vec![user1, user2])
+    .execute()
+    .await?;
 ```
 
 ## Read (Query)
@@ -135,13 +145,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "Alice".to_string(),
         age: 25,
         email: Some("alice@example.com".to_string()),
-    }).await?;
+    })
+    .execute()
+    .await?;
     
     // Batch insert
     db.insert(&vec![
         User { id: 2, name: "Bob".to_string(), age: 30, email: None },
         User { id: 3, name: "Charlie".to_string(), age: 35, email: None },
-    ]).await?;
+    ])
+    .execute()
+    .await?;
     
     // Query
     let all: Vec<User> = db.select::<User>().collect().await?;
@@ -172,7 +186,9 @@ Batch insert is more efficient than individual inserts:
 
 ```rust
 // Batch insert
-db.insert(&users).await?;
+db.insert(&users)
+    .execute()
+    .await?;
 ```
 
 ### Transactions
@@ -181,8 +197,12 @@ Multiple related operations can use transactions for consistency:
 
 ```rust
 let mut txn = db.begin().await?;
-txn.insert(&user1).await?;
-txn.insert(&user2).await?;
+txn.insert(&user1)
+    .execute()
+    .await?;
+txn.insert(&user2)
+    .execute()
+    .await?;
 txn.commit().await?;
 ```
 
@@ -197,3 +217,45 @@ db.delete::<User>()
     .execute()
     .await?;
 ```
+
+## Hooks System
+
+Ormer provides a hooks system that allows you to automatically execute custom logic before and after data operations. Supported hooks include:
+
+- `BeforeInsert` / `AfterInsert` - Before and after insert
+- `BeforeUpdate` / `AfterUpdate` - Before and after update
+- `BeforeDelete` / `AfterDelete` - Before and after delete
+
+### Example
+
+```rust
+use ormer::{Model, BeforeInsert, BeforeUpdate};
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait::async_trait]
+impl BeforeInsert for User {
+    async fn before_insert(&mut self) {
+        let now = chrono::Utc::now();
+        self.created_at = now;
+        self.updated_at = now;
+    }
+}
+
+#[async_trait::async_trait]
+impl BeforeUpdate for User {
+    async fn before_update(&mut self) {
+        self.updated_at = chrono::Utc::now();
+    }
+}
+```
+
+For detailed documentation, please refer to: [Hooks System](09_hooks.md)

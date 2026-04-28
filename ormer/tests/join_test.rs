@@ -36,12 +36,14 @@ async fn test_inner_join_impl(
         name: "Alice".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     db.insert(&TestUserJoin {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
 
     // 只为 Alice 插入角色
@@ -50,6 +52,7 @@ async fn test_inner_join_impl(
         uid: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 测试 INNER JOIN - 只返回有匹配的记录
@@ -94,6 +97,7 @@ async fn test_right_join_impl(
         name: "Alice".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     // Bob 没有插入
 
@@ -103,12 +107,14 @@ async fn test_right_join_impl(
         uid: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&TestRoleJoin2 {
         id: 2,
         uid: 99, // 这个 uid 没有对应的用户
         role_name: "orphan_role".to_string(),
     })
+    .execute()
     .await?;
 
     // 测试 RIGHT JOIN - 返回所有角色,即使没有匹配的用户
@@ -173,12 +179,14 @@ async fn test_left_join_impl(
         name: "Alice".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     db.insert(&TestUserJoin3 {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
 
     // 只为 Alice 插入角色
@@ -187,6 +195,7 @@ async fn test_left_join_impl(
         uid: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     // 测试 LEFT JOIN - 返回所有用户，即使没有角色
@@ -245,12 +254,14 @@ async fn test_inner_join_with_filter_impl(
         name: "Alice".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     db.insert(&TestUserJoin4 {
         id: 2,
         name: "Bob".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
 
     db.insert(&TestRoleJoin4 {
@@ -258,12 +269,14 @@ async fn test_inner_join_with_filter_impl(
         uid: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&TestRoleJoin4 {
         id: 2,
         uid: 2,
         role_name: "user".to_string(),
     })
+    .execute()
     .await?;
 
     // 测试带 range 的 INNER JOIN

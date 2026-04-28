@@ -152,6 +152,114 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
+/// 插入执行器
+pub struct InsertExecutor<'a, I: crate::model::Insertable> {
+    pool: &'a Pool,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.insert_batch::<I::Model>(&refs).await
+    }
+
+    async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let columns = T::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            T::TABLE_NAME,
+            &columns,
+            models.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
+                models,
+            );
+        let params = values_to_params(&all_values)?;
+
+        conn.exec_drop(&sql, params)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// 插入或更新执行器
+pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    pool: &'a Pool,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        self.insert_or_update_batch::<I::Model>(&refs).await
+    }
+
+    async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        // 添加 ON DUPLICATE KEY UPDATE 子句
+        sql.push_str(" ON DUPLICATE KEY UPDATE ");
+        let mut first = true;
+        for col_name in T::COLUMNS.iter() {
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            first = false;
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        conn.exec_drop(&sql, params)
+            .await
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
 impl Database {
     /// 连接到 MySQL 数据库
     pub async fn connect(
@@ -387,14 +495,25 @@ impl Database {
         normalize(actual) == normalize(expected)
     }
 
-    /// 插入单条记录
-    pub async fn insert<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
-        self.insert_batch::<T>(&[model]).await
+    /// 插入记录 - 返回执行器
+    pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
+        InsertExecutor {
+            pool: &self.pool,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    /// 插入或更新单条记录（遇到重复键时更新）
-    pub async fn insert_or_update<T: Model>(&self, model: &T) -> Result<(), crate::Error> {
-        self.insert_or_update_batch::<T>(&[model]).await
+    /// 插入或更新记录 - 返回执行器
+    pub fn insert_or_update<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrUpdateExecutor<'_, I> {
+        InsertOrUpdateExecutor {
+            pool: &self.pool,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 批量插入记录
@@ -541,7 +660,7 @@ impl Database {
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(Transaction {
-            conn,
+            conn: Some(conn),
             pool: &self.pool,
             committed: false,
             rolled_back: false,
@@ -615,10 +734,95 @@ impl Database {
 
 /// MySQL 事务对象
 pub struct Transaction<'a> {
-    conn: mysql_async::Conn,
+    conn: Option<mysql_async::Conn>,
     pool: &'a Pool,
     committed: bool,
     rolled_back: bool,
+}
+
+/// 事务中的插入执行器 - 现在持有连接的引用而不是所有权  
+pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
+    conn: &'a mut Option<mysql_async::Conn>,
+    models: I,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+        let params = values_to_params(&all_values)?;
+
+        if let Some(conn) = self.conn.as_mut() {
+            conn.exec_drop(&sql, params)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// 事务中的插入或更新执行器 - 现在持有连接的引用而不是所有权  
+pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
+    conn: &'a mut Option<mysql_async::Conn>,
+    models: I,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+    pub async fn execute(self) -> Result<(), crate::Error> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(" ON DUPLICATE KEY UPDATE ");
+        let mut first = true;
+        for col_name in I::Model::COLUMNS.iter() {
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            first = false;
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        if let Some(conn) = self.conn.as_mut() {
+            conn.exec_drop(&sql, params)
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+        }
+
+        Ok(())
+    }
 }
 
 impl<'a> Transaction<'a> {
@@ -629,10 +833,11 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.conn
-            .query_drop("COMMIT")
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        if let Some(mut conn) = self.conn.take() {
+            conn.query_drop("COMMIT")
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+        }
         self.committed = true;
         Ok(())
     }
@@ -644,10 +849,11 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.conn
-            .query_drop("ROLLBACK")
-            .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+        if let Some(mut conn) = self.conn.take() {
+            conn.query_drop("ROLLBACK")
+                .await
+                .map_err(|e| crate::Error::Database(e.to_string()))?;
+        }
         self.rolled_back = true;
         Ok(())
     }
@@ -689,14 +895,28 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// 插入单条记录
-    pub async fn insert<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
-        self.insert_batch::<T>(&[model]).await
+    /// 插入记录 - 返回执行器  
+    pub fn insert<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertExecutor<'_, I> {
+        TransactionInsertExecutor {
+            conn: &mut self.conn,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
-    /// 插入或更新单条记录（遇到重复键时更新）
-    pub async fn insert_or_update<T: Model>(&mut self, model: &T) -> Result<(), crate::Error> {
-        self.insert_or_update_batch::<T>(&[model]).await
+    /// 插入或更新记录 - 返回执行器  
+    pub fn insert_or_update<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
+        TransactionInsertOrUpdateExecutor {
+            conn: &mut self.conn,
+            models,
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 批量插入记录
@@ -717,10 +937,11 @@ impl<'a> Transaction<'a> {
             );
         let params = values_to_params(&all_values)?;
 
-        self.conn
-            .exec_drop(&sql, params)
-            .await
-            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+        if let Some(ref mut conn) = self.conn {
+            conn.exec_drop(&sql, params)
+                .await
+                .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -766,10 +987,11 @@ impl<'a> Transaction<'a> {
 
         let params = values_to_params(&all_values)?;
 
-        self.conn
-            .exec_drop(&sql, params)
-            .await
-            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+        if let Some(ref mut conn) = self.conn {
+            conn.exec_drop(&sql, params)
+                .await
+                .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -818,6 +1040,11 @@ pub struct GroupedSelectExecutor<'a, T: Model, V> {
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    /// 生成子查询SQL和参数
+    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
+        self.select.to_sql_with_params(DbType::MySQL)
+    }
+
     /// 执行查询并收集结果
     pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
     where
@@ -1550,6 +1777,15 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 }
 
 /// SelectStreamIterator - 流式查询迭代器 (MySQL)
+///
+/// **注意**: MySQL后端当前实现为伪流式查询。
+/// 由于mysql_async库的限制,在调用into_iter()时会一次性加载所有结果到内存中,
+/// 然后通过迭代器逐条返回。这对于大数据集可能不够高效。
+///
+/// **建议**: 对于超大数据集的流式查询,建议使用PostgreSQL或Turso后端,
+/// 它们支持真正的逐行流式查询,内存占用更低。
+///
+/// **未来优化**: 可以考虑使用mysql_async的query_iter()方法实现真正的流式查询。
 pub struct SelectStreamIterator<'a, T: Model> {
     rows: Vec<mysql_async::Row>,
     index: usize,
@@ -1751,19 +1987,19 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).unwrap();
+                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Integer(v)
                         }
                         "String" => {
-                            let v: String = row.get(i).unwrap();
+                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Text(v)
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).unwrap();
+                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Real(v)
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).unwrap();
+                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
                             if v == 1 {
                                 crate::model::Value::Integer(1)
                             } else {
@@ -1911,19 +2147,19 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).unwrap();
+                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Integer(v)
                         }
                         "String" => {
-                            let v: String = row.get(i).unwrap();
+                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Text(v)
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).unwrap();
+                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Real(v)
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).unwrap();
+                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
                             if v == 1 {
                                 crate::model::Value::Integer(1)
                             } else {
@@ -2071,19 +2307,19 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).unwrap();
+                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Integer(v)
                         }
                         "String" => {
-                            let v: String = row.get(i).unwrap();
+                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Text(v)
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).unwrap();
+                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
                             crate::model::Value::Real(v)
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).unwrap();
+                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
                             if v == 1 {
                                 crate::model::Value::Integer(1)
                             } else {
@@ -2551,7 +2787,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                         if v.is_some() {
                             t_is_null = false;
                         }
-                        crate::model::Value::Text(v.unwrap_or(String::new()))
+                        crate::model::Value::Text(v.unwrap_or_default())
                     }
                     "f32" | "f64" => {
                         let v: Option<f64> = row.get(i);

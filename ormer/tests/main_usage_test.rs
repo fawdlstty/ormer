@@ -21,6 +21,7 @@ async fn test_main_rs_usage_impl(
         age: 18,
         email: None,
     })
+    .execute()
     .await?;
     db.insert(&vec![TestUser {
         id: 2,
@@ -28,6 +29,7 @@ async fn test_main_rs_usage_impl(
         age: 20,
         email: Some("bob@example.com".to_string()),
     }])
+    .execute()
     .await?;
     db.insert(&vec![TestUser {
         id: 3,
@@ -35,6 +37,7 @@ async fn test_main_rs_usage_impl(
         age: 22,
         email: Some("charlie@example.com".to_string()),
     }])
+    .execute()
     .await?;
     db.insert(&[TestUser {
         id: 4,
@@ -42,6 +45,7 @@ async fn test_main_rs_usage_impl(
         age: 24,
         email: Some("david@example.com".to_string()),
     }])
+    .execute()
     .await?;
     db.insert(&[TestUser {
         id: 5,
@@ -49,6 +53,7 @@ async fn test_main_rs_usage_impl(
         age: 26,
         email: Some("eve@example.com".to_string()),
     }])
+    .execute()
     .await?;
     db.insert(
         &[TestUser {
@@ -58,6 +63,7 @@ async fn test_main_rs_usage_impl(
             email: Some("frank@example.com".to_string()),
         }][..],
     )
+    .execute()
     .await?;
     db.insert(
         &[TestUser {
@@ -67,12 +73,14 @@ async fn test_main_rs_usage_impl(
             email: Some("grace@example.com".to_string()),
         }][..],
     )
+    .execute()
     .await?;
     db.insert_or_update(&TestRole {
         id: 1,
         uid: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
     println!("inserted data");
 

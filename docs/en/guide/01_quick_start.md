@@ -137,16 +137,16 @@ let db = Database::connect(
 
 ```rust
 // Single insert
-db.insert(&user).await?;
+db.insert(&user).execute().await?;
 
 // Batch insert (Vec)
-db.insert(&vec![user1, user2, user3]).await?;
+db.insert(&vec![user1, user2, user3]).execute().await?;
 
 // Batch insert (array)
-db.insert(&[user1, user2]).await?;
+db.insert(&[user1, user2]).execute().await?;
 
 // Insert or update
-db.insert_or_update(&user).await?;
+db.insert_or_update(&user).execute().await?;
 ```
 
 ### Query Data

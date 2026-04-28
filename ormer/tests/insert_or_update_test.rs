@@ -17,6 +17,7 @@ async fn test_insert_or_update_impl(
         id: 1,
         name: "admin".to_string(),
     })
+    .execute()
     .await?;
     println!("第一次插入成功");
 
@@ -31,6 +32,7 @@ async fn test_insert_or_update_impl(
         id: 1,
         name: "super_admin".to_string(),
     })
+    .execute()
     .await?;
     println!("第二次 insert_or_update 成功（更新操作）");
 

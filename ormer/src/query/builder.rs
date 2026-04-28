@@ -180,7 +180,7 @@ impl<T: Model, R> AggregateSelect<T, R> {
             self.column_name,
             T::TABLE_NAME
         )
-        .unwrap();
+        .expect("Failed to write aggregate SELECT clause");
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -229,7 +229,8 @@ impl<T: Model, V> MappedSelect<T, V> {
         } else {
             self.column_names.join(", ")
         };
-        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME).unwrap();
+        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME)
+            .expect("Failed to write SELECT clause");
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -259,10 +260,10 @@ impl<T: Model, V> MappedSelect<T, V> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
@@ -407,7 +408,8 @@ impl<T: Model, V> GroupedSelect<T, V> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME).unwrap();
+        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME)
+            .expect("Failed to write SELECT clause");
 
         // WHERE 子句（分组前过滤）
         if !self.filters.is_empty() {
@@ -431,7 +433,13 @@ impl<T: Model, V> GroupedSelect<T, V> {
         // HAVING 子句（分组后过滤）
         if !self.having_filters.is_empty() {
             sql.push_str(" HAVING ");
-            let formatter = FilterFormatter::new(db_type);
+            // PostgreSQL需要为HAVING子句中的参数添加::bigint类型转换
+            // 因为COUNT等聚合函数返回BIGINT
+            let formatter = if matches!(db_type, crate::DbType::PostgreSQL) {
+                FilterFormatter::new(db_type).with_postgresql_having_cast(true)
+            } else {
+                FilterFormatter::new(db_type)
+            };
             for (i, filter) in self.having_filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
@@ -455,10 +463,10 @@ impl<T: Model, V> GroupedSelect<T, V> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
@@ -504,9 +512,9 @@ impl<T: Model> Select<T> {
 
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
-    pub fn from<T2: Model, R: Model>(self) -> RelatedSelect<T, R>
+    pub fn from<T2, R: Model>(self) -> RelatedSelect<T, R>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         // 通过类型约束确保 T2 == T
         // 如果 T2 != T,编译器会在类型推导时报错
@@ -521,9 +529,9 @@ impl<T: Model> Select<T> {
 
     /// 添加关联表查询（支持3个表）
     /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2: Model, R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2>
+    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         MultiTableSelect {
             filters: self.filters,
@@ -536,9 +544,9 @@ impl<T: Model> Select<T> {
 
     /// 添加关联表查询（支持4个表）
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2: Model, R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3>
+    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3>
     where
-        T2: 'static,
+        T2: Model + 'static,
     {
         FourTableSelect {
             filters: self.filters,
@@ -807,10 +815,10 @@ impl<T: Model> Select<T> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         // 返回参数
@@ -906,10 +914,10 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
@@ -999,10 +1007,10 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
@@ -1094,10 +1102,10 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
@@ -1899,8 +1907,8 @@ pub trait ColumnBuilder {
     fn ne(self, value: impl Into<FilterValue>) -> FilterExpr;
     fn like(self, pattern: &str) -> FilterExpr;
     fn contains(self, pattern: &str) -> FilterExpr;
-    fn is_some(self) -> FilterExpr;
-    fn is_none(self) -> FilterExpr;
+    fn into_some(self) -> FilterExpr;
+    fn into_none(self) -> FilterExpr;
     fn asc(self) -> OrderBy;
     fn desc(self) -> OrderBy;
 }
@@ -2161,26 +2169,24 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
     }
 
     fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        match filter {
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
+        if let FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } = filter
+        {
+            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
         }
     }
 }
@@ -2250,26 +2256,24 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
     }
 
     fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        match filter {
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
+        if let FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } = filter
+        {
+            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
         }
     }
 }
@@ -2339,26 +2343,24 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).unwrap();
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
         }
         if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).unwrap();
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)
     }
 
     fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        match filter {
-            FilterExpr::ColumnComparison {
-                left_column,
-                operator,
-                right_column,
-            } => {
-                // 左列加 t0. 前缀（主表），右列加 t1. 前缀（JOIN表）
-                write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
-            }
-            _ => {}
+        if let FilterExpr::ColumnComparison {
+            left_column,
+            operator,
+            right_column,
+        } = filter
+        {
+            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
         }
     }
 }

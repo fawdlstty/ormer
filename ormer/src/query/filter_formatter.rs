@@ -11,6 +11,8 @@ pub struct FilterFormatter {
     table_prefix: Option<String>,
     /// 右列表别名前缀，用于 ColumnComparison（列-列比较）
     right_table_prefix: Option<String>,
+    /// PostgreSQL HAVING子句中的参数需要添加::bigint类型转换
+    postgresql_having_cast: bool,
 }
 
 impl FilterFormatter {
@@ -19,6 +21,7 @@ impl FilterFormatter {
             db_type,
             table_prefix: None,
             right_table_prefix: None,
+            postgresql_having_cast: false,
         }
     }
 
@@ -31,6 +34,12 @@ impl FilterFormatter {
     /// 设置右列表别名前缀（用于列-列比较）
     pub fn with_right_table_prefix(mut self, prefix: &str) -> Self {
         self.right_table_prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// 设置PostgreSQL HAVING子句类型转换标志
+    pub fn with_postgresql_having_cast(mut self, cast: bool) -> Self {
+        self.postgresql_having_cast = cast;
         self
     }
 
@@ -68,7 +77,7 @@ impl FilterFormatter {
                 value,
             } => {
                 let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}", prefix)
+                    prefix.to_string()
                 } else {
                     String::new()
                 };
@@ -82,7 +91,14 @@ impl FilterFormatter {
                         } else {
                             column.clone()
                         };
-                        write!(sql, "{} {} ${}", full_col_name, operator, param_idx).unwrap();
+                        // 如果启用了HAVING类型转换,添加::bigint
+                        let param_placeholder = if self.postgresql_having_cast {
+                            format!("${}::bigint", param_idx)
+                        } else {
+                            format!("${}", param_idx)
+                        };
+                        write!(sql, "{} {} {}", full_col_name, operator, param_placeholder)
+                            .expect("Failed to write SQL WHERE clause");
                     }
                     #[cfg(feature = "turso")]
                     DbType::Turso => {
@@ -92,7 +108,8 @@ impl FilterFormatter {
                         } else {
                             column.clone()
                         };
-                        write!(sql, "{} {} ?", full_col_name, operator).unwrap();
+                        write!(sql, "{} {} ?", full_col_name, operator)
+                            .expect("Failed to write SQL WHERE clause");
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
@@ -102,7 +119,8 @@ impl FilterFormatter {
                         } else {
                             column.clone()
                         };
-                        write!(sql, "{} {} ?", full_col_name, operator).unwrap();
+                        write!(sql, "{} {} ?", full_col_name, operator)
+                            .expect("Failed to write SQL WHERE clause");
                     }
                     #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
                     DbType::None => {
@@ -133,7 +151,8 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} {} {}", left_col, operator, right_col).unwrap();
+                write!(sql, "{} {} {}", left_col, operator, right_col)
+                    .expect("Failed to write column comparison SQL");
             }
             FilterExpr::In { column, values } => {
                 // 生成 IN 语句: column IN (?, ?, ...)
@@ -144,7 +163,7 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} IN (", col_name).unwrap();
+                write!(sql, "{} IN (", col_name).expect("Failed to write IN clause");
                 for (i, value) in values.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
@@ -152,7 +171,8 @@ impl FilterFormatter {
                     match self.db_type {
                         #[cfg(feature = "postgresql")]
                         DbType::PostgreSQL => {
-                            write!(sql, "${}", param_idx).unwrap();
+                            write!(sql, "${}", param_idx)
+                                .expect("Failed to write parameter placeholder");
                         }
                         #[cfg(feature = "turso")]
                         DbType::Turso => {
@@ -189,7 +209,8 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} IN ({})", col_name, subquery_sql).unwrap();
+                write!(sql, "{} IN ({})", col_name, subquery_sql)
+                    .expect("Failed to write subquery IN clause");
 
                 // 添加子查询的参数
                 for param in subquery_params {

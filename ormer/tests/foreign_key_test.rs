@@ -25,6 +25,7 @@ async fn test_foreign_key_creation_impl(
         id: 1,
         name: "Alice".to_string(),
     })
+    .execute()
     .await?;
 
     // 插入带有外键的记录
@@ -33,6 +34,7 @@ async fn test_foreign_key_creation_impl(
         user_id: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
 
     println!("Foreign key test passed!");

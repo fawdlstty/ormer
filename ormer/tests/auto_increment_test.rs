@@ -33,8 +33,8 @@ async fn test_auto_increment_insert() -> Result<(), Box<dyn std::error::Error>> 
     };
 
     // 插入用户
-    db.insert(&user1).await?;
-    db.insert(&user2).await?;
+    db.insert(&user1).execute().await?;
+    db.insert(&user2).execute().await?;
 
     // 查询所有用户
     let users: Vec<TestUser> = db.select::<TestUser>().collect::<Vec<TestUser>>().await?;

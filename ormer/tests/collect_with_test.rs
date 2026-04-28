@@ -32,6 +32,7 @@ async fn test_collect_with_impl(
         name: "Alice".to_string(),
         age: 25,
     })
+    .execute()
     .await?;
     println!("[TEST] Inserted TestUser 1");
     db.insert(&TestUser {
@@ -39,6 +40,7 @@ async fn test_collect_with_impl(
         name: "Bob".to_string(),
         age: 30,
     })
+    .execute()
     .await?;
     println!("[TEST] Inserted TestUser 2");
     db.insert(&TestUser {
@@ -46,6 +48,7 @@ async fn test_collect_with_impl(
         name: "Charlie".to_string(),
         age: 35,
     })
+    .execute()
     .await?;
     println!("[TEST] Inserted TestUser 3");
 
@@ -54,18 +57,21 @@ async fn test_collect_with_impl(
         user_id: 1,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&TestRole {
         id: 2,
         user_id: 2,
         role_name: "admin".to_string(),
     })
+    .execute()
     .await?;
     db.insert(&TestRole {
         id: 3,
         user_id: 3,
         role_name: "user".to_string(),
     })
+    .execute()
     .await?;
 
     // 测试1: 普通的collect为基本类型
