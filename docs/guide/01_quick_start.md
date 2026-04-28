@@ -1,15 +1,6 @@
 ﻿# 快速开始
 
-## 环境要求
-
-- Rust 1.70+
-- Cargo
-
 ## 安装
-
-### 添加依赖
-
-在 `Cargo.toml` 中添加 Ormer 依赖和异步运行时:
 
 ```toml
 [dependencies]
@@ -21,8 +12,6 @@ tokio = { version = "1", features = ["full"] }
 - `turso` - Turso/libSQL/SQLite
 - `postgresql` - PostgreSQL
 - `mysql` - MySQL
-
-
 
 ## 完整示例
 
@@ -83,34 +72,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-运行: `cargo run`
-
-## 核心操作速览
+## 核心操作
 
 ### 模型定义
-
-使用 `#[derive(Model)]` 宏定义数据模型:
 
 ```rust
 #[derive(Debug, Model)]
 #[table = "表名"]
 struct ModelName {
-    #[primary(auto)]      // 主键,自动递增
+    #[primary(auto)]
     id: i32,
     
-    #[unique]             // 唯一约束
+    #[unique]
     name: String,
     
-    #[index]              // 索引
+    #[index]
     age: i32,
     
-    #[unique(group = 1)]  // 联合唯一约束
+    #[unique(group = 1)]
     field1: String,
     
     #[unique(group = 1)]
     field2: String,
     
-    nullable_field: Option<String>,  // 可空字段
+    nullable_field: Option<String>,
 }
 ```
 

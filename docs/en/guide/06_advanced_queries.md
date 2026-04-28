@@ -3,19 +3,14 @@
 ## Aggregate Queries
 
 ```rust
-// COUNT
 let count: usize = db.select::<User>().count(|u| u.id).await?;
 
-// SUM
 let total: Option<i32> = db.select::<Product>().sum(|p| p.price).await?;
 
-// AVG
 let avg: Option<f64> = db.select::<User>().avg(|u| u.age).await?;
 
-// MAX
 let max: Option<i32> = db.select::<User>().max(|u| u.age).await?;
 
-// MIN
 let min: Option<i32> = db.select::<User>().min(|u| u.age).await?;
 ```
 
@@ -36,50 +31,38 @@ let adult_count: usize = db
 ```rust
 use ormer::Select;
 
-// Count users by age group
 let sql = Select::<User>::new()
     .select_column(|u| u.id.count())
     .group_by(|u| u.age)
     .to_sql();
-
-// Generated SQL: SELECT COUNT(id) FROM users GROUP BY age
 ```
 
 ### Multiple Columns + Grouping
 
 ```rust
-// Select department and user count
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.id.count()))
     .group_by(|u| u.department)
     .to_sql();
-
-// Generated SQL: SELECT department, COUNT(id) FROM users GROUP BY department
 ```
 
 ### HAVING Condition Filter
 
 ```rust
-// Count departments with more than 5 users
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.id.count()))
     .group_by(|u| u.department)
     .having(|u| u.id.count().gt(5))
     .to_sql();
-
-// Generated SQL: SELECT department, COUNT(id) FROM users GROUP BY department HAVING COUNT(id) > ?
 ```
 
 ### Multi-Column Grouping
 
 ```rust
-// Group by department and age, count and calculate average score
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.age, u.id.count(), u.score.avg()))
     .group_by(|u| (u.department, u.age))
     .to_sql();
-
-// Generated SQL: SELECT department, age, COUNT(id), AVG(score) FROM users GROUP BY department, age
 ```
 
 ### Complete Query: WHERE + GROUP BY + HAVING + ORDER BY + LIMIT
@@ -93,15 +76,6 @@ let sql = Select::<User>::new()
     .order_by(|u| u.department)
     .range(0..10)
     .to_sql();
-
-// Generated SQL:
-// SELECT department, COUNT(id), AVG(score)
-// FROM users
-// WHERE age >= ?
-// GROUP BY department
-// HAVING COUNT(id) > ?
-// ORDER BY department ASC
-// LIMIT 10
 ```
 
 ### Supported Aggregate Functions
@@ -111,12 +85,6 @@ let sql = Select::<User>::new()
 - `avg()` - Average, returns `f64`
 - `max()` - Maximum, returns original type (numeric types)
 - `min()` - Minimum, returns original type (numeric types)
-
-### Notes
-
-- `group_by()` can be called before or after `having()`, but it's recommended to call `group_by()` first
-- `filter()` adds WHERE conditions (pre-group filter), `having()` adds HAVING conditions (post-group filter)
-- All aggregate functions generate parameterized SQL queries for safety
 
 ## JOIN Queries
 
@@ -306,20 +274,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.drop_table::<User>().execute().await?;
     Ok(())
 }
-```
-
-## Notes
-
-### JOIN Types
-
-- **LEFT JOIN**: Returns all records from left table, NULL for unmatched right table
-- **INNER JOIN**: Returns only matched records from both tables
-- **RIGHT JOIN**: Returns all records from right table, NULL for unmatched left table
-
-### Aggregate Functions
-
-Aggregate functions compute at database level, more efficient than fetching all data and computing in application:
-
-```rust
-let count: usize = db.select::<User>().count(|u| u.id).await?;
 ```

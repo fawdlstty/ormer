@@ -1,7 +1,5 @@
 ﻿# Model Definition
 
-Models define the mapping between database table structures and Rust types.
-
 ## Basic Definition
 
 ```rust
@@ -46,8 +44,6 @@ struct User {
 
 #### Composite Unique
 
-Use the `group` parameter to create composite unique indexes:
-
 ```rust
 #[derive(Debug, Model)]
 #[table = "user_roles"]
@@ -60,7 +56,6 @@ struct UserRole {
     
     #[unique(group = 1)]
     role_id: i32,
-    // (user_id, role_id) combination must be unique
 }
 ```
 
@@ -82,8 +77,6 @@ struct User {
 ```
 
 ### Nullable Fields
-
-Use `Option<T>` to represent nullable fields:
 
 ```rust
 #[derive(Debug, Model)]
@@ -112,8 +105,6 @@ All basic types can be wrapped with `Option<T>` for nullable fields.
 
 ## Enum Types
 
-Define enum types with `#[derive(ModelEnum)]` and use them as model fields:
-
 ```rust
 use ormer::{Model, ModelEnum};
 
@@ -134,7 +125,7 @@ struct User {
 }
 ```
 
-Supports `Option<EnumType>` for nullable enum fields. Enum values are stored as text with automatic serialization and deserialization.
+Supports `Option<EnumType>` for nullable enum fields.
 
 ## Complete Example
 
@@ -218,8 +209,6 @@ db.create_table::<User>().execute().await?;
 db.validate_table::<User>().await?;
 ```
 
-Validates whether the table schema matches the model definition (table existence, column count, names, types, constraints, etc.).
-
 ### Dropping Tables
 
 ```rust
@@ -227,8 +216,6 @@ db.drop_table::<User>().execute().await?;
 ```
 
 ## Model Wrappers
-
-Use tuple struct wrappers to reuse table structure with different table names:
 
 ```rust
 // Base model
@@ -255,11 +242,9 @@ struct TempUser(User);
 ### Usage Example
 
 ```rust
-// Create tables
 db.create_table::<User>().execute().await?;
 db.create_table::<ArchiveUser>().execute().await?;
 
-// Insert data
 db.insert(&User {
     id: 0,
     name: "Alice".to_string(),
@@ -267,7 +252,6 @@ db.insert(&User {
     email: Some("alice@example.com".to_string()),
 }).await?;
 
-// Insert using wrapper
 let archive_user = ArchiveUser(User {
     id: 0,
     name: "Bob".to_string(),
@@ -276,13 +260,11 @@ let archive_user = ArchiveUser(User {
 });
 db.insert(&archive_user).execute().await?;
 
-// Query archive table
 let archived: Vec<ArchiveUser> = db
     .select::<ArchiveUser>()
     .collect::<Vec<_>>()
     .await?;
 
-// Access inner data
 for au in &archived {
     println!("User: {}", au.inner().name);
 }

@@ -1,7 +1,5 @@
 ﻿# 模型定义
 
-模型定义数据库表结构与 Rust 类型的映射。
-
 ## 基本定义
 
 ```rust
@@ -46,8 +44,6 @@ struct User {
 
 #### 联合唯一
 
-使用 `group` 参数创建联合唯一索引:
-
 ```rust
 #[derive(Debug, Model)]
 #[table = "user_roles"]
@@ -60,7 +56,6 @@ struct UserRole {
     
     #[unique(group = 1)]
     role_id: i32,
-    // (user_id, role_id) 组合唯一
 }
 ```
 
@@ -82,8 +77,6 @@ struct User {
 ```
 
 ### 可空字段
-
-使用 `Option<T>` 表示可空字段:
 
 ```rust
 #[derive(Debug, Model)]
@@ -112,8 +105,6 @@ struct User {
 
 ## 枚举类型
 
-使用 `#[derive(ModelEnum)]` 定义枚举类型，可在模型中作为字段使用：
-
 ```rust
 use ormer::{Model, ModelEnum};
 
@@ -134,7 +125,7 @@ struct User {
 }
 ```
 
-支持 `Option<EnumType>` 表示可空枚举字段。枚举值存储为文本，自动完成序列化与反序列化。
+支持 `Option<EnumType>` 表示可空枚举字段。
 
 ## 完整示例
 
@@ -218,8 +209,6 @@ db.create_table::<User>().execute().await?;
 db.validate_table::<User>().await?;
 ```
 
-验证表结构是否与模型定义匹配（表存在、列数量、列名、类型、约束等）。
-
 ### 删除表
 
 ```rust
@@ -227,8 +216,6 @@ db.drop_table::<User>().execute().await?;
 ```
 
 ## 模型包装器
-
-使用元组结构体包装器复用表结构，使用不同表名：
 
 ```rust
 // 基础模型
@@ -255,11 +242,9 @@ struct TempUser(User);
 ### 使用示例
 
 ```rust
-// 创建表
 db.create_table::<User>().execute().await?;
 db.create_table::<ArchiveUser>().execute().await?;
 
-// 插入数据
 db.insert(&User {
     id: 0,
     name: "Alice".to_string(),
@@ -267,7 +252,6 @@ db.insert(&User {
     email: Some("alice@example.com".to_string()),
 }).await?;
 
-// 使用包装器插入
 let archive_user = ArchiveUser(User {
     id: 0,
     name: "Bob".to_string(),
@@ -276,13 +260,11 @@ let archive_user = ArchiveUser(User {
 });
 db.insert(&archive_user).execute().await?;
 
-// 查询归档表
 let archived: Vec<ArchiveUser> = db
     .select::<ArchiveUser>()
     .collect::<Vec<_>>()
     .await?;
 
-// 访问内部数据
 for au in &archived {
     println!("User: {}", au.inner().name);
 }

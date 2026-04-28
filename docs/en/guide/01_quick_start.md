@@ -1,15 +1,6 @@
 ﻿# Quick Start
 
-## Requirements
-
-- Rust 1.70+
-- Cargo
-
 ## Installation
-
-### Add Dependencies
-
-Add Ormer dependency and async runtime to `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -21,8 +12,6 @@ tokio = { version = "1", features = ["full"] }
 - `turso` - Turso/libSQL/SQLite
 - `postgresql` - PostgreSQL
 - `mysql` - MySQL
-
-
 
 ## Complete Example
 
@@ -83,34 +72,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Run: `cargo run`
-
-## Core Operations Overview
+## Core Operations
 
 ### Model Definition
-
-Use `#[derive(Model)]` macro to define data models:
 
 ```rust
 #[derive(Debug, Model)]
 #[table = "table_name"]
 struct ModelName {
-    #[primary(auto)]      // Primary key, auto-increment
+    #[primary(auto)]
     id: i32,
     
-    #[unique]             // Unique constraint
+    #[unique]
     name: String,
     
-    #[index]              // Index
+    #[index]
     age: i32,
     
-    #[unique(group = 1)]  // Composite unique constraint
+    #[unique(group = 1)]
     field1: String,
     
     #[unique(group = 1)]
     field2: String,
     
-    nullable_field: Option<String>,  // Nullable field
+    nullable_field: Option<String>,
 }
 ```
 

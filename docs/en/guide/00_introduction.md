@@ -18,16 +18,7 @@ Ormer is a minimal, high-performance Rust ORM framework providing type-safe data
 - Multi-table association queries (2-4 tables)
 - Subquery support
 - Pagination queries (LIMIT/OFFSET)
-
-### 💾 Transaction Support
-- ACID transaction guarantees
-- Query, insert, update, delete within transactions
-- Commit and rollback control
-
-
-
-
-
+- Transaction support (ACID)
 
 ## Quick Preview
 

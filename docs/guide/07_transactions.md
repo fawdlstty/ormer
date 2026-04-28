@@ -3,13 +3,10 @@
 ## 基本操作
 
 ```rust
-// 开始事务
 let mut txn = db.begin().await?;
 
-// 提交
 txn.commit().await?;
 
-// 回滚
 txn.rollback().await?;
 ```
 
@@ -30,7 +27,6 @@ txn.commit().await?;
 let mut txn = db.begin().await?;
 txn.insert(&user).execute().await?;
 
-// 事务内可见未提交数据
 let users: Vec<User> = txn.select::<User>().collect().await?;
 txn.commit().await?;
 ```
@@ -139,27 +135,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
-## 说明
-
-
-
-
-
-
-
-## 注意事项
-
-### 事务可见性
-
-事务内可查询未提交数据，提交后其他连接才可见。
-
-### 死锁避免
-
-按相同顺序访问资源，避免多个事务互相等待。
-
-### 性能
-
-- 事务会增加数据库负载
-- 长时间事务会阻塞其他操作
-- 批量操作使用单个事务

@@ -44,7 +44,7 @@ harness = true
 all-features = true
 
 [features]
-default = ["full"]
+default = []
 full = ["turso", "postgresql", "mysql"]
 turso = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types"]

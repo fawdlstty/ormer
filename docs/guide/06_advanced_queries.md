@@ -3,19 +3,14 @@
 ## 聚合查询
 
 ```rust
-// COUNT
 let count: usize = db.select::<User>().count(|u| u.id).await?;
 
-// SUM
 let total: Option<i32> = db.select::<Product>().sum(|p| p.price).await?;
 
-// AVG
 let avg: Option<f64> = db.select::<User>().avg(|u| u.age).await?;
 
-// MAX
 let max: Option<i32> = db.select::<User>().max(|u| u.age).await?;
 
-// MIN
 let min: Option<i32> = db.select::<User>().min(|u| u.age).await?;
 ```
 
@@ -36,50 +31,38 @@ let adult_count: usize = db
 ```rust
 use ormer::Select;
 
-// 统计每个年龄段的用户数量
 let sql = Select::<User>::new()
     .select_column(|u| u.id.count())
     .group_by(|u| u.age)
     .to_sql();
-
-// 生成 SQL: SELECT COUNT(id) FROM users GROUP BY age
 ```
 
 ### 多字段选择 + 分组
 
 ```rust
-// 选择部门和用户数量
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.id.count()))
     .group_by(|u| u.department)
     .to_sql();
-
-// 生成 SQL: SELECT department, COUNT(id) FROM users GROUP BY department
 ```
 
 ### HAVING 条件过滤
 
 ```rust
-// 统计用户数量大于 5 的部门
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.id.count()))
     .group_by(|u| u.department)
     .having(|u| u.id.count().gt(5))
     .to_sql();
-
-// 生成 SQL: SELECT department, COUNT(id) FROM users GROUP BY department HAVING COUNT(id) > ?
 ```
 
 ### 多字段分组
 
 ```rust
-// 按部门和年龄分组，统计每组的数量和平均分
 let sql = Select::<User>::new()
     .select_column(|u| (u.department, u.age, u.id.count(), u.score.avg()))
     .group_by(|u| (u.department, u.age))
     .to_sql();
-
-// 生成 SQL: SELECT department, age, COUNT(id), AVG(score) FROM users GROUP BY department, age
 ```
 
 ### 完整查询：WHERE + GROUP BY + HAVING + ORDER BY + LIMIT
@@ -93,15 +76,6 @@ let sql = Select::<User>::new()
     .order_by(|u| u.department)
     .range(0..10)
     .to_sql();
-
-// 生成 SQL:
-// SELECT department, COUNT(id), AVG(score)
-// FROM users
-// WHERE age >= ?
-// GROUP BY department
-// HAVING COUNT(id) > ?
-// ORDER BY department ASC
-// LIMIT 10
 ```
 
 ### 支持的聚合函数
@@ -111,12 +85,6 @@ let sql = Select::<User>::new()
 - `avg()` - 平均值，返回 `f64`
 - `max()` - 最大值，返回原类型（数值类型）
 - `min()` - 最小值，返回原类型（数值类型）
-
-### 注意事项
-
-- `group_by()` 方法可以在 `having()` 之前或之后调用，但推荐先 `group_by()` 后 `having()`
-- `filter()` 添加的是 WHERE 条件（分组前过滤），`having()` 添加的是 HAVING 条件（分组后过滤）
-- 所有聚合函数生成的 SQL 使用参数化查询，保证安全性
 
 ## JOIN 查询
 
@@ -306,20 +274,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.drop_table::<User>().execute().await?;
     Ok(())
 }
-```
-
-## 说明
-
-### JOIN 类型选择
-
-- **LEFT JOIN**: 返回左表所有记录，右表无匹配时返回 NULL
-- **INNER JOIN**: 只返回两表匹配的记录
-- **RIGHT JOIN**: 返回右表所有记录，左表无匹配时返回 NULL
-
-### 聚合函数
-
-聚合函数在数据库层面计算，比查询所有数据后在应用层计算更高效：
-
-```rust
-let count: usize = db.select::<User>().count(|u| u.id).await?;
 ```

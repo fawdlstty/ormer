@@ -3,13 +3,10 @@
 ## Basic Operations
 
 ```rust
-// Begin transaction
 let mut txn = db.begin().await?;
 
-// Commit
 txn.commit().await?;
 
-// Rollback
 txn.rollback().await?;
 ```
 
@@ -30,7 +27,6 @@ txn.commit().await?;
 let mut txn = db.begin().await?;
 txn.insert(&user).execute().await?;
 
-// Can see uncommitted data in transaction
 let users: Vec<User> = txn.select::<User>().collect().await?;
 txn.commit().await?;
 ```
@@ -139,20 +135,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
-## Notes
-## Notes
-
-### Transaction Visibility
-
-Uncommitted data visible within transaction. After commit, visible to other connections.
-
-### Deadlock Avoidance
-
-Access resources in same order to avoid deadlocks.
-
-### Performance
-
-- Transactions increase database load
-- Long transactions block other operations
-- Use single transaction for batch operations

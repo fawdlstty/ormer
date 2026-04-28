@@ -435,11 +435,14 @@ impl<T: Model, V> GroupedSelect<T, V> {
             sql.push_str(" HAVING ");
             // PostgreSQL需要为HAVING子句中的参数添加::bigint类型转换
             // 因为COUNT等聚合函数返回BIGINT
+            #[cfg(feature = "postgresql")]
             let formatter = if matches!(db_type, crate::DbType::PostgreSQL) {
                 FilterFormatter::new(db_type).with_postgresql_having_cast(true)
             } else {
                 FilterFormatter::new(db_type)
             };
+            #[cfg(not(feature = "postgresql"))]
+            let formatter = FilterFormatter::new(db_type);
             for (i, filter) in self.having_filters.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(" AND ");
