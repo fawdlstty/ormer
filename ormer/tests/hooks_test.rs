@@ -1,6 +1,11 @@
+#[cfg(feature = "sqlite")]
 use ormer::{
     AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, Database,
     DbType, Model,
+};
+#[cfg(not(feature = "sqlite"))]
+use ormer::{
+    AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, Model,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -106,6 +111,7 @@ async fn test_hooks_trait_definition() {
     assert_eq!(AFTER_DELETE_COUNT.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_hooks_with_database_insert() {
     // 测试使用数据库时的钩子调用
@@ -132,6 +138,7 @@ async fn test_hooks_with_database_insert() {
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_hooks_with_database_batch_insert() {
     // 测试批量插入时的钩子

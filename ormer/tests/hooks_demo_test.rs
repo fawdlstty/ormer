@@ -1,7 +1,10 @@
 // 钩子自动触发示例
 // 展示如何实现钩子并在数据库操作中自动触发
 
-use ormer::{AfterInsert, AfterUpdate, BeforeInsert, BeforeUpdate, Database, DbType, Model};
+use ormer::{AfterInsert, AfterUpdate, BeforeInsert, BeforeUpdate, Model};
+#[cfg(feature = "sqlite")]
+use ormer::{Database, DbType};
+#[cfg(not(feature = "sqlite"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // 全局计数器
@@ -54,6 +57,7 @@ impl AfterUpdate for HookDemoUser {
     }
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_hooks_demo() {
     #[cfg(feature = "sqlite")]

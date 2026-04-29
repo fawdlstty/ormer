@@ -25,7 +25,7 @@ ormer-derive = { version = "0.1.7", path = "../ormer-derive" }
 paste = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
-# sqlite (底层使用turso库)
+# sqlite
 turso = { version = "0.1", optional = true }
 # postgres
 postgres-types = { version = "0.2", optional = true }

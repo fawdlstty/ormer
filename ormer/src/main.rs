@@ -12,6 +12,7 @@ struct User {
 
 #[derive(Debug, ormer::Model)]
 #[table = "roles"]
+#[allow(dead_code)]
 struct Role {
     #[primary]
     id: i32,
@@ -29,32 +30,24 @@ struct NewUser(User);
 
 #[derive(Debug, ormer::Model)]
 #[table = "new_roles"]
+#[allow(dead_code)]
 struct NewRole(Role);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
-    {
-        let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    // let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    // db.create_table::<User>().execute().await?;
+    // db.create_table::<NewRole>().execute().await?;
 
-        db.create_table::<User>().execute().await?;
-        db.create_table::<NewRole>().execute().await?;
-
-        // insert
-        db.insert(&User {
-            id: 1,
-            name: "Alice".to_string(),
-            age: 18,
-            email: None,
-        })
-        .execute()
-        .await?;
-    }
-
-    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
-    {
-        println!("No database features enabled");
-    }
+    // // insert
+    // db.insert(&User {
+    //     id: 1,
+    //     name: "Alice".to_string(),
+    //     age: 18,
+    //     email: None,
+    // })
+    // .execute()
+    // .await?;
 
     Ok(())
 }
