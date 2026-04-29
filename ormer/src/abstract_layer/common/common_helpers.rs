@@ -60,7 +60,11 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                     DbType::MySQL => {
                         sql.push('?');
                     }
-                    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                    #[cfg(not(any(
+                        feature = "sqlite",
+                        feature = "postgresql",
+                        feature = "mysql"
+                    )))]
                     DbType::None => {}
                 }
                 *param_idx += 1;
@@ -157,7 +161,11 @@ pub fn format_filter_with_params(
                     DbType::MySQL => {
                         sql.push('?');
                     }
-                    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                    #[cfg(not(any(
+                        feature = "sqlite",
+                        feature = "postgresql",
+                        feature = "mysql"
+                    )))]
                     DbType::None => {}
                 }
                 params.push(value.clone().into());
@@ -365,4 +373,78 @@ pub fn collect_batch_insert_values_with_auto_increment<T: Model>(models: &[&T]) 
         all_values.extend(values);
     }
     all_values
+}
+
+/// 统一的列值解析函数 - 严格模式
+///
+/// 用于流式查询中解析列值,非空字段解析失败时返回错误而非默认值
+pub fn parse_column_value_strict(
+    rust_type: &str,
+    is_nullable: bool,
+    column_name: &str,
+    get_int: impl FnOnce() -> Option<i64>,
+    get_string: impl FnOnce() -> Option<String>,
+    get_real: impl FnOnce() -> Option<f64>,
+    get_bool: impl FnOnce() -> Option<i8>,
+) -> Result<Value, crate::Error> {
+    if is_nullable {
+        // 可空字段:允许 None
+        match rust_type {
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match get_int() {
+                Some(val) => Ok(Value::Integer(val)),
+                None => Ok(Value::Null),
+            },
+            "String" => match get_string() {
+                Some(val) => Ok(Value::Text(val)),
+                None => Ok(Value::Null),
+            },
+            "f32" | "f64" => match get_real() {
+                Some(val) => Ok(Value::Real(val)),
+                None => Ok(Value::Null),
+            },
+            "bool" => match get_bool() {
+                Some(1) => Ok(Value::Integer(1)),
+                Some(0) => Ok(Value::Integer(0)),
+                _ => Ok(Value::Null),
+            },
+            _ => Err(crate::Error::Database(format!(
+                "Unsupported nullable column type: {rust_type}"
+            ))),
+        }
+    } else {
+        // 非空字段:解析失败时返回错误
+        match rust_type {
+            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match get_int() {
+                Some(val) => Ok(Value::Integer(val)),
+                None => Err(crate::Error::ParseError(format!(
+                    "Failed to parse non-nullable column '{}' (expected integer type)",
+                    column_name
+                ))),
+            },
+            "String" => match get_string() {
+                Some(val) => Ok(Value::Text(val)),
+                None => Err(crate::Error::ParseError(format!(
+                    "Failed to parse non-nullable column '{}' (expected String type)",
+                    column_name
+                ))),
+            },
+            "f32" | "f64" => match get_real() {
+                Some(val) => Ok(Value::Real(val)),
+                None => Err(crate::Error::ParseError(format!(
+                    "Failed to parse non-nullable column '{}' (expected float type)",
+                    column_name
+                ))),
+            },
+            "bool" => match get_bool() {
+                Some(v) => Ok(Value::Integer(if v == 1 { 1 } else { 0 })),
+                None => Err(crate::Error::ParseError(format!(
+                    "Failed to parse non-nullable column '{}' (expected bool type)",
+                    column_name
+                ))),
+            },
+            _ => Err(crate::Error::Database(format!(
+                "Unsupported column type: {rust_type}"
+            ))),
+        }
+    }
 }

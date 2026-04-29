@@ -785,6 +785,9 @@ pub enum Error {
 
     #[error("Hook error: {0}")]
     HookError(String),
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
 }
 
 // 使用宏生成 From<T> for Value 实现

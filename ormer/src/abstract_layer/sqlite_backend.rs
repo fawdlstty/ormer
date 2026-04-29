@@ -500,7 +500,7 @@ impl Database {
     }
 
     /// 创建 Select 查询执行器
-    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
             conn: self.conn.clone(),
@@ -509,7 +509,7 @@ impl Database {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<T, V> {
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         GroupedSelectExecutor {
             select: GroupedSelect::<T, V>::new(),
             conn: self.conn.clone(),
@@ -681,7 +681,7 @@ impl Transaction {
     }
 
     /// 创建 Select 查询执行器
-    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
             conn: self.conn.clone(),
@@ -690,7 +690,7 @@ impl Transaction {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<T, V> {
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         GroupedSelectExecutor {
             select: GroupedSelect::<T, V>::new(),
             conn: self.conn.clone(),
@@ -826,13 +826,13 @@ impl Transaction {
 }
 
 /// Select 查询执行器
-pub struct SelectExecutor<T: Model> {
+pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
     conn: Arc<turso::Connection>,
-    _marker: PhantomData<T>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<T: Model> Clone for SelectExecutor<T> {
+impl<'a, T: Model> Clone for SelectExecutor<'a, T> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
@@ -917,20 +917,20 @@ pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
 }
 
 /// Mapped 查询执行器（字段投影查询）
-pub struct MappedSelectExecutor<T: Model, V> {
+pub struct MappedSelectExecutor<'a, T: Model, V> {
     select: MappedSelect<T, V>,
     conn: Arc<turso::Connection>,
-    _marker: PhantomData<(T, V)>,
+    _marker: PhantomData<&'a (T, V)>,
 }
 
 /// Grouped 查询执行器（分组聚合查询）
-pub struct GroupedSelectExecutor<T: Model, V> {
+pub struct GroupedSelectExecutor<'a, T: Model, V> {
     select: GroupedSelect<T, V>,
     conn: Arc<turso::Connection>,
-    _marker: PhantomData<(T, V)>,
+    _marker: PhantomData<&'a (T, V)>,
 }
 
-impl<T: Model, V> Clone for MappedSelectExecutor<T, V> {
+impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
@@ -940,7 +940,7 @@ impl<T: Model, V> Clone for MappedSelectExecutor<T, V> {
     }
 }
 
-impl<T: Model, V> Clone for GroupedSelectExecutor<T, V> {
+impl<'a, T: Model, V> Clone for GroupedSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
@@ -950,7 +950,7 @@ impl<T: Model, V> Clone for GroupedSelectExecutor<T, V> {
     }
 }
 
-impl<T: Model> SelectExecutor<T> {
+impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 添加 LEFT JOIN 查询
     pub fn left_join<J: Model>(
         self,
@@ -988,10 +988,10 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 字段投影 - 将查询结果映射到单个字段或元组
-    /// 支持：
-    /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<T, i32>
-    /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<T, (i32, i32)>
-    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<T, M::Output>
+    /// 支持:
+    /// - 单字段:map_to(|r| r.uid) -> MappedSelectExecutor<T, i32>
+    /// - 元组:map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<T, (i32, i32)>
+    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(<T as Model>::Where) -> M,
         M: crate::query::builder::MapToResult,
@@ -1004,8 +1004,8 @@ impl<T: Model> SelectExecutor<T> {
         }
     }
 
-    /// 选择列（支持聚合函数）- 转换为分组查询
-    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<T, V>
+    /// 选择列(支持聚合函数)- 转换为分组查询
+    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
     where
         F: FnOnce(<T as Model>::Where) -> V,
         V: crate::query::builder::SelectColumnResult,
@@ -1019,15 +1019,15 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<T, C> {
+    pub fn collect<C: FromIterator<T> + 'static>(self) -> CollectFuture<'a, T, C> {
         CollectFuture {
-            executor: self.clone(),
+            executor: self,
             _marker: PhantomData,
         }
     }
 
     /// 执行查询并返回 Vec<T>
-    pub fn exec(self) -> CollectFuture<T, Vec<T>>
+    pub fn exec(self) -> CollectFuture<'a, T, Vec<T>>
     where
         T: 'static,
     {
@@ -1035,7 +1035,7 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 执行查询并返回 Vec<T> (exec 的别名)
-    pub fn execute(self) -> CollectFuture<T, Vec<T>>
+    pub fn execute(self) -> CollectFuture<'a, T, Vec<T>>
     where
         T: 'static,
     {
@@ -1153,11 +1153,11 @@ impl<T: Model> SelectExecutor<T> {
     }
 
     /// 创建流式查询执行器
-    pub fn stream(self) -> SelectStream<T> {
+    pub fn stream(self) -> SelectStream<'a, T> {
         SelectStream {
             select: self.select,
-            conn: self.conn,
-            _marker: PhantomData,
+            conn: super::common::StreamConnection::Sqlite(self.conn),
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -1455,9 +1455,9 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
 }
 
 /// Collect future - 允许 .collect::<Vec<_>>().await 语法
-pub struct CollectFuture<T: Model, C: FromIterator<T>> {
-    executor: SelectExecutor<T>,
-    _marker: PhantomData<C>,
+pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
+    executor: SelectExecutor<'a, T>,
+    _marker: std::marker::PhantomData<C>,
 }
 
 /// Aggregate future for聚合函数执行
@@ -1545,16 +1545,16 @@ pub struct RightJoinCollectFuture<T: Model, J: Model> {
 }
 
 /// Grouped Collect future（分组聚合查询）
-pub struct GroupedCollectFuture<T: Model, V, C> {
-    executor: GroupedSelectExecutor<T, V>,
+pub struct GroupedCollectFuture<'a, T: Model, V, C> {
+    executor: GroupedSelectExecutor<'a, T, V>,
     _marker: PhantomData<(T, V, C)>,
 }
 
-impl<T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
-    for CollectFuture<T, C>
+impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
+    for CollectFuture<'a, T, C>
 {
     type Output = Result<C, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -1692,7 +1692,7 @@ impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
     }
 }
 
-impl<T: Model> SelectExecutor<T> {
+impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
@@ -1946,30 +1946,30 @@ fn convert_turso_value(value: &turso::Value) -> Result<Value, crate::Error> {
 }
 
 /// Mapped Select Collect future
-pub struct MappedCollectFuture<T: Model, V, C: FromIterator<V>> {
-    executor: MappedSelectExecutor<T, V>,
+pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+    executor: MappedSelectExecutor<'a, T, V>,
     _marker: PhantomData<C>,
 }
 
-impl<T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
-    std::future::IntoFuture for MappedCollectFuture<T, V, C>
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = Result<C, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
     }
 }
 
-/// ModelCollectWithFuture - 用于collect_with的Future，支持类型转换
-pub struct ModelCollectWithFuture<T: Model, V, C, M, F> {
-    executor: MappedSelectExecutor<T, V>,
+/// ModelCollectWithFuture - 用于collect_with的Future,支持类型转换
+pub struct ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
+    executor: MappedSelectExecutor<'a, T, V>,
     transform: F,
     _marker: PhantomData<(C, M)>,
 }
 
-impl<T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<T, V, C, M, F>
+impl<'a, T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<'a, T, V, C, M, F>
 where
     T: Model + 'static,
     V: crate::model::FromRowValues + 'static,
@@ -1978,7 +1978,7 @@ where
     F: Fn(V) -> M + Clone + 'static,
 {
     type Output = Result<C, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -1988,16 +1988,16 @@ where
     }
 }
 
-impl<T: Model, V> MappedSelectExecutor<T, V> {
+impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 获取子查询的 SQL 和参数
     pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
         self.select.to_sql_with_params(DbType::Sqlite)
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<T, V, C> {
+    pub fn collect<C: FromIterator<V> + 'static>(self) -> MappedCollectFuture<'a, T, V, C> {
         MappedCollectFuture {
-            executor: self.clone(),
+            executor: self,
             _marker: PhantomData,
         }
     }
@@ -2005,7 +2005,7 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
-    pub fn collect_with<C, F, M>(&self, f: F) -> ModelCollectWithFuture<T, V, C, M, F>
+    pub fn collect_with<C, F, M>(self, f: F) -> ModelCollectWithFuture<'a, T, V, C, M, F>
     where
         C: FromIterator<M> + 'static,
         F: Fn(V) -> M + Clone + 'static,
@@ -2073,9 +2073,9 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
     }
 }
 
-impl<T: Model, V> GroupedSelectExecutor<T, V> {
+impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -2124,11 +2124,11 @@ impl<T: Model, V> GroupedSelectExecutor<T, V> {
     }
 }
 
-impl<T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
-    std::future::IntoFuture for GroupedCollectFuture<T, V, C>
+impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+    std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = Result<C, crate::Error>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2138,7 +2138,7 @@ impl<T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterat
     }
 }
 
-impl<T: Model, V> GroupedSelectExecutor<T, V> {
+impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
     where
         V: crate::model::FromRowValues,
@@ -2195,16 +2195,22 @@ impl<T: Model, V> GroupedSelectExecutor<T, V> {
 }
 
 /// SelectStream - 流式查询执行器
-pub struct SelectStream<T: Model> {
+pub struct SelectStream<'a, T: Model> {
     select: Select<T>,
-    conn: Arc<turso::Connection>,
-    _marker: PhantomData<T>,
+    conn: super::common::StreamConnection<'a>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<T: Model + 'static> SelectStream<T> {
+impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
-    pub async fn into_iter(self) -> Result<SelectStreamIterator<T>, crate::Error> {
+    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+
+        // 从 StreamConnection 获取连接
+        let conn = match &self.conn {
+            super::common::StreamConnection::Sqlite(c) => c.clone(),
+            _ => unreachable!("Expected Sqlite connection"),
+        };
 
         // 将 ormer::Value 转换为 turso::Value
         let turso_params: Vec<turso::Value> = params
@@ -2218,31 +2224,31 @@ impl<T: Model + 'static> SelectStream<T> {
             .collect();
 
         let rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
+            conn.query(&sql, ())
                 .await
                 .map_err(|e| crate::Error::Database(e.to_string()))?
         } else {
-            self.conn
-                .query(&sql, turso_params)
+            conn.query(&sql, turso_params)
                 .await
                 .map_err(|e| crate::Error::Database(e.to_string()))?
         };
 
         Ok(SelectStreamIterator {
+            conn: super::common::StreamConnection::Sqlite(conn),
             rows,
-            _marker: PhantomData,
+            _marker: std::marker::PhantomData,
         })
     }
 }
 
 /// SelectStreamIterator - 流式查询迭代器
-pub struct SelectStreamIterator<T: Model> {
+pub struct SelectStreamIterator<'a, T: Model> {
+    conn: super::common::StreamConnection<'a>,
     rows: turso::Rows,
-    _marker: PhantomData<T>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
-impl<T: Model + 'static> SelectStreamIterator<T> {
+impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
     pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
         match self.rows.next().await {

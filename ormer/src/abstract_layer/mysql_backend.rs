@@ -1725,8 +1725,8 @@ pub struct RelatedSelectExecutor<'a, T: Model, R: Model> {
 /// SelectStream - 流式查询执行器 (MySQL)
 pub struct SelectStream<'a, T: Model> {
     select: Select<T>,
-    pool: &'a Pool,
-    _marker: PhantomData<T>,
+    pool: &'a mysql_async::Pool,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -1735,16 +1735,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         SelectStream {
             select: self.select,
             pool: self.pool,
-            _marker: PhantomData,
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
-    /// 返回异步迭代器
+    /// 返回异步迭代器 (真正的流式查询)
+    ///
+    /// 使用 mysql_async 的 Query::stream() 实现真正的流式查询，
+    /// 逐行读取数据而不是一次性加载所有结果到内存中。
     pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
+        // 将参数转换为 mysql_async::Value
         let mysql_params: Vec<mysql_async::Value> = params
             .iter()
             .map(|v| match v {
@@ -1755,129 +1759,81 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             })
             .collect();
 
-        // 从连接池获取连接并执行查询
-        let mut conn = self
+        // 获取连接
+        let conn = self
             .pool
             .get_conn()
             .await
-            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
 
-        // 执行查询获取行数据 (MySQL不支持真正的流式查询,使用exec获取所有结果)
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(&sql, mysql_params)
+        // 使用 Query::stream() 实现真正的流式查询
+        // 该方法返回 'static 的流，流拥有连接的所有权
+        use mysql_async::prelude::Query;
+        let stream = sql
+            .with(mysql_params)
+            .stream::<mysql_async::Row, _>(conn)
             .await
-            .map_err(|e: mysql_async::Error| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(SelectStreamIterator {
-            rows,
-            index: 0,
-            _marker: PhantomData,
+            stream: Some(stream),
+            _marker: std::marker::PhantomData,
         })
     }
 }
 
-/// SelectStreamIterator - 流式查询迭代器 (MySQL)
+/// 将 MySQL Row 解析为 Model
+fn parse_mysql_row<T: Model>(row: &mysql_async::Row) -> Result<T, crate::Error> {
+    let mut data = HashMap::new();
+    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+        let ormer_value = convert_mysql_value(row, i)?;
+        data.insert(col_name.to_string(), ormer_value);
+    }
+
+    let ormer_row = crate::model::Row::new(data);
+    T::from_row(&ormer_row)
+}
+
+/// SelectStreamIterator - 真正的流式查询迭代器 (MySQL)
 ///
-/// **注意**: MySQL后端当前实现为伪流式查询。
-/// 由于mysql_async库的限制,在调用into_iter()时会一次性加载所有结果到内存中,
-/// 然后通过迭代器逐条返回。这对于大数据集可能不够高效。
+/// 使用 mysql_async 的 Query::stream() 实现真正的流式查询，
+/// 逐行读取数据而不是一次性加载所有结果到内存中。
 ///
-/// **建议**: 对于超大数据集的流式查询,建议使用PostgreSQL或Turso后端,
-/// 它们支持真正的逐行流式查询,内存占用更低。
-///
-/// **未来优化**: 可以考虑使用mysql_async的query_iter()方法实现真正的流式查询。
+/// 该流拥有连接的所有权，当流被消费完毕或丢弃时，
+/// 连接会自动释放回连接池。
 pub struct SelectStreamIterator<'a, T: Model> {
-    rows: Vec<mysql_async::Row>,
-    index: usize,
-    _marker: PhantomData<&'a T>,
+    stream: Option<
+        mysql_async::ResultSetStream<
+            'static,
+            'static,
+            'static,
+            mysql_async::Row,
+            mysql_async::BinaryProtocol,
+        >,
+    >,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
-    /// 获取下一行数据 (模拟流式)
+    /// 获取下一行数据 (真正的流式查询)
+    ///
+    /// 逐行从数据库中读取数据，内存占用为 O(1)。
     pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
-        if self.index >= self.rows.len() {
-            return None;
-        }
+        use futures::StreamExt;
 
-        let row = &self.rows[self.index];
-        self.index += 1;
+        let stream = self.stream.as_mut()?;
 
-        // 解析行数据为 Model (与collect_inner类似)
-        let mut data = HashMap::new();
-        for (i, col_name) in T::COLUMNS.iter().enumerate() {
-            let column_info = &T::COLUMN_SCHEMA[i];
-            let rust_type = column_info.rust_type;
-            let is_nullable = column_info.is_nullable;
-
-            let ormer_value = if is_nullable {
-                // 可空类型处理 - 直接使用 match 处理 Option<Result<...>>
-                match rust_type {
-                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                        match row.get_opt::<i32, usize>(i) {
-                            Some(Ok(val)) => crate::model::Value::Integer(val as i64),
-                            _ => crate::model::Value::Null,
-                        }
-                    }
-                    "i64" | "u64" => match row.get_opt::<i64, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Integer(val),
-                        _ => crate::model::Value::Null,
-                    },
-                    "String" => match row.get_opt::<String, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Text(val),
-                        _ => crate::model::Value::Null,
-                    },
-                    "f32" | "f64" => match row.get_opt::<f64, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Real(val),
-                        _ => crate::model::Value::Null,
-                    },
-                    "bool" => match row.get_opt::<u8, usize>(i) {
-                        Some(Ok(1)) => crate::model::Value::Integer(1),
-                        Some(Ok(0)) => crate::model::Value::Integer(0),
-                        _ => crate::model::Value::Null,
-                    },
-                    _ => {
-                        return Some(Err(crate::Error::Database(format!(
-                            "Unsupported nullable column type: {rust_type}"
-                        ))));
-                    }
+        match stream.next().await {
+            Some(Ok(row)) => {
+                // 解析行数据
+                match parse_mysql_row::<T>(&row) {
+                    Ok(model) => Some(Ok(model)),
+                    Err(e) => Some(Err(e)),
                 }
-            } else {
-                // 非空类型处理 (简化版)
-                match rust_type {
-                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                        match row.get_opt::<i32, usize>(i) {
-                            Some(Ok(val)) => crate::model::Value::Integer(val as i64),
-                            _ => crate::model::Value::Integer(0),
-                        }
-                    }
-                    "i64" | "u64" => match row.get_opt::<i64, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Integer(val),
-                        _ => crate::model::Value::Integer(0),
-                    },
-                    "String" => match row.get_opt::<String, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Text(val),
-                        _ => crate::model::Value::Text(String::new()),
-                    },
-                    "f32" | "f64" => match row.get_opt::<f64, usize>(i) {
-                        Some(Ok(val)) => crate::model::Value::Real(val),
-                        _ => crate::model::Value::Real(0.0),
-                    },
-                    "bool" => match row.get_opt::<u8, usize>(i) {
-                        Some(Ok(1)) => crate::model::Value::Integer(1),
-                        _ => crate::model::Value::Integer(0),
-                    },
-                    _ => {
-                        return Some(Err(crate::Error::Database(format!(
-                            "Unsupported column type: {rust_type}"
-                        ))));
-                    }
-                }
-            };
-
-            data.insert(col_name.to_string(), ormer_value);
+            }
+            Some(Err(e)) => Some(Err(crate::Error::Database(e.to_string()))),
+            None => None,
         }
-        let ormer_row = crate::model::Row::new(data);
-        Some(T::from_row(&ormer_row))
     }
 }
 
@@ -1987,23 +1943,58 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Integer(v)
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected integer type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "String" => {
-                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Text(v)
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected String type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Real(v)
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected float type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
-                            if v == 1 {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
+                            let v: Option<i8> = row.get(i);
+                            match v {
+                                Some(1) => crate::model::Value::Integer(1),
+                                Some(0) => crate::model::Value::Integer(0),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected bool type)",
+                                        col_name
+                                    )));
+                                }
+                                _ => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
+                                        col_name
+                                    )));
+                                }
                             }
                         }
                         _ => {
@@ -2147,23 +2138,58 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Integer(v)
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected integer type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "String" => {
-                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Text(v)
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected String type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Real(v)
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected float type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
-                            if v == 1 {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
+                            let v: Option<i8> = row.get(i);
+                            match v {
+                                Some(1) => crate::model::Value::Integer(1),
+                                Some(0) => crate::model::Value::Integer(0),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected bool type)",
+                                        col_name
+                                    )));
+                                }
+                                _ => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
+                                        col_name
+                                    )));
+                                }
                             }
                         }
                         _ => {
@@ -2307,23 +2333,58 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                 } else {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Integer(v)
+                            let v: Option<i64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Integer(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected integer type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "String" => {
-                            let v: String = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Text(v)
+                            let v: Option<String> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Text(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected String type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "f32" | "f64" => {
-                            let v: f64 = row.get(i).expect("Failed to get value from MySQL row");
-                            crate::model::Value::Real(v)
+                            let v: Option<f64> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Real(val),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected float type)",
+                                        col_name
+                                    )));
+                                }
+                            }
                         }
                         "bool" => {
-                            let v: i8 = row.get(i).expect("Failed to get value from MySQL row");
-                            if v == 1 {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
+                            let v: Option<i8> = row.get(i);
+                            match v {
+                                Some(1) => crate::model::Value::Integer(1),
+                                Some(0) => crate::model::Value::Integer(0),
+                                None => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (expected bool type)",
+                                        col_name
+                                    )));
+                                }
+                                _ => {
+                                    return Err(crate::Error::ParseError(format!(
+                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
+                                        col_name
+                                    )));
+                                }
                             }
                         }
                         _ => {

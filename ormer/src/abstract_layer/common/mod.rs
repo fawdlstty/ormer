@@ -8,6 +8,12 @@ pub mod common_helpers;
 #[macro_use]
 pub mod macros;
 
+/// 流式查询连接管理模块
+#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+pub mod stream_connection;
+#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+pub use stream_connection::StreamConnection;
+
 /// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
 #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 mod unified;

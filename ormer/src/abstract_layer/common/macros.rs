@@ -86,7 +86,7 @@ macro_rules! impl_executor_methods {
         $conn_field:ident,
         $conn_type:ty
     ) => {
-        impl<T: $crate::Model> $executor_type<T> {
+        impl<'a, T: $crate::Model> $executor_type<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,
@@ -136,7 +136,7 @@ macro_rules! impl_executor_methods {
 /// 为统一的 SelectExecutor 生成方法（filter/order_by/range）
 #[macro_export]
 macro_rules! impl_unified_select_executor_methods {
-    ($executor_name:ident, $sqlite_phantom:expr) => {
+    ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
@@ -144,13 +144,13 @@ macro_rules! impl_unified_select_executor_methods {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
-                    }
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.filter(f)),
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -161,15 +161,15 @@ macro_rules! impl_unified_select_executor_methods {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.order_by(f), $sqlite_phantom)
-                    }
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.order_by(f)),
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
                         $executor_name::PostgreSQL(exec.order_by(f))
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -180,30 +180,30 @@ macro_rules! impl_unified_select_executor_methods {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.order_by_desc(f), $sqlite_phantom)
-                    }
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.order_by_desc(f)),
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
                         $executor_name::PostgreSQL(exec.order_by_desc(f))
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
-                    }
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.range(range)),
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
                         $executor_name::PostgreSQL(exec.range(range))
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
         }
@@ -213,7 +213,7 @@ macro_rules! impl_unified_select_executor_methods {
 /// 为统一的 DeleteExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_delete_executor {
-    ($executor_name:ident, $sqlite_phantom:expr) => {
+    ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
@@ -221,13 +221,15 @@ macro_rules! impl_unified_delete_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.filter(f), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
             }
 
@@ -239,6 +241,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => exec.execute().await,
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
             }
         }
@@ -258,7 +262,7 @@ macro_rules! impl_unified_delete_executor {
 /// 为统一的 UpdateExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_update_executor {
-    ($executor_name:ident, $sqlite_phantom:expr) => {
+    ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
@@ -266,13 +270,15 @@ macro_rules! impl_unified_update_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.filter(f), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
 
@@ -283,8 +289,8 @@ macro_rules! impl_unified_update_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.set(field_fn, value), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.set(field_fn, value), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -292,6 +298,8 @@ macro_rules! impl_unified_update_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(field_fn, value)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
 
@@ -303,6 +311,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => exec.execute().await,
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
         }
@@ -322,7 +332,7 @@ macro_rules! impl_unified_update_executor {
 /// 为统一的 CollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_collect_future {
-    ($future_name:ident, $sqlite_phantom:expr) => {
+    ($future_name:ident) => {
         impl<'a, T: $crate::Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
             for $future_name<'a, T, C>
         {
@@ -333,11 +343,13 @@ macro_rules! impl_unified_collect_future {
             fn into_future(self) -> Self::IntoFuture {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $future_name::Sqlite(future, _) => Box::pin(future.into_future()),
+                    $future_name::Sqlite(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "postgresql")]
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("CollectFuture not implemented for this backend"),
                 }
             }
         }
@@ -347,7 +359,7 @@ macro_rules! impl_unified_collect_future {
 /// 为统一的 AggregateFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_aggregate_future {
-    ($future_name:ident, $sqlite_phantom:expr) => {
+    ($future_name:ident) => {
         impl<'a, T: $crate::Model + 'static, R: $crate::model::FromValue + 'static>
             std::future::IntoFuture for $future_name<'a, T, R>
         {
@@ -363,6 +375,8 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::PostgreSQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(async move { future.await }),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("AggregateFuture not implemented for this backend"),
                 }
             }
         }
@@ -372,7 +386,7 @@ macro_rules! impl_unified_aggregate_future {
 /// 为统一的 JOIN Executor 生成 filter/range 方法
 #[macro_export]
 macro_rules! impl_unified_join_executor {
-    ($executor_name:ident, $sqlite_phantom:expr) => {
+    ($executor_name:ident) => {
         impl<'a, T: $crate::Model, J: $crate::Model> $executor_name<'a, T, J> {
             pub fn filter<F>(self, f: F) -> Self
             where
@@ -380,21 +394,23 @@ macro_rules! impl_unified_join_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.filter(f), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
             }
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.range(range), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -402,6 +418,8 @@ macro_rules! impl_unified_join_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
             }
         }
@@ -411,7 +429,7 @@ macro_rules! impl_unified_join_executor {
 /// 为统一的 JOIN CollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_join_collect_future {
-    ($future_name:ident, $output_type:ty, $sqlite_phantom:expr) => {
+    ($future_name:ident, $output_type:ty) => {
         impl<'a, T: $crate::Model + 'static, J: $crate::Model + 'static> std::future::IntoFuture
             for $future_name<'a, T, J>
         {
@@ -427,6 +445,8 @@ macro_rules! impl_unified_join_collect_future {
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("JoinCollectFuture not implemented for this backend"),
                 }
             }
         }
@@ -436,7 +456,7 @@ macro_rules! impl_unified_join_collect_future {
 /// 为统一的 RelatedSelectExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_related_select_executor {
-    ($executor_name:ident, $sqlite_phantom:expr) => {
+    ($executor_name:ident) => {
         impl<'a, T: $crate::Model, R: $crate::Model> $executor_name<'a, T, R> {
             pub fn filter<F>(self, f: F) -> Self
             where
@@ -444,21 +464,23 @@ macro_rules! impl_unified_related_select_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.filter(f), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.range(range), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -466,6 +488,8 @@ macro_rules! impl_unified_related_select_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -476,8 +500,8 @@ macro_rules! impl_unified_related_select_executor {
             {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $executor_name::Sqlite(exec, _) => {
-                        RelatedCollectFuture::Sqlite(exec.exec(), std::marker::PhantomData)
+                    $executor_name::Sqlite(exec, phantom) => {
+                        RelatedCollectFuture::Sqlite(exec.exec(), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -485,6 +509,8 @@ macro_rules! impl_unified_related_select_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -510,7 +536,7 @@ macro_rules! impl_unified_related_select_executor {
 /// 为统一的 RelatedCollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_related_collect_future {
-    ($future_name:ident, $sqlite_phantom:expr) => {
+    ($future_name:ident) => {
         impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> std::future::IntoFuture
             for $future_name<'a, T, R>
         {
@@ -526,6 +552,8 @@ macro_rules! impl_unified_related_collect_future {
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("RelatedCollectFuture not implemented for this backend"),
                 }
             }
         }
@@ -542,7 +570,7 @@ macro_rules! impl_backend_executor_methods {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<T: $crate::Model> $executor_type<T> {
+        impl<'a, T: $crate::Model> $executor_type<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,

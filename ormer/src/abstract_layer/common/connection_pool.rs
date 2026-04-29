@@ -135,8 +135,8 @@ impl ManualPool {
         match self.db_type {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
-                let db =
-                    sqlite_backend::Database::connect(self.db_type, &self.connection_string).await?;
+                let db = sqlite_backend::Database::connect(self.db_type, &self.connection_string)
+                    .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
             #[cfg(feature = "postgresql")]
@@ -405,9 +405,7 @@ impl<'a> PooledConnection<'a> {
     pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => {
-                CreateTableExecutor::Sqlite(db.create_table::<T>(), std::marker::PhantomData)
-            }
+            ConnectionWrapper::Sqlite(db) => CreateTableExecutor::Sqlite(db.create_table::<T>()),
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
                 CreateTableExecutor::PostgreSQL(db.create_table::<T>())
@@ -455,7 +453,7 @@ impl<'a> PooledConnection<'a> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                super::unified::SelectExecutor::Sqlite(db.select::<T>(), PhantomData)
+                super::unified::SelectExecutor::Sqlite(db.select::<T>())
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -476,7 +474,7 @@ impl<'a> PooledConnection<'a> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                super::unified::DeleteExecutor::Sqlite(db.delete::<T>(), PhantomData)
+                super::unified::DeleteExecutor::Sqlite(db.delete::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -492,7 +490,7 @@ impl<'a> PooledConnection<'a> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                super::unified::UpdateExecutor::Sqlite(db.update::<T>(), PhantomData)
+                super::unified::UpdateExecutor::Sqlite(db.update::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -509,9 +507,10 @@ impl<'a> PooledConnection<'a> {
     ) -> super::unified::RelatedSelectExecutor<'_, T, R> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => {
-                super::unified::RelatedSelectExecutor::Sqlite(db.related::<T, R>(), PhantomData)
-            }
+            ConnectionWrapper::Sqlite(db) => super::unified::RelatedSelectExecutor::Sqlite(
+                db.related::<T, R>(),
+                std::marker::PhantomData,
+            ),
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
                 super::unified::RelatedSelectExecutor::PostgreSQL(db.related::<T, R>())
@@ -524,12 +523,12 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> Result<super::unified::Transaction<'_>, crate::Error> {
+    pub async fn begin(&self) -> Result<super::unified::Transaction, crate::Error> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
                 let txn = db.begin().await?;
-                Ok(super::unified::Transaction::Sqlite(txn, PhantomData))
+                Ok(super::unified::Transaction::Sqlite(txn))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -548,9 +547,7 @@ impl<'a> PooledConnection<'a> {
     pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => {
-                DropTableExecutor::Sqlite(db.drop_table::<T>(), std::marker::PhantomData)
-            }
+            ConnectionWrapper::Sqlite(db) => DropTableExecutor::Sqlite(db.drop_table::<T>()),
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
                 DropTableExecutor::PostgreSQL(db.drop_table::<T>())

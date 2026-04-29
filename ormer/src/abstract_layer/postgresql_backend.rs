@@ -2000,8 +2000,8 @@ pub struct RelatedSelectExecutor<'a, T: Model, R: Model> {
 /// SelectStream - 流式查询执行器 (PostgreSQL)
 pub struct SelectStream<'a, T: Model> {
     select: Select<T>,
-    client: &'a tokio_postgres::Client,
-    _marker: PhantomData<T>,
+    conn: super::common::StreamConnection<'a>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -2009,8 +2009,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     pub fn stream(self) -> SelectStream<'a, T> {
         SelectStream {
             select: self.select,
-            client: self.client,
-            _marker: PhantomData,
+            conn: super::common::StreamConnection::PostgreSQL(self.client),
+            _marker: std::marker::PhantomData,
         }
     }
 }
@@ -2023,24 +2023,31 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             pg_params.iter().map(|p| p.as_ref()).collect();
 
+        // 从 StreamConnection 获取 client 引用
+        let client = match &self.conn {
+            super::common::StreamConnection::PostgreSQL(c) => c,
+            _ => unreachable!("Expected PostgreSQL connection"),
+        };
+
         // 使用 query_raw 获取 RowStream
-        let row_stream = self
-            .client
+        let row_stream = client
             .query_raw(&sql, param_refs)
             .await
             .map_err(|e| crate::Error::Database(e.to_string()))?;
 
         Ok(SelectStreamIterator {
+            conn: self.conn,
             row_stream: Box::pin(row_stream),
-            _marker: PhantomData,
+            _marker: std::marker::PhantomData,
         })
     }
 }
 
 /// SelectStreamIterator - 流式查询迭代器 (PostgreSQL)
 pub struct SelectStreamIterator<'a, T: Model> {
+    conn: super::common::StreamConnection<'a>,
     row_stream: std::pin::Pin<Box<tokio_postgres::RowStream>>,
-    _marker: PhantomData<&'a T>,
+    _marker: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
@@ -2150,30 +2157,67 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                             },
                         }
                     } else {
-                        // 非空类型处理 (简化版,与collect_inner类似)
+                        // 非空类型处理 - 解析失败时返回错误
                         match rust_type {
                             "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                                let v: i32 = row.get(i);
-                                crate::model::Value::Integer(v as i64)
+                                let v: Option<i32> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Integer(val as i64),
+                                    None => {
+                                        return Some(Err(crate::Error::ParseError(format!(
+                                            "Failed to parse non-nullable column '{}' (expected integer type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
                             }
                             "i64" | "u64" => {
-                                let v: i64 = row.get(i);
-                                crate::model::Value::Integer(v)
+                                let v: Option<i64> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Integer(val),
+                                    None => {
+                                        return Some(Err(crate::Error::ParseError(format!(
+                                            "Failed to parse non-nullable column '{}' (expected i64 type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
                             }
                             "String" => {
-                                let v: String = row.get(i);
-                                crate::model::Value::Text(v)
+                                let v: Option<String> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Text(val),
+                                    None => {
+                                        return Some(Err(crate::Error::ParseError(format!(
+                                            "Failed to parse non-nullable column '{}' (expected String type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
                             }
                             "f32" | "f64" => {
-                                let v: f64 = row.get(i);
-                                crate::model::Value::Real(v)
+                                let v: Option<f64> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Real(val),
+                                    None => {
+                                        return Some(Err(crate::Error::ParseError(format!(
+                                            "Failed to parse non-nullable column '{}' (expected float type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
                             }
                             "bool" => {
-                                let v: bool = row.get(i);
-                                if v {
-                                    crate::model::Value::Integer(1)
-                                } else {
-                                    crate::model::Value::Integer(0)
+                                let v: Option<bool> = row.get(i);
+                                match v {
+                                    Some(true) => crate::model::Value::Integer(1),
+                                    Some(false) => crate::model::Value::Integer(0),
+                                    None => {
+                                        return Some(Err(crate::Error::ParseError(format!(
+                                            "Failed to parse non-nullable column '{}' (expected bool type)",
+                                            col_name
+                                        ))));
+                                    }
                                 }
                             }
                             _ => {
