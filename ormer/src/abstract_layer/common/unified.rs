@@ -1,12 +1,12 @@
-/// 统一的数据库抽象层
+﻿/// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use crate::model::Model;
 use crate::query::builder::WhereExpr;
 
 // 根据启用的 feature 导入后端实现
-#[cfg(feature = "turso")]
-use super::super::turso_backend;
+#[cfg(feature = "sqlite")]
+use super::super::sqlite_backend;
 
 #[cfg(feature = "postgresql")]
 use super::super::postgresql_backend;
@@ -16,8 +16,8 @@ use super::super::mysql_backend;
 
 /// 统一的 Database 枚举
 pub enum Database {
-    #[cfg(feature = "turso")]
-    Turso(turso_backend::Database),
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::Database),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::Database),
     #[cfg(feature = "mysql")]
@@ -26,9 +26,9 @@ pub enum Database {
 
 /// 统一的 CreateTableExecutor 枚举
 pub enum CreateTableExecutor<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::CreateTableExecutor<'a, T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::CreateTableExecutor<'a, T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -40,8 +40,8 @@ pub enum CreateTableExecutor<'a, T: Model> {
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            CreateTableExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            CreateTableExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             CreateTableExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -52,9 +52,9 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
 
 /// 统一的 DropTableExecutor 枚举
 pub enum DropTableExecutor<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::DropTableExecutor<'a, T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::DropTableExecutor<'a, T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -66,8 +66,8 @@ pub enum DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            DropTableExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            DropTableExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             DropTableExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -78,9 +78,9 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
 
 /// 统一的 InsertExecutor 枚举
 pub enum InsertExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::InsertExecutor<'a, I>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::InsertExecutor<'a, I>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -92,8 +92,8 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            InsertExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -104,9 +104,9 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
 /// 统一的 InsertOrUpdateExecutor 枚举
 pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::InsertOrUpdateExecutor<'a, I>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::InsertOrUpdateExecutor<'a, I>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -118,8 +118,8 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            InsertOrUpdateExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            InsertOrUpdateExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             InsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -135,10 +135,10 @@ impl Database {
         connection_string: &str,
     ) -> Result<Self, crate::Error> {
         match db_type {
-            #[cfg(feature = "turso")]
-            super::super::DbType::Turso => {
-                let db = turso_backend::Database::connect(db_type, connection_string).await?;
-                Ok(Database::Turso(db))
+            #[cfg(feature = "sqlite")]
+            super::super::DbType::Sqlite => {
+                let db = sqlite_backend::Database::connect(db_type, connection_string).await?;
+                Ok(Database::Sqlite(db))
             }
             #[cfg(feature = "postgresql")]
             super::super::DbType::PostgreSQL => {
@@ -156,9 +156,9 @@ impl Database {
     /// 创建表 - 返回执行器
     pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                CreateTableExecutor::Turso(db.create_table::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                CreateTableExecutor::Sqlite(db.create_table::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => CreateTableExecutor::PostgreSQL(db.create_table::<T>()),
@@ -170,8 +170,8 @@ impl Database {
     /// 验证表结构
     pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => db.validate_table::<T>().await,
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "mysql")]
@@ -182,9 +182,9 @@ impl Database {
     /// 插入记录 - 返回执行器
     pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                InsertExecutor::Turso(db.insert::<I>(models), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                InsertExecutor::Sqlite(db.insert::<I>(models), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => InsertExecutor::PostgreSQL(db.insert::<I>(models)),
@@ -199,8 +199,8 @@ impl Database {
         models: I,
     ) -> InsertOrUpdateExecutor<'_, I> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => InsertOrUpdateExecutor::Turso(
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => InsertOrUpdateExecutor::Sqlite(
                 db.insert_or_update::<I>(models),
                 std::marker::PhantomData,
             ),
@@ -216,9 +216,9 @@ impl Database {
     /// 创建 Select 查询执行器
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                SelectExecutor::Turso(db.select::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                SelectExecutor::Sqlite(db.select::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => SelectExecutor::PostgreSQL(db.select::<T>()),
@@ -230,9 +230,9 @@ impl Database {
     /// 创建分组聚合查询执行器
     pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                GroupedSelectExecutor::Turso(db.select_column::<T, V>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                GroupedSelectExecutor::Sqlite(db.select_column::<T, V>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => {
@@ -246,9 +246,9 @@ impl Database {
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                DeleteExecutor::Turso(db.delete::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                DeleteExecutor::Sqlite(db.delete::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => DeleteExecutor::PostgreSQL(db.delete::<T>()),
@@ -260,9 +260,9 @@ impl Database {
     /// 创建 Update 执行器
     pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                UpdateExecutor::Turso(db.update::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                UpdateExecutor::Sqlite(db.update::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => UpdateExecutor::PostgreSQL(db.update::<T>()),
@@ -274,9 +274,9 @@ impl Database {
     /// 创建 Related 查询执行器（关联查询）
     pub fn from<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<'_, T, R> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                RelatedSelectExecutor::Turso(db.related::<T, R>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                RelatedSelectExecutor::Sqlite(db.related::<T, R>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => RelatedSelectExecutor::PostgreSQL(db.related::<T, R>()),
@@ -288,10 +288,10 @@ impl Database {
     /// 开始事务
     pub async fn begin(&self) -> Result<Transaction<'_>, crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
                 let txn = db.begin().await?;
-                Ok(Transaction::Turso(txn, std::marker::PhantomData))
+                Ok(Transaction::Sqlite(txn, std::marker::PhantomData))
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => {
@@ -309,9 +309,9 @@ impl Database {
     /// 删除表 - 返回执行器
     pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => {
-                DropTableExecutor::Turso(db.drop_table::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                DropTableExecutor::Sqlite(db.drop_table::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => DropTableExecutor::PostgreSQL(db.drop_table::<T>()),
@@ -323,8 +323,8 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => db.exec_table::<T>(sql).await,
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => db.exec_table::<T>(sql).await,
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => db.exec_table::<T>(sql).await,
             #[cfg(feature = "mysql")]
@@ -335,8 +335,8 @@ impl Database {
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Database::Turso(db) => db.exec_non_query(sql).await,
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => db.exec_non_query(sql).await,
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => db.exec_non_query(sql).await,
             #[cfg(feature = "mysql")]
@@ -345,7 +345,7 @@ impl Database {
     }
 
     /// 创建连接池
-    #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+    #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
     pub fn create_pool(
         db_type: super::super::DbType,
         connection_string: &str,
@@ -356,9 +356,9 @@ impl Database {
 
 /// 统一的 SelectExecutor 枚举
 pub enum SelectExecutor<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::SelectExecutor<T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::SelectExecutor<T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -377,9 +377,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         T2: Model + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                RelatedSelectExecutor::Turso(exec.from::<T2, R>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                RelatedSelectExecutor::Sqlite(exec.from::<T2, R>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -397,8 +397,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         T2: Model + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => MultiTableSelectExecutor::Turso(
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => MultiTableSelectExecutor::Sqlite(
                 exec.from3::<T2, R1, R2>(),
                 std::marker::PhantomData,
             ),
@@ -422,8 +422,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         T2: Model + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => FourTableSelectExecutor::Turso(
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => FourTableSelectExecutor::Sqlite(
                 exec.from4::<T2, R1, R2, R3>(),
                 std::marker::PhantomData,
             ),
@@ -444,9 +444,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> LeftJoinedSelectExecutor<'a, T, J> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                LeftJoinedSelectExecutor::Turso(exec.left_join::<J>(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                LeftJoinedSelectExecutor::Sqlite(exec.left_join::<J>(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -463,9 +463,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> InnerJoinedSelectExecutor<'a, T, J> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                InnerJoinedSelectExecutor::Turso(exec.inner_join::<J>(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                InnerJoinedSelectExecutor::Sqlite(exec.inner_join::<J>(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -484,9 +484,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> RightJoinedSelectExecutor<'a, T, J> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                RightJoinedSelectExecutor::Turso(exec.right_join::<J>(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                RightJoinedSelectExecutor::Sqlite(exec.right_join::<J>(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -501,9 +501,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     pub fn collect<C: FromIterator<T> + 'static>(&self) -> CollectFuture<'a, T, C> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                CollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                CollectFuture::Sqlite(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -530,9 +530,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                AggregateFuture::Turso(exec.count(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                AggregateFuture::Sqlite(exec.count(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.count(f)),
@@ -548,9 +548,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                AggregateFuture::Turso(exec.sum(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                AggregateFuture::Sqlite(exec.sum(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.sum(f)),
@@ -566,9 +566,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                AggregateFuture::Turso(exec.avg(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                AggregateFuture::Sqlite(exec.avg(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.avg(f)),
@@ -584,9 +584,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                AggregateFuture::Turso(exec.max(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                AggregateFuture::Sqlite(exec.max(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.max(f)),
@@ -602,9 +602,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                AggregateFuture::Turso(exec.min(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                AggregateFuture::Sqlite(exec.min(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => AggregateFuture::PostgreSQL(exec.min(f)),
@@ -616,9 +616,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
 /// 统一的 DeleteExecutor 枚举
 pub enum DeleteExecutor<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::DeleteExecutor<T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::DeleteExecutor<T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -631,9 +631,9 @@ crate::impl_unified_delete_executor!(DeleteExecutor, std::marker::PhantomData);
 
 /// 统一的 UpdateExecutor 枚举
 pub enum UpdateExecutor<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::UpdateExecutor<T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::UpdateExecutor<T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -646,9 +646,9 @@ crate::impl_unified_update_executor!(UpdateExecutor, std::marker::PhantomData);
 
 /// 统一的 CollectFuture 枚举
 pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::CollectFuture<T, C>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::CollectFuture<T, C>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -659,9 +659,9 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
 
 /// 统一的 AggregateFuture 枚举
 pub enum AggregateFuture<'a, T: Model, R> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::AggregateFuture<T, R>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::AggregateFuture<T, R>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -674,9 +674,9 @@ crate::impl_unified_aggregate_future!(AggregateFuture, std::marker::PhantomData)
 
 /// 统一的 RelatedSelectExecutor 枚举
 pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::RelatedSelectExecutor<T, R>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::RelatedSelectExecutor<T, R>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -687,9 +687,9 @@ pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
 
 /// 统一的 MultiTableSelectExecutor 枚举
 pub enum MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::MultiTableSelectExecutor<T, R1, R2>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::MultiTableSelectExecutor<T, R1, R2>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -700,9 +700,9 @@ pub enum MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
 
 /// 统一的 FourTableSelectExecutor 枚举
 pub enum FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::FourTableSelectExecutor<T, R1, R2, R3>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::FourTableSelectExecutor<T, R1, R2, R3>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -713,9 +713,9 @@ pub enum FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> 
 
 /// 统一的 InnerJoinedSelectExecutor 枚举
 pub enum InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::InnerJoinedSelectExecutor<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::InnerJoinedSelectExecutor<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -726,9 +726,9 @@ pub enum InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
 
 /// 统一的 RightJoinedSelectExecutor 枚举
 pub enum RightJoinedSelectExecutor<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::RightJoinedSelectExecutor<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::RightJoinedSelectExecutor<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -739,9 +739,9 @@ pub enum RightJoinedSelectExecutor<'a, T: Model, J: Model> {
 
 /// 统一的 LeftJoinedSelectExecutor 枚举
 pub enum LeftJoinedSelectExecutor<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::LeftJoinedSelectExecutor<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::LeftJoinedSelectExecutor<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -752,9 +752,9 @@ pub enum LeftJoinedSelectExecutor<'a, T: Model, J: Model> {
 
 /// 统一的 LeftJoinCollectFuture 枚举
 pub enum LeftJoinCollectFuture<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::LeftJoinCollectFuture<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::LeftJoinCollectFuture<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -765,9 +765,9 @@ pub enum LeftJoinCollectFuture<'a, T: Model, J: Model> {
 
 /// 统一的 InnerJoinCollectFuture 枚举
 pub enum InnerJoinCollectFuture<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::InnerJoinCollectFuture<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::InnerJoinCollectFuture<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -778,9 +778,9 @@ pub enum InnerJoinCollectFuture<'a, T: Model, J: Model> {
 
 /// 统一的 RightJoinCollectFuture 枚举
 pub enum RightJoinCollectFuture<'a, T: Model, J: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::RightJoinCollectFuture<T, J>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::RightJoinCollectFuture<T, J>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -795,9 +795,9 @@ crate::impl_unified_related_select_executor!(RelatedSelectExecutor, std::marker:
 
 /// 统一的 RelatedCollectFuture 枚举
 pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::RelatedCollectFuture<T, R>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::RelatedCollectFuture<T, R>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -810,8 +810,8 @@ crate::impl_unified_related_collect_future!(RelatedCollectFuture, std::marker::P
 
 /// 统一的 Transaction 枚举
 pub enum Transaction<'a> {
-    #[cfg(feature = "turso")]
-    Turso(turso_backend::Transaction, std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::Transaction, std::marker::PhantomData<&'a ()>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::Transaction<'a>),
     #[cfg(feature = "mysql")]
@@ -820,9 +820,9 @@ pub enum Transaction<'a> {
 
 /// 事务中的插入执行器
 pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::TransactionInsertExecutor<'a, I>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::TransactionInsertExecutor<'a, I>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -834,8 +834,8 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            TransactionInsertExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             TransactionInsertExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -846,9 +846,9 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
 
 /// 事务中的插入或更新执行器
 pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::TransactionInsertOrUpdateExecutor<'a, I>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::TransactionInsertOrUpdateExecutor<'a, I>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -860,8 +860,8 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            TransactionInsertOrUpdateExecutor::Turso(exec, _) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            TransactionInsertOrUpdateExecutor::Sqlite(exec, _) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             TransactionInsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
@@ -874,8 +874,8 @@ impl<'a> Transaction<'a> {
     /// 提交事务
     pub async fn commit(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => txn.commit().await,
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => txn.commit().await,
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => txn.commit().await,
             #[cfg(feature = "mysql")]
@@ -886,8 +886,8 @@ impl<'a> Transaction<'a> {
     /// 回滚事务
     pub async fn rollback(self) -> Result<(), crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => txn.rollback().await,
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => txn.rollback().await,
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => txn.rollback().await,
             #[cfg(feature = "mysql")]
@@ -898,9 +898,9 @@ impl<'a> Transaction<'a> {
     /// 创建 Select 查询执行器
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => {
-                SelectExecutor::Turso(txn.select::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => {
+                SelectExecutor::Sqlite(txn.select::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => SelectExecutor::PostgreSQL(txn.select::<T>()),
@@ -912,9 +912,9 @@ impl<'a> Transaction<'a> {
     /// 创建分组聚合查询执行器
     pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => {
-                GroupedSelectExecutor::Turso(txn.select_column::<T, V>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => {
+                GroupedSelectExecutor::Sqlite(txn.select_column::<T, V>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
@@ -928,9 +928,9 @@ impl<'a> Transaction<'a> {
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => {
-                DeleteExecutor::Turso(txn.delete::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => {
+                DeleteExecutor::Sqlite(txn.delete::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => DeleteExecutor::PostgreSQL(txn.delete::<T>()),
@@ -942,9 +942,9 @@ impl<'a> Transaction<'a> {
     /// 创建 Update 执行器
     pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => {
-                UpdateExecutor::Turso(txn.update::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => {
+                UpdateExecutor::Sqlite(txn.update::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => UpdateExecutor::PostgreSQL(txn.update::<T>()),
@@ -959,9 +959,9 @@ impl<'a> Transaction<'a> {
         models: I,
     ) -> TransactionInsertExecutor<'_, I> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => {
-                TransactionInsertExecutor::Turso(txn.insert::<I>(models), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => {
+                TransactionInsertExecutor::Sqlite(txn.insert::<I>(models), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
@@ -978,8 +978,8 @@ impl<'a> Transaction<'a> {
         models: I,
     ) -> TransactionInsertOrUpdateExecutor<'_, I> {
         match self {
-            #[cfg(feature = "turso")]
-            Transaction::Turso(txn, _) => TransactionInsertOrUpdateExecutor::Turso(
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn, _) => TransactionInsertOrUpdateExecutor::Sqlite(
                 txn.insert_or_update::<I>(models),
                 std::marker::PhantomData,
             ),
@@ -1006,9 +1006,9 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
         J: 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            LeftJoinedSelectExecutor::Turso(exec, _) => {
-                LeftJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            LeftJoinedSelectExecutor::Sqlite(exec, _) => {
+                LeftJoinCollectFuture::Sqlite(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             LeftJoinedSelectExecutor::PostgreSQL(exec) => {
@@ -1040,9 +1040,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         J: 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            InnerJoinedSelectExecutor::Turso(exec, _) => {
-                InnerJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            InnerJoinedSelectExecutor::Sqlite(exec, _) => {
+                InnerJoinCollectFuture::Sqlite(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             InnerJoinedSelectExecutor::PostgreSQL(exec) => {
@@ -1076,9 +1076,9 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         J: 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            RightJoinedSelectExecutor::Turso(exec, _) => {
-                RightJoinCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            RightJoinedSelectExecutor::Sqlite(exec, _) => {
+                RightJoinCollectFuture::Sqlite(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             RightJoinedSelectExecutor::PostgreSQL(exec) => {
@@ -1121,31 +1121,31 @@ crate::impl_unified_join_collect_future!(
 
 /// 统一的 MappedSelectExecutor 枚举
 pub enum MappedSelectExecutor<'a, T: Model, V> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::MappedSelectExecutor<T, V>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::MappedSelectExecutor<T, V>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::MappedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
 /// 统一的 GroupedSelectExecutor 枚举
 pub enum GroupedSelectExecutor<'a, T: Model, V> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::GroupedSelectExecutor<T, V>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::GroupedSelectExecutor<T, V>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::GroupedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
@@ -1158,9 +1158,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         G: crate::query::builder::GroupByColumns,
     {
         match self {
-            #[cfg(feature = "turso")]
-            GroupedSelectExecutor::Turso(exec, _) => {
-                GroupedSelectExecutor::Turso(exec.group_by(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            GroupedSelectExecutor::Sqlite(exec, _) => {
+                GroupedSelectExecutor::Sqlite(exec.group_by(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             GroupedSelectExecutor::PostgreSQL(exec) => {
@@ -1168,7 +1168,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "mysql")]
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.group_by(f)),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
@@ -1180,9 +1180,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
     {
         match self {
-            #[cfg(feature = "turso")]
-            GroupedSelectExecutor::Turso(exec, _) => {
-                GroupedSelectExecutor::Turso(exec.having(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            GroupedSelectExecutor::Sqlite(exec, _) => {
+                GroupedSelectExecutor::Sqlite(exec.having(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             GroupedSelectExecutor::PostgreSQL(exec) => {
@@ -1190,7 +1190,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "mysql")]
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.having(f)),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
@@ -1202,9 +1202,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
     {
         match self {
-            #[cfg(feature = "turso")]
-            GroupedSelectExecutor::Turso(exec, _) => {
-                GroupedSelectExecutor::Turso(exec.filter(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            GroupedSelectExecutor::Sqlite(exec, _) => {
+                GroupedSelectExecutor::Sqlite(exec.filter(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             GroupedSelectExecutor::PostgreSQL(exec) => {
@@ -1212,7 +1212,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "mysql")]
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.filter(f)),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
@@ -1225,9 +1225,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         C: FromIterator<V> + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            GroupedSelectExecutor::Turso(exec, _) => {
-                GroupedCollectFuture::Turso(exec.collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            GroupedSelectExecutor::Sqlite(exec, _) => {
+                GroupedCollectFuture::Sqlite(exec.collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             GroupedSelectExecutor::PostgreSQL(exec) => {
@@ -1235,7 +1235,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "mysql")]
             GroupedSelectExecutor::MySQL(exec) => GroupedCollectFuture::MySQL(exec.collect::<C>()),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             GroupedSelectExecutor::NotImplemented(_) => {
                 panic!("GroupedSelectExecutor::collect is not implemented for this backend")
             }
@@ -1255,9 +1255,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         match self {
-            #[cfg(feature = "turso")]
-            MappedSelectExecutor::Turso(exec, phantom) => {
-                MappedSelectExecutor::Turso(exec.clone(), *phantom)
+            #[cfg(feature = "sqlite")]
+            MappedSelectExecutor::Sqlite(exec, phantom) => {
+                MappedSelectExecutor::Sqlite(exec.clone(), *phantom)
             }
             #[cfg(feature = "postgresql")]
             MappedSelectExecutor::PostgreSQL(exec) => {
@@ -1267,7 +1267,7 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MySQL(exec) => {
                 MappedSelectExecutor::MySQL(exec.clone_with_pool())
             }
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             MappedSelectExecutor::NotImplemented(phantom) => {
                 MappedSelectExecutor::NotImplemented(*phantom)
             }
@@ -1277,31 +1277,31 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
 
 /// 统一的 MappedCollectFuture 枚举
 pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::MappedCollectFuture<T, V, C>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::MappedCollectFuture<T, V, C>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
 /// 统一的 GroupedCollectFuture 枚举
 pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::GroupedCollectFuture<T, V, C>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::GroupedCollectFuture<T, V, C>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::GroupedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
@@ -1313,13 +1313,13 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 
     fn into_future(self) -> Self::IntoFuture {
         match self {
-            #[cfg(feature = "turso")]
-            GroupedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
+            #[cfg(feature = "sqlite")]
+            GroupedCollectFuture::Sqlite(future, _) => Box::pin(future.into_future()),
             #[cfg(feature = "postgresql")]
             GroupedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mysql")]
             GroupedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             GroupedCollectFuture::NotImplemented(_) => Box::pin(std::future::ready(Err(
                 crate::Error::Database("No database backend available".to_string()),
             ))),
@@ -1329,9 +1329,9 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 
 /// 统一的 ModelCollectWithFuture 枚举
 pub enum ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::ModelCollectWithFuture<T, V, C, M, F>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::ModelCollectWithFuture<T, V, C, M, F>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -1346,7 +1346,7 @@ pub enum ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     NotImplemented(std::marker::PhantomData<&'a (T, V, C, M, F)>),
 }
 
@@ -1362,9 +1362,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         M: crate::query::builder::MapToResult,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                MappedSelectExecutor::Turso(exec.map_to(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                MappedSelectExecutor::Sqlite(exec.map_to(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => MappedSelectExecutor::PostgreSQL(exec.map_to(f)),
@@ -1383,9 +1383,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         V: crate::query::builder::SelectColumnResult,
     {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                GroupedSelectExecutor::Turso(exec.select_column(f), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                GroupedSelectExecutor::Sqlite(exec.select_column(f), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
@@ -1407,9 +1407,9 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         C: FromIterator<V> + 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            MappedSelectExecutor::Turso(exec, _) => {
-                MappedCollectFuture::Turso(exec.clone().collect::<C>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            MappedSelectExecutor::Sqlite(exec, _) => {
+                MappedCollectFuture::Sqlite(exec.clone().collect::<C>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             MappedSelectExecutor::PostgreSQL(exec) => {
@@ -1419,7 +1419,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MySQL(exec) => {
                 MappedCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
             }
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             MappedSelectExecutor::NotImplemented(_) => {
                 panic!("MappedSelectExecutor::collect is not implemented for this backend")
             }
@@ -1439,8 +1439,8 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         M: 'static,
     {
         match self {
-            #[cfg(feature = "turso")]
-            MappedSelectExecutor::Turso(exec, _) => ModelCollectWithFuture::Turso(
+            #[cfg(feature = "sqlite")]
+            MappedSelectExecutor::Sqlite(exec, _) => ModelCollectWithFuture::Sqlite(
                 exec.collect_with::<C, F, M>(f),
                 std::marker::PhantomData,
             ),
@@ -1458,7 +1458,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 let future = exec_clone.collect::<Vec<V>>();
                 ModelCollectWithFuture::MySQLCollect(future, f, std::marker::PhantomData)
             }
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             MappedSelectExecutor::NotImplemented(_) => {
                 panic!("MappedSelectExecutor::collect_with is not implemented for this backend")
             }
@@ -1470,13 +1470,13 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
 impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a, T, V> {
     fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
         match self {
-            #[cfg(feature = "turso")]
-            MappedSelectExecutor::Turso(exec, _) => exec.to_subquery_sql(),
+            #[cfg(feature = "sqlite")]
+            MappedSelectExecutor::Sqlite(exec, _) => exec.to_subquery_sql(),
             #[cfg(feature = "postgresql")]
             MappedSelectExecutor::PostgreSQL(exec) => exec.to_subquery_sql(),
             #[cfg(feature = "mysql")]
             MappedSelectExecutor::MySQL(exec) => exec.to_subquery_sql(),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             MappedSelectExecutor::NotImplemented(_) => {
                 panic!("MappedSelectExecutor::to_subquery_sql is not implemented for this backend")
             }
@@ -1532,13 +1532,13 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 
     fn into_future(self) -> Self::IntoFuture {
         match self {
-            #[cfg(feature = "turso")]
-            MappedCollectFuture::Turso(future, _) => Box::pin(future.into_future()),
+            #[cfg(feature = "sqlite")]
+            MappedCollectFuture::Sqlite(future, _) => Box::pin(future.into_future()),
             #[cfg(feature = "postgresql")]
             MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mysql")]
             MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             MappedCollectFuture::NotImplemented(_) => {
                 panic!("MappedCollectFuture is not implemented for this backend")
             }
@@ -1559,8 +1559,8 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         match self {
-            #[cfg(feature = "turso")]
-            ModelCollectWithFuture::Turso(future, _) => Box::pin(future.into_future()),
+            #[cfg(feature = "sqlite")]
+            ModelCollectWithFuture::Sqlite(future, _) => Box::pin(future.into_future()),
             #[cfg(feature = "postgresql")]
             ModelCollectWithFuture::PostgreSQLCollect(future, mapper, _) => Box::pin(async move {
                 let vec = future.await?;
@@ -1571,7 +1571,7 @@ where
                 let vec = future.await?;
                 Ok(vec.into_iter().map(mapper).collect())
             }),
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             ModelCollectWithFuture::NotImplemented(_) => {
                 panic!("ModelCollectWithFuture is not implemented for this backend")
             }
@@ -1581,9 +1581,9 @@ where
 
 /// 统一的 SelectStream 枚举
 pub enum SelectStream<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::SelectStream<T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::SelectStream<T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -1596,9 +1596,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 创建流式查询执行器
     pub fn stream(self) -> SelectStream<'a, T> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectExecutor::Turso(exec, _) => {
-                SelectStream::Turso(exec.stream(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec, _) => {
+                SelectStream::Sqlite(exec.stream(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => SelectStream::PostgreSQL(exec.stream()),
@@ -1612,9 +1612,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
 /// 统一的 SelectStreamIterator 枚举
 pub enum SelectStreamIterator<'a, T: Model> {
-    #[cfg(feature = "turso")]
-    Turso(
-        turso_backend::SelectStreamIterator<T>,
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::SelectStreamIterator<T>,
         std::marker::PhantomData<&'a ()>,
     ),
     #[cfg(feature = "postgresql")]
@@ -1627,10 +1627,10 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
     pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectStream::Turso(stream, _) => {
+            #[cfg(feature = "sqlite")]
+            SelectStream::Sqlite(stream, _) => {
                 let iter = stream.into_iter().await?;
-                Ok(SelectStreamIterator::Turso(iter, std::marker::PhantomData))
+                Ok(SelectStreamIterator::Sqlite(iter, std::marker::PhantomData))
             }
             #[cfg(feature = "postgresql")]
             SelectStream::PostgreSQL(stream) => {
@@ -1642,7 +1642,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 let iter = stream.into_iter().await?;
                 Ok(SelectStreamIterator::MySQL(iter))
             }
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             _ => panic!("SelectStream is not implemented for this backend"),
         }
     }
@@ -1652,13 +1652,13 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
     pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
         match self {
-            #[cfg(feature = "turso")]
-            SelectStreamIterator::Turso(iter, _) => iter.next().await,
+            #[cfg(feature = "sqlite")]
+            SelectStreamIterator::Sqlite(iter, _) => iter.next().await,
             #[cfg(feature = "postgresql")]
             SelectStreamIterator::PostgreSQL(iter) => iter.next().await,
             #[cfg(feature = "mysql")]
             SelectStreamIterator::MySQL(iter) => iter.next().await,
-            #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
             _ => panic!("SelectStreamIterator is not implemented for this backend"),
         }
     }

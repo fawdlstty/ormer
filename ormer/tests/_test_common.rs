@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 /// 测试数据库配置模块
 /// 提供统一的数据库后端配置，支持在多个数据库上运行测试
@@ -17,9 +17,9 @@ pub type DbConfig = (DbType, &'static str);
 pub fn get_all_db_configs() -> Vec<DbConfig> {
     let mut configs = Vec::new();
 
-    // Turso 仅在启用 turso feature 时可用
-    #[cfg(feature = "turso")]
-    configs.push((DbType::Turso, ":memory:"));
+    // Sqlite 仅在启用 sqlite feature 时可用
+    #[cfg(feature = "sqlite")]
+    configs.push((DbType::Sqlite, ":memory:"));
 
     // PostgreSQL 仅在启用 postgresql feature 时可用
     #[cfg(feature = "postgresql")]
@@ -35,11 +35,11 @@ pub fn get_all_db_configs() -> Vec<DbConfig> {
     configs
 }
 
-/// 获取仅包含 Turso 的配置（用于快速测试或不支持多数据库的场景）
-#[cfg(feature = "turso")]
+/// 获取仅包含 Sqlite 的配置（用于快速测试或不支持多数据库的场景）
+#[cfg(feature = "sqlite")]
 #[allow(dead_code)]
-pub fn get_turso_config() -> Vec<DbConfig> {
-    vec![(DbType::Turso, ":memory:")]
+pub fn get_sqlite_config() -> Vec<DbConfig> {
+    vec![(DbType::Sqlite, ":memory:")]
 }
 
 /// 辅助函数：创建数据库连接
@@ -70,8 +70,8 @@ macro_rules! test_on_all_dbs {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
-                        #[cfg(feature = "turso")]
-                        ormer::DbType::Turso => "Turso",
+                        #[cfg(feature = "sqlite")]
+                        ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
                         #[cfg(feature = "mysql")]
@@ -106,8 +106,8 @@ macro_rules! test_on_all_dbs_result {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
-                        #[cfg(feature = "turso")]
-                        ormer::DbType::Turso => "Turso",
+                        #[cfg(feature = "sqlite")]
+                        ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
                         #[cfg(feature = "mysql")]
@@ -128,23 +128,23 @@ macro_rules! test_on_all_dbs_result {
     };
 }
 
-/// 宏：仅为 Turso 数据库生成测试（用于快速测试或有问题的功能）
+/// 宏：仅为 Sqlite 数据库生成测试（用于快速测试或有问题的功能）
 ///
 /// 使用方法：
 /// ```rust
-/// test_on_turso_only!(my_test_fn);
+/// test_on_sqlite_only!(my_test_fn);
 /// ```
 #[macro_export]
-#[cfg(feature = "turso")]
-macro_rules! test_on_turso_only {
+#[cfg(feature = "sqlite")]
+macro_rules! test_on_sqlite_only {
     ($test_fn:ident) => {
         paste::paste! {
             #[tokio::test]
-            async fn [<test_on_turso_ $test_fn>]() {
-                let configs = $crate::_test_common::get_turso_config();
+            async fn [<test_on_sqlite_ $test_fn>]() {
+                let configs = $crate::_test_common::get_sqlite_config();
 
                 for (idx, config) in configs.iter().enumerate() {
-                    let db_type_name = "Turso";
+                    let db_type_name = "Sqlite";
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);
 

@@ -86,7 +86,7 @@ struct Account {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Turso, "file:test.db").await?;
+    let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
     db.create_table::<Account>().execute().await?;
     
     db.insert(&Account { id: 1, name: "Alice".to_string(), balance: 1000.0 })

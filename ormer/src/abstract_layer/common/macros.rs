@@ -1,4 +1,4 @@
-/// 宏定义 - 用于减少重复代码
+﻿/// 宏定义 - 用于减少重复代码
 ///
 /// 本文件包含用于生成重复代码模式的宏
 /// 为 JOIN Executor 生成通用的 filter/range 方法
@@ -136,16 +136,16 @@ macro_rules! impl_executor_methods {
 /// 为统一的 SelectExecutor 生成方法（filter/order_by/range）
 #[macro_export]
 macro_rules! impl_unified_select_executor_methods {
-    ($executor_name:ident, $turso_phantom:expr) => {
+    ($executor_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.filter(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
@@ -160,9 +160,9 @@ macro_rules! impl_unified_select_executor_methods {
                 O: Into<$crate::OrderBy>,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.order_by(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.order_by(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -179,9 +179,9 @@ macro_rules! impl_unified_select_executor_methods {
                 O: Into<$crate::OrderBy>,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.order_by_desc(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.order_by_desc(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -194,9 +194,9 @@ macro_rules! impl_unified_select_executor_methods {
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.range(range), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -213,16 +213,16 @@ macro_rules! impl_unified_select_executor_methods {
 /// 为统一的 DeleteExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_delete_executor {
-    ($executor_name:ident, $turso_phantom:expr) => {
+    ($executor_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.filter(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
@@ -233,8 +233,8 @@ macro_rules! impl_unified_delete_executor {
 
             pub async fn execute(self) -> Result<u64, $crate::Error> {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => exec.execute().await,
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.execute().await,
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
@@ -258,16 +258,16 @@ macro_rules! impl_unified_delete_executor {
 /// 为统一的 UpdateExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_update_executor {
-    ($executor_name:ident, $turso_phantom:expr) => {
+    ($executor_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.filter(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
@@ -282,9 +282,9 @@ macro_rules! impl_unified_update_executor {
                 V: Into<$crate::model::Value>,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.set(field_fn, value), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.set(field_fn, value), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -297,8 +297,8 @@ macro_rules! impl_unified_update_executor {
 
             pub async fn execute(self) -> Result<u64, $crate::Error> {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => exec.execute().await,
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.execute().await,
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
@@ -322,7 +322,7 @@ macro_rules! impl_unified_update_executor {
 /// 为统一的 CollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_collect_future {
-    ($future_name:ident, $turso_phantom:expr) => {
+    ($future_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
             for $future_name<'a, T, C>
         {
@@ -332,8 +332,8 @@ macro_rules! impl_unified_collect_future {
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $future_name::Turso(future, _) => Box::pin(future.into_future()),
+                    #[cfg(feature = "sqlite")]
+                    $future_name::Sqlite(future, _) => Box::pin(future.into_future()),
                     #[cfg(feature = "postgresql")]
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
@@ -347,7 +347,7 @@ macro_rules! impl_unified_collect_future {
 /// 为统一的 AggregateFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_aggregate_future {
-    ($future_name:ident, $turso_phantom:expr) => {
+    ($future_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model + 'static, R: $crate::model::FromValue + 'static>
             std::future::IntoFuture for $future_name<'a, T, R>
         {
@@ -357,8 +357,8 @@ macro_rules! impl_unified_aggregate_future {
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $future_name::Turso(future, _) => Box::pin(async move { future.await }),
+                    #[cfg(feature = "sqlite")]
+                    $future_name::Sqlite(future, _) => Box::pin(async move { future.await }),
                     #[cfg(feature = "postgresql")]
                     $future_name::PostgreSQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "mysql")]
@@ -372,16 +372,16 @@ macro_rules! impl_unified_aggregate_future {
 /// 为统一的 JOIN Executor 生成 filter/range 方法
 #[macro_export]
 macro_rules! impl_unified_join_executor {
-    ($executor_name:ident, $turso_phantom:expr) => {
+    ($executor_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model, J: $crate::Model> $executor_name<'a, T, J> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> $crate::WhereExpr,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.filter(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
@@ -392,9 +392,9 @@ macro_rules! impl_unified_join_executor {
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.range(range), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -411,7 +411,7 @@ macro_rules! impl_unified_join_executor {
 /// 为统一的 JOIN CollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_join_collect_future {
-    ($future_name:ident, $output_type:ty, $turso_phantom:expr) => {
+    ($future_name:ident, $output_type:ty, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model + 'static, J: $crate::Model + 'static> std::future::IntoFuture
             for $future_name<'a, T, J>
         {
@@ -421,8 +421,8 @@ macro_rules! impl_unified_join_collect_future {
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $future_name::Turso(future, _) => Box::pin(future.into_future()),
+                    #[cfg(feature = "sqlite")]
+                    $future_name::Sqlite(future, _) => Box::pin(future.into_future()),
                     #[cfg(feature = "postgresql")]
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
@@ -436,16 +436,16 @@ macro_rules! impl_unified_join_collect_future {
 /// 为统一的 RelatedSelectExecutor 生成方法
 #[macro_export]
 macro_rules! impl_unified_related_select_executor {
-    ($executor_name:ident, $turso_phantom:expr) => {
+    ($executor_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model, R: $crate::Model> $executor_name<'a, T, R> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.filter(f), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.filter(f), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
@@ -456,9 +456,9 @@ macro_rules! impl_unified_related_select_executor {
 
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        $executor_name::Turso(exec.range(range), $turso_phantom)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        $executor_name::Sqlite(exec.range(range), $sqlite_phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -475,9 +475,9 @@ macro_rules! impl_unified_related_select_executor {
                 R: 'static,
             {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $executor_name::Turso(exec, _) => {
-                        RelatedCollectFuture::Turso(exec.exec(), std::marker::PhantomData)
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => {
+                        RelatedCollectFuture::Sqlite(exec.exec(), std::marker::PhantomData)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
@@ -510,7 +510,7 @@ macro_rules! impl_unified_related_select_executor {
 /// 为统一的 RelatedCollectFuture 生成 IntoFuture 实现
 #[macro_export]
 macro_rules! impl_unified_related_collect_future {
-    ($future_name:ident, $turso_phantom:expr) => {
+    ($future_name:ident, $sqlite_phantom:expr) => {
         impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> std::future::IntoFuture
             for $future_name<'a, T, R>
         {
@@ -520,8 +520,8 @@ macro_rules! impl_unified_related_collect_future {
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
-                    #[cfg(feature = "turso")]
-                    $future_name::Turso(future, _) => Box::pin(future.into_future()),
+                    #[cfg(feature = "sqlite")]
+                    $future_name::Sqlite(future, _) => Box::pin(future.into_future()),
                     #[cfg(feature = "postgresql")]
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
@@ -776,10 +776,10 @@ macro_rules! impl_backend_related_executor_methods_with_lifetime {
 /// 示例用法 (在实际代码中使用):
 ///
 /// ```ignore
-/// // 在 turso_backend.rs 中:
-/// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<turso::Connection>);
-/// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<turso::Connection>);
-/// ormer::impl_join_executor_methods!(RightJoinedSelectExecutor, conn, Arc<turso::Connection>);
+/// // 在 sqlite_backend.rs 中:
+/// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<Sqlite::Connection>);
+/// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<Sqlite::Connection>);
+/// ormer::impl_join_executor_methods!(RightJoinedSelectExecutor, conn, Arc<Sqlite::Connection>);
 ///
 /// // 在 mysql_backend.rs 中:
 /// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, pool, &'a Pool);

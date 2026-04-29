@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 use ormer::generate_create_table_sql;
 
@@ -19,8 +19,8 @@ mod create_table_tests {
         // 根据不同的数据库类型进行不同的断言
         #[allow(unreachable_patterns)]
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
                 assert!(sql.contains("id INTEGER PRIMARY KEY"));
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
@@ -47,8 +47,8 @@ mod create_table_tests {
         }
 
         let db_type_name = match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => "Turso",
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => "Sqlite",
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => "PostgreSQL",
             #[cfg(feature = "mysql")]
@@ -65,16 +65,16 @@ mod create_table_tests {
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
-                // Turso/SQLite 使用 INTEGER
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
+                // Sqlite/SQLite 使用 INTEGER
                 assert!(
                     sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
                 );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
-                println!("Turso SQL: {}", sql);
+                println!("Sqlite SQL: {}", sql);
             }
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
@@ -107,16 +107,16 @@ mod create_table_tests {
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
-                // Turso/SQLite 使用 INTEGER
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
+                // Sqlite/SQLite 使用 INTEGER
                 assert!(
                     sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
                 );
                 assert!(sql.contains("name TEXT NOT NULL"));
                 assert!(sql.contains("age INTEGER NOT NULL"));
                 assert!(sql.contains("email TEXT"));
-                println!("Turso SQL: {}", sql);
+                println!("Sqlite SQL: {}", sql);
             }
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
@@ -146,24 +146,24 @@ mod create_table_tests {
     async fn test_different_databases_produce_different_sql_impl(config: &_test_common::DbConfig) {
         let _ = config; // 避免未使用变量警告
         // 使用条件编译确保只使用已启用的数据库类型
-        #[cfg(all(feature = "turso", feature = "postgresql", feature = "mysql"))]
+        #[cfg(all(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
         {
             // 使用 TestCompleteTypes 来测试，因为它包含 bool 类型，在不同数据库中映射不同
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
             let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
             let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
 
             // 验证三个数据库生成的SQL确实不同
-            // Turso: bool -> INTEGER, String -> TEXT
+            // Sqlite: bool -> INTEGER, String -> TEXT
             // PostgreSQL: bool -> BOOLEAN, String -> TEXT
             // MySQL: bool -> TINYINT(1), String -> VARCHAR(255)
             assert_ne!(
                 turso_sql, pg_sql,
-                "Turso and PostgreSQL SQL should be different"
+                "Sqlite and PostgreSQL SQL should be different"
             );
             assert_ne!(
                 turso_sql, mysql_sql,
-                "Turso and MySQL SQL should be different"
+                "Sqlite and MySQL SQL should be different"
             );
             assert_ne!(
                 pg_sql, mysql_sql,
@@ -171,21 +171,21 @@ mod create_table_tests {
             );
         }
 
-        #[cfg(all(feature = "turso", feature = "postgresql", not(feature = "mysql")))]
+        #[cfg(all(feature = "sqlite", feature = "postgresql", not(feature = "mysql")))]
         {
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
             let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
             assert_ne!(turso_sql, pg_sql);
         }
 
-        #[cfg(all(feature = "turso", feature = "mysql", not(feature = "postgresql")))]
+        #[cfg(all(feature = "sqlite", feature = "mysql", not(feature = "postgresql")))]
         {
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Turso);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
             let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
             assert_ne!(turso_sql, mysql_sql);
         }
 
-        #[cfg(all(feature = "postgresql", feature = "mysql", not(feature = "turso")))]
+        #[cfg(all(feature = "postgresql", feature = "mysql", not(feature = "sqlite")))]
         {
             let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
             let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
@@ -199,9 +199,9 @@ mod create_table_tests {
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
-                // Turso 使用 INTEGER 和 TEXT
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
+                // Sqlite 使用 INTEGER 和 TEXT
                 assert!(
                     sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
                 );
@@ -210,7 +210,7 @@ mod create_table_tests {
                 assert!(sql.contains("optional_int INTEGER"));
                 assert!(sql.contains("bool_val INTEGER NOT NULL"));
                 assert!(sql.contains("optional_bool INTEGER"));
-                println!("Turso Complete Types SQL: {}", sql);
+                println!("Sqlite Complete Types SQL: {}", sql);
             }
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
@@ -245,9 +245,9 @@ mod create_table_tests {
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
-                // Turso 使用 INTEGER 和 TEXT
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
+                // Sqlite 使用 INTEGER 和 TEXT
                 assert!(
                     sql.contains("id SERIAL PRIMARY KEY") || sql.contains("id INTEGER PRIMARY KEY")
                 );
@@ -256,7 +256,7 @@ mod create_table_tests {
                 assert!(sql.contains("optional_int INTEGER"));
                 assert!(sql.contains("bool_val INTEGER NOT NULL"));
                 assert!(sql.contains("optional_bool INTEGER"));
-                println!("Turso Complete Types SQL: {}", sql);
+                println!("Sqlite Complete Types SQL: {}", sql);
             }
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => {
@@ -291,8 +291,8 @@ mod create_table_tests {
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => {
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => {
                 assert!(sql.contains("id INTEGER PRIMARY KEY"));
                 assert!(sql.contains("text_val TEXT NOT NULL"));
                 assert!(sql.contains("optional_text TEXT")); // 不加 NOT NULL
@@ -324,8 +324,8 @@ mod create_table_tests {
         }
 
         let db_type_name = match config.0 {
-            #[cfg(feature = "turso")]
-            ormer::DbType::Turso => "Turso",
+            #[cfg(feature = "sqlite")]
+            ormer::DbType::Sqlite => "Sqlite",
             #[cfg(feature = "postgresql")]
             ormer::DbType::PostgreSQL => "PostgreSQL",
             #[cfg(feature = "mysql")]

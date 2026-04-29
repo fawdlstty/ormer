@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 /// drop_table 功能测试
 mod _test_common;

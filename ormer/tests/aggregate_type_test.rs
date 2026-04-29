@@ -1,5 +1,5 @@
 // 测试聚合函数的编译期类型推断
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 

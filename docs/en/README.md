@@ -14,7 +14,7 @@ features:
   - title: Type Safety & Compile-time Optimization
     details: Leverage Rust's type system to catch errors at compile time, avoiding runtime exceptions with zero-cost abstractions
   - title: Multi-Database Support
-    details: Support for Turso (libSQL/SQLite), PostgreSQL, MySQL with unified API interface
+    details: Support for Sqlite (libSQL/SQLite), PostgreSQL, MySQL with unified API interface
   - title: Elegant Chain Query API
     details: Intuitive filtering, sorting, and pagination syntax with support for JOIN, aggregation, and subqueries
   - title: High-Performance Async Runtime

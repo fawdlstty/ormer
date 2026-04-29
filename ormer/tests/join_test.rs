@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
@@ -6,9 +6,9 @@ mod _test_common;
 define_test_user_for_join!(TestUserJoin, "test_join_users_1");
 define_test_role_for_join!(TestRoleJoin, "test_join_roles_1");
 
-#[cfg(not(feature = "turso"))]
+#[cfg(not(feature = "sqlite"))]
 define_test_user_for_join!(TestUserJoin2, "test_join_users_2");
-#[cfg(not(feature = "turso"))]
+#[cfg(not(feature = "sqlite"))]
 define_test_role_for_join!(TestRoleJoin2, "test_join_roles_2");
 
 define_test_user_for_join!(TestUserJoin3, "test_join_users_3");
@@ -77,8 +77,8 @@ async fn test_inner_join_impl(
 }
 
 /// 测试 RIGHT JOIN 查询
-/// 注意:SQLite/Turso 不支持 RIGHT JOIN,在Turso上跳过测试
-#[cfg(not(feature = "turso"))]
+/// 注意:SQLite/Sqlite 不支持 RIGHT JOIN,在Turso上跳过测试
+#[cfg(not(feature = "sqlite"))]
 async fn test_right_join_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -152,11 +152,11 @@ async fn test_right_join_impl(
 }
 
 /// Turso版本:跳过RIGHT JOIN测试
-#[cfg(feature = "turso")]
+#[cfg(feature = "sqlite")]
 async fn test_right_join_impl(
     _config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("⊘ Right join test skipped on Turso (SQLite doesn't support RIGHT JOIN)");
+    println!("⊘ Right join test skipped on Sqlite (SQLite doesn't support RIGHT JOIN)");
     Ok(())
 }
 

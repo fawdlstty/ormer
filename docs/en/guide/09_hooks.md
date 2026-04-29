@@ -1,4 +1,4 @@
-# Hooks System
+﻿# Hooks System
 
 ## Supported Hook Types
 
@@ -58,7 +58,7 @@ impl AfterInsert for User {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Turso, "mydb.db").await?;
+    let db = Database::connect(DbType::Sqlite, "mydb.db").await?;
     
     db.create_table::<User>().execute().await?;
     

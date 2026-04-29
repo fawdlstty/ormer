@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 use ormer::generate_create_table_sql;
 
@@ -12,7 +12,7 @@ async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfi
     let user_sql = generate_create_table_sql::<TestUser>(config.0);
     println!("User SQL: {}", user_sql);
 
-    // 验证 AUTOINCREMENT (Turso/SQLite) 或 SERIAL (PostgreSQL) 或 AUTO_INCREMENT (MySQL)
+    // 验证 AUTOINCREMENT (Sqlite/SQLite) 或 SERIAL (PostgreSQL) 或 AUTO_INCREMENT (MySQL)
     let has_auto_increment = user_sql.contains("AUTOINCREMENT")
         || user_sql.contains("SERIAL")
         || user_sql.contains("AUTO_INCREMENT");
@@ -21,7 +21,7 @@ async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfi
         "Should contain AUTOINCREMENT, SERIAL, or AUTO_INCREMENT"
     );
 
-    // 验证 name 字段的 UNIQUE（不同数据库类型不同：TEXT for Turso/PostgreSQL, VARCHAR for MySQL）
+    // 验证 name 字段的 UNIQUE（不同数据库类型不同：TEXT for Sqlite/PostgreSQL, VARCHAR for MySQL）
     let has_unique_name = user_sql.contains("name TEXT NOT NULL UNIQUE")
         || user_sql.contains("name VARCHAR(255) NOT NULL UNIQUE");
     assert!(has_unique_name, "name should be UNIQUE");

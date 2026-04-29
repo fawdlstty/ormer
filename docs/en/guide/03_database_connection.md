@@ -2,7 +2,7 @@
 
 ## Supported Databases
 
-- Turso/SQLite
+- Sqlite
 - PostgreSQL
 - MySQL
 
@@ -10,15 +10,15 @@
 
 ```toml
 [dependencies]
-ormer = { version = "0.1", features = ["turso"] }
+ormer = { version = "0.1", features = ["sqlite"] }
 ```
 
 ## Connection Strings
 
-**Turso/SQLite:**
+**Sqlite:**
 - Memory: `:memory:`
 - File: `file:test.db`
-- Remote: `libsql://url.turso.io?authToken=token`
+- Remote: `libsql://url.Sqlite.io?authToken=token`
 
 **PostgreSQL:**
 - `postgresql://user:password@localhost/dbname`
@@ -41,7 +41,7 @@ struct User {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Turso, "file:test.db").await?;
+    let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
     db.create_table::<User>().execute().await?;
     db.drop_table::<User>().execute().await?;
     Ok(())

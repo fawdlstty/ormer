@@ -1,4 +1,4 @@
-#![cfg(feature = "turso")]
+#![cfg(feature = "sqlite")]
 
 use ormer::Model;
 
@@ -14,7 +14,7 @@ struct TestUser {
 #[tokio::test]
 async fn test_auto_increment_insert() -> Result<(), Box<dyn std::error::Error>> {
     // 创建数据库连接
-    let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+    let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
 
     // 创建表
     db.create_table::<TestUser>().execute().await?;

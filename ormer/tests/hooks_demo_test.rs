@@ -56,9 +56,9 @@ impl AfterUpdate for HookDemoUser {
 
 #[tokio::test]
 async fn test_hooks_demo() {
-    #[cfg(feature = "turso")]
+    #[cfg(feature = "sqlite")]
     {
-        let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
+        let db = Database::connect(DbType::Sqlite, ":memory:").await.unwrap();
 
         // 创建表
         db.create_table::<HookDemoUser>().execute().await.unwrap();

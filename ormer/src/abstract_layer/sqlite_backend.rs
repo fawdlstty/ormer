@@ -15,10 +15,10 @@ use crate::impl_backend_executor_methods;
 use crate::impl_backend_join_executor_methods;
 use crate::impl_backend_related_executor_methods;
 
-/// Turso 类型映射器
-pub struct TursoTypeMapper;
+/// Sqlite 类型映射器
+pub struct SqliteTypeMapper;
 
-impl DbBackendTypeMapper for TursoTypeMapper {
+impl DbBackendTypeMapper for SqliteTypeMapper {
     fn sql_type(
         rust_type: &str,
         is_primary: bool,
@@ -45,7 +45,7 @@ impl DbBackendTypeMapper for TursoTypeMapper {
             }
         }
 
-        // 基础类型映射（SQLite/Turso 类型系统更简单）
+        // 基础类型映射（SQLite 类型系统更简单）
         let base_type = match rust_type {
             // 整数类型
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "INTEGER",
@@ -78,7 +78,7 @@ impl DbBackendTypeMapper for TursoTypeMapper {
     }
 }
 
-/// Turso 数据库连接封装
+/// Sqlite 数据库连接封装
 pub struct Database {
     conn: Arc<turso::Connection>,
 }
@@ -94,7 +94,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
     pub async fn execute(self) -> Result<(), crate::Error> {
         // 表不存在，创建新表
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
-            crate::abstract_layer::DbType::Turso,
+            crate::abstract_layer::DbType::Sqlite,
             self.table_name.as_deref(),
         );
 
@@ -155,7 +155,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 }
 
 impl Database {
-    /// 连接到 Turso 数据库 (本地模式)
+    /// 连接到 Sqlite 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> Result<Self, crate::Error> {
         let db = turso::Builder::new_local(path)
             .build()
@@ -313,7 +313,7 @@ impl Database {
             }
 
             // 检查列类型（只比较基础类型，不包含 NOT NULL 约束）
-            let expected_type = crate::abstract_layer::DbType::Turso.sql_type(
+            let expected_type = crate::abstract_layer::DbType::Sqlite.sql_type(
                 expected_col.rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
@@ -336,7 +336,7 @@ impl Database {
                 }
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
-                let full_type = crate::abstract_layer::DbType::Turso.sql_type(
+                let full_type = crate::abstract_layer::DbType::Sqlite.sql_type(
                     expected_col.rust_type,
                     false,
                     expected_col.is_auto_increment,
@@ -614,7 +614,7 @@ impl Database {
     }
 }
 
-/// Turso 事务对象
+/// Sqlite 事务对象
 pub struct Transaction {
     conn: Arc<turso::Connection>,
     committed: bool,
@@ -1177,7 +1177,7 @@ impl_backend_join_executor_methods!(
 impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     /// 获取 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        self.select.to_sql_with_params(DbType::Turso).0
+        self.select.to_sql_with_params(DbType::Sqlite).0
     }
 
     /// 执行查询并收集结果
@@ -1207,7 +1207,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1305,7 +1305,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner(self) -> Result<Vec<(T, J)>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1392,7 +1392,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner(self) -> Result<Vec<(Option<T>, J)>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1475,7 +1475,7 @@ impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::Into
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Turso);
+            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Sqlite);
 
             let values: Vec<turso::Value> = params
                 .into_iter()
@@ -1628,7 +1628,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
     }
 
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
             .map(|v| match v {
@@ -1694,7 +1694,7 @@ impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
 
 impl<T: Model> SelectExecutor<T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 将 ormer::Value 转换为 turso::Value
         let turso_params: Vec<turso::Value> = params
@@ -1797,7 +1797,7 @@ impl<T: Model> DeleteExecutor<T> {
                     &mut sql,
                     &mut param_idx,
                     &mut ormer_params,
-                    DbType::Turso,
+                    DbType::Sqlite,
                 );
             }
         }
@@ -1895,7 +1895,7 @@ impl<T: Model> UpdateExecutor<T> {
                     &mut sql,
                     &mut param_idx,
                     &mut ormer_params,
-                    DbType::Turso,
+                    DbType::Sqlite,
                 );
             }
         }
@@ -1991,7 +1991,7 @@ where
 impl<T: Model, V> MappedSelectExecutor<T, V> {
     /// 获取子查询的 SQL 和参数
     pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::Turso)
+        self.select.to_sql_with_params(DbType::Sqlite)
     }
 
     /// 执行查询并收集结果
@@ -2022,7 +2022,7 @@ impl<T: Model, V> MappedSelectExecutor<T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -2143,7 +2143,7 @@ impl<T: Model, V> GroupedSelectExecutor<T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.build_sql(DbType::Turso);
+        let (sql, params) = self.select.build_sql(DbType::Sqlite);
 
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -2204,7 +2204,7 @@ pub struct SelectStream<T: Model> {
 impl<T: Model + 'static> SelectStream<T> {
     /// 返回异步迭代器
     pub async fn into_iter(self) -> Result<SelectStreamIterator<T>, crate::Error> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Turso);
+        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 将 ormer::Value 转换为 turso::Value
         let turso_params: Vec<turso::Value> = params

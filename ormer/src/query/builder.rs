@@ -272,13 +272,17 @@ impl<T: Model, V> MappedSelect<T, V> {
     /// 生成 SQL（用于调试）
     pub fn to_sql(&self) -> String {
         // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "turso")]
-        let db_type = DbType::Turso;
-        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
         let db_type = DbType::PostgreSQL;
-        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -478,13 +482,17 @@ impl<T: Model, V> GroupedSelect<T, V> {
     /// 生成 SQL（用于调试）
     pub fn to_sql(&self) -> String {
         // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "turso")]
-        let db_type = DbType::Turso;
-        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
         let db_type = DbType::PostgreSQL;
-        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -763,13 +771,17 @@ impl<T: Model> Select<T> {
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
         // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "turso")]
-        let db_type = DbType::Turso;
-        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
         let db_type = DbType::PostgreSQL;
-        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -1560,13 +1572,17 @@ impl<T: ColumnValueType> IsInValues<T> for SubqueryParam {
 impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
     fn to_in_expr(self, column: String) -> WhereExpr {
         // 使用第一个可用的数据库类型
-        #[cfg(feature = "turso")]
-        let db_type = DbType::Turso;
-        #[cfg(all(not(feature = "turso"), feature = "postgresql"))]
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
         let db_type = DbType::PostgreSQL;
-        #[cfg(all(not(feature = "turso"), not(feature = "postgresql"), feature = "mysql"))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
         let db_type = DbType::None;
 
         let (sql, params) = self.to_sql_with_params(db_type);

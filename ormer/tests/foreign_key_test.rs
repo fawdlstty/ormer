@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
@@ -17,7 +17,7 @@ async fn test_foreign_key_creation_impl(
     db.create_table::<TestRole>().execute().await?;
 
     // 验证外键约束是否正确生成
-    // 在 Turso/SQLite 中，我们可以通过检查表结构来验证
+    // 在 Sqlite/SQLite 中，我们可以通过检查表结构来验证
     println!("Tables created successfully with foreign key constraints");
 
     // 插入测试数据

@@ -5,7 +5,7 @@
 
 [English](README.md) | 简体中文
 
-一款用法接近Linq的ORM框架，支持Turso(SQLite)、PostgresQL、MySQL。
+一款用法接近Linq的ORM框架，支持Sqlite、PostgresQL、MySQL。
 
 [在线文档](https://ormer.fawdlstty.com/)
 

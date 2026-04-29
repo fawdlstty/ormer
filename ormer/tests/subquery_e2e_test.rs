@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
@@ -85,12 +85,12 @@ fn test_subquery_with_params() {
 
     let (sql, params) = Select::<TestSubqueryPost>::new()
         .filter(|p| p.age.is_in(subquery))
-        .to_sql_with_params(DbType::Turso);
+        .to_sql_with_params(DbType::Sqlite);
 
     println!("SUBQUERY WITH PARAMS SQL: {}", sql);
     println!("Params: {:?}", params);
 
     assert!(sql.contains("WHERE age >"));
-    assert!(sql.contains("?")); // Turso uses ? for parameters
+    assert!(sql.contains("?")); // Sqlite uses ? for parameters
     assert!(!params.is_empty(), "Should have parameters");
 }

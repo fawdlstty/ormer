@@ -432,7 +432,7 @@ fn generate_indexes_with_name<T: Model>(
                     index_name, table_name, column.name
                 )
             } else {
-                // PostgreSQL 和 Turso (SQLite) 支持 IF NOT EXISTS
+                // PostgreSQL 和 Sqlite (SQLite) 支持 IF NOT EXISTS
                 format!(
                     "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
                     index_name, table_name, column.name

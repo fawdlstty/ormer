@@ -111,9 +111,9 @@ async fn test_hooks_with_database_insert() {
     // 测试使用数据库时的钩子调用
     reset_counters();
 
-    #[cfg(feature = "turso")]
+    #[cfg(feature = "sqlite")]
     {
-        let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
+        let db = Database::connect(DbType::Sqlite, ":memory:").await.unwrap();
 
         // 创建表
         db.create_table::<HookTestUser>().execute().await.unwrap();
@@ -137,9 +137,9 @@ async fn test_hooks_with_database_batch_insert() {
     // 测试批量插入时的钩子
     reset_counters();
 
-    #[cfg(feature = "turso")]
+    #[cfg(feature = "sqlite")]
     {
-        let db = Database::connect(DbType::Turso, ":memory:").await.unwrap();
+        let db = Database::connect(DbType::Sqlite, ":memory:").await.unwrap();
         db.create_table::<HookTestUser>().execute().await.unwrap();
 
         let users = vec![

@@ -100,8 +100,8 @@ impl FilterFormatter {
                         write!(sql, "{} {} {}", full_col_name, operator, param_placeholder)
                             .expect("Failed to write SQL WHERE clause");
                     }
-                    #[cfg(feature = "turso")]
-                    DbType::Turso => {
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
                         use std::fmt::Write;
                         let full_col_name = if !col_name.is_empty() {
                             format!("{}.{}", col_name, column)
@@ -122,7 +122,11 @@ impl FilterFormatter {
                         write!(sql, "{} {} ?", full_col_name, operator)
                             .expect("Failed to write SQL WHERE clause");
                     }
-                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    #[cfg(not(any(
+                        feature = "sqlite",
+                        feature = "postgresql",
+                        feature = "mysql"
+                    )))]
                     DbType::None => {
                         // 当没有启用任何特性时，仅用于编译通过
                         let _ = (column, operator, col_name);
@@ -174,8 +178,8 @@ impl FilterFormatter {
                             write!(sql, "${}", param_idx)
                                 .expect("Failed to write parameter placeholder");
                         }
-                        #[cfg(feature = "turso")]
-                        DbType::Turso => {
+                        #[cfg(feature = "sqlite")]
+                        DbType::Sqlite => {
                             sql.push('?');
                         }
                         #[cfg(feature = "mysql")]
@@ -183,7 +187,7 @@ impl FilterFormatter {
                             sql.push('?');
                         }
                         #[cfg(not(any(
-                            feature = "turso",
+                            feature = "sqlite",
                             feature = "postgresql",
                             feature = "mysql"
                         )))]

@@ -6,7 +6,7 @@ Ormer is a minimal, high-performance Rust ORM framework providing type-safe data
 
 - **Type Safety**: Compile-time type checking, strongly-typed query builder
 - **High Performance**: Zero-cost abstraction, async runtime, connection pool support
-- **Multi-Database**: Turso/SQLite, PostgreSQL, MySQL
+- **Multi-Database**: Sqlite, PostgreSQL, MySQL
 - **Elegant API**: Chainable queries, macro-driven models, intuitive syntax
 
 ## Query Capabilities
@@ -38,7 +38,7 @@ struct User {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect to database
-    let db = Database::connect(DbType::Turso, "file:test.db").await?;
+    let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
     
     // Create table
     db.create_table::<User>().execute().await?;

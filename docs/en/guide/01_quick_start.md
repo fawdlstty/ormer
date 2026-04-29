@@ -4,12 +4,12 @@
 
 ```toml
 [dependencies]
-ormer = { version = "0.1", features = ["turso"] }
+ormer = { version = "0.1", features = ["sqlite"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
 **Database Features:**
-- `turso` - Turso/libSQL/SQLite
+- `Sqlite` - Sqlite/libSQL/SQLite
 - `postgresql` - PostgreSQL
 - `mysql` - MySQL
 
@@ -32,7 +32,7 @@ struct User {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Connect to database
-    let db = Database::connect(DbType::Turso, "file:test.db").await?;
+    let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
     
     // 3. Create table
     db.create_table::<User>().execute().await?;
@@ -102,8 +102,8 @@ struct ModelName {
 ### Database Connection
 
 ```rust
-// Turso/SQLite
-let db = Database::connect(DbType::Turso, "file:test.db").await?;
+// Sqlite
+let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
 
 // PostgreSQL
 let db = Database::connect(

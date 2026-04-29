@@ -6,7 +6,7 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/fawdlstty/ormer"
 homepage = "https://github.com/fawdlstty/ormer"
-description = "An ORM framework with a usage style similar to Linq, supporting Turso(SQLite), PostgresQL, MySQL"
+description = "An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL"
 authors = ["fawdlstty<f@fawdlstty.com>"]
 keywords = ["orm", "database"]
 categories = []
@@ -25,7 +25,7 @@ ormer-derive = { version = "0.1.7", path = "../ormer-derive" }
 paste = "1.0"
 thiserror = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
-# turso
+# sqlite (底层使用turso库)
 turso = { version = "0.1", optional = true }
 # postgres
 postgres-types = { version = "0.2", optional = true }
@@ -45,8 +45,8 @@ all-features = true
 
 [features]
 default = []
-full = ["turso", "postgresql", "mysql"]
-turso = ["dep:turso"]
+full = ["sqlite", "postgresql", "mysql"]
+sqlite = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types"]
 mysql = ["dep:mysql_async"]
 

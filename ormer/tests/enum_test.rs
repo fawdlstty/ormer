@@ -30,10 +30,10 @@ struct TestEnumUserOptional {
 
 #[tokio::test]
 async fn test_enum_basic() {
-    #[cfg(feature = "turso")]
+    #[cfg(feature = "sqlite")]
     {
         use ormer::Database;
-        let db = Database::connect(ormer::DbType::Turso, ":memory:")
+        let db = Database::connect(ormer::DbType::Sqlite, ":memory:")
             .await
             .unwrap();
         let _ = db.drop_table::<TestEnumUser>().execute().await;
@@ -88,10 +88,10 @@ async fn test_enum_basic() {
 
 #[tokio::test]
 async fn test_enum_optional() {
-    #[cfg(feature = "turso")]
+    #[cfg(feature = "sqlite")]
     {
         use ormer::Database;
-        let db = Database::connect(ormer::DbType::Turso, ":memory:")
+        let db = Database::connect(ormer::DbType::Sqlite, ":memory:")
             .await
             .unwrap();
         let _ = db.drop_table::<TestEnumUserOptional>().execute().await;

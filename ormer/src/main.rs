@@ -33,9 +33,9 @@ struct NewRole(Role);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+    #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
     {
-        let db = ormer::Database::connect(ormer::DbType::Turso, ":memory:").await?;
+        let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
 
         db.create_table::<User>().execute().await?;
         db.create_table::<NewRole>().execute().await?;
@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
 
-    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
     {
         println!("No database features enabled");
     }

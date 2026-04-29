@@ -1,4 +1,4 @@
-use super::super::DbType;
+﻿use super::super::DbType;
 use crate::model::{Model, Row, Value};
 use crate::query::filter::FilterExpr;
 use std::collections::HashMap;
@@ -17,15 +17,15 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                 DbType::PostgreSQL => {
                     write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
                 }
-                #[cfg(feature = "turso")]
-                DbType::Turso => {
+                #[cfg(feature = "sqlite")]
+                DbType::Sqlite => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
-                #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                 DbType::None => {
                     // 当没有启用任何特性时，仅用于编译通过
                     let _ = (column, operator);
@@ -52,15 +52,15 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                     DbType::PostgreSQL => {
                         write!(sql, "${}", param_idx).unwrap();
                     }
-                    #[cfg(feature = "turso")]
-                    DbType::Turso => {
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
                         sql.push('?');
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
                         sql.push('?');
                     }
-                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                     DbType::None => {}
                 }
                 *param_idx += 1;
@@ -113,15 +113,15 @@ pub fn format_filter_with_params(
                 DbType::PostgreSQL => {
                     write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
                 }
-                #[cfg(feature = "turso")]
-                DbType::Turso => {
+                #[cfg(feature = "sqlite")]
+                DbType::Sqlite => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
                     write!(sql, "{} {} ?", column, operator).unwrap();
                 }
-                #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                 DbType::None => {
                     // 当没有启用任何特性时，仅用于编译通过
                     let _ = (column, operator);
@@ -145,8 +145,8 @@ pub fn format_filter_with_params(
                     sql.push_str(", ");
                 }
                 match db_type {
-                    #[cfg(feature = "turso")]
-                    DbType::Turso => {
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
                         sql.push('?');
                     }
                     #[cfg(feature = "postgresql")]
@@ -157,7 +157,7 @@ pub fn format_filter_with_params(
                     DbType::MySQL => {
                         sql.push('?');
                     }
-                    #[cfg(not(any(feature = "turso", feature = "postgresql", feature = "mysql")))]
+                    #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                     DbType::None => {}
                 }
                 params.push(value.clone().into());

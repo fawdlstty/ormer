@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
@@ -218,11 +218,11 @@ async fn test_stream_in_transaction_impl(config: &_test_common::DbConfig) {
 
 // 使用宏生成所有数据库的测试
 // 基础测试目前只在Turso上运行(PostgreSQL/MySQL需要数据库服务)
-test_on_turso_only!(test_stream_basic_impl);
-test_on_turso_only!(test_stream_with_filter_impl);
-test_on_turso_only!(test_stream_with_order_and_range_impl);
-test_on_turso_only!(test_stream_empty_result_impl);
-test_on_turso_only!(test_stream_in_transaction_impl);
+test_on_sqlite_only!(test_stream_basic_impl);
+test_on_sqlite_only!(test_stream_with_filter_impl);
+test_on_sqlite_only!(test_stream_with_order_and_range_impl);
+test_on_sqlite_only!(test_stream_empty_result_impl);
+test_on_sqlite_only!(test_stream_in_transaction_impl);
 
 // ==================== 新增测试用例 ====================
 
@@ -316,7 +316,7 @@ async fn test_stream_error_handling_impl(config: &_test_common::DbConfig) {
 /// 测试连接池中的流式查询
 async fn test_stream_with_connection_pool_impl(config: &_test_common::DbConfig) {
     // Turso后端连接池最大连接数必须为1
-    let pool = if config.0 == ormer::DbType::Turso {
+    let pool = if config.0 == ormer::DbType::Sqlite {
         ormer::Database::create_pool(config.0, config.1)
             .range(0..1)
             .build()
@@ -417,14 +417,14 @@ async fn test_stream_with_limit_impl(config: &_test_common::DbConfig) {
 
 // ==================== 新增测试注册 ====================
 
-// 大数据量测试 - 仅Turso(避免其他数据库需要准备环境)
-test_on_turso_only!(test_stream_large_dataset_impl);
+// 大数据量测试 - 仅Sqlite(避免其他数据库需要准备环境)
+test_on_sqlite_only!(test_stream_large_dataset_impl);
 
-// 错误处理测试 - 仅Turso
-test_on_turso_only!(test_stream_error_handling_impl);
+// 错误处理测试 - 仅Sqlite
+test_on_sqlite_only!(test_stream_error_handling_impl);
 
-// 连接池流式测试 - 仅Turso
-test_on_turso_only!(test_stream_with_connection_pool_impl);
+// 连接池流式测试 - 仅Sqlite
+test_on_sqlite_only!(test_stream_with_connection_pool_impl);
 
-// LIMIT测试 - 仅Turso
-test_on_turso_only!(test_stream_with_limit_impl);
+// LIMIT测试 - 仅Sqlite
+test_on_sqlite_only!(test_stream_with_limit_impl);

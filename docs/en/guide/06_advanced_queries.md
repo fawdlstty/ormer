@@ -227,7 +227,7 @@ struct Role {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Turso, "file:test.db").await?;
+    let db = Database::connect(DbType::Sqlite, "file:test.db").await?;
     db.create_table::<User>().execute().await?;
     db.create_table::<Role>().execute().await?;
     

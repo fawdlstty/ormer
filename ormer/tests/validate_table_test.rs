@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 mod _test_common;
 
@@ -13,7 +13,7 @@ define_test_user_simple!(
     "validate_table_novalidation_users_1"
 );
 
-#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 mod validate_table_tests {
     use super::*;
     use _test_common::{DbConfig, create_db_connection};

@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 use ormer::Model;
 use ormer::generate_create_table_sql;
@@ -37,7 +37,7 @@ mod tuple_wrapper_tests {
     #[tokio::test]
     async fn test_tuple_wrapper_sql_generation() {
         // 测试基础模型
-        let user_sql = generate_create_table_sql::<TestUser>(ormer::DbType::Turso);
+        let user_sql = generate_create_table_sql::<TestUser>(ormer::DbType::Sqlite);
         println!("TestUser SQL: {}", user_sql);
         assert!(user_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_test_users_1"));
         assert!(user_sql.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"));
@@ -46,7 +46,7 @@ mod tuple_wrapper_tests {
         assert!(user_sql.contains("email TEXT"));
 
         // 测试元组包装器模型 - 应该使用新的表名，但字段结构相同
-        let archive_sql = generate_create_table_sql::<ArchiveUser>(ormer::DbType::Turso);
+        let archive_sql = generate_create_table_sql::<ArchiveUser>(ormer::DbType::Sqlite);
         println!("ArchiveUser SQL: {}", archive_sql);
         assert!(archive_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_archive_users_1"));
         assert!(!archive_sql.contains("tuple_wrapper_test_users_1"));
@@ -57,7 +57,7 @@ mod tuple_wrapper_tests {
         assert!(archive_sql.contains("email TEXT"));
 
         // 测试另一个包装器
-        let temp_sql = generate_create_table_sql::<TempUser>(ormer::DbType::Turso);
+        let temp_sql = generate_create_table_sql::<TempUser>(ormer::DbType::Sqlite);
         println!("TempUser SQL: {}", temp_sql);
         assert!(temp_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_temp_users_1"));
         assert!(!temp_sql.contains("tuple_wrapper_test_users_1"));
@@ -156,7 +156,7 @@ mod tuple_wrapper_tests {
 
     #[tokio::test]
     async fn test_tuple_wrapper_crud_turso() {
-        let config: _test_common::DbConfig = (ormer::DbType::Turso, ":memory:");
+        let config: _test_common::DbConfig = (ormer::DbType::Sqlite, ":memory:");
         match test_tuple_wrapper_crud_impl(&config).await {
             Ok(_) => println!("✓ All tuple wrapper CRUD tests passed"),
             Err(e) => panic!("✗ Test failed: {}", e),

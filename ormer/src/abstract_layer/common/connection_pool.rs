@@ -1,4 +1,4 @@
-use super::super::DbType;
+﻿use super::super::DbType;
 use crate::model::Model;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{Mutex, Semaphore};
 
 // 导入统一的执行器类型
-#[cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 use super::unified::{CreateTableExecutor, DropTableExecutor};
 
 /// 连接池插入执行器
@@ -22,8 +22,8 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
         // 直接调用 PooledConnection 的 insert_batch 方法
         let refs = self.models.as_refs();
         match &self.pooled_conn.connection {
-            #[cfg(feature = "turso")]
-            Some(ConnectionWrapper::Turso(db)) => db.insert_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "sqlite")]
+            Some(ConnectionWrapper::Sqlite(db)) => db.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "postgresql")]
             Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_batch::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
@@ -47,8 +47,8 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
         // 直接调用 PooledConnection 的 insert_or_update_batch 方法
         let refs = self.models.as_refs();
         match &self.pooled_conn.connection {
-            #[cfg(feature = "turso")]
-            Some(ConnectionWrapper::Turso(db)) => {
+            #[cfg(feature = "sqlite")]
+            Some(ConnectionWrapper::Sqlite(db)) => {
                 db.insert_or_update_batch::<I::Model>(&refs).await
             }
             #[cfg(feature = "postgresql")]
@@ -67,8 +67,8 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
 }
 
 // 根据启用的 feature 导入后端实现
-#[cfg(feature = "turso")]
-use super::super::turso_backend;
+#[cfg(feature = "sqlite")]
+use super::super::sqlite_backend;
 
 #[cfg(feature = "postgresql")]
 use super::super::postgresql_backend;
@@ -78,8 +78,8 @@ use super::super::mysql_backend;
 
 /// 连接包装器 - 包装各后端的 Database 实例
 enum ConnectionWrapper {
-    #[cfg(feature = "turso")]
-    Turso(turso_backend::Database),
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::Database),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::Database),
     #[cfg(feature = "mysql")]
@@ -90,8 +90,8 @@ impl ConnectionWrapper {
     /// 检查连接是否有效
     async fn is_valid(&self) -> bool {
         match self {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.is_valid().await,
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.is_valid().await,
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => db.is_valid().await,
             #[cfg(feature = "mysql")]
@@ -133,11 +133,11 @@ impl ManualPool {
     /// 创建新的数据库连接
     async fn create_connection(&self) -> Result<ConnectionWrapper, crate::Error> {
         match self.db_type {
-            #[cfg(feature = "turso")]
-            DbType::Turso => {
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => {
                 let db =
-                    turso_backend::Database::connect(self.db_type, &self.connection_string).await?;
-                Ok(ConnectionWrapper::Turso(db))
+                    sqlite_backend::Database::connect(self.db_type, &self.connection_string).await?;
+                Ok(ConnectionWrapper::Sqlite(db))
             }
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
@@ -267,11 +267,11 @@ impl PoolBuilder {
 
     /// 构建连接池
     pub async fn build(self) -> Result<ConnectionPool, crate::Error> {
-        // 对于 turso 后端，连接池最大连接数必须为 1，超过 1 则报错
-        #[cfg(feature = "turso")]
-        if self.db_type == DbType::Turso && self.config.max_size > 1 {
+        // 对于 Sqlite 后端，连接池最大连接数必须为 1，超过 1 则报错
+        #[cfg(feature = "sqlite")]
+        if self.db_type == DbType::Sqlite && self.config.max_size > 1 {
             return Err(crate::Error::Database(
-                "Turso backend only supports a maximum of 1 connection in the pool".to_string(),
+                "Sqlite backend only supports a maximum of 1 connection in the pool".to_string(),
             ));
         }
 
@@ -283,8 +283,8 @@ impl PoolBuilder {
         }
 
         match self.db_type {
-            #[cfg(feature = "turso")]
-            DbType::Turso => Ok(ConnectionPool::Turso(pool)),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => Ok(ConnectionPool::Sqlite(pool)),
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => Ok(ConnectionPool::PostgreSQL(pool)),
             #[cfg(feature = "mysql")]
@@ -295,8 +295,8 @@ impl PoolBuilder {
 
 /// 统一的连接池枚举
 pub enum ConnectionPool {
-    #[cfg(feature = "turso")]
-    Turso(Arc<ManualPool>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<ManualPool>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(Arc<ManualPool>),
     #[cfg(feature = "mysql")]
@@ -310,15 +310,15 @@ impl ConnectionPool {
     /// 如果池中没有连接且未达到 max_size,会自动创建新连接
     pub async fn get(&self) -> Result<PooledConnection<'_>, crate::Error> {
         match self {
-            #[cfg(feature = "turso")]
-            ConnectionPool::Turso(pool) => {
+            #[cfg(feature = "sqlite")]
+            ConnectionPool::Sqlite(pool) => {
                 // 获取信号量 permit
                 let _permit = pool.semaphore.acquire().await.map_err(|e| {
                     crate::Error::Database(format!("Failed to acquire connection: {}", e))
                 })?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
-                    inner: PooledConnectionInner::Turso(pool.clone()),
+                    inner: PooledConnectionInner::Sqlite(pool.clone()),
                     connection: Some(conn),
                     _marker: PhantomData,
                 })
@@ -354,8 +354,8 @@ impl ConnectionPool {
 /// 连接池内部类型
 #[derive(Clone)]
 enum PooledConnectionInner {
-    #[cfg(feature = "turso")]
-    Turso(Arc<ManualPool>),
+    #[cfg(feature = "sqlite")]
+    Sqlite(Arc<ManualPool>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(Arc<ManualPool>),
     #[cfg(feature = "mysql")]
@@ -365,8 +365,8 @@ enum PooledConnectionInner {
 impl PooledConnectionInner {
     async fn return_connection(&self, conn: ConnectionWrapper) {
         match self {
-            #[cfg(feature = "turso")]
-            PooledConnectionInner::Turso(pool) => pool.return_connection(conn).await,
+            #[cfg(feature = "sqlite")]
+            PooledConnectionInner::Sqlite(pool) => pool.return_connection(conn).await,
             #[cfg(feature = "postgresql")]
             PooledConnectionInner::PostgreSQL(pool) => pool.return_connection(conn).await,
             #[cfg(feature = "mysql")]
@@ -404,9 +404,9 @@ impl<'a> PooledConnection<'a> {
     /// 创建表 - 返回执行器
     pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                CreateTableExecutor::Turso(db.create_table::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                CreateTableExecutor::Sqlite(db.create_table::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -420,8 +420,8 @@ impl<'a> PooledConnection<'a> {
     /// 验证表结构
     pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "mysql")]
@@ -453,9 +453,9 @@ impl<'a> PooledConnection<'a> {
     /// 创建 Select 查询执行器
     pub fn select<T: Model>(&self) -> super::unified::SelectExecutor<'_, T> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                super::unified::SelectExecutor::Turso(db.select::<T>(), PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                super::unified::SelectExecutor::Sqlite(db.select::<T>(), PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -474,9 +474,9 @@ impl<'a> PooledConnection<'a> {
     /// 创建 Delete 执行器
     pub fn delete<T: Model>(&self) -> super::unified::DeleteExecutor<'_, T> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                super::unified::DeleteExecutor::Turso(db.delete::<T>(), PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                super::unified::DeleteExecutor::Sqlite(db.delete::<T>(), PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -490,9 +490,9 @@ impl<'a> PooledConnection<'a> {
     /// 创建 Update 执行器
     pub fn update<T: Model>(&self) -> super::unified::UpdateExecutor<'_, T> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                super::unified::UpdateExecutor::Turso(db.update::<T>(), PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                super::unified::UpdateExecutor::Sqlite(db.update::<T>(), PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -508,9 +508,9 @@ impl<'a> PooledConnection<'a> {
         &self,
     ) -> super::unified::RelatedSelectExecutor<'_, T, R> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                super::unified::RelatedSelectExecutor::Turso(db.related::<T, R>(), PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                super::unified::RelatedSelectExecutor::Sqlite(db.related::<T, R>(), PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -526,10 +526,10 @@ impl<'a> PooledConnection<'a> {
     /// 开始事务
     pub async fn begin(&self) -> Result<super::unified::Transaction<'_>, crate::Error> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
                 let txn = db.begin().await?;
-                Ok(super::unified::Transaction::Turso(txn, PhantomData))
+                Ok(super::unified::Transaction::Sqlite(txn, PhantomData))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -547,9 +547,9 @@ impl<'a> PooledConnection<'a> {
     /// 删除表 - 返回执行器
     pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => {
-                DropTableExecutor::Turso(db.drop_table::<T>(), std::marker::PhantomData)
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                DropTableExecutor::Sqlite(db.drop_table::<T>(), std::marker::PhantomData)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
@@ -563,8 +563,8 @@ impl<'a> PooledConnection<'a> {
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.exec_table::<T>(sql).await,
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.exec_table::<T>(sql).await,
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => db.exec_table::<T>(sql).await,
             #[cfg(feature = "mysql")]
@@ -575,8 +575,8 @@ impl<'a> PooledConnection<'a> {
     /// 执行原生非查询 SQL
     pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
         match self.get_connection() {
-            #[cfg(feature = "turso")]
-            ConnectionWrapper::Turso(db) => db.exec_non_query(sql).await,
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.exec_non_query(sql).await,
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => db.exec_non_query(sql).await,
             #[cfg(feature = "mysql")]

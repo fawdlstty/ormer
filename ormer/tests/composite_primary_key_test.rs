@@ -1,4 +1,4 @@
-#![cfg(any(feature = "turso", feature = "postgresql", feature = "mysql"))]
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 use ormer::Model;
 use ormer::generate_create_table_sql;
@@ -33,8 +33,8 @@ mod composite_primary_key_tests {
 
     #[test]
     fn test_composite_pk_sql_generation() {
-        // 测试 Turso (SQLite) 的 SQL 生成
-        let sql = generate_create_table_sql::<UserRole>(ormer::DbType::Turso);
+        // 测试 Sqlite (SQLite) 的 SQL 生成
+        let sql = generate_create_table_sql::<UserRole>(ormer::DbType::Sqlite);
         println!("UserRole SQL: {}", sql);
 
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS composite_pk_user_roles_1"));
@@ -48,7 +48,7 @@ mod composite_primary_key_tests {
     #[test]
     fn test_composite_pk_with_auto_sql_generation() {
         // 测试带 auto 的复合主键
-        let sql = generate_create_table_sql::<OrderItem>(ormer::DbType::Turso);
+        let sql = generate_create_table_sql::<OrderItem>(ormer::DbType::Sqlite);
         println!("OrderItem SQL: {}", sql);
 
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS composite_pk_auto_test_1"));
@@ -88,7 +88,7 @@ mod composite_primary_key_tests {
     #[test]
     fn test_composite_pk_multiple_databases() {
         // 测试不同数据库的 SQL 生成
-        let sql_turso = generate_create_table_sql::<UserRole>(ormer::DbType::Turso);
+        let sql_turso = generate_create_table_sql::<UserRole>(ormer::DbType::Sqlite);
         assert!(sql_turso.contains("PRIMARY KEY (user_id, role_id)"));
 
         #[cfg(feature = "postgresql")]

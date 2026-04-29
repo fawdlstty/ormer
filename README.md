@@ -5,7 +5,7 @@
 
 English | [简体中文](README.zh.md)
 
-An ORM framework with a usage style similar to Linq, supporting Turso(SQLite), PostgresQL, MySQL.
+An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL.
 
 [Online Documentation](https://ormer.fawdlstty.com/en/)
 
