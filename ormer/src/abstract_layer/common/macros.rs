@@ -233,7 +233,7 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
-            pub async fn execute(self) -> Result<u64, $crate::Error> {
+            pub async fn execute(self) -> anyhow::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -248,7 +248,7 @@ macro_rules! impl_unified_delete_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = Result<u64, $crate::Error>;
+            type Output = anyhow::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -303,7 +303,7 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
-            pub async fn execute(self) -> Result<u64, $crate::Error> {
+            pub async fn execute(self) -> anyhow::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -318,7 +318,7 @@ macro_rules! impl_unified_update_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = Result<u64, $crate::Error>;
+            type Output = anyhow::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -336,7 +336,7 @@ macro_rules! impl_unified_collect_future {
         impl<'a, T: $crate::Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
             for $future_name<'a, T, C>
         {
-            type Output = Result<C, $crate::Error>;
+            type Output = anyhow::Result<C>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -363,7 +363,7 @@ macro_rules! impl_unified_aggregate_future {
         impl<'a, T: $crate::Model + 'static, R: $crate::model::FromValue + 'static>
             std::future::IntoFuture for $future_name<'a, T, R>
         {
-            type Output = Result<R, $crate::Error>;
+            type Output = anyhow::Result<R>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -540,7 +540,7 @@ macro_rules! impl_unified_related_collect_future {
         impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> std::future::IntoFuture
             for $future_name<'a, T, R>
         {
-            type Output = Result<Vec<T>, $crate::Error>;
+            type Output = anyhow::Result<Vec<T>>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 

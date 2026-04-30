@@ -141,7 +141,8 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
         }
         println!("  Streamed {} users in transaction", count);
 
-        // 提交事务（流已经被 Drop）
+        // 提交事务前必须先 drop stream，释放对 txn 的借用
+        drop(stream);
         txn.commit().await.unwrap();
     }
 
@@ -153,62 +154,62 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_stream_connection_release_sqlite() {
-    let config = _test_common::DbConfig::sqlite_memory();
+    let config = (ormer::DbType::Sqlite, ":memory:");
     test_stream_connection_release_impl(&config).await;
 }
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_stream_early_termination_sqlite() {
-    let config = _test_common::DbConfig::sqlite_memory();
+    let config = (ormer::DbType::Sqlite, ":memory:");
     test_stream_early_termination_impl(&config).await;
 }
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn test_stream_in_transaction_release_sqlite() {
-    let config = _test_common::DbConfig::sqlite_memory();
+    let config = (ormer::DbType::Sqlite, ":memory:");
     test_stream_in_transaction_release_impl(&config).await;
 }
 
 #[cfg(feature = "postgresql")]
 #[tokio::test]
 async fn test_stream_connection_release_postgresql() {
-    let config = _test_common::DbConfig::postgresql();
+    let config = _test_common::postgresql_config();
     test_stream_connection_release_impl(&config).await;
 }
 
 #[cfg(feature = "postgresql")]
 #[tokio::test]
 async fn test_stream_early_termination_postgresql() {
-    let config = _test_common::DbConfig::postgresql();
+    let config = _test_common::postgresql_config();
     test_stream_early_termination_impl(&config).await;
 }
 
 #[cfg(feature = "postgresql")]
 #[tokio::test]
 async fn test_stream_in_transaction_release_postgresql() {
-    let config = _test_common::DbConfig::postgresql();
+    let config = _test_common::postgresql_config();
     test_stream_in_transaction_release_impl(&config).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn test_stream_connection_release_mysql() {
-    let config = _test_common::DbConfig::mysql();
+    let config = _test_common::mysql_config();
     test_stream_connection_release_impl(&config).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn test_stream_early_termination_mysql() {
-    let config = _test_common::DbConfig::mysql();
+    let config = _test_common::mysql_config();
     test_stream_early_termination_impl(&config).await;
 }
 
 #[cfg(feature = "mysql")]
 #[tokio::test]
 async fn test_stream_in_transaction_release_mysql() {
-    let config = _test_common::DbConfig::mysql();
+    let config = _test_common::mysql_config();
     test_stream_in_transaction_release_impl(&config).await;
 }

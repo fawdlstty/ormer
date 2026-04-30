@@ -98,7 +98,7 @@ impl FilterFormatter {
                             format!("${}", param_idx)
                         };
                         write!(sql, "{} {} {}", full_col_name, operator, param_placeholder)
-                            .expect("Failed to write SQL WHERE clause");
+                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
                     }
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => {
@@ -109,7 +109,7 @@ impl FilterFormatter {
                             column.clone()
                         };
                         write!(sql, "{} {} ?", full_col_name, operator)
-                            .expect("Failed to write SQL WHERE clause");
+                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
@@ -120,17 +120,14 @@ impl FilterFormatter {
                             column.clone()
                         };
                         write!(sql, "{} {} ?", full_col_name, operator)
-                            .expect("Failed to write SQL WHERE clause");
+                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
                     }
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
                         feature = "mysql"
                     )))]
-                    DbType::None => {
-                        // 当没有启用任何特性时，仅用于编译通过
-                        let _ = (column, operator, col_name);
-                    }
+                    DbType::None => panic!("No database backend available"),
                 }
                 // 转换 filter Value 到 ormer Value
                 let ormer_value = Self::convert_filter_value(value);
@@ -156,7 +153,7 @@ impl FilterFormatter {
 
                 use std::fmt::Write;
                 write!(sql, "{} {} {}", left_col, operator, right_col)
-                    .expect("Failed to write column comparison SQL");
+                    .unwrap_or_else(|e| panic!("Failed to write column comparison SQL: {}", e));
             }
             FilterExpr::In { column, values } => {
                 // 生成 IN 语句: column IN (?, ?, ...)
@@ -167,7 +164,8 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} IN (", col_name).expect("Failed to write IN clause");
+                write!(sql, "{} IN (", col_name)
+                    .unwrap_or_else(|e| panic!("Failed to write IN clause: {}", e));
                 for (i, value) in values.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
@@ -175,8 +173,9 @@ impl FilterFormatter {
                     match self.db_type {
                         #[cfg(feature = "postgresql")]
                         DbType::PostgreSQL => {
-                            write!(sql, "${}", param_idx)
-                                .expect("Failed to write parameter placeholder");
+                            write!(sql, "${}", param_idx).unwrap_or_else(|e| {
+                                panic!("Failed to write parameter placeholder: {}", e)
+                            });
                         }
                         #[cfg(feature = "sqlite")]
                         DbType::Sqlite => {
@@ -191,7 +190,7 @@ impl FilterFormatter {
                             feature = "postgresql",
                             feature = "mysql"
                         )))]
-                        DbType::None => {}
+                        DbType::None => panic!("No database backend available"),
                     }
                     // 转换 filter Value 到 ormer Value
                     let ormer_value = Self::convert_filter_value(value);
@@ -214,7 +213,7 @@ impl FilterFormatter {
 
                 use std::fmt::Write;
                 write!(sql, "{} IN ({})", col_name, subquery_sql)
-                    .expect("Failed to write subquery IN clause");
+                    .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
 
                 // 添加子查询的参数
                 for param in subquery_params {
@@ -239,8 +238,14 @@ impl FilterFormatter {
     fn convert_filter_value(value: &FilterValue) -> Value {
         match value {
             FilterValue::Integer(v) => Value::Integer(*v),
+            FilterValue::BigInt(v) => Value::BigInt(*v),
             FilterValue::Text(v) => Value::Text(v.clone()),
             FilterValue::Real(v) => Value::Real(*v),
+            FilterValue::Boolean(v) => Value::Boolean(*v),
+            FilterValue::Bytes(v) => Value::Bytes(v.clone()),
+            FilterValue::DateTime(v) => Value::DateTime(v.clone()),
+            FilterValue::Json(v) => Value::Json(v.clone()),
+            FilterValue::Uuid(v) => Value::Uuid(*v),
             FilterValue::Null => Value::Null,
         }
     }

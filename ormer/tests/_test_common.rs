@@ -52,6 +52,27 @@ pub async fn create_db_connection(
     Ok(db)
 }
 
+#[cfg(feature = "sqlite")]
+#[allow(dead_code)]
+pub fn sqlite_config() -> DbConfig {
+    (DbType::Sqlite, ":memory:")
+}
+
+#[cfg(feature = "postgresql")]
+#[allow(dead_code)]
+pub fn postgresql_config() -> DbConfig {
+    (
+        DbType::PostgreSQL,
+        "postgres://postgres:postgres@localhost:5432/ormer_test",
+    )
+}
+
+#[cfg(feature = "mysql")]
+#[allow(dead_code)]
+pub fn mysql_config() -> DbConfig {
+    (DbType::MySQL, "mysql://root:root@localhost:3306/ormer_test")
+}
+
 /// 宏：为所有数据库后端生成测试（用于返回 () 的函数）
 ///
 /// 使用方法：
@@ -70,6 +91,8 @@ macro_rules! test_on_all_dbs {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
+                        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                        ormer::DbType::None => "Unknown",
                         #[cfg(feature = "sqlite")]
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
@@ -90,12 +113,6 @@ macro_rules! test_on_all_dbs {
     };
 }
 
-/// 宏：为所有数据库后端生成测试（使用 Result 返回类型）
-///
-/// 使用方法：
-/// ```rust
-/// test_on_all_dbs_result!(my_test_fn);
-/// ```
 #[macro_export]
 macro_rules! test_on_all_dbs_result {
     ($test_fn:ident) => {
@@ -106,6 +123,8 @@ macro_rules! test_on_all_dbs_result {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
+                        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                        ormer::DbType::None => "Unknown",
                         #[cfg(feature = "sqlite")]
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]

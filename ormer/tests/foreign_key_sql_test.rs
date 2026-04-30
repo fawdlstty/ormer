@@ -6,9 +6,11 @@ mod _test_common;
 define_test_user_for_fk!(VerifyUser, "verify_fk_users_1");
 define_test_role_for_fk!(VerifyRole, "verify_fk_roles_1", VerifyUser);
 
-async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
+async fn test_foreign_key_sql_generation_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 验证生成的 CREATE TABLE SQL 包含外键约束
-    let sql = ormer::model::generate_create_table_sql::<VerifyRole>(config.0);
+    let sql = ormer::model::generate_create_table_sql::<VerifyRole>(config.0)?;
 
     println!("Generated SQL:\n{}", sql);
 
@@ -33,6 +35,7 @@ async fn test_foreign_key_sql_generation_impl(config: &_test_common::DbConfig) {
     );
 
     println!("Foreign key SQL generation test passed!");
+    Ok(())
 }
 
-test_on_all_dbs!(test_foreign_key_sql_generation_impl);
+test_on_all_dbs_result!(test_foreign_key_sql_generation_impl);

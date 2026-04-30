@@ -19,37 +19,29 @@ struct AgeGroupStats {
 }
 
 impl FromRowValues for AgeGroupStats {
-    fn from_row_values(values: &[Value]) -> Result<Self, ormer::Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.len() < 3 {
-            return Err(ormer::Error::Database(
-                "Expected at least 3 values".to_string(),
-            ));
+            return Err(anyhow::anyhow!("Expected at least 3 values"));
         }
 
         let age = match &values[0] {
             Value::Integer(i) => *i as i32,
             _ => {
-                return Err(ormer::Error::Database(
-                    "Expected integer for age".to_string(),
-                ));
+                return Err(anyhow::anyhow!("Expected integer for age"));
             }
         };
 
         let user_count = match &values[1] {
             Value::Integer(i) => *i,
             _ => {
-                return Err(ormer::Error::Database(
-                    "Expected integer for user_count".to_string(),
-                ));
+                return Err(anyhow::anyhow!("Expected integer for user_count"));
             }
         };
 
         let avg_score = match &values[2] {
             Value::Real(f) => *f,
             _ => {
-                return Err(ormer::Error::Database(
-                    "Expected real for avg_score".to_string(),
-                ));
+                return Err(anyhow::anyhow!("Expected real for avg_score"));
             }
         };
 

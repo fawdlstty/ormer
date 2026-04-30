@@ -8,8 +8,8 @@ define_test_user!(ExecTestUser2, "exec_test_users_2");
 define_test_user!(ExecTestUser3, "exec_test_users_3");
 define_test_user!(ExecTestUser4, "exec_test_users_4");
 
-/// 测试 exec_table 方法 - 执行原生 SQL 查询并返回模型列表
-async fn test_exec_table_impl(
+/// 测试 execute 方法 - 执行原生 SQL 查询并返回模型列表
+async fn test_execute_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -49,9 +49,9 @@ async fn test_exec_table_impl(
     .execute()
     .await?;
 
-    // 测试 exec_table - 查询所有用户
+    // 测试 execute - 查询所有用户
     let users = db
-        .exec_table::<ExecTestUser1>("SELECT * FROM exec_test_users_1;")
+        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1;")
         .await?;
 
     assert_eq!(users.len(), 3);
@@ -59,25 +59,25 @@ async fn test_exec_table_impl(
     assert_eq!(users[1].name, "Bob");
     assert_eq!(users[2].name, "Charlie");
 
-    // 测试 exec_table - 带 WHERE 条件的查询
+    // 测试 execute - 带 WHERE 条件的查询
     let young_users = db
-        .exec_table::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age < 30;")
+        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age < 30;")
         .await?;
 
     assert_eq!(young_users.len(), 1);
     assert_eq!(young_users[0].name, "Alice");
     assert_eq!(young_users[0].age, 25);
 
-    // 测试 exec_table - 空结果
+    // 测试 execute - 空结果
     let old_users = db
-        .exec_table::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age > 100;")
+        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age > 100;")
         .await?;
 
     assert_eq!(old_users.len(), 0);
 
-    // 测试 exec_table - 排序查询
+    // 测试 execute - 排序查询
     let sorted_users = db
-        .exec_table::<ExecTestUser1>("SELECT * FROM exec_test_users_1 ORDER BY age DESC;")
+        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 ORDER BY age DESC;")
         .await?;
 
     assert_eq!(sorted_users.len(), 3);
@@ -144,7 +144,7 @@ async fn test_exec_non_query_impl(
 
     // 验证更新结果
     let users = db
-        .exec_table::<ExecTestUser2>("SELECT * FROM exec_test_users_2 ORDER BY id;")
+        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2 ORDER BY id;")
         .await?;
 
     assert_eq!(users[0].age, 25); // Alice 未变
@@ -162,7 +162,7 @@ async fn test_exec_non_query_impl(
 
     // 验证删除结果
     let users = db
-        .exec_table::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
         .await?;
 
     assert_eq!(users.len(), 2); // 只剩下 Bob 和 Charlie
@@ -178,7 +178,7 @@ async fn test_exec_non_query_impl(
 
     // 验证插入结果
     let users = db
-        .exec_table::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
         .await?;
 
     assert_eq!(users.len(), 3); // 现在有 3 个用户
@@ -196,8 +196,8 @@ async fn test_exec_non_query_impl(
     Ok(())
 }
 
-/// 测试 exec_table 和 exec_non_query 的组合使用
-async fn test_exec_table_and_non_query_combined_impl(
+/// 测试 execute 和 exec_non_query 的组合使用
+async fn test_execute_and_non_query_combined_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -218,9 +218,9 @@ async fn test_exec_table_and_non_query_combined_impl(
     )
     .await?;
 
-    // 使用 exec_table 查询数据
+    // 使用 execute 查询数据
     let users = db
-        .exec_table::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
         .await?;
 
     assert_eq!(users.len(), 3);
@@ -237,7 +237,7 @@ async fn test_exec_table_and_non_query_combined_impl(
 
     // 验证批量更新
     let users = db
-        .exec_table::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
         .await?;
 
     assert_eq!(users[0].age, 30);
@@ -253,7 +253,7 @@ async fn test_exec_table_and_non_query_combined_impl(
 
     // 验证表为空
     let users = db
-        .exec_table::<ExecTestUser3>("SELECT * FROM exec_test_users_3;")
+        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3;")
         .await?;
 
     assert_eq!(users.len(), 0);
@@ -264,8 +264,8 @@ async fn test_exec_table_and_non_query_combined_impl(
     Ok(())
 }
 
-/// 测试 exec_table 处理 NULL 值
-async fn test_exec_table_with_null_values_impl(
+/// 测试 execute 处理 NULL 值
+async fn test_execute_with_null_values_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -287,7 +287,7 @@ async fn test_exec_table_with_null_values_impl(
 
     // 查询并验证 NULL 值处理
     let users = db
-        .exec_table::<ExecTestUser4>("SELECT * FROM exec_test_users_4 ORDER BY id;")
+        .execute::<ExecTestUser4>("SELECT * FROM exec_test_users_4 ORDER BY id;")
         .await?;
 
     assert_eq!(users.len(), 2);
@@ -302,7 +302,7 @@ async fn test_exec_table_with_null_values_impl(
     Ok(())
 }
 
-test_on_all_dbs_result!(test_exec_table_impl);
+test_on_all_dbs_result!(test_execute_impl);
 test_on_all_dbs_result!(test_exec_non_query_impl);
-test_on_all_dbs_result!(test_exec_table_and_non_query_combined_impl);
-test_on_all_dbs_result!(test_exec_table_with_null_values_impl);
+test_on_all_dbs_result!(test_execute_and_non_query_combined_impl);
+test_on_all_dbs_result!(test_execute_with_null_values_impl);

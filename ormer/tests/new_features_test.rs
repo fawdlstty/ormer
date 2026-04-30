@@ -8,8 +8,10 @@ mod _test_common;
 define_test_user!(TestUser, "test_new_features_users_1");
 define_test_role_with_unique_group!(TestRole, "test_new_features_roles_1");
 
-async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfig) {
-    let user_sql = generate_create_table_sql::<TestUser>(config.0);
+async fn test_generate_sql_with_new_features_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let user_sql = generate_create_table_sql::<TestUser>(config.0)?;
     println!("User SQL: {}", user_sql);
 
     // 验证 AUTOINCREMENT (Sqlite/SQLite) 或 SERIAL (PostgreSQL) 或 AUTO_INCREMENT (MySQL)
@@ -36,7 +38,7 @@ async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfi
         "Should have index on age"
     );
 
-    let role_sql = generate_create_table_sql::<TestRole>(config.0);
+    let role_sql = generate_create_table_sql::<TestRole>(config.0)?;
     println!("Role SQL: {}", role_sql);
 
     // 验证没有 AUTOINCREMENT/SERIAL/AUTO_INCREMENT（因为主键没有 auto）
@@ -53,6 +55,7 @@ async fn test_generate_sql_with_new_features_impl(config: &_test_common::DbConfi
         role_sql.contains("UNIQUE (uid, name)"),
         "Should have UNIQUE (uid, name)"
     );
+    Ok(())
 }
 
-test_on_all_dbs!(test_generate_sql_with_new_features_impl);
+test_on_all_dbs_result!(test_generate_sql_with_new_features_impl);

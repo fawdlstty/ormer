@@ -25,9 +25,10 @@ mod connection_pool_tests {
         let _ = _test_common::create_db_connection(&config).await?;
 
         // 创建连接池，min=0 表示创建时不建立连接
-        // Sqlite 后端限制最大连接数为 1
+        // SQLite 建议使用单连接池（max_size=1）以避免并发写入冲突
+        // 如需并发支持，可考虑启用 MVCC 模式（PRAGMA journal_mode = 'mvcc'）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
@@ -48,8 +49,9 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_insert_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
@@ -94,12 +96,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_select_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 插入测试数据并查询 - 使用同一个连接完成所有操作（Sqlite 连接池大小为 1）
+        // 插入测试数据并查询 - 使用同一个连接完成所有操作（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
             conn.create_table::<PoolTestUser>().execute().await?;
@@ -137,12 +140,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_filter_select_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 插入测试数据并进行过滤查询 - 使用同一个连接（Sqlite 连接池大小为 1）
+        // 插入测试数据并进行过滤查询 - 使用同一个连接（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
             conn.create_table::<PoolTestUser>().execute().await?;
@@ -177,12 +181,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_update_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 插入、更新和验证 - 使用同一个连接（Sqlite 连接池大小为 1）
+        // 插入、更新和验证 - 使用同一个连接（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
             conn.create_table::<PoolTestUser>().execute().await?;
@@ -226,12 +231,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_delete_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 插入、删除和验证 - 使用同一个连接（Sqlite 连接池大小为 1）
+        // 插入、删除和验证 - 使用同一个连接（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
             conn.create_table::<PoolTestUser>().execute().await?;
@@ -277,8 +283,9 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_transaction_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
@@ -323,12 +330,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_aggregate_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 插入测试数据和聚合查询 - 使用同一个连接（Sqlite 连接池大小为 1）
+        // 插入测试数据和聚合查询 - 使用同一个连接（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
             conn.create_table::<PoolTestUser>().execute().await?;
@@ -370,12 +378,13 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_multiple_get_return_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
-        // 多次操作 - 使用同一个连接（Sqlite 连接池大小为 1）
+        // 多次操作 - 使用同一个连接（SQLite 连接池大小为 1）
         {
             let conn = pool.get().await?;
 
@@ -407,8 +416,9 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_exec_sql_turso() -> Result<(), Box<dyn std::error::Error>> {
+        // SQLite 建议使用单连接池（max_size=1）
         let pool = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
@@ -427,7 +437,7 @@ mod connection_pool_tests {
 
         // 执行原生查询 SQL
         let users = conn
-            .exec_table::<PoolTestUser>("SELECT * FROM pool_test_users_1")
+            .execute::<PoolTestUser>("SELECT * FROM pool_test_users_1")
             .await?;
 
         assert_eq!(users.len(), 1);
@@ -443,14 +453,14 @@ mod connection_pool_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_pool_range_config_turso() -> Result<(), Box<dyn std::error::Error>> {
-        // 测试不同的范围配置（Sqlite 限制最大为 1）
+        // 测试不同的范围配置（SQLite 建议 max_size=1）
         let pool1 = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 
         let pool2 = Database::create_pool(ormer::DbType::Sqlite, ":memory:")
-            .range(0..1) // Sqlite: max=1
+            .range(0..1)
             .build()
             .await?;
 

@@ -112,7 +112,7 @@ fn to_snake_case(s: &str) -> String {
             if i > 0 {
                 result.push('_');
             }
-            result.push(c.to_lowercase().next().unwrap());
+            result.push(c.to_lowercase().next().unwrap_or(c));
         } else {
             result.push(c);
         }
@@ -135,7 +135,7 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         // 先创建所有需要的 ENUM 类型
         for column in T::COLUMN_SCHEMA.iter() {
             if let Some(variants) = column.enum_variants {
@@ -153,7 +153,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                 self.client
                     .execute(&create_enum_sql, &[])
                     .await
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             }
         }
 
@@ -161,7 +161,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::PostgreSQL,
             self.table_name.as_deref(),
-        );
+        )?;
 
         // 分离 CREATE TABLE 和 CREATE INDEX 语句
         let sql_parts: Vec<&str> = create_sql.split(';').collect();
@@ -175,7 +175,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             self.client
                 .execute(sql_part, &[])
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         }
 
         Ok(())
@@ -189,12 +189,12 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
         self.client
             .execute(&sql, &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(())
     }
 }
@@ -207,9 +207,9 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.db.insert_batch::<I::Model>(&refs).await
+        self.db.insert_impl::<I::Model>(&refs).await
     }
 }
 
@@ -221,7 +221,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
         self.db.insert_or_update_batch::<I::Model>(&refs).await
     }
@@ -229,13 +229,10 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 
 impl Database {
     /// 连接到 PostgreSQL 数据库
-    pub async fn connect(
-        _db_type: super::DbType,
-        connection_string: &str,
-    ) -> Result<Self, crate::Error> {
+    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
         let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         // 在后台运行连接
         let connection_handle = tokio::spawn(async move {
@@ -282,15 +279,15 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().await?;
 
         if !table_exists {
-            return Err(crate::Error::SchemaMismatch {
-                table: T::TABLE_NAME.to_string(),
-                reason: "Table does not exist".to_string(),
-            });
+            return Err(anyhow::anyhow!(
+                "Schema mismatch: table {}, reason: Table does not exist",
+                T::TABLE_NAME
+            ));
         }
 
         // 表已存在，验证表结构
@@ -298,24 +295,24 @@ impl Database {
     }
 
     /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> Result<bool, crate::Error> {
+    async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public' AND table_name=$1";
 
         let row = self
             .client
             .query_one(sql, &[&T::TABLE_NAME])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let count: i64 = row
             .try_get(0)
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(count > 0)
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> Result<(), crate::Error> {
+    async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
         // 查询表的列信息
         let sql = r#"
             SELECT column_name, data_type, is_nullable
@@ -328,56 +325,55 @@ impl Database {
             .client
             .query(sql, &[&T::TABLE_NAME])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
         for row in rows {
             let name: String = row
                 .try_get(0)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             let col_type: String = row
                 .try_get(1)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             let is_nullable: String = row
                 .try_get(2)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             actual_columns.push((name, col_type, is_nullable == "YES"));
         }
 
         // 比较列数量
         if actual_columns.len() != T::COLUMNS.len() {
-            return Err(crate::Error::SchemaMismatch {
-                table: T::TABLE_NAME.to_string(),
-                reason: format!(
-                    "Column count mismatch: expected {}, but actual is {}",
-                    T::COLUMNS.len(),
-                    actual_columns.len()
-                ),
-            });
+            return Err(anyhow::anyhow!(
+                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
+                T::TABLE_NAME,
+                T::COLUMNS.len(),
+                actual_columns.len()
+            ));
         }
 
         // 比较每一列的定义
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!("Missing column: {}", expected_col.name),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Missing column: {}",
+                    T::TABLE_NAME,
+                    expected_col.name
+                ));
             }
 
             let (actual_name, actual_type, actual_nullable) = &actual_columns[i];
 
             // 检查列名
             if actual_name != expected_col.name {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!(
-                        "Column name mismatch at position {i}: expected '{}', but actual is '{actual_name}'",
-                        expected_col.name
-                    ),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
+                    T::TABLE_NAME,
+                    i,
+                    expected_col.name,
+                    actual_name
+                ));
             }
 
             // 检查列类型（只比较基础类型，不包含约束）
@@ -420,28 +416,24 @@ impl Database {
             };
 
             if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!(
-                        "Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
-                        expected_col.name
-                    ),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
+                    T::TABLE_NAME,
+                    expected_col.name
+                ));
             }
 
             // 检查 NOT NULL 约束（主键列除外，因为主键自动 NOT NULL）
             if !expected_col.is_primary {
                 let expected_nullable = expected_col.is_nullable;
                 if *actual_nullable != expected_nullable {
-                    return Err(crate::Error::SchemaMismatch {
-                        table: T::TABLE_NAME.to_string(),
-                        reason: format!(
-                            "Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                            expected_col.name,
-                            if expected_nullable { "" } else { "NOT " },
-                            if *actual_nullable { "" } else { "NOT " }
-                        ),
-                    });
+                    return Err(anyhow::anyhow!(
+                        "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
+                        T::TABLE_NAME,
+                        expected_col.name,
+                        if expected_nullable { "" } else { "NOT " },
+                        if *actual_nullable { "" } else { "NOT " }
+                    ));
                 }
             }
         }
@@ -489,7 +481,7 @@ impl Database {
     }
 
     /// 批量插入记录
-    pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -520,23 +512,20 @@ impl Database {
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> Result<(), crate::Error> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
-        let primary_key = T::primary_key_column();
+        let primary_key = T::primary_key_columns()[0];
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
         let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
@@ -581,7 +570,7 @@ impl Database {
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(format!("db error: {}", e)))?;
+            .map_err(|e| anyhow::anyhow!(format!("db error: {}", e)))?;
 
         Ok(())
     }
@@ -633,11 +622,11 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> Result<Transaction<'_>, crate::Error> {
+    pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
         self.client
             .execute("BEGIN", &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(Transaction {
             client: &self.client,
             committed: false,
@@ -654,12 +643,13 @@ impl Database {
     }
 
     /// 执行原生 SQL 查询并返回模型列表
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+    /// 执行原生 SQL 查询并返回模型列表
+    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
         let rows = self
             .client
             .query(sql, &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
 
@@ -678,13 +668,19 @@ impl Database {
         Ok(results)
     }
 
+    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
+    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
+        self.execute::<T>(sql).await
+    }
+
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
         let result = self
             .client
             .execute(sql, &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(result)
     }
 
@@ -709,7 +705,7 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
         // 直接调用批量插入逻辑，使用 client 引用
         if refs.is_empty() {
@@ -741,7 +737,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(())
     }
 }
@@ -754,7 +750,7 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(());
@@ -808,38 +804,38 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(())
     }
 }
 
 impl<'a> Transaction<'a> {
     /// 提交事务
-    pub async fn commit(mut self) -> Result<(), crate::Error> {
+    pub async fn commit(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(crate::Error::Database(
+            return Err(anyhow::anyhow!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
         self.client
             .execute("COMMIT", &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         self.committed = true;
         Ok(())
     }
 
     /// 回滚事务
-    pub async fn rollback(mut self) -> Result<(), crate::Error> {
+    pub async fn rollback(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(crate::Error::Database(
+            return Err(anyhow::anyhow!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
         self.client
             .execute("ROLLBACK", &[])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         self.rolled_back = true;
         Ok(())
     }
@@ -906,7 +902,8 @@ impl<'a> Transaction<'a> {
     }
 
     /// 批量插入记录
-    pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+    #[allow(dead_code)]
+    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -935,8 +932,8 @@ impl<'a> Transaction<'a> {
             params.iter().map(|p| p.as_ref()).collect();
 
         self.client.execute(&sql, &param_refs).await.map_err(|e| {
-            crate::Error::Database(format!(
-                "Transaction insert_batch failed: {:?}, SQL: {}",
+            anyhow::anyhow!(format!(
+                "Transaction insert_impl failed: {:?}, SQL: {}",
                 e, sql
             ))
         })?;
@@ -945,17 +942,14 @@ impl<'a> Transaction<'a> {
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> Result<(), crate::Error> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
-        let primary_key = T::primary_key_column();
+        let primary_key = T::primary_key_columns()[0];
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
         let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
@@ -1000,7 +994,7 @@ impl<'a> Transaction<'a> {
         self.client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
@@ -1087,7 +1081,7 @@ pub struct MappedCollectFuture<'a, T: Model, V, C> {
 impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1101,7 +1095,7 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
                 .client
                 .query(&sql, &param_refs)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -1378,7 +1372,7 @@ pub struct AggregateFuture<'a, T: Model, R> {
 impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
     for AggregateFuture<'a, T, R>
 {
-    type Output = Result<R, crate::Error>;
+    type Output = anyhow::Result<R>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1416,6 +1410,24 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
                     }
+                    crate::model::Value::Boolean(b) => {
+                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Bytes(b) => {
+                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::DateTime(dt) => {
+                        Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Json(j) => {
+                        Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::Uuid(u) => {
+                        Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    }
+                    crate::model::Value::BigInt(b) => {
+                        Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                    }
                     crate::model::Value::Null => {
                         Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
                     }
@@ -1429,7 +1441,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                 .client
                 .query_one(&sql, &params_ref)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             // 获取第一列的值
             use tokio_postgres::types::Type;
@@ -1440,35 +1452,35 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                 Type::INT2 => {
                     let val: Option<i16> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT4 => {
                     let val: Option<i32> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT8 => {
                     let val: Option<i64> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(crate::model::Value::Integer)
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT4 => {
                     let val: Option<f32> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(|v| crate::model::Value::Real(v as f64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT8 => {
                     let val: Option<f64> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(crate::model::Value::Real)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1485,7 +1497,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
                 Type::TEXT | Type::VARCHAR => {
                     let val: Option<String> = row
                         .try_get(0)
-                        .map_err(|e| crate::Error::Database(e.to_string()))?;
+                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                     val.map(crate::model::Value::Text)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1501,7 +1513,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
 impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
     for CollectFuture<'a, T, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1510,7 +1522,7 @@ impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFutu
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params = values_to_params(&params)?;
@@ -1523,7 +1535,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
 
@@ -1624,7 +1636,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     }
                                 }
                                 _ => {
-                                    return Err(crate::Error::Database(format!(
+                                    return Err(anyhow::anyhow!(format!(
                                         "Unsupported nullable column type: {rust_type}"
                                     )));
                                 }
@@ -1693,7 +1705,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     }
                                 }
                                 _ => {
-                                    return Err(crate::Error::Database(format!(
+                                    return Err(anyhow::anyhow!(format!(
                                         "Unsupported column type: {rust_type}"
                                     )));
                                 }
@@ -1733,7 +1745,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     /// 执行删除操作并返回影响的行数
-    pub async fn execute(self) -> Result<u64, crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql_with_params();
 
         // 获取列的rust_type信息
@@ -1746,7 +1758,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             .client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(result)
     }
@@ -1768,7 +1780,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter_with_params(
+                let _ = common_helpers::format_filter_with_params(
                     filter,
                     &mut sql,
                     &mut param_idx,
@@ -1783,7 +1795,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 }
 
 impl<'a, T: Model + 'static> std::future::IntoFuture for DeleteExecutor<'a, T> {
-    type Output = Result<u64, crate::Error>;
+    type Output = anyhow::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1825,7 +1837,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     /// 执行更新操作
-    pub async fn execute(self) -> Result<u64, crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql()?;
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
@@ -1837,12 +1849,12 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             .client
             .execute(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(result)
     }
 
-    fn build_sql(&self) -> Result<(String, Vec<crate::model::Value>), crate::Error> {
+    fn build_sql(&self) -> anyhow::Result<(String, Vec<crate::model::Value>)> {
         let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
         let mut params = Vec::new();
 
@@ -1865,7 +1877,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter_with_params(
+                let _ = common_helpers::format_filter_with_params(
                     filter,
                     &mut sql,
                     &mut param_idx,
@@ -1880,7 +1892,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 }
 
 impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
-    type Output = Result<u64, crate::Error>;
+    type Output = anyhow::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1893,7 +1905,7 @@ impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
 fn values_to_params_with_types(
     values: &[crate::model::Value],
     rust_types: &[&str],
-) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>, crate::Error> {
+) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>> {
     // ToSql trait is used in the trait object type above
     #[allow(unused_imports)]
     use tokio_postgres::types::ToSql;
@@ -1921,6 +1933,24 @@ fn values_to_params_with_types(
             }
             crate::model::Value::Real(v) => {
                 Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Boolean(v) => {
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Bytes(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::DateTime(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Json(v) => {
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Uuid(v) => {
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::BigInt(v) => {
+                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
             }
             crate::model::Value::Null => {
                 // 根据列类型选择NULL的类型
@@ -1958,7 +1988,7 @@ fn values_to_params_with_types(
 /// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）
 fn values_to_params(
     values: &[crate::model::Value],
-) -> Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>, crate::Error> {
+) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>> {
     // ToSql trait is used in the trait object type above
     #[allow(unused_imports)]
     use tokio_postgres::types::ToSql;
@@ -1977,6 +2007,24 @@ fn values_to_params(
             }
             crate::model::Value::Real(v) => {
                 Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Boolean(v) => {
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Bytes(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::DateTime(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Json(v) => {
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::Uuid(v) => {
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+            }
+            crate::model::Value::BigInt(v) => {
+                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
             }
             crate::model::Value::Null => {
                 // 使用 Option<i32> 的 None 来表示 NULL
@@ -2017,7 +2065,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器  
-    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
+    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
@@ -2033,7 +2081,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let row_stream = client
             .query_raw(&sql, param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(SelectStreamIterator {
             conn: self.conn,
@@ -2045,6 +2093,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
 /// SelectStreamIterator - 流式查询迭代器 (PostgreSQL)
 pub struct SelectStreamIterator<'a, T: Model> {
+    #[allow(dead_code)]
     conn: super::common::StreamConnection<'a>,
     row_stream: std::pin::Pin<Box<tokio_postgres::RowStream>>,
     _marker: std::marker::PhantomData<&'a T>,
@@ -2052,7 +2101,7 @@ pub struct SelectStreamIterator<'a, T: Model> {
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
-    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
         use futures::StreamExt;
 
         match self.row_stream.next().await {
@@ -2150,7 +2199,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                     }
                                 }
                                 _ => {
-                                    return Some(Err(crate::Error::Database(format!(
+                                    return Some(Err(anyhow::anyhow!(format!(
                                         "Unsupported nullable column type: {rust_type}"
                                     ))));
                                 }
@@ -2164,7 +2213,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                 match v {
                                     Some(val) => crate::model::Value::Integer(val as i64),
                                     None => {
-                                        return Some(Err(crate::Error::ParseError(format!(
+                                        return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected integer type)",
                                             col_name
                                         ))));
@@ -2176,7 +2225,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                 match v {
                                     Some(val) => crate::model::Value::Integer(val),
                                     None => {
-                                        return Some(Err(crate::Error::ParseError(format!(
+                                        return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected i64 type)",
                                             col_name
                                         ))));
@@ -2188,7 +2237,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                 match v {
                                     Some(val) => crate::model::Value::Text(val),
                                     None => {
-                                        return Some(Err(crate::Error::ParseError(format!(
+                                        return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected String type)",
                                             col_name
                                         ))));
@@ -2200,7 +2249,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                 match v {
                                     Some(val) => crate::model::Value::Real(val),
                                     None => {
-                                        return Some(Err(crate::Error::ParseError(format!(
+                                        return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected float type)",
                                             col_name
                                         ))));
@@ -2213,7 +2262,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                     Some(true) => crate::model::Value::Integer(1),
                                     Some(false) => crate::model::Value::Integer(0),
                                     None => {
-                                        return Some(Err(crate::Error::ParseError(format!(
+                                        return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected bool type)",
                                             col_name
                                         ))));
@@ -2221,7 +2270,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                 }
                             }
                             _ => {
-                                return Some(Err(crate::Error::Database(format!(
+                                return Some(Err(anyhow::anyhow!(format!(
                                     "Unsupported column type: {rust_type}"
                                 ))));
                             }
@@ -2233,7 +2282,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                 let ormer_row = crate::model::Row::new(data);
                 Some(T::from_row(&ormer_row))
             }
-            Some(Err(e)) => Some(Err(crate::Error::Database(e.to_string()))),
+            Some(Err(e)) => Some(Err(anyhow::anyhow!(e).context("Database operation failed"))),
             None => None,
         }
     }
@@ -2267,12 +2316,12 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         RelatedCollectFuture { executor: self }
     }
 
-    pub async fn collect<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
+    pub async fn collect<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let results = self.collect_inner().await?;
         Ok(results.into_iter().collect())
     }
 
-    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
@@ -2284,7 +2333,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
             .client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2326,7 +2375,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
                             )));
                         }
@@ -2354,7 +2403,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported column type: {rust_type}"
                             )));
                         }
@@ -2377,7 +2426,7 @@ pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
 impl<'a, T: Model + 'static, R: Model + 'static> std::future::IntoFuture
     for RelatedCollectFuture<'a, T, R>
 {
-    type Output = Result<Vec<T>, crate::Error>;
+    type Output = anyhow::Result<Vec<T>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2421,7 +2470,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
         MultiTableCollectFuture { executor: self }
     }
 
-    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
@@ -2433,7 +2482,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
             .client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2475,7 +2524,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
                             )));
                         }
@@ -2503,7 +2552,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported column type: {rust_type}"
                             )));
                         }
@@ -2526,7 +2575,7 @@ pub struct MultiTableCollectFuture<'a, T: Model, R1: Model, R2: Model> {
 impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static> std::future::IntoFuture
     for MultiTableCollectFuture<'a, T, R1, R2>
 {
-    type Output = Result<Vec<T>, crate::Error>;
+    type Output = anyhow::Result<Vec<T>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2571,7 +2620,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         FourTableCollectFuture { executor: self }
     }
 
-    async fn collect_inner(self) -> Result<Vec<T>, crate::Error> {
+    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
@@ -2583,7 +2632,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             .client
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2625,7 +2674,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
                             )));
                         }
@@ -2653,7 +2702,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                             }
                         }
                         _ => {
-                            return Err(crate::Error::Database(format!(
+                            return Err(anyhow::anyhow!(format!(
                                 "Unsupported column type: {rust_type}"
                             )));
                         }
@@ -2676,7 +2725,7 @@ pub struct FourTableCollectFuture<'a, T: Model, R1: Model, R2: Model, R3: Model>
 impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model + 'static>
     std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
 {
-    type Output = Result<Vec<T>, crate::Error>;
+    type Output = anyhow::Result<Vec<T>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2741,7 +2790,7 @@ pub struct LeftJoinCollectFuture<'a, T: Model, J: Model> {
 impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for LeftJoinCollectFuture<'a, T, J>
 {
-    type Output = Result<Vec<(T, Option<J>)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(T, Option<J>)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2750,7 +2799,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 }
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
@@ -2765,6 +2814,24 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Real(r) => {
                     Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
                 }
+                crate::model::Value::Boolean(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Bytes(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::DateTime(dt) => {
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Json(j) => {
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Uuid(u) => {
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::BigInt(b) => {
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                }
                 crate::model::Value::Null => {
                     Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
                 }
@@ -2778,7 +2845,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             .client
             .query(&sql, &pg_params_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2805,7 +2872,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v.unwrap_or(0.0))
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -2850,7 +2917,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v.unwrap_or(0.0))
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -2925,7 +2992,7 @@ pub struct InnerJoinCollectFuture<'a, T: Model, J: Model> {
 impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for InnerJoinCollectFuture<'a, T, J>
 {
-    type Output = Result<Vec<(T, J)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(T, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2934,7 +3001,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 }
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
@@ -2949,6 +3016,24 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Real(r) => {
                     Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
                 }
+                crate::model::Value::Boolean(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Bytes(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::DateTime(dt) => {
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Json(j) => {
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Uuid(u) => {
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::BigInt(b) => {
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                }
                 crate::model::Value::Null => {
                     Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
                 }
@@ -2962,7 +3047,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             .client
             .query(&sql, &pg_params_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2989,7 +3074,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v)
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -3020,7 +3105,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v)
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -3099,7 +3184,7 @@ pub struct GroupedCollectFuture<'a, T: Model, V, C> {
 impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
-    type Output = Result<Vec<(Option<T>, J)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(Option<T>, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -3108,7 +3193,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 }
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
@@ -3123,6 +3208,24 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Real(r) => {
                     Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
                 }
+                crate::model::Value::Boolean(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Bytes(b) => {
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::DateTime(dt) => {
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Json(j) => {
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::Uuid(u) => {
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                }
+                crate::model::Value::BigInt(b) => {
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                }
                 crate::model::Value::Null => {
                     Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
                 }
@@ -3136,7 +3239,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             .client
             .query(&sql, &pg_params_refs)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3176,7 +3279,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v.unwrap_or(0.0))
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -3212,7 +3315,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                         crate::model::Value::Real(v)
                     }
                     _ => {
-                        return Err(crate::Error::Database(format!(
+                        return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
                         )));
                     }
@@ -3232,7 +3335,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 fn convert_postgres_value(
     row: &tokio_postgres::Row,
     index: usize,
-) -> Result<crate::model::Value, crate::Error> {
+) -> anyhow::Result<crate::model::Value> {
     use tokio_postgres::types::Type;
 
     let col_type = row.columns()[index].type_();
@@ -3303,7 +3406,7 @@ fn convert_postgres_value(
         _ => {}
     }
 
-    Err(crate::Error::Database(format!(
+    Err(anyhow::anyhow!(format!(
         "Unsupported column type {:?} at index {}",
         col_type, index
     )))
@@ -3367,7 +3470,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -3395,6 +3498,24 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync>
                     }
+                    crate::model::Value::Boolean(b) => {
+                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    crate::model::Value::Bytes(b) => {
+                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    crate::model::Value::DateTime(dt) => {
+                        Box::new(dt) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    crate::model::Value::Json(j) => {
+                        Box::new(j.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    crate::model::Value::Uuid(u) => {
+                        Box::new(u.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
+                    crate::model::Value::BigInt(b) => {
+                        Box::new(b as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    }
                     crate::model::Value::Null => {
                         if use_i64 {
                             let null_val: Option<i64> = None;
@@ -3415,7 +3536,7 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
                 .client
                 .query(&sql, &param_refs)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();

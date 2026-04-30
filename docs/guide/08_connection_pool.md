@@ -31,6 +31,36 @@ async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error:
 }
 ```
 
+## SQLite 后端注意事项
+
+SQLite (turso) 后端由于其嵌入式特性，官方不支持多线程共享连接。建议：
+
+1. **连接池配置**: 设置 `max_size=1`，使用单连接池
+   ```rust
+   let pool = Database::create_pool(DbType::Sqlite, "path/to/database.db")
+       .range(0..1)  // 建议使用单连接
+       .build()
+       .await?;
+   ```
+
+2. **并发场景**: 如需高并发读写，考虑启用 MVCC 模式
+   ```rust
+   let conn = pool.get().await?;
+   conn.exec_non_query("PRAGMA journal_mode = 'mvcc'").await?;
+   // 使用 BEGIN CONCURRENT 实现并发写入
+   ```
+
+3. **事务处理**: 避免长时间持有连接，及时归还到池中
+   ```rust
+   {
+       let conn = pool.get().await?;
+       // 执行操作
+       // conn 离开作用域后自动归还
+   }
+   ```
+
+4. **多进程访问**: SQLite 不支持多进程同时访问同一数据库文件，如需多进程场景请考虑使用 PostgreSQL 或 MySQL
+
 ## 完整示例
 
 ```rust

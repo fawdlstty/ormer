@@ -18,19 +18,17 @@ pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
-        // 直接调用 PooledConnection 的 insert_batch 方法
+    pub async fn execute(self) -> anyhow::Result<()> {
+        // 直接调用 PooledConnection 的 insert_impl 方法
         let refs = self.models.as_refs();
         match &self.pooled_conn.connection {
             #[cfg(feature = "sqlite")]
-            Some(ConnectionWrapper::Sqlite(db)) => db.insert_batch::<I::Model>(&refs).await,
+            Some(ConnectionWrapper::Sqlite(db)) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "postgresql")]
-            Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_batch::<I::Model>(&refs).await,
+            Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
-            Some(ConnectionWrapper::MySQL(db)) => db.insert_batch::<I::Model>(&refs).await,
-            None => Err(crate::Error::Database(
-                "No connection available".to_string(),
-            )),
+            Some(ConnectionWrapper::MySQL(db)) => db.insert_impl::<I::Model>(&refs).await,
+            None => Err(anyhow::anyhow!("No connection available")),
         }
     }
 }
@@ -43,7 +41,7 @@ pub struct PooledInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         // 直接调用 PooledConnection 的 insert_or_update_batch 方法
         let refs = self.models.as_refs();
         match &self.pooled_conn.connection {
@@ -59,9 +57,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
             Some(ConnectionWrapper::MySQL(db)) => {
                 db.insert_or_update_batch::<I::Model>(&refs).await
             }
-            None => Err(crate::Error::Database(
-                "No connection available".to_string(),
-            )),
+            None => Err(anyhow::anyhow!("No connection available")),
         }
     }
 }
@@ -101,6 +97,9 @@ impl ConnectionWrapper {
 }
 
 /// 手工连接池核心结构
+///
+/// 注意：对于 SQLite 后端，由于其嵌入式特性不支持多线程共享连接，
+/// 建议设置 max_size=1。如需并发支持，可考虑启用 MVCC 模式。
 pub struct ManualPool {
     /// 空闲连接队列
     idle_connections: Mutex<VecDeque<ConnectionWrapper>>,
@@ -131,7 +130,7 @@ impl ManualPool {
     }
 
     /// 创建新的数据库连接
-    async fn create_connection(&self) -> Result<ConnectionWrapper, crate::Error> {
+    async fn create_connection(&self) -> anyhow::Result<ConnectionWrapper> {
         match self.db_type {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
@@ -156,7 +155,7 @@ impl ManualPool {
     }
 
     /// 获取连接(异步)
-    async fn get(&self) -> Result<ConnectionWrapper, crate::Error> {
+    async fn get(&self) -> anyhow::Result<ConnectionWrapper> {
         // 尝试从空闲队列获取
         {
             let mut idle = self.idle_connections.lock().await;
@@ -201,10 +200,11 @@ impl ManualPool {
             let mut idle = self.idle_connections.lock().await;
             idle.push_back(conn);
         } else {
-            // 连接失效,减少计数
+            // 连接失效，减少计数
             self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            // 连接失效时不放入空闲队列，会自动被丢弃
         }
-        // 释放信号量 permit
+        // 释放信号量 permit，允许新的连接请求
         self.semaphore.add_permits(1);
     }
 
@@ -266,14 +266,9 @@ impl PoolBuilder {
     }
 
     /// 构建连接池
-    pub async fn build(self) -> Result<ConnectionPool, crate::Error> {
-        // 对于 Sqlite 后端，连接池最大连接数必须为 1，超过 1 则报错
-        #[cfg(feature = "sqlite")]
-        if self.db_type == DbType::Sqlite && self.config.max_size > 1 {
-            return Err(crate::Error::Database(
-                "Sqlite backend only supports a maximum of 1 connection in the pool".to_string(),
-            ));
-        }
+    pub async fn build(self) -> anyhow::Result<ConnectionPool> {
+        // 注意：SQLite 后端建议设置 max_size=1，因为其嵌入式特性不支持多线程共享连接
+        // 如需并发支持，可考虑启用 MVCC 模式（PRAGMA journal_mode = 'mvcc'）
 
         let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
 
@@ -308,14 +303,16 @@ impl ConnectionPool {
     ///
     /// 此方法会等待直到有可用连接或创建新连接
     /// 如果池中没有连接且未达到 max_size,会自动创建新连接
-    pub async fn get(&self) -> Result<PooledConnection<'_>, crate::Error> {
+    pub async fn get(&self) -> anyhow::Result<PooledConnection<'_>> {
         match self {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
                 // 获取信号量 permit
-                let _permit = pool.semaphore.acquire().await.map_err(|e| {
-                    crate::Error::Database(format!("Failed to acquire connection: {}", e))
-                })?;
+                let _permit = pool
+                    .semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
@@ -325,9 +322,11 @@ impl ConnectionPool {
             }
             #[cfg(feature = "postgresql")]
             ConnectionPool::PostgreSQL(pool) => {
-                let _permit = pool.semaphore.acquire().await.map_err(|e| {
-                    crate::Error::Database(format!("Failed to acquire connection: {}", e))
-                })?;
+                let _permit = pool
+                    .semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::PostgreSQL(pool.clone()),
@@ -337,9 +336,11 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mysql")]
             ConnectionPool::MySQL(pool) => {
-                let _permit = pool.semaphore.acquire().await.map_err(|e| {
-                    crate::Error::Database(format!("Failed to acquire connection: {}", e))
-                })?;
+                let _permit = pool
+                    .semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MySQL(pool.clone()),
@@ -387,10 +388,24 @@ impl<'a> Drop for PooledConnection<'a> {
     fn drop(&mut self) {
         if let Some(conn) = self.connection.take() {
             let inner = self.inner.clone();
-            // 使用 tokio::spawn 异步归还连接并释放信号量
-            tokio::spawn(async move {
-                inner.return_connection(conn).await;
-            });
+            // 尝试获取 tokio 运行时句柄
+            // 如果成功，使用 spawn 异步归还连接
+            // 如果失败（不在 tokio 运行时中），则阻塞执行
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    // 在 tokio 运行时中，异步归还连接
+                    handle.spawn(async move {
+                        inner.return_connection(conn).await;
+                    });
+                }
+                Err(_) => {
+                    // 不在 tokio 运行时中，这种情况不应该在正常使用中出现
+                    // 记录警告信息，连接可能会被泄露
+                    eprintln!(
+                        "Warning: PooledConnection dropped outside tokio runtime, connection may be leaked"
+                    );
+                }
+            }
         }
     }
 }
@@ -416,7 +431,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 验证表结构
-    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
@@ -523,7 +538,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> Result<super::unified::Transaction, crate::Error> {
+    pub async fn begin(&self) -> anyhow::Result<super::unified::Transaction<'_>> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -558,19 +573,25 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 执行原生 SQL 查询并返回模型列表
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => db.exec_table::<T>(sql).await,
+            ConnectionWrapper::Sqlite(db) => db.execute::<T>(sql).await,
             #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.exec_table::<T>(sql).await,
+            ConnectionWrapper::PostgreSQL(db) => db.execute::<T>(sql).await,
             #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.exec_table::<T>(sql).await,
+            ConnectionWrapper::MySQL(db) => db.execute::<T>(sql).await,
         }
     }
 
+    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
+    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
+        self.execute::<T>(sql).await
+    }
+
     /// 执行原生非查询 SQL
-    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => db.exec_non_query(sql).await,

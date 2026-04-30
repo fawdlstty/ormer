@@ -4,7 +4,6 @@
 use ormer::{AfterInsert, AfterUpdate, BeforeInsert, BeforeUpdate, Model};
 #[cfg(feature = "sqlite")]
 use ormer::{Database, DbType};
-#[cfg(not(feature = "sqlite"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // 全局计数器

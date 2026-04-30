@@ -100,7 +100,7 @@ db.drop_table::<User>().execute().await?;
 
 ```rust
 let users: Vec<User> = db
-    .exec_table::<User>("SELECT * FROM users WHERE age >= 18")
+    .execute::<User>("SELECT * FROM users WHERE age >= 18")
     .await?;
 
 let affected = db

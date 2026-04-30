@@ -31,6 +31,36 @@ async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error:
 }
 ```
 
+## SQLite Backend Considerations
+
+The SQLite (turso) backend, due to its embedded nature, does not officially support multi-threaded shared connections. Recommendations:
+
+1. **Connection Pool Configuration**: Set `max_size=1` for a single connection pool
+   ```rust
+   let pool = Database::create_pool(DbType::Sqlite, "path/to/database.db")
+       .range(0..1)  // Single connection recommended
+       .build()
+       .await?;
+   ```
+
+2. **Concurrent Scenarios**: For high concurrency read/write, consider enabling MVCC mode
+   ```rust
+   let conn = pool.get().await?;
+   conn.exec_non_query("PRAGMA journal_mode = 'mvcc'").await?;
+   // Use BEGIN CONCURRENT for concurrent writes
+   ```
+
+3. **Transaction Handling**: Avoid holding connections for long periods, return them to the pool promptly
+   ```rust
+   {
+       let conn = pool.get().await?;
+       // Perform operations
+       // conn is automatically returned when out of scope
+   }
+   ```
+
+4. **Multi-Process Access**: SQLite does not support multiple processes accessing the same database file simultaneously. For multi-process scenarios, consider using PostgreSQL or MySQL
+
 ## Complete Example
 
 ```rust

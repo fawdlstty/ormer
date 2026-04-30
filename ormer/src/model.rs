@@ -1,5 +1,39 @@
 use std::collections::HashMap;
 
+/// 错误类型
+#[derive(Debug)]
+pub enum Error {
+    /// 数据库错误
+    Database(String),
+    /// 类型不匹配
+    TypeMismatch(String),
+    /// 解析错误
+    ParseError(String),
+    /// Schema 不匹配
+    SchemaMismatch { table: String, reason: String },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Database(msg) => write!(f, "Database error: {}", msg),
+            Error::TypeMismatch(msg) => write!(f, "Type mismatch: {}", msg),
+            Error::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            Error::SchemaMismatch { table, reason } => {
+                write!(f, "Schema mismatch for table '{}': {}", table, reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<anyhow::Error> for Error {
+    fn from(err: anyhow::Error) -> Self {
+        Error::Database(err.to_string())
+    }
+}
+
 /// 字段元数据
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
@@ -56,33 +90,31 @@ pub trait Model: Sized {
 
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
-    fn from_row(row: &Row) -> Result<Self, Error>;
-    fn from_row_values(values: &[Value]) -> Result<Self, Error>;
+    fn from_row(row: &Row) -> anyhow::Result<Self>;
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self>;
 
     /// 获取字段值 (用于 INSERT/UPDATE)
     fn field_values(&self) -> Vec<Value>;
 
-    /// 获取主键字段名列表 (用于 UPDATE/DELETE，支持复合主键)
+    /// 获取主键字段名列表（支持单主键和复合主键）
     fn primary_key_columns() -> &'static [&'static str] {
-        // 默认实现：返回单个主键，保持向后兼容
-        const PRIMARY_KEY: &[&str] = &[""];
-        PRIMARY_KEY
+        // 默认实现返回空，要求派生宏生成
+        &[]
     }
 
-    /// 获取主键值列表 (支持复合主键)
-    fn primary_key_values(&self) -> Vec<Value> {
-        // 默认实现：返回单个主键值，保持向后兼容
-        vec![self.primary_key_value()]
-    }
+    /// 获取主键值列表（支持单主键和复合主键）
+    fn primary_key_values(&self) -> Vec<Value>;
 
-    /// 获取主键字段名 (用于 UPDATE/DELETE，已废弃，请使用 primary_key_columns)
+    /// 获取主键字段名（已废弃，请使用 primary_key_columns）
+    #[deprecated(since = "0.2.0", note = "Please use `primary_key_columns()` instead")]
     fn primary_key_column() -> &'static str {
-        ""
+        Self::primary_key_columns()[0]
     }
 
-    /// 获取主键值 (已废弃，请使用 primary_key_values)
+    /// 获取主键值（已废弃，请使用 primary_key_values）
+    #[deprecated(since = "0.2.0", note = "Please use `primary_key_values()` instead")]
     fn primary_key_value(&self) -> Value {
-        Value::Null
+        self.primary_key_values()[0].clone()
     }
 
     /// 获取需要插入的列名（排除自增主键）
@@ -102,15 +134,16 @@ pub trait Model: Sized {
             .filter(|col| !col.is_auto_increment)
             .filter_map(|col| {
                 // 找到原始字段值中对应的索引
-                let original_idx = Self::COLUMNS
+                Self::COLUMNS
                     .iter()
                     .position(|&c| c == col.name)
-                    .expect("Column name in COLUMN_SCHEMA must exist in COLUMNS");
-                if original_idx < all_values.len() {
-                    Some(all_values[original_idx].clone())
-                } else {
-                    None
-                }
+                    .and_then(|original_idx| {
+                        if original_idx < all_values.len() {
+                            Some(all_values[original_idx].clone())
+                        } else {
+                            None
+                        }
+                    })
             })
             .collect()
     }
@@ -132,9 +165,32 @@ pub trait ModelEnum: ModelEnumProvider {
     fn name(&self) -> &'static str;
 
     /// 从名称构造枚举值
-    fn from_name(name: &str) -> Result<Self, Error>
+    fn from_name(name: &str) -> anyhow::Result<Self>
     where
         Self: Sized;
+
+    /// 获取当前变体的数值表示（用于数值枚举）
+    /// 默认返回 0，数值枚举应重写此方法
+    fn as_i64(&self) -> i64 {
+        0
+    }
+
+    /// 从数值构造枚举值（用于数值枚举）
+    /// 默认返回错误，数值枚举应重写此方法
+    fn from_i64(_value: i64) -> anyhow::Result<Self>
+    where
+        Self: Sized,
+    {
+        Err(anyhow::anyhow!(
+            "This enum does not support numeric conversion"
+        ))
+    }
+
+    /// 判断是否为数值枚举
+    /// 默认返回 false，数值枚举应重写此方法返回 true
+    fn is_numeric_enum() -> bool {
+        false
+    }
 }
 
 /// 为 Option<T> 实现 ModelEnumProvider (如果 T 实现了 ModelEnum)
@@ -156,20 +212,20 @@ impl<T: ModelEnum> From<Option<T>> for Value {
 
 // 为 Option<T> where T: ModelEnum 实现 FromValue
 impl<T: ModelEnum> FromValue for Option<T> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Text(s) => {
                 // 使用 ModelEnum::from_name 构造枚举值
                 match T::from_name(s) {
                     Ok(enum_val) => Ok(Some(enum_val)),
-                    Err(_) => Err(Error::TypeMismatch(format!("Unknown enum variant: {}", s))),
+                    Err(_) => Err(anyhow::anyhow!("Unknown enum variant: {}", s)),
                 }
             }
-            _ => Err(Error::TypeMismatch(format!(
+            _ => Err(anyhow::anyhow!(
                 "Expected Text value for Option<{}>",
                 std::any::type_name::<T>()
-            ))),
+            )),
         }
     }
 }
@@ -288,7 +344,9 @@ macro_rules! impl_insertable_for_ref_collections {
 }
 
 /// 运行时动态生成 CREATE TABLE SQL
-pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbType) -> String {
+pub fn generate_create_table_sql<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+) -> anyhow::Result<String> {
     generate_create_table_sql_with_name::<T>(db_type, None)
 }
 
@@ -296,7 +354,7 @@ pub fn generate_create_table_sql<T: Model>(db_type: crate::abstract_layer::DbTyp
 pub fn generate_create_table_sql_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
-) -> String {
+) -> anyhow::Result<String> {
     let table_name = table_name.unwrap_or(T::TABLE_NAME);
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
 
@@ -375,7 +433,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
         sql.push_str(&index_sql);
     }
 
-    sql
+    Ok(sql)
 }
 
 /// 生成 UNIQUE 约束
@@ -490,10 +548,10 @@ impl Row {
         Self { data }
     }
 
-    pub fn get<T: FromValue>(&self, column: &str) -> Result<T, Error> {
+    pub fn get<T: FromValue>(&self, column: &str) -> anyhow::Result<T> {
         self.data
             .get(column)
-            .ok_or_else(|| Error::ColumnNotFound(column.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("Column not found: {}", column))
             .and_then(|v| T::from_value(v))
     }
 }
@@ -502,24 +560,30 @@ impl Row {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    BigInt(i128),
     Text(String),
     Real(f64),
+    Boolean(bool),
+    Bytes(Vec<u8>),
+    DateTime(chrono::DateTime<chrono::Utc>),
+    Json(serde_json::Value),
+    Uuid(uuid::Uuid),
     Null,
 }
 
 pub trait FromValue: Sized {
-    fn from_value(value: &Value) -> Result<Self, Error>;
+    fn from_value(value: &Value) -> anyhow::Result<Self>;
 }
 
-/// FromRowValues trait - 用于从一行中的多个值构建类型（如元组、Model）
+/// FromRowValues trait - 用于从一行中的多个值构建类型(如元组、Model)
 pub trait FromRowValues: Sized {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error>;
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self>;
 }
 
-/// FromSingleValue trait - 用于从单个值构建Model（用于map_to后的转换）
+/// FromSingleValue trait - 用于从单个值构建Model(用于map_to后的转换)
 /// 当查询单列结果并想转换为Model时使用
 pub trait FromSingleValue<V>: Sized {
-    fn from_single_value(value: V, column_name: &str) -> Result<Self, Error>;
+    fn from_single_value(value: V, column_name: &str) -> anyhow::Result<Self>;
 }
 
 // 为所有可以转换为Value的类型实现FromSingleValue的blanket implementation
@@ -529,7 +593,7 @@ where
     V: Into<Value>,
     T: FromValue,
 {
-    fn from_single_value(value: V, _column_name: &str) -> Result<Self, Error> {
+    fn from_single_value(value: V, _column_name: &str) -> anyhow::Result<Self> {
         let ormer_value: Value = value.into();
         Self::from_value(&ormer_value)
     }
@@ -540,10 +604,10 @@ macro_rules! impl_from_value_for {
     ($($type:ty => $variant:ident),* $(,)?) => {
         $(
             impl FromValue for $type {
-                fn from_value(value: &Value) -> Result<Self, Error> {
+                fn from_value(value: &Value) -> anyhow::Result<Self> {
                     match value {
                         Value::$variant(v) => Ok(*v as $type),
-                        _ => Err(Error::TypeMismatch(stringify!($type).to_string())),
+                        _ => Err(anyhow::anyhow!("Type mismatch: expected {}", stringify!($type))),
                     }
                 }
             }
@@ -560,27 +624,27 @@ impl_from_value_for!(
 
 // 为基本类型实现 FromRowValues（从单列构建）
 impl FromRowValues for i32 {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("i32".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected i32"));
         }
         Self::from_value(&values[0])
     }
 }
 
 impl FromRowValues for i64 {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("i64".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected i64"));
         }
         Self::from_value(&values[0])
     }
 }
 
 impl FromRowValues for usize {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("usize".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected usize"));
         }
         Self::from_value(&values[0])
     }
@@ -588,19 +652,19 @@ impl FromRowValues for usize {
 
 // f64 特殊处理（支持 Integer 和 Real）
 impl FromValue for f64 {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Real(v) => Ok(*v),
             Value::Integer(v) => Ok(*v as f64),
-            _ => Err(Error::TypeMismatch("f64".to_string())),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected f64")),
         }
     }
 }
 
 impl FromRowValues for f64 {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("f64".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected f64"));
         }
         Self::from_value(&values[0])
     }
@@ -608,37 +672,38 @@ impl FromRowValues for f64 {
 
 // String 特殊处理（需要 clone）
 impl FromValue for String {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Text(v) => Ok(v.clone()),
-            _ => Err(Error::TypeMismatch("String".to_string())),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected String")),
         }
     }
 }
 
 impl FromRowValues for String {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("String".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected String"));
         }
         Self::from_value(&values[0])
     }
 }
 
-// bool 特殊处理（0/1 转换）
+// bool 特殊处理（从 Boolean 读取）
 impl FromValue for bool {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
-            Value::Integer(v) => Ok(*v != 0),
-            _ => Err(Error::TypeMismatch("bool".to_string())),
+            Value::Boolean(v) => Ok(*v),
+            Value::Integer(v) => Ok(*v != 0), // 向后兼容
+            _ => Err(anyhow::anyhow!("Type mismatch: expected bool")),
         }
     }
 }
 
 impl FromRowValues for bool {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch("bool".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected bool"));
         }
         Self::from_value(&values[0])
     }
@@ -646,18 +711,18 @@ impl FromRowValues for bool {
 
 // 为二元组实现 FromValue
 impl<T1: FromValue, T2: FromValue> FromValue for (T1, T2) {
-    fn from_value(_value: &Value) -> Result<Self, Error> {
+    fn from_value(_value: &Value) -> anyhow::Result<Self> {
         // 元组不能从单个Value构建，这个实现仅用于类型系统完整性
         // 实际上元组应该从多个Value构建
-        Err(Error::TypeMismatch("tuple".to_string()))
+        Err(anyhow::anyhow!("Type mismatch: expected tuple"))
     }
 }
 
 // 为二元组实现 FromRowValues
 impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.len() < 2 {
-            return Err(Error::TypeMismatch("tuple (T1, T2)".to_string()));
+            return Err(anyhow::anyhow!("Type mismatch: expected tuple (T1, T2)"));
         }
         let v1 = T1::from_row_values(&values[0..1])?;
         let v2 = T2::from_row_values(&values[1..2])?;
@@ -667,16 +732,18 @@ impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
 
 // 为三元组实现 FromValue
 impl<T1: FromValue, T2: FromValue, T3: FromValue> FromValue for (T1, T2, T3) {
-    fn from_value(_value: &Value) -> Result<Self, Error> {
-        Err(Error::TypeMismatch("tuple".to_string()))
+    fn from_value(_value: &Value) -> anyhow::Result<Self> {
+        Err(anyhow::anyhow!("Type mismatch: expected tuple"))
     }
 }
 
 // 为三元组实现 FromRowValues
 impl<T1: FromRowValues, T2: FromRowValues, T3: FromRowValues> FromRowValues for (T1, T2, T3) {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.len() < 3 {
-            return Err(Error::TypeMismatch("tuple (T1, T2, T3)".to_string()));
+            return Err(anyhow::anyhow!(
+                "Type mismatch: expected tuple (T1, T2, T3)"
+            ));
         }
         let v1 = T1::from_row_values(&values[0..1])?;
         let v2 = T2::from_row_values(&values[1..2])?;
@@ -690,11 +757,11 @@ macro_rules! impl_from_value_for_option {
     ($($type:ty => $variant:ident),* $(,)?) => {
         $(
             impl FromValue for Option<$type> {
-                fn from_value(value: &Value) -> Result<Self, Error> {
+                fn from_value(value: &Value) -> anyhow::Result<Self> {
                     match value {
                         Value::Null => Ok(None),
                         Value::$variant(v) => Ok(Some(*v as $type)),
-                        _ => Err(Error::TypeMismatch(concat!("Option<", stringify!($type), ">").to_string())),
+                        _ => Err(anyhow::anyhow!("Type mismatch: expected Option<{}>", stringify!($type))),
                     }
                 }
             }
@@ -709,44 +776,45 @@ impl_from_value_for_option!(
 );
 
 impl FromValue for Option<String> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Text(v) => Ok(Some(v.clone())),
-            _ => Err(Error::TypeMismatch("Option<String>".to_string())),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<String>")),
         }
     }
 }
 
 impl FromValue for Option<bool> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
-            Value::Integer(v) => Ok(Some(*v != 0)),
-            _ => Err(Error::TypeMismatch("Option<bool>".to_string())),
+            Value::Boolean(v) => Ok(Some(*v)),
+            Value::Integer(v) => Ok(Some(*v != 0)), // 向后兼容
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<bool>")),
         }
     }
 }
 
 impl FromValue for Option<f64> {
-    fn from_value(value: &Value) -> Result<Self, Error> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Real(v) => Ok(Some(*v)),
             Value::Integer(v) => Ok(Some(*v as f64)),
-            _ => Err(Error::TypeMismatch("Option<f64>".to_string())),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<f64>")),
         }
     }
 }
 
 // 为 Option 类型实现 FromRowValues
 impl<T: FromValue> FromRowValues for Option<T> {
-    fn from_row_values(values: &[Value]) -> Result<Self, Error> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(Error::TypeMismatch(format!(
-                "Option<{}>",
+            return Err(anyhow::anyhow!(
+                "Type mismatch: expected Option<{}>",
                 std::any::type_name::<T>()
-            )));
+            ));
         }
         // 直接使用 Option<T> 的 from_value 实现
         match &values[0] {
@@ -757,37 +825,6 @@ impl<T: FromValue> FromRowValues for Option<T> {
             }
         }
     }
-}
-
-/// 错误类型
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("Column not found: {0}")]
-    ColumnNotFound(String),
-
-    #[error("Type mismatch: expected {0}")]
-    TypeMismatch(String),
-
-    #[error("Database error: {0}")]
-    Database(String),
-
-    #[error("Table schema mismatch for table '{table}': {reason}")]
-    SchemaMismatch { table: String, reason: String },
-
-    #[error("Validation error: {0}")]
-    ValidationError(String),
-
-    #[error("Connection error: {0}")]
-    ConnectionError(String),
-
-    #[error("Transaction error: {0}")]
-    TransactionError(String),
-
-    #[error("Hook error: {0}")]
-    HookError(String),
-
-    #[error("Parse error: {0}")]
-    ParseError(String),
 }
 
 // 使用宏生成 From<T> for Value 实现
@@ -823,14 +860,10 @@ impl From<String> for Value {
     }
 }
 
-// bool 特殊处理（转为 0/1）
+// bool 特殊处理（转为 Boolean）
 impl From<bool> for Value {
     fn from(v: bool) -> Self {
-        if v {
-            Value::Integer(1)
-        } else {
-            Value::Integer(0)
-        }
+        Value::Boolean(v)
     }
 }
 
@@ -870,8 +903,8 @@ impl From<Option<String>> for Value {
 impl From<Option<bool>> for Value {
     fn from(v: Option<bool>) -> Self {
         match v {
-            Some(true) => Value::Integer(1),
-            Some(false) => Value::Integer(0),
+            Some(true) => Value::Boolean(true),
+            Some(false) => Value::Boolean(false),
             None => Value::Null,
         }
     }
@@ -882,9 +915,161 @@ impl From<crate::query::filter::Value> for Value {
     fn from(value: crate::query::filter::Value) -> Self {
         match value {
             crate::query::filter::Value::Integer(v) => Value::Integer(v),
+            crate::query::filter::Value::BigInt(v) => Value::BigInt(v),
             crate::query::filter::Value::Text(v) => Value::Text(v),
             crate::query::filter::Value::Real(v) => Value::Real(v),
+            crate::query::filter::Value::Boolean(v) => Value::Boolean(v),
+            crate::query::filter::Value::Bytes(v) => Value::Bytes(v),
+            crate::query::filter::Value::DateTime(v) => Value::DateTime(v),
+            crate::query::filter::Value::Json(v) => Value::Json(v),
+            crate::query::filter::Value::Uuid(v) => Value::Uuid(v),
             crate::query::filter::Value::Null => Value::Null,
+        }
+    }
+}
+
+// Vec<u8> (Bytes) 特殊处理
+impl From<Vec<u8>> for Value {
+    fn from(v: Vec<u8>) -> Self {
+        Value::Bytes(v)
+    }
+}
+
+impl FromValue for Vec<u8> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Bytes(v) => Ok(v.clone()),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>")),
+        }
+    }
+}
+
+impl From<Option<Vec<u8>>> for Value {
+    fn from(v: Option<Vec<u8>>) -> Self {
+        match v {
+            Some(bytes) => Value::Bytes(bytes),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<Vec<u8>> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Bytes(v) => Ok(Some(v.clone())),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<Vec<u8>>")),
+        }
+    }
+}
+
+// chrono::DateTime<Utc> 特殊处理
+impl From<chrono::DateTime<chrono::Utc>> for Value {
+    fn from(v: chrono::DateTime<chrono::Utc>) -> Self {
+        Value::DateTime(v)
+    }
+}
+
+impl FromValue for chrono::DateTime<chrono::Utc> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::DateTime(v) => Ok(*v),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected DateTime<Utc>")),
+        }
+    }
+}
+
+impl From<Option<chrono::DateTime<chrono::Utc>>> for Value {
+    fn from(v: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+        match v {
+            Some(dt) => Value::DateTime(dt),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<chrono::DateTime<chrono::Utc>> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::DateTime(v) => Ok(Some(*v)),
+            _ => Err(anyhow::anyhow!(
+                "Type mismatch: expected Option<DateTime<Utc>>"
+            )),
+        }
+    }
+}
+
+// serde_json::Value 特殊处理
+impl From<serde_json::Value> for Value {
+    fn from(v: serde_json::Value) -> Self {
+        Value::Json(v)
+    }
+}
+
+impl FromValue for serde_json::Value {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Json(v) => Ok(v.clone()),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected serde_json::Value")),
+        }
+    }
+}
+
+impl From<Option<serde_json::Value>> for Value {
+    fn from(v: Option<serde_json::Value>) -> Self {
+        match v {
+            Some(json) => Value::Json(json),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<serde_json::Value> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Json(v) => Ok(Some(v.clone())),
+            _ => Err(anyhow::anyhow!(
+                "Type mismatch: expected Option<serde_json::Value>"
+            )),
+        }
+    }
+}
+
+// uuid::Uuid 特殊处理
+impl From<uuid::Uuid> for Value {
+    fn from(v: uuid::Uuid) -> Self {
+        Value::Uuid(v)
+    }
+}
+
+impl FromValue for uuid::Uuid {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Uuid(v) => Ok(*v),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected uuid::Uuid")),
+        }
+    }
+}
+
+impl From<Option<uuid::Uuid>> for Value {
+    fn from(v: Option<uuid::Uuid>) -> Self {
+        match v {
+            Some(uuid) => Value::Uuid(uuid),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<uuid::Uuid> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Uuid(v) => Ok(Some(*v)),
+            _ => Err(anyhow::anyhow!(
+                "Type mismatch: expected Option<uuid::Uuid>"
+            )),
         }
     }
 }

@@ -31,8 +31,14 @@ pub enum FilterExpr {
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(i64),
+    BigInt(i128),
     Text(String),
     Real(f64),
+    Boolean(bool),
+    Bytes(Vec<u8>),
+    DateTime(chrono::DateTime<chrono::Utc>),
+    Json(serde_json::Value),
+    Uuid(uuid::Uuid),
     Null,
 }
 

@@ -5,7 +5,12 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 /// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
-pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32, db_type: DbType) {
+pub fn format_filter(
+    filter: &FilterExpr,
+    sql: &mut String,
+    param_idx: &mut i32,
+    db_type: DbType,
+) -> anyhow::Result<()> {
     match filter {
         FilterExpr::Comparison {
             column,
@@ -15,20 +20,23 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             match db_type {
                 #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
-                    write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    write!(sql, "{} {} ${}", column, operator, param_idx)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
                 #[cfg(feature = "sqlite")]
                 DbType::Sqlite => {
-                    write!(sql, "{} {} ?", column, operator).unwrap();
+                    write!(sql, "{} {} ?", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
-                    write!(sql, "{} {} ?", column, operator).unwrap();
+                    write!(sql, "{} {} ?", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
+                // 无数据库后端时返回错误
                 #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                 DbType::None => {
-                    // 当没有启用任何特性时，仅用于编译通过
-                    let _ = (column, operator);
+                    return Err(anyhow::anyhow!("No database backend available"));
                 }
             }
             *param_idx += 1;
@@ -38,11 +46,13 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             operator,
             right_column,
         } => {
-            write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
+            write!(sql, "{} {} {}", left_column, operator, right_column)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
         }
         FilterExpr::In { column, values } => {
             // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column).unwrap();
+            write!(sql, "{} IN (", column)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
             for (i, _) in values.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -50,7 +60,8 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                 match db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx).unwrap();
+                        write!(sql, "${}", param_idx)
+                            .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                     }
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => {
@@ -60,12 +71,15 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    // 无数据库后端时返回错误
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
                         feature = "mysql"
                     )))]
-                    DbType::None => {}
+                    DbType::None => {
+                        return Err(anyhow::anyhow!("No database backend available"));
+                    }
                 }
                 *param_idx += 1;
             }
@@ -77,7 +91,8 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             subquery_params: _,
         } => {
             // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{} IN ({})", column, subquery_sql).unwrap();
+            write!(sql, "{} IN ({})", column, subquery_sql)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
             // 注意：子查询的参数数量需要累加到 param_idx
             // 但在这个函数中我们不处理参数值，只处理占位符
             // 子查询的 SQL 中已经包含了占位符，我们需要计算占位符数量
@@ -86,16 +101,17 @@ pub fn format_filter(filter: &FilterExpr, sql: &mut String, param_idx: &mut i32,
             *param_idx += placeholder_count as i32;
         }
         FilterExpr::And(left, right) => {
-            format_filter(left, sql, param_idx, db_type);
+            format_filter(left, sql, param_idx, db_type)?;
             sql.push_str(" AND ");
-            format_filter(right, sql, param_idx, db_type);
+            format_filter(right, sql, param_idx, db_type)?;
         }
         FilterExpr::Or(left, right) => {
-            format_filter(left, sql, param_idx, db_type);
+            format_filter(left, sql, param_idx, db_type)?;
             sql.push_str(" OR ");
-            format_filter(right, sql, param_idx, db_type);
+            format_filter(right, sql, param_idx, db_type)?;
         }
     }
+    Ok(())
 }
 
 /// 通用过滤器格式化函数并收集参数（用于 UPDATE/SELECT）
@@ -105,7 +121,7 @@ pub fn format_filter_with_params(
     param_idx: &mut usize,
     params: &mut Vec<Value>,
     db_type: DbType,
-) {
+) -> anyhow::Result<()> {
     match filter {
         FilterExpr::Comparison {
             column,
@@ -115,20 +131,23 @@ pub fn format_filter_with_params(
             match db_type {
                 #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
-                    write!(sql, "{} {} ${}", column, operator, param_idx).unwrap();
+                    write!(sql, "{} {} ${}", column, operator, param_idx)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
                 #[cfg(feature = "sqlite")]
                 DbType::Sqlite => {
-                    write!(sql, "{} {} ?", column, operator).unwrap();
+                    write!(sql, "{} {} ?", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
-                    write!(sql, "{} {} ?", column, operator).unwrap();
+                    write!(sql, "{} {} ?", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
+                // 无数据库后端时返回错误
                 #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
                 DbType::None => {
-                    // 当没有启用任何特性时，仅用于编译通过
-                    let _ = (column, operator);
+                    return Err(anyhow::anyhow!("No database backend available"));
                 }
             }
             params.push(value.clone().into());
@@ -139,11 +158,13 @@ pub fn format_filter_with_params(
             operator,
             right_column,
         } => {
-            write!(sql, "{} {} {}", left_column, operator, right_column).unwrap();
+            write!(sql, "{} {} {}", left_column, operator, right_column)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
         }
         FilterExpr::In { column, values } => {
             // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column).unwrap();
+            write!(sql, "{} IN (", column)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
             for (i, value) in values.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -155,18 +176,22 @@ pub fn format_filter_with_params(
                     }
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx).unwrap();
+                        write!(sql, "${}", param_idx)
+                            .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    // 无数据库后端时返回错误
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
                         feature = "mysql"
                     )))]
-                    DbType::None => {}
+                    DbType::None => {
+                        return Err(anyhow::anyhow!("No database backend available"));
+                    }
                 }
                 params.push(value.clone().into());
                 *param_idx += 1;
@@ -179,7 +204,8 @@ pub fn format_filter_with_params(
             subquery_params,
         } => {
             // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{} IN ({})", column, subquery_sql).unwrap();
+            write!(sql, "{} IN ({})", column, subquery_sql)
+                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
             // 添加子查询的参数
             for param in subquery_params {
                 params.push(param.clone());
@@ -187,22 +213,21 @@ pub fn format_filter_with_params(
             }
         }
         FilterExpr::And(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params, db_type);
+            format_filter_with_params(left, sql, param_idx, params, db_type)?;
             sql.push_str(" AND ");
-            format_filter_with_params(right, sql, param_idx, params, db_type);
+            format_filter_with_params(right, sql, param_idx, params, db_type)?;
         }
         FilterExpr::Or(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params, db_type);
+            format_filter_with_params(left, sql, param_idx, params, db_type)?;
             sql.push_str(" OR ");
-            format_filter_with_params(right, sql, param_idx, params, db_type);
+            format_filter_with_params(right, sql, param_idx, params, db_type)?;
         }
     }
+    Ok(())
 }
 
 /// 通用行数据提取函数 - 从数据库行中提取模型数据
-pub fn extract_model_from_row<T: Model>(
-    row_data: &HashMap<String, Value>,
-) -> Result<T, crate::Error> {
+pub fn extract_model_from_row<T: Model>(row_data: &HashMap<String, Value>) -> anyhow::Result<T> {
     let row = Row::new(row_data.clone());
     T::from_row(&row)
 }
@@ -215,7 +240,9 @@ pub fn convert_column_value(
     get_string: impl FnOnce() -> Option<String>,
     get_real: impl FnOnce() -> Option<f64>,
     get_bool: impl FnOnce() -> Option<i8>,
-) -> Result<Value, crate::Error> {
+    get_bytes: impl FnOnce() -> Option<Vec<u8>>,
+    get_datetime: impl FnOnce() -> Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<Value> {
     if is_nullable {
         match rust_type {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match get_int() {
@@ -231,13 +258,23 @@ pub fn convert_column_value(
                 None => Ok(Value::Null),
             },
             "bool" => match get_bool() {
-                Some(1) => Ok(Value::Integer(1)),
-                Some(0) => Ok(Value::Integer(0)),
+                Some(1) => Ok(Value::Boolean(true)),
+                Some(0) => Ok(Value::Boolean(false)),
                 _ => Ok(Value::Null),
             },
-            _ => Err(crate::Error::Database(format!(
+            "Vec<u8>" | "&[u8]" => match get_bytes() {
+                Some(val) => Ok(Value::Bytes(val)),
+                None => Ok(Value::Null),
+            },
+            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                match get_datetime() {
+                    Some(val) => Ok(Value::DateTime(val)),
+                    None => Ok(Value::Null),
+                }
+            }
+            _ => Err(anyhow::anyhow!(
                 "Unsupported nullable column type: {rust_type}"
-            ))),
+            )),
         }
     } else {
         match rust_type {
@@ -248,11 +285,15 @@ pub fn convert_column_value(
             "f32" | "f64" => Ok(Value::Real(get_real().unwrap_or(0.0))),
             "bool" => {
                 let v = get_bool().unwrap_or(0);
-                Ok(Value::Integer(if v == 1 { 1 } else { 0 }))
+                Ok(Value::Boolean(v == 1))
             }
-            _ => Err(crate::Error::Database(format!(
-                "Unsupported column type: {rust_type}"
-            ))),
+            "Vec<u8>" | "&[u8]" => Ok(Value::Bytes(get_bytes().unwrap_or_default())),
+            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                Ok(Value::DateTime(get_datetime().unwrap_or_else(|| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                })))
+            }
+            _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
         }
     }
 }
@@ -386,7 +427,9 @@ pub fn parse_column_value_strict(
     get_string: impl FnOnce() -> Option<String>,
     get_real: impl FnOnce() -> Option<f64>,
     get_bool: impl FnOnce() -> Option<i8>,
-) -> Result<Value, crate::Error> {
+    get_bytes: impl FnOnce() -> Option<Vec<u8>>,
+    get_datetime: impl FnOnce() -> Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<Value> {
     if is_nullable {
         // 可空字段:允许 None
         match rust_type {
@@ -403,48 +446,72 @@ pub fn parse_column_value_strict(
                 None => Ok(Value::Null),
             },
             "bool" => match get_bool() {
-                Some(1) => Ok(Value::Integer(1)),
-                Some(0) => Ok(Value::Integer(0)),
+                Some(1) => Ok(Value::Boolean(true)),
+                Some(0) => Ok(Value::Boolean(false)),
                 _ => Ok(Value::Null),
             },
-            _ => Err(crate::Error::Database(format!(
+            "Vec<u8>" | "&[u8]" => match get_bytes() {
+                Some(val) => Ok(Value::Bytes(val)),
+                None => Ok(Value::Null),
+            },
+            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                match get_datetime() {
+                    Some(val) => Ok(Value::DateTime(val)),
+                    None => Ok(Value::Null),
+                }
+            }
+            _ => Err(anyhow::anyhow!(
                 "Unsupported nullable column type: {rust_type}"
-            ))),
+            )),
         }
     } else {
         // 非空字段:解析失败时返回错误
         match rust_type {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match get_int() {
                 Some(val) => Ok(Value::Integer(val)),
-                None => Err(crate::Error::ParseError(format!(
+                None => Err(anyhow::anyhow!(
                     "Failed to parse non-nullable column '{}' (expected integer type)",
                     column_name
-                ))),
+                )),
             },
             "String" => match get_string() {
                 Some(val) => Ok(Value::Text(val)),
-                None => Err(crate::Error::ParseError(format!(
+                None => Err(anyhow::anyhow!(
                     "Failed to parse non-nullable column '{}' (expected String type)",
                     column_name
-                ))),
+                )),
             },
             "f32" | "f64" => match get_real() {
                 Some(val) => Ok(Value::Real(val)),
-                None => Err(crate::Error::ParseError(format!(
+                None => Err(anyhow::anyhow!(
                     "Failed to parse non-nullable column '{}' (expected float type)",
                     column_name
-                ))),
+                )),
             },
             "bool" => match get_bool() {
-                Some(v) => Ok(Value::Integer(if v == 1 { 1 } else { 0 })),
-                None => Err(crate::Error::ParseError(format!(
+                Some(v) => Ok(Value::Boolean(v == 1)),
+                None => Err(anyhow::anyhow!(
                     "Failed to parse non-nullable column '{}' (expected bool type)",
                     column_name
-                ))),
+                )),
             },
-            _ => Err(crate::Error::Database(format!(
-                "Unsupported column type: {rust_type}"
-            ))),
+            "Vec<u8>" | "&[u8]" => match get_bytes() {
+                Some(val) => Ok(Value::Bytes(val)),
+                None => Err(anyhow::anyhow!(
+                    "Failed to parse non-nullable column '{}' (expected Vec<u8> type)",
+                    column_name
+                )),
+            },
+            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                match get_datetime() {
+                    Some(val) => Ok(Value::DateTime(val)),
+                    None => Err(anyhow::anyhow!(
+                        "Failed to parse non-nullable column '{}' (expected DateTime type)",
+                        column_name
+                    )),
+                }
+            }
+            _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
         }
     }
 }

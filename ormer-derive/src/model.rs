@@ -218,16 +218,16 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 ::ormer::Select::new()
             }
 
-            fn from_row(row: &::ormer::Row) -> Result<Self, ::ormer::Error> {
+            fn from_row(row: &::ormer::Row) -> anyhow::Result<Self> {
                 Ok(Self {
                     #(#from_row_fields),*
                 })
             }
 
-            fn from_row_values(values: &[::ormer::Value]) -> Result<Self, ::ormer::Error> {
+            fn from_row_values(values: &[::ormer::Value]) -> anyhow::Result<Self> {
                 if values.len() < Self::COLUMNS.len() {
-                    return Err(::ormer::Error::TypeMismatch(
-                        format!("Expected {} values for {}", Self::COLUMNS.len(), stringify!(#name))
+                    return Err(anyhow::anyhow!(
+                        "Expected {} values for {}", Self::COLUMNS.len(), stringify!(#name)
                     ));
                 }
                 Ok(Self {
@@ -311,12 +311,12 @@ fn derive_model_tuple_wrapper(
                 ::ormer::Select::new()
             }
 
-            fn from_row(row: &::ormer::Row) -> Result<Self, ::ormer::Error> {
+            fn from_row(row: &::ormer::Row) -> anyhow::Result<Self> {
                 let inner = <#inner_type as ::ormer::Model>::from_row(row)?;
                 Ok(#name(inner))
             }
 
-            fn from_row_values(values: &[::ormer::Value]) -> Result<Self, ::ormer::Error> {
+            fn from_row_values(values: &[::ormer::Value]) -> anyhow::Result<Self> {
                 let inner = <#inner_type as ::ormer::Model>::from_row_values(values)?;
                 Ok(#name(inner))
             }
@@ -466,12 +466,23 @@ fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
                     let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
 
                     // 使用函数指针在运行时获取目标模型的主键字段名（避免在常量上下文中调用非 const 函数）
+                    // 创建一个辅助函数来返回主键列名
+                    let pk_fn_name = syn::Ident::new(
+                        &format!("__{}_primary_key_column", ref_type),
+                        proc_macro2::Span::call_site(),
+                    );
+
                     return quote! {
-                        Some(::ormer::model::ForeignKeyInfo {
-                            ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
-                            ref_column: "",
-                            ref_column_fn: Some(<#ref_type_ident as ::ormer::Model>::primary_key_column),
-                        })
+                        {
+                            fn #pk_fn_name() -> &'static str {
+                                <#ref_type_ident as ::ormer::Model>::primary_key_columns()[0]
+                            }
+                            Some(::ormer::model::ForeignKeyInfo {
+                                ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
+                                ref_column: "",
+                                ref_column_fn: Some(#pk_fn_name),
+                            })
+                        }
                     };
                 }
             }

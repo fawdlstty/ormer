@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -21,13 +21,17 @@ path = "src/lib.rs"
 anyhow = "1.0.102"
 async-trait = "0.1"
 futures = "0.3"
-ormer-derive = { version = "0.1.7", path = "../ormer-derive" }
+ormer-derive = { version = "0.1.8", path = "../ormer-derive" }
 paste = "1.0"
-thiserror = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["serde"] }
+serde_json = "1.0"
 # sqlite
 turso = { version = "0.1", optional = true }
 # postgres
+bb8 = { version = "0.8", optional = true }
+bb8-postgres = { version = "0.8", optional = true }
 postgres-types = { version = "0.2", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
 # mysql
@@ -47,7 +51,7 @@ all-features = true
 default = []
 full = ["sqlite", "postgresql", "mysql"]
 sqlite = ["dep:turso"]
-postgresql = ["dep:tokio-postgres", "dep:postgres-types"]
+postgresql = ["dep:tokio-postgres", "dep:postgres-types", "dep:bb8", "dep:bb8-postgres"]
 mysql = ["dep:mysql_async"]
 
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io

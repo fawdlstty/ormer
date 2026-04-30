@@ -800,7 +800,7 @@ impl<T: Model> Select<T> {
             T::COLUMNS.join(", "),
             T::TABLE_NAME
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -898,7 +898,7 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
             T::TABLE_NAME,
             R::TABLE_NAME
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -991,7 +991,7 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
             R1::TABLE_NAME,
             R2::TABLE_NAME
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -1086,7 +1086,7 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
             R2::TABLE_NAME,
             R3::TABLE_NAME
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -1646,11 +1646,9 @@ impl<T> From<TypedColumn<T>> for OrderBy {
 }
 
 impl<T: crate::model::FromValue> crate::model::FromRowValues for TypedColumn<T> {
-    fn from_row_values(values: &[crate::model::Value]) -> Result<Self, crate::Error> {
+    fn from_row_values(values: &[crate::model::Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
-            return Err(crate::Error::Database(
-                "Expected at least 1 value for TypedColumn".to_string(),
-            ));
+            return Err(anyhow::anyhow!("Expected at least 1 value for TypedColumn"));
         }
 
         // 从第一个值解析出实际的 T 类型
@@ -2163,7 +2161,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             self.join_table,
             self.join_alias
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
         self.format_join_condition(&self.on_condition, &mut sql);
@@ -2205,7 +2203,8 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         } = filter
         {
             // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
+                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
         }
     }
 }
@@ -2250,7 +2249,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             self.join_table,
             self.join_alias
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
         self.format_join_condition(&self.on_condition, &mut sql);
@@ -2292,7 +2291,8 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         } = filter
         {
             // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
+                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
         }
     }
 }
@@ -2337,7 +2337,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             self.join_table,
             self.join_alias
         )
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
         self.format_join_condition(&self.on_condition, &mut sql);
@@ -2379,7 +2379,8 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         } = filter
         {
             // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column).unwrap();
+            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
+                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
         }
     }
 }

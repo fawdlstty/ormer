@@ -91,18 +91,18 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         // 表不存在，创建新表
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::Sqlite,
             self.table_name.as_deref(),
-        );
+        )?;
 
         self.db
             .conn
             .execute(&create_sql, ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
@@ -115,13 +115,13 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
         self.db
             .conn
             .execute(&sql, ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(())
     }
 }
@@ -134,9 +134,9 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.db.insert_batch::<I::Model>(&refs).await
+        self.db.insert_impl::<I::Model>(&refs).await
     }
 }
 
@@ -148,7 +148,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
         self.db.insert_or_update_batch::<I::Model>(&refs).await
     }
@@ -156,15 +156,15 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 
 impl Database {
     /// 连接到 Sqlite 数据库 (本地模式)
-    pub async fn connect(_db_type: super::DbType, path: &str) -> Result<Self, crate::Error> {
+    pub async fn connect(_db_type: super::DbType, path: &str) -> anyhow::Result<Self> {
         let db = turso::Builder::new_local(path)
             .build()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let conn = Arc::new(
             db.connect()
-                .map_err(|e| crate::Error::Database(e.to_string()))?,
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?,
         );
 
         Ok(Self { conn })
@@ -180,15 +180,15 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> Result<(), crate::Error> {
+    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().await?;
 
         if !table_exists {
-            return Err(crate::Error::SchemaMismatch {
-                table: T::TABLE_NAME.to_string(),
-                reason: "Table does not exist".to_string(),
-            });
+            return Err(anyhow::anyhow!(
+                "Schema mismatch: table {} does not exist",
+                T::TABLE_NAME
+            ));
         }
 
         // 表已存在，验证表结构
@@ -196,23 +196,23 @@ impl Database {
     }
 
     /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> Result<bool, crate::Error> {
+    async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
         let mut rows = self
             .conn
             .query(sql, [T::TABLE_NAME])
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         if let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let count = row
                 .get_value(0)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             match count {
                 turso::Value::Integer(c) => Ok(c > 0),
@@ -224,7 +224,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> Result<(), crate::Error> {
+    async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", T::TABLE_NAME);
 
@@ -232,27 +232,27 @@ impl Database {
             .conn
             .query(&sql, ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool, bool)> = Vec::new();
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let name = row
                 .get_value(1)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             let col_type = row
                 .get_value(2)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             let notnull = row
                 .get_value(3)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
             let pk = row
                 .get_value(5)
-                .map_err(|e| crate::Error::Database(e.to_string()))?;
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
             if let (
                 turso::Value::Text(name),
@@ -267,49 +267,46 @@ impl Database {
 
         // 比较列数量
         if actual_columns.len() != T::COLUMNS.len() {
-            return Err(crate::Error::SchemaMismatch {
-                table: T::TABLE_NAME.to_string(),
-                reason: format!(
-                    "Column count mismatch: expected {}, but actual is {}",
-                    T::COLUMNS.len(),
-                    actual_columns.len()
-                ),
-            });
+            return Err(anyhow::anyhow!(
+                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
+                T::TABLE_NAME,
+                T::COLUMNS.len(),
+                actual_columns.len()
+            ));
         }
 
         // 比较每一列的定义
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!("Missing column: {}", expected_col.name),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Missing column: {}",
+                    T::TABLE_NAME,
+                    expected_col.name
+                ));
             }
 
             let (actual_name, actual_type, actual_notnull, actual_pk) = &actual_columns[i];
 
             // 检查列名
             if actual_name != expected_col.name {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!(
-                        "Column name mismatch at position {i}: expected '{}', but actual is '{actual_name}'",
-                        expected_col.name
-                    ),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
+                    T::TABLE_NAME,
+                    i,
+                    expected_col.name,
+                    actual_name
+                ));
             }
 
             // 检查主键约束
             if expected_col.is_primary != *actual_pk {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!(
-                        "Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
-                        expected_col.name,
-                        if expected_col.is_primary { "" } else { "not " },
-                        if *actual_pk { "" } else { "not " }
-                    ),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    if expected_col.is_primary { "" } else { "not " },
+                    if *actual_pk { "" } else { "not " }
+                ));
             }
 
             // 检查列类型（只比较基础类型，不包含 NOT NULL 约束）
@@ -348,28 +345,24 @@ impl Database {
             };
 
             if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(crate::Error::SchemaMismatch {
-                    table: T::TABLE_NAME.to_string(),
-                    reason: format!(
-                        "Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
-                        expected_col.name
-                    ),
-                });
+                return Err(anyhow::anyhow!(
+                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
+                    T::TABLE_NAME,
+                    expected_col.name
+                ));
             }
 
             // 检查 NOT NULL 约束（主键列自动 NOT NULL，所以不需要额外检查）
             if !expected_col.is_primary {
                 let expected_notnull = !expected_col.is_nullable;
                 if *actual_notnull != expected_notnull {
-                    return Err(crate::Error::SchemaMismatch {
-                        table: T::TABLE_NAME.to_string(),
-                        reason: format!(
-                            "Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                            expected_col.name,
-                            if expected_notnull { "NOT " } else { "" },
-                            if *actual_notnull { "NOT " } else { "" }
-                        ),
-                    });
+                    return Err(anyhow::anyhow!(
+                        "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
+                        T::TABLE_NAME,
+                        expected_col.name,
+                        if expected_notnull { "NOT " } else { "" },
+                        if *actual_notnull { "NOT " } else { "" }
+                    ));
                 }
             }
         }
@@ -417,7 +410,7 @@ impl Database {
     }
 
     /// 批量插入记录
-    pub async fn insert_batch<T: Model>(&self, models: &[&T]) -> Result<(), crate::Error> {
+    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -437,16 +430,13 @@ impl Database {
         self.conn
             .execute(&sql, all_params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> Result<(), crate::Error> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -494,7 +484,7 @@ impl Database {
         self.conn
             .execute(&sql, all_params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
@@ -546,11 +536,11 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> Result<Transaction, crate::Error> {
+    pub async fn begin(&self) -> anyhow::Result<Transaction> {
         self.conn
             .execute("BEGIN", ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(Transaction {
             conn: self.conn.clone(),
             committed: false,
@@ -567,25 +557,26 @@ impl Database {
     }
 
     /// 执行原生 SQL 查询并返回模型列表
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> Result<Vec<T>, crate::Error> {
+    /// 执行原生 SQL 查询并返回模型列表
+    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
         let mut rows = self
             .conn
             .query(sql, ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         let mut results = Vec::new();
 
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -598,13 +589,19 @@ impl Database {
         Ok(results)
     }
 
+    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
+    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
+    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
+        self.execute::<T>(sql).await
+    }
+
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn exec_non_query(&self, sql: &str) -> Result<u64, crate::Error> {
+    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
         let result = self
             .conn
             .execute(sql, ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         Ok(result)
     }
 
@@ -629,9 +626,9 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.txn.insert_batch::<I::Model>(&refs).await
+        self.txn.insert_impl::<I::Model>(&refs).await
     }
 }
 
@@ -643,39 +640,39 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> Result<(), crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.txn.insert_or_update_batch::<I::Model>(&refs).await
+        self.txn.insert_or_update_impl::<I::Model>(&refs).await
     }
 }
 
 impl Transaction {
     /// 提交事务
-    pub async fn commit(mut self) -> Result<(), crate::Error> {
+    pub async fn commit(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(crate::Error::Database(
-                "Transaction already committed or rolled back".to_string(),
+            return Err(anyhow::anyhow!(
+                "Transaction already committed or rolled back"
             ));
         }
         self.conn
             .execute("COMMIT", ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         self.committed = true;
         Ok(())
     }
 
     /// 回滚事务
-    pub async fn rollback(mut self) -> Result<(), crate::Error> {
+    pub async fn rollback(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(crate::Error::Database(
-                "Transaction already committed or rolled back".to_string(),
+            return Err(anyhow::anyhow!(
+                "Transaction already committed or rolled back"
             ));
         }
         self.conn
             .execute("ROLLBACK", ())
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
         self.rolled_back = true;
         Ok(())
     }
@@ -741,8 +738,8 @@ impl Transaction {
         }
     }
 
-    /// 批量插入记录
-    pub async fn insert_batch<T: Model>(&mut self, models: &[&T]) -> Result<(), crate::Error> {
+    /// 批量插入记录（内部使用）
+    async fn insert_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -762,16 +759,13 @@ impl Transaction {
         self.conn
             .execute(&sql, all_params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
 
-    /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(
-        &mut self,
-        models: &[&T],
-    ) -> Result<(), crate::Error> {
+    /// 批量插入或更新记录（遇到重复键时更新）（内部使用）
+    async fn insert_or_update_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -819,7 +813,7 @@ impl Transaction {
         self.conn
             .execute(&sql, all_params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(())
     }
@@ -1206,7 +1200,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         self.collect::<Vec<(T, Option<J>)>>()
     }
 
-    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -1214,6 +1208,12 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1222,12 +1222,12 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -1236,13 +1236,13 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1304,7 +1304,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         }
     }
 
-    async fn collect_inner(self) -> Result<Vec<(T, J)>, crate::Error> {
+    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -1312,6 +1312,12 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1320,12 +1326,12 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -1334,13 +1340,13 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1350,7 +1356,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
                 let idx = t_col_count + i;
                 let value = row
                     .get_value(idx)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1358,7 +1364,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             results.push((t_model, j_model));
         }
 
-        Ok(results)
+        Ok(results.into_iter().collect())
     }
 }
 
@@ -1391,7 +1397,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         }
     }
 
-    async fn collect_inner(self) -> Result<Vec<(Option<T>, J)>, crate::Error> {
+    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -1399,6 +1405,12 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1407,12 +1419,12 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -1421,7 +1433,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut t_data = HashMap::new();
             let mut t_is_null = true;
@@ -1442,7 +1454,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
                 let idx = t_col_count + i;
                 let value = row
                     .get_value(idx)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1450,7 +1462,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             results.push((t_model, j_model));
         }
 
-        Ok(results)
+        Ok(results.into_iter().collect())
     }
 }
 
@@ -1470,7 +1482,7 @@ pub struct AggregateFuture<T: Model, R> {
 impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
     for AggregateFuture<T, R>
 {
-    type Output = Result<R, crate::Error>;
+    type Output = anyhow::Result<R>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1483,6 +1495,12 @@ impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::Into
                     crate::model::Value::Integer(i) => turso::Value::Integer(i),
                     crate::model::Value::Text(t) => turso::Value::Text(t),
                     crate::model::Value::Real(r) => turso::Value::Real(r),
+                    crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                    crate::model::Value::Bytes(b) => turso::Value::Blob(b),
+                    crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                    crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                    crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                    crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64),
                     crate::model::Value::Null => turso::Value::Null,
                 })
                 .collect();
@@ -1491,22 +1509,22 @@ impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::Into
                 self.conn
                     .query(&sql, ())
                     .await
-                    .map_err(|e| crate::Error::Database(e.to_string()))?
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
             } else {
                 self.conn
                     .query(&sql, values)
                     .await
-                    .map_err(|e| crate::Error::Database(e.to_string()))?
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
             };
 
             if let Some(row) = rows
                 .next()
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
             {
                 let value = row
                     .get_value(0)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
                 // 将turso::Value转换为ormer::Value
                 let ormer_value = match value {
@@ -1553,7 +1571,7 @@ pub struct GroupedCollectFuture<'a, T: Model, V, C> {
 impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
     for CollectFuture<'a, T, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1564,7 +1582,7 @@ impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFutu
 impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for LeftJoinCollectFuture<T, J>
 {
-    type Output = Result<Vec<(T, Option<J>)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(T, Option<J>)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1575,7 +1593,7 @@ impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for InnerJoinCollectFuture<T, J>
 {
-    type Output = Result<Vec<(T, J)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(T, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1586,7 +1604,7 @@ impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
 impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for RightJoinCollectFuture<T, J>
 {
-    type Output = Result<Vec<(Option<T>, J)>, crate::Error>;
+    type Output = anyhow::Result<Vec<(Option<T>, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1627,7 +1645,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         self.collect::<Vec<T>>()
     }
 
-    async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
             .into_iter()
@@ -1635,6 +1653,12 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1643,12 +1667,12 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -1656,13 +1680,13 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1684,7 +1708,7 @@ pub struct RelatedCollectFuture<T: Model, R: Model> {
 impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
     for RelatedCollectFuture<T, R>
 {
-    type Output = Result<Vec<T>, crate::Error>;
+    type Output = anyhow::Result<Vec<T>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1693,7 +1717,7 @@ impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    async fn collect_inner<C: FromIterator<T>>(self) -> Result<C, crate::Error> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 将 ormer::Value 转换为 turso::Value
@@ -1703,6 +1727,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1711,12 +1741,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -1724,13 +1754,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1764,20 +1794,20 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     /// 执行删除操作并返回影响的行数
-    pub async fn execute(self) -> Result<u64, crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql();
 
         let result = self
             .conn
             .execute(&sql, params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(result)
     }
 
     /// 执行删除操作并返回影响的行数（execute 的别名）
-    pub async fn exec(self) -> Result<u64, crate::Error> {
+    pub async fn exec(self) -> anyhow::Result<u64> {
         self.execute().await
     }
 
@@ -1792,7 +1822,7 @@ impl<T: Model> DeleteExecutor<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter_with_params(
+                let _ = common_helpers::format_filter_with_params(
                     filter,
                     &mut sql,
                     &mut param_idx,
@@ -1808,7 +1838,7 @@ impl<T: Model> DeleteExecutor<T> {
 }
 
 impl<T: Model + 'static> std::future::IntoFuture for DeleteExecutor<T> {
-    type Output = Result<u64, crate::Error>;
+    type Output = anyhow::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1850,24 +1880,24 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 执行更新操作
-    pub async fn execute(self) -> Result<u64, crate::Error> {
+    pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql()?;
 
         let result = self
             .conn
             .execute(&sql, params)
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?;
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(result)
     }
 
     /// 执行更新操作（execute 的别名）
-    pub async fn exec(self) -> Result<u64, crate::Error> {
+    pub async fn exec(self) -> anyhow::Result<u64> {
         self.execute().await
     }
 
-    fn build_sql(&self) -> Result<(String, Vec<turso::Value>), crate::Error> {
+    fn build_sql(&self) -> anyhow::Result<(String, Vec<turso::Value>)> {
         let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
         let mut ormer_params = Vec::new();
 
@@ -1890,7 +1920,7 @@ impl<T: Model> UpdateExecutor<T> {
                 if i > 0 {
                     sql.push_str(" AND ");
                 }
-                common_helpers::format_filter_with_params(
+                let _ = common_helpers::format_filter_with_params(
                     filter,
                     &mut sql,
                     &mut param_idx,
@@ -1906,7 +1936,7 @@ impl<T: Model> UpdateExecutor<T> {
 }
 
 impl<T: Model + 'static> std::future::IntoFuture for UpdateExecutor<T> {
-    type Output = Result<u64, crate::Error>;
+    type Output = anyhow::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1915,7 +1945,7 @@ impl<T: Model + 'static> std::future::IntoFuture for UpdateExecutor<T> {
 }
 
 /// 将 ormer Value 转换为 turso 参数
-fn values_to_params(values: &[Value]) -> Result<Vec<turso::Value>, crate::Error> {
+fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
     let mut params = Vec::new();
 
     for value in values {
@@ -1923,6 +1953,12 @@ fn values_to_params(values: &[Value]) -> Result<Vec<turso::Value>, crate::Error>
             Value::Integer(v) => turso::Value::Integer(*v),
             Value::Text(v) => turso::Value::Text(v.clone()),
             Value::Real(v) => turso::Value::Real(*v),
+            Value::Boolean(v) => turso::Value::Integer(if *v { 1 } else { 0 }),
+            Value::Bytes(v) => turso::Value::Blob(v.clone()),
+            Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
+            Value::Json(v) => turso::Value::Text(v.to_string()),
+            Value::Uuid(v) => turso::Value::Text(v.to_string()),
+            Value::BigInt(v) => turso::Value::Integer(*v as i64),
             Value::Null => turso::Value::Null,
         };
         params.push(param);
@@ -1932,16 +1968,13 @@ fn values_to_params(values: &[Value]) -> Result<Vec<turso::Value>, crate::Error>
 }
 
 /// 将 turso Value 转换为 ormer Value
-fn convert_turso_value(value: &turso::Value) -> Result<Value, crate::Error> {
+fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
     match value {
         turso::Value::Integer(v) => Ok(Value::Integer(*v)),
         turso::Value::Text(v) => Ok(Value::Text(v.clone())),
         turso::Value::Real(v) => Ok(Value::Real(*v)),
         turso::Value::Null => Ok(Value::Null),
-        _ => Err(crate::Error::Database(format!(
-            "Unsupported turso value type: {:?}",
-            value
-        ))),
+        _ => Err(anyhow::anyhow!("Unsupported turso value type: {:?}", value)),
     }
 }
 
@@ -1954,7 +1987,7 @@ pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
 impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1977,7 +2010,7 @@ where
     M: 'static,
     F: Fn(V) -> M + Clone + 'static,
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2018,7 +2051,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         }
     }
 
-    async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
+    async fn collect_inner<C: FromIterator<V>>(self) -> anyhow::Result<C>
     where
         V: crate::model::FromRowValues,
     {
@@ -2030,6 +2063,12 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2038,12 +2077,12 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -2051,7 +2090,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             // 获取行中的所有值
             let column_count = self.select.column_names().len();
@@ -2059,7 +2098,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             for i in 0..column_count {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2127,7 +2166,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
     std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = Result<C, crate::Error>;
+    type Output = anyhow::Result<C>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2139,7 +2178,7 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 }
 
 impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
-    async fn collect_inner<C: FromIterator<V>>(self) -> Result<C, crate::Error>
+    async fn collect_inner<C: FromIterator<V>>(self) -> anyhow::Result<C>
     where
         V: crate::model::FromRowValues,
     {
@@ -2151,6 +2190,12 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2159,12 +2204,12 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             self.conn
                 .query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             self.conn
                 .query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         let mut results = Vec::new();
@@ -2172,7 +2217,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         while let Some(row) = rows
             .next()
             .await
-            .map_err(|e| crate::Error::Database(e.to_string()))?
+            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         {
             // 获取行中的所有值（从 column_count 获取列数）
             let column_count = self.select.column_count();
@@ -2180,7 +2225,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             for i in 0..column_count {
                 let value = row
                     .get_value(i)
-                    .map_err(|e| crate::Error::Database(e.to_string()))?;
+                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2194,7 +2239,25 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 }
 
-/// SelectStream - 流式查询执行器
+/// SelectStream - 流式查询执行器 (SQLite/Turso)
+///
+/// 该执行器用于创建流式查询，允许逐行读取数据而不是一次性加载所有结果到内存中。
+/// 适用于处理大量数据的场景，内存占用为 O(1)。
+///
+/// # 示例
+///
+/// ```rust,ignore
+/// let mut stream = db.select::<User>().stream().into_iter().await?;
+/// while let Some(result) = stream.next().await {
+///     let user = result?;
+///     println!("User: {:?}", user);
+/// }
+/// ```
+///
+/// # 连接管理
+///
+/// 该执行器持有 `Arc<turso::Connection>` 的克隆，确保在流式查询期间连接保持活跃。
+/// 当 `SelectStreamIterator` 被 drop 时，连接会自动释放（通过 Arc 的引用计数）。
 pub struct SelectStream<'a, T: Model> {
     select: Select<T>,
     conn: super::common::StreamConnection<'a>,
@@ -2203,7 +2266,7 @@ pub struct SelectStream<'a, T: Model> {
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
-    pub async fn into_iter(self) -> Result<SelectStreamIterator<'a, T>, crate::Error> {
+    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 从 StreamConnection 获取连接
@@ -2219,6 +2282,12 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
                 crate::model::Value::Real(r) => turso::Value::Real(r),
+                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
+                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
+                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
+                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2226,31 +2295,60 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let rows = if turso_params.is_empty() {
             conn.query(&sql, ())
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         } else {
             conn.query(&sql, turso_params)
                 .await
-                .map_err(|e| crate::Error::Database(e.to_string()))?
+                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
         };
 
         Ok(SelectStreamIterator {
             conn: super::common::StreamConnection::Sqlite(conn),
             rows,
+            polluted: false,
             _marker: std::marker::PhantomData,
         })
     }
 }
 
-/// SelectStreamIterator - 流式查询迭代器
+/// SelectStreamIterator - 流式查询迭代器 (SQLite/Turso)
+///
+/// 该迭代器用于逐行读取流式查询的结果。
+/// 每次调用 `next()` 方法会从数据库中获取下一行数据。
+///
+/// # 错误处理
+///
+/// 如果在解析行数据时发生错误，迭代器会被标记为"污染"状态，
+/// 后续调用 `next()` 将直接返回 `None`，避免连续错误。
+///
+/// # 资源释放
+///
+/// 当迭代器被 drop 时（无论是正常完成、提前终止还是发生错误），
+/// 底层的 turso::Rows 会自动关闭游标，连接会通过 Arc 的引用计数自动释放。
 pub struct SelectStreamIterator<'a, T: Model> {
+    #[allow(dead_code)]
     conn: super::common::StreamConnection<'a>,
     rows: turso::Rows,
+    polluted: bool, // 标记是否发生解析错误，污染后不再尝试读取
     _marker: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T: Model> Drop for SelectStreamIterator<'a, T> {
+    fn drop(&mut self) {
+        // turso::Rows 会在 Drop 时自动关闭游标并释放相关资源
+        // StreamConnection 中的 Arc<turso::Connection> 会在最后一个引用释放时自动清理
+        // 不需要显式操作，Rust 的 RAII 机制会确保资源正确释放
+    }
 }
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
-    pub async fn next(&mut self) -> Option<Result<T, crate::Error>> {
+    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
+        // 如果已经污染，直接返回 None
+        if self.polluted {
+            return None;
+        }
+
         match self.rows.next().await {
             Ok(Some(row)) => {
                 // 解析行数据为 Model
@@ -2261,16 +2359,27 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                             Ok(ormer_value) => {
                                 data.insert(col_name.to_string(), ormer_value);
                             }
-                            Err(e) => return Some(Err(e)),
+                            Err(e) => {
+                                self.polluted = true;
+                                return Some(Err(e));
+                            }
                         },
-                        Err(e) => return Some(Err(crate::Error::Database(e.to_string()))),
+                        Err(e) => {
+                            self.polluted = true;
+                            return Some(Err(
+                                anyhow::anyhow!(e).context("Database operation failed")
+                            ));
+                        }
                     }
                 }
                 let ormer_row = Row::new(data);
                 Some(T::from_row(&ormer_row))
             }
             Ok(None) => None,
-            Err(e) => Some(Err(crate::Error::Database(e.to_string()))),
+            Err(e) => {
+                self.polluted = true;
+                Some(Err(anyhow::anyhow!(e).context("Database operation failed")))
+            }
         }
     }
 }

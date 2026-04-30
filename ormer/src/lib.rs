@@ -16,6 +16,7 @@ pub use abstract_layer::{
     MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, PooledConnection,
     SelectStream, SelectStreamIterator, Transaction,
 };
+pub use anyhow::Result;
 pub use model::{
     AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, Error,
     FromRowValues, FromSingleValue, FromValue, Insertable, Model, ModelEnum, ModelEnumProvider,

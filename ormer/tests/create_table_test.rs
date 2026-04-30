@@ -12,13 +12,17 @@ define_test_complete_types!(TestCompleteTypes, "create_table_complete_types_1");
 mod create_table_tests {
     use super::*;
 
-    async fn test_turso_create_table_sql_impl(config: &_test_common::DbConfig) {
+    async fn test_turso_create_table_sql_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestUser>(config.0);
+        let sql = generate_create_table_sql::<TestUser>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         #[allow(unreachable_patterns)]
         match config.0 {
+            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+            ormer::DbType::None => panic!("No database backend available"),
             #[cfg(feature = "sqlite")]
             ormer::DbType::Sqlite => {
                 assert!(sql.contains("id INTEGER PRIMARY KEY"));
@@ -57,11 +61,14 @@ mod create_table_tests {
             _ => "Unknown",
         };
         println!("{} SQL: {}", db_type_name, sql);
+        Ok(())
     }
 
-    async fn test_postgresql_create_table_sql_impl(config: &_test_common::DbConfig) {
+    async fn test_postgresql_create_table_sql_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestUser>(config.0);
+        let sql = generate_create_table_sql::<TestUser>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
@@ -99,11 +106,14 @@ mod create_table_tests {
             #[allow(unreachable_patterns)]
             _ => {}
         }
+        Ok(())
     }
 
-    async fn test_mysql_create_table_sql_impl(config: &_test_common::DbConfig) {
+    async fn test_mysql_create_table_sql_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestUser>(config.0);
+        let sql = generate_create_table_sql::<TestUser>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
@@ -141,17 +151,20 @@ mod create_table_tests {
             #[allow(unreachable_patterns)]
             _ => {}
         }
+        Ok(())
     }
 
-    async fn test_different_databases_produce_different_sql_impl(config: &_test_common::DbConfig) {
+    async fn test_different_databases_produce_different_sql_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
         // 使用条件编译确保只使用已启用的数据库类型
         #[cfg(all(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
         {
             // 使用 TestCompleteTypes 来测试，因为它包含 bool 类型，在不同数据库中映射不同
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
-            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
-            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite)?;
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL)?;
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL)?;
 
             // 验证三个数据库生成的SQL确实不同
             // Sqlite: bool -> INTEGER, String -> TEXT
@@ -173,29 +186,32 @@ mod create_table_tests {
 
         #[cfg(all(feature = "sqlite", feature = "postgresql", not(feature = "mysql")))]
         {
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
-            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite)?;
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL)?;
             assert_ne!(turso_sql, pg_sql);
         }
 
         #[cfg(all(feature = "sqlite", feature = "mysql", not(feature = "postgresql")))]
         {
-            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite);
-            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
+            let turso_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::Sqlite)?;
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL)?;
             assert_ne!(turso_sql, mysql_sql);
         }
 
         #[cfg(all(feature = "postgresql", feature = "mysql", not(feature = "sqlite")))]
         {
-            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL);
-            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL);
+            let pg_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::PostgreSQL)?;
+            let mysql_sql = generate_create_table_sql::<TestCompleteTypes>(ormer::DbType::MySQL)?;
             assert_ne!(pg_sql, mysql_sql);
         }
+        Ok(())
     }
 
-    async fn test_postgresql_complete_types_impl(config: &_test_common::DbConfig) {
+    async fn test_postgresql_complete_types_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
@@ -237,11 +253,14 @@ mod create_table_tests {
             #[allow(unreachable_patterns)]
             _ => {}
         }
+        Ok(())
     }
 
-    async fn test_mysql_complete_types_impl(config: &_test_common::DbConfig) {
+    async fn test_mysql_complete_types_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
@@ -283,11 +302,14 @@ mod create_table_tests {
             #[allow(unreachable_patterns)]
             _ => {}
         }
+        Ok(())
     }
 
-    async fn test_turso_complete_types_impl(config: &_test_common::DbConfig) {
+    async fn test_turso_complete_types_impl(
+        config: &_test_common::DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = config; // 避免未使用变量警告
-        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0);
+        let sql = generate_create_table_sql::<TestCompleteTypes>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
         match config.0 {
@@ -334,13 +356,14 @@ mod create_table_tests {
             _ => "Unknown",
         };
         println!("{} Complete Types SQL: {}", db_type_name, sql);
+        Ok(())
     }
 
-    test_on_all_dbs!(test_turso_create_table_sql_impl);
-    test_on_all_dbs!(test_postgresql_create_table_sql_impl);
-    test_on_all_dbs!(test_mysql_create_table_sql_impl);
-    test_on_all_dbs!(test_different_databases_produce_different_sql_impl);
-    test_on_all_dbs!(test_postgresql_complete_types_impl);
-    test_on_all_dbs!(test_mysql_complete_types_impl);
-    test_on_all_dbs!(test_turso_complete_types_impl);
+    test_on_all_dbs_result!(test_turso_create_table_sql_impl);
+    test_on_all_dbs_result!(test_postgresql_create_table_sql_impl);
+    test_on_all_dbs_result!(test_mysql_create_table_sql_impl);
+    test_on_all_dbs_result!(test_different_databases_produce_different_sql_impl);
+    test_on_all_dbs_result!(test_postgresql_complete_types_impl);
+    test_on_all_dbs_result!(test_mysql_complete_types_impl);
+    test_on_all_dbs_result!(test_turso_complete_types_impl);
 }

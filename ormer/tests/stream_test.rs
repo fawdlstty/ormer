@@ -25,9 +25,7 @@ async fn test_stream_basic_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 18 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 流式查询所有用户
@@ -66,9 +64,7 @@ async fn test_stream_with_filter_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 18 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 流式查询年龄 >= 23 的用户
@@ -110,9 +106,7 @@ async fn test_stream_with_order_and_range_impl(config: &_test_common::DbConfig) 
             name: format!("user{}", i),
             age: 18 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 流式查询，按年龄降序，取前 3 个
@@ -183,9 +177,7 @@ async fn test_stream_in_transaction_impl(config: &_test_common::DbConfig) {
             name: format!("txn_user{}", i),
             age: 20 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 在事务中流式查询
@@ -208,6 +200,9 @@ async fn test_stream_in_transaction_impl(config: &_test_common::DbConfig) {
 
     // 年龄 >= 22 的用户应该有 3 个 (22, 23, 24)
     assert_eq!(count, 3);
+
+    // stream 必须先 drop，释放对 txn 的借用
+    drop(stream);
 
     // 提交事务
     txn.commit().await.unwrap();
@@ -244,9 +239,7 @@ async fn test_stream_large_dataset_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 18 + (i % 50),
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 流式查询所有用户
@@ -289,9 +282,7 @@ async fn test_stream_error_handling_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 20 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 正常流式查询，验证不会panic
@@ -351,9 +342,7 @@ async fn test_stream_with_connection_pool_impl(config: &_test_common::DbConfig) 
             age: 18 + i,
             email: Some(format!("user{}@test.com", i)),
         };
-        pooled_conn.insert(&user)
-    .execute()
-    .await.unwrap();
+        pooled_conn.insert(&user).execute().await.unwrap();
     }
 
     // 使用连接池的stream方法
@@ -391,9 +380,7 @@ async fn test_stream_with_limit_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 18 + i,
         };
-        db.insert(&user)
-    .execute()
-    .await.unwrap();
+        db.insert(&user).execute().await.unwrap();
     }
 
     // 流式查询，限制返回5条

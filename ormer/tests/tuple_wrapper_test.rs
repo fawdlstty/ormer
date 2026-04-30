@@ -37,7 +37,7 @@ mod tuple_wrapper_tests {
     #[tokio::test]
     async fn test_tuple_wrapper_sql_generation() {
         // 测试基础模型
-        let user_sql = generate_create_table_sql::<TestUser>(ormer::DbType::Sqlite);
+        let user_sql = generate_create_table_sql::<TestUser>(ormer::DbType::Sqlite).unwrap();
         println!("TestUser SQL: {}", user_sql);
         assert!(user_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_test_users_1"));
         assert!(user_sql.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"));
@@ -46,7 +46,7 @@ mod tuple_wrapper_tests {
         assert!(user_sql.contains("email TEXT"));
 
         // 测试元组包装器模型 - 应该使用新的表名，但字段结构相同
-        let archive_sql = generate_create_table_sql::<ArchiveUser>(ormer::DbType::Sqlite);
+        let archive_sql = generate_create_table_sql::<ArchiveUser>(ormer::DbType::Sqlite).unwrap();
         println!("ArchiveUser SQL: {}", archive_sql);
         assert!(archive_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_archive_users_1"));
         assert!(!archive_sql.contains("tuple_wrapper_test_users_1"));
@@ -57,7 +57,7 @@ mod tuple_wrapper_tests {
         assert!(archive_sql.contains("email TEXT"));
 
         // 测试另一个包装器
-        let temp_sql = generate_create_table_sql::<TempUser>(ormer::DbType::Sqlite);
+        let temp_sql = generate_create_table_sql::<TempUser>(ormer::DbType::Sqlite).unwrap();
         println!("TempUser SQL: {}", temp_sql);
         assert!(temp_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_temp_users_1"));
         assert!(!temp_sql.contains("tuple_wrapper_test_users_1"));
@@ -101,9 +101,7 @@ mod tuple_wrapper_tests {
             age: 30,
             email: Some("bob@example.com".to_string()),
         });
-        db.insert(&archive_user)
-    .execute()
-    .await?;
+        db.insert(&archive_user).execute().await?;
         println!("✓ Inserted into archive_users");
 
         // 使用包装器类型查询归档表
