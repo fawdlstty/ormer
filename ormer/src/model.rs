@@ -1,39 +1,5 @@
 use std::collections::HashMap;
 
-/// 错误类型
-#[derive(Debug)]
-pub enum Error {
-    /// 数据库错误
-    Database(String),
-    /// 类型不匹配
-    TypeMismatch(String),
-    /// 解析错误
-    ParseError(String),
-    /// Schema 不匹配
-    SchemaMismatch { table: String, reason: String },
-}
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Database(msg) => write!(f, "Database error: {}", msg),
-            Error::TypeMismatch(msg) => write!(f, "Type mismatch: {}", msg),
-            Error::ParseError(msg) => write!(f, "Parse error: {}", msg),
-            Error::SchemaMismatch { table, reason } => {
-                write!(f, "Schema mismatch for table '{}': {}", table, reason)
-            }
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<anyhow::Error> for Error {
-    fn from(err: anyhow::Error) -> Self {
-        Error::Database(err.to_string())
-    }
-}
-
 /// 字段元数据
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
