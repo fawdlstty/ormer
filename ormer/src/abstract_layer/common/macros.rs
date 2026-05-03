@@ -333,12 +333,12 @@ macro_rules! impl_unified_update_executor {
 #[macro_export]
 macro_rules! impl_unified_collect_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
+        impl<'a, T: $crate::Model + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<T> + 'static> std::future::IntoFuture
             for $future_name<'a, T, C>
         {
             type Output = anyhow::Result<C>;
             type IntoFuture =
-                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
@@ -360,12 +360,12 @@ macro_rules! impl_unified_collect_future {
 #[macro_export]
 macro_rules! impl_unified_aggregate_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static, R: $crate::model::FromValue + 'static>
+        impl<'a, T: $crate::Model + 'static + std::marker::Send, R: $crate::model::FromValue + 'static + std::marker::Send>
             std::future::IntoFuture for $future_name<'a, T, R>
         {
             type Output = anyhow::Result<R>;
             type IntoFuture =
-                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
@@ -430,12 +430,12 @@ macro_rules! impl_unified_join_executor {
 #[macro_export]
 macro_rules! impl_unified_join_collect_future {
     ($future_name:ident, $output_type:ty) => {
-        impl<'a, T: $crate::Model + 'static, J: $crate::Model + 'static> std::future::IntoFuture
+        impl<'a, T: $crate::Model + 'static + std::marker::Send, J: $crate::Model + 'static + std::marker::Send> std::future::IntoFuture
             for $future_name<'a, T, J>
         {
             type Output = $output_type;
             type IntoFuture =
-                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
@@ -537,12 +537,12 @@ macro_rules! impl_unified_related_select_executor {
 #[macro_export]
 macro_rules! impl_unified_related_collect_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> std::future::IntoFuture
+        impl<'a, T: $crate::Model + 'static + std::marker::Send, R: $crate::Model + 'static + std::marker::Send> std::future::IntoFuture
             for $future_name<'a, T, R>
         {
             type Output = anyhow::Result<Vec<T>>;
             type IntoFuture =
-                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {

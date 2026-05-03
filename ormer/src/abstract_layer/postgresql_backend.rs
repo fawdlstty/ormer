@@ -1082,7 +1082,7 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
     std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -1373,7 +1373,7 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
     for AggregateFuture<'a, T, R>
 {
     type Output = anyhow::Result<R>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -1514,7 +1514,7 @@ impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFutu
     for CollectFuture<'a, T, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -1796,7 +1796,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 
 impl<'a, T: Model + 'static> std::future::IntoFuture for DeleteExecutor<'a, T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -1893,7 +1893,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
 impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -2427,7 +2427,7 @@ impl<'a, T: Model + 'static, R: Model + 'static> std::future::IntoFuture
     for RelatedCollectFuture<'a, T, R>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2576,7 +2576,7 @@ impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static> std::futu
     for MultiTableCollectFuture<'a, T, R1, R2>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2726,7 +2726,7 @@ impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model
     std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2791,7 +2791,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for LeftJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, Option<J>)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2993,7 +2993,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for InnerJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -3185,7 +3185,7 @@ impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(Option<T>, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -3471,7 +3471,7 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
     std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {

@@ -1228,7 +1228,7 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
 }
 
 /// 统一的 MappedCollectFuture 枚举
-pub enum MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+pub enum MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator<V> + 'static> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "postgresql")]
@@ -1251,11 +1251,11 @@ pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<V> + 'static>
     std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         match self {
@@ -1464,11 +1464,11 @@ impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
     }
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<V> + 'static>
     std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         match self {
@@ -1488,14 +1488,14 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
 
 impl<'a, T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<'a, T, V, C, M, F>
 where
-    T: Model + 'static,
-    V: crate::model::FromRowValues + 'static,
+    T: Model + 'static + std::marker::Send + std::marker::Sync,
+    V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
     C: FromIterator<M> + 'static,
-    M: 'static,
-    F: Fn(V) -> M + Clone + 'static,
+    M: 'static + std::marker::Send,
+    F: Fn(V) -> M + Clone + Send + 'static,
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         match self {

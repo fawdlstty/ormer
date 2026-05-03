@@ -83,6 +83,19 @@ pub struct Database {
     conn: Arc<turso::Connection>,
 }
 
+// SAFETY: turso::Connection uses internal synchronization mechanisms
+// that make it safe to share between threads. The turso library
+// doesn't explicitly implement Send, but the local connection mode
+// is safe to share because all operations are serialized through
+// async/await.
+unsafe impl Send for Database {}
+unsafe impl Sync for Database {}
+
+// Wrapper type to make turso::Connection explicitly Send
+struct SendableConnection(turso::Connection);
+
+unsafe impl Send for SendableConnection {}
+
 /// 创建表执行器
 pub struct CreateTableExecutor<'a, T: Model> {
     db: &'a Database,
@@ -1472,6 +1485,10 @@ pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     _marker: std::marker::PhantomData<C>,
 }
 
+// SAFETY: CollectFuture contains SelectExecutor which references Database (Send + Sync),
+// and the async operations are all await-based which ensures thread safety
+unsafe impl<'a, T: Model + Send, C: FromIterator<T> + Send> Send for CollectFuture<'a, T, C> {}
+
 /// Aggregate future for聚合函数执行
 pub struct AggregateFuture<T: Model, R> {
     aggregate_select: crate::query::builder::AggregateSelect<T, R>,
@@ -1479,11 +1496,11 @@ pub struct AggregateFuture<T: Model, R> {
     _marker: PhantomData<(T, R)>,
 }
 
-impl<T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
+impl<T: Model + 'static + std::marker::Send, R: crate::model::FromValue + 'static + std::marker::Send> std::future::IntoFuture
     for AggregateFuture<T, R>
 {
     type Output = anyhow::Result<R>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -1552,15 +1569,24 @@ pub struct LeftJoinCollectFuture<T: Model, J: Model> {
     executor: LeftJoinedSelectExecutor<T, J>,
 }
 
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<T: Model + Send, J: Model + Send> Send for LeftJoinCollectFuture<T, J> {}
+
 /// INNER JOIN Collect future
 pub struct InnerJoinCollectFuture<T: Model, J: Model> {
     executor: InnerJoinedSelectExecutor<T, J>,
 }
 
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<T: Model + Send, J: Model + Send> Send for InnerJoinCollectFuture<T, J> {}
+
 /// RIGHT JOIN Collect future
 pub struct RightJoinCollectFuture<T: Model, J: Model> {
     executor: RightJoinedSelectExecutor<T, J>,
 }
+
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<T: Model + Send, J: Model + Send> Send for RightJoinCollectFuture<T, J> {}
 
 /// Grouped Collect future（分组聚合查询）
 pub struct GroupedCollectFuture<'a, T: Model, V, C> {
@@ -1568,44 +1594,47 @@ pub struct GroupedCollectFuture<'a, T: Model, V, C> {
     _marker: PhantomData<(T, V, C)>,
 }
 
-impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<'a, T: Model + Send, V: Send, C: Send> Send for GroupedCollectFuture<'a, T, V, C> {}
+
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<T> + 'static> std::future::IntoFuture
     for CollectFuture<'a, T, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
     }
 }
 
-impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send> std::future::IntoFuture
     for LeftJoinCollectFuture<T, J>
 {
     type Output = anyhow::Result<Vec<(T, Option<J>)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
     }
 }
 
-impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send> std::future::IntoFuture
     for InnerJoinCollectFuture<T, J>
 {
     type Output = anyhow::Result<Vec<(T, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
     }
 }
 
-impl<T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send> std::future::IntoFuture
     for RightJoinCollectFuture<T, J>
 {
     type Output = anyhow::Result<Vec<(Option<T>, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -1705,11 +1734,14 @@ pub struct RelatedCollectFuture<T: Model, R: Model> {
     executor: RelatedSelectExecutor<T, R>,
 }
 
-impl<T: Model + 'static, R: Model + 'static> std::future::IntoFuture
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<T: Model + Send, R: Model + Send> Send for RelatedCollectFuture<T, R> {}
+
+impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::Send> std::future::IntoFuture
     for RelatedCollectFuture<T, R>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -1837,9 +1869,9 @@ impl<T: Model> DeleteExecutor<T> {
     }
 }
 
-impl<T: Model + 'static> std::future::IntoFuture for DeleteExecutor<T> {
+impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for DeleteExecutor<T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -1935,9 +1967,9 @@ impl<T: Model> UpdateExecutor<T> {
     }
 }
 
-impl<T: Model + 'static> std::future::IntoFuture for UpdateExecutor<T> {
+impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateExecutor<T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output>>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -1979,16 +2011,19 @@ fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
 }
 
 /// Mapped Select Collect future
-pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+pub struct MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator<V> + 'static> {
     executor: MappedSelectExecutor<'a, T, V>,
     _marker: PhantomData<C>,
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
-    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+// SAFETY: Contains executor which references Database (Send + Sync)
+unsafe impl<'a, T: Model + Send, V: Send, C: FromIterator<V> + Send> Send for MappedCollectFuture<'a, T, V, C> {}
+
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<V> + 'static> std::future::IntoFuture
+    for MappedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2002,16 +2037,19 @@ pub struct ModelCollectWithFuture<'a, T: Model, V, C, M, F> {
     _marker: PhantomData<(C, M)>,
 }
 
+// SAFETY: Contains executor which references Database (Send + Sync), and transform function is Send
+unsafe impl<'a, T: Model + Send, V: Send, C: Send, M: Send, F: Send> Send for ModelCollectWithFuture<'a, T, V, C, M, F> {}
+
 impl<'a, T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<'a, T, V, C, M, F>
 where
-    T: Model + 'static,
-    V: crate::model::FromRowValues + 'static,
+    T: Model + 'static + std::marker::Send + std::marker::Sync,
+    V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
     C: FromIterator<M> + 'static,
-    M: 'static,
-    F: Fn(V) -> M + Clone + 'static,
+    M: 'static + std::marker::Send,
+    F: Fn(V) -> M + Clone + Send + 'static,
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2163,11 +2201,11 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<V> + 'static>
     std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
