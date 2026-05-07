@@ -6,6 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::{Mutex, Semaphore};
 
+#[cfg(feature = "postgresql")]
+use bb8_postgres::PostgresConnectionManager;
+#[cfg(feature = "postgresql")]
+use tokio_postgres::NoTls;
+
 // 导入统一的执行器类型
 #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 use super::unified::{CreateTableExecutor, DropTableExecutor};
@@ -138,19 +143,14 @@ impl ManualPool {
                     .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
-            #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => {
-                let db =
-                    postgresql_backend::Database::connect(self.db_type, &self.connection_string)
-                        .await?;
-                Ok(ConnectionWrapper::PostgreSQL(db))
-            }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
                 let db =
                     mysql_backend::Database::connect(self.db_type, &self.connection_string).await?;
                 Ok(ConnectionWrapper::MySQL(db))
             }
+            #[cfg(feature = "postgresql")]
+            _ => unreachable!(),
         }
     }
 
@@ -270,20 +270,37 @@ impl PoolBuilder {
         // 注意：SQLite 后端建议设置 max_size=1，因为其嵌入式特性不支持多线程共享连接
         // 如需并发支持，可考虑启用 MVCC 模式（PRAGMA journal_mode = 'mvcc'）
 
-        let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
-
-        // 如果 min_size > 0,预先创建最小连接数
-        if self.config.min_size > 0 {
-            pool.maintain_min_connections().await;
-        }
-
         match self.db_type {
             #[cfg(feature = "sqlite")]
-            DbType::Sqlite => Ok(ConnectionPool::Sqlite(pool)),
+            DbType::Sqlite => {
+                let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                if self.config.min_size > 0 {
+                    pool.maintain_min_connections().await;
+                }
+                Ok(ConnectionPool::Sqlite(pool))
+            }
             #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => Ok(ConnectionPool::PostgreSQL(pool)),
+            DbType::PostgreSQL => {
+                let manager = PostgresConnectionManager::new_from_stringlike(
+                    &self.connection_string,
+                    NoTls,
+                )?;
+                let mut builder = bb8::Pool::builder();
+                builder = builder.max_size(self.config.max_size as u32);
+                if self.config.min_size > 0 {
+                    builder = builder.min_idle(Some(self.config.min_size as u32));
+                }
+                let pool = builder.build(manager).await?;
+                Ok(ConnectionPool::PostgreSQL(pool))
+            }
             #[cfg(feature = "mysql")]
-            DbType::MySQL => Ok(ConnectionPool::MySQL(pool)),
+            DbType::MySQL => {
+                let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                if self.config.min_size > 0 {
+                    pool.maintain_min_connections().await;
+                }
+                Ok(ConnectionPool::MySQL(pool))
+            }
         }
     }
 }
@@ -293,7 +310,7 @@ pub enum ConnectionPool {
     #[cfg(feature = "sqlite")]
     Sqlite(Arc<ManualPool>),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(Arc<ManualPool>),
+    PostgreSQL(bb8::Pool<PostgresConnectionManager<NoTls>>),
     #[cfg(feature = "mysql")]
     MySQL(Arc<ManualPool>),
 }
@@ -322,15 +339,11 @@ impl ConnectionPool {
             }
             #[cfg(feature = "postgresql")]
             ConnectionPool::PostgreSQL(pool) => {
-                let _permit = pool
-                    .semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
-                let conn = pool.get().await?;
+                let pooled = pool.get().await?;
+                let db = postgresql_backend::Database::from_pooled_connection(pooled);
                 Ok(PooledConnection {
-                    inner: PooledConnectionInner::PostgreSQL(pool.clone()),
-                    connection: Some(conn),
+                    inner: PooledConnectionInner::PostgreSQL,
+                    connection: Some(ConnectionWrapper::PostgreSQL(db)),
                     _marker: PhantomData,
                 })
             }
@@ -358,7 +371,7 @@ enum PooledConnectionInner {
     #[cfg(feature = "sqlite")]
     Sqlite(Arc<ManualPool>),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(Arc<ManualPool>),
+    PostgreSQL,
     #[cfg(feature = "mysql")]
     MySQL(Arc<ManualPool>),
 }
@@ -369,7 +382,10 @@ impl PooledConnectionInner {
             #[cfg(feature = "sqlite")]
             PooledConnectionInner::Sqlite(pool) => pool.return_connection(conn).await,
             #[cfg(feature = "postgresql")]
-            PooledConnectionInner::PostgreSQL(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::PostgreSQL => {
+                // bb8 自动管理连接生命周期，无需手动归还
+                let _ = conn;
+            }
             #[cfg(feature = "mysql")]
             PooledConnectionInner::MySQL(pool) => pool.return_connection(conn).await,
         }

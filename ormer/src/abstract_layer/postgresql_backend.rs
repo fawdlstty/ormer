@@ -121,10 +121,8 @@ fn to_snake_case(s: &str) -> String {
 }
 
 /// PostgreSQL 数据库连接封装
-#[allow(dead_code)]
 pub struct Database {
     client: tokio_postgres::Client,
-    connection_handle: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
 }
 
 /// 创建表执行器
@@ -235,17 +233,28 @@ impl Database {
             .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         // 在后台运行连接
-        let connection_handle = tokio::spawn(async move {
-            if let Err(_e) = connection.await {
-                // PostgreSQL connection error silently handled
-            }
-            Ok(())
+        tokio::spawn(async move {
+            let _ = connection.await;
         });
 
-        Ok(Self {
-            client,
-            connection_handle,
-        })
+        Ok(Self { client })
+    }
+
+    /// 从 bb8 PooledConnection 创建 Database
+    ///
+    /// bb8-postgres 的 PooledConnection 通过 Deref 提供 &Client 访问。
+    /// 由于 tokio_postgres::Client 不实现 Clone，我们使用 std::ops::Deref
+    /// 获取引用后，通过 unsafe ptr::read 复制 Client（Client 内部使用 Arc，
+    /// 复制是安全的，只是增加 Arc 引用计数），然后 forget PooledConnection
+    /// 防止其 drop 时关闭连接。
+    pub fn from_pooled_connection(
+        pooled: bb8::PooledConnection<'_, bb8_postgres::PostgresConnectionManager<NoTls>>,
+    ) -> Self {
+        use std::ops::Deref;
+        let client_ref: &tokio_postgres::Client = pooled.deref();
+        let client = unsafe { std::ptr::read(client_ref as *const _) };
+        std::mem::forget(pooled);
+        Self { client }
     }
 
     /// 创建表 - 返回执行器
@@ -506,8 +515,10 @@ impl Database {
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client
             .execute(&sql, &param_refs)
@@ -564,8 +575,10 @@ impl Database {
         // 获取列的rust_type信息
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client
             .execute(&sql, &param_refs)
@@ -731,8 +744,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client
             .execute(&sql, &param_refs)
@@ -798,8 +813,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client
             .execute(&sql, &param_refs)
@@ -928,8 +945,10 @@ impl<'a> Transaction<'a> {
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client.execute(&sql, &param_refs).await.map_err(|e| {
             anyhow::anyhow!(format!(
@@ -988,8 +1007,10 @@ impl<'a> Transaction<'a> {
         // 获取列的rust_type信息
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         self.client
             .execute(&sql, &param_refs)
@@ -1078,18 +1099,25 @@ pub struct MappedCollectFuture<'a, T: Model, V, C> {
     _marker: PhantomData<(T, V, C)>,
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
-    std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+impl<
+    'a,
+    T: Model + 'static + Send,
+    V: crate::model::FromRowValues + 'static + Send,
+    C: FromIterator<V> + 'static,
+> std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
             let pg_params = values_to_params(&params)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                pg_params.iter().map(|p| p.as_ref()).collect();
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
 
             let rows = self
                 .client
@@ -1369,11 +1397,12 @@ pub struct AggregateFuture<'a, T: Model, R> {
     _marker: PhantomData<(T, R)>,
 }
 
-impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::IntoFuture
-    for AggregateFuture<'a, T, R>
+impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
+    std::future::IntoFuture for AggregateFuture<'a, T, R>
 {
     type Output = anyhow::Result<R>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -1393,49 +1422,51 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
             }
 
             // 将ormer::Value转换为postgres_types::ToSql
-            let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+            let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
                 .into_iter()
                 .map(|v| match v {
                     crate::model::Value::Integer(i) => {
                         // PostgreSQL INTEGER (Int4) 是 32 位，需要将 i64 转换为 i32
                         if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                            Box::new(i as i32) as Box<dyn postgres_types::ToSql + Sync>
+                            Box::new(i as i32) as Box<dyn postgres_types::ToSql + Sync + Send>
                         } else {
-                            Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                            Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
                         }
                     }
                     crate::model::Value::Text(t) => {
-                        Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Real(r) => {
-                        Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Boolean(b) => {
-                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Bytes(b) => {
-                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::DateTime(dt) => {
-                        Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Json(j) => {
-                        Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Uuid(u) => {
-                        Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::BigInt(b) => {
-                        Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Null => {
-                        Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                        Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                 })
                 .collect();
 
-            let params_ref: Vec<&(dyn postgres_types::ToSql + Sync)> =
-                pg_params.iter().map(|p| p.as_ref()).collect();
+            let params_ref: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+                .collect();
 
             let row = self
                 .client
@@ -1510,11 +1541,12 @@ impl<'a, T: Model + 'static, R: crate::model::FromValue + 'static> std::future::
     }
 }
 
-impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> std::future::IntoFuture
+impl<'a, T: Model + 'static + Send, C: FromIterator<T> + 'static> std::future::IntoFuture
     for CollectFuture<'a, T, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -1751,8 +1783,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         // 获取列的rust_type信息
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
         let pg_params = values_to_params_with_types(&params, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            pg_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         let result = self
             .client
@@ -1794,9 +1828,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model + 'static> std::future::IntoFuture for DeleteExecutor<'a, T> {
+impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'a, T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -1891,9 +1926,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
+impl<'a, T: Model + 'static + Send> std::future::IntoFuture for UpdateExecutor<'a, T> {
     type Output = anyhow::Result<u64>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.execute().await })
@@ -1905,76 +1941,76 @@ impl<'a, T: Model + 'static> std::future::IntoFuture for UpdateExecutor<'a, T> {
 fn values_to_params_with_types(
     values: &[crate::model::Value],
     rust_types: &[&str],
-) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>> {
+) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
     // ToSql trait is used in the trait object type above
     #[allow(unused_imports)]
     use tokio_postgres::types::ToSql;
 
-    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
 
     for (idx, value) in values.iter().enumerate() {
         // 循环使用rust_types，因为values可能包含多个记录的所有字段
         let rust_type = rust_types[idx % rust_types.len()];
 
-        let param: Box<dyn tokio_postgres::types::ToSql + Sync> = match value {
+        let param: Box<dyn tokio_postgres::types::ToSql + Sync + Send> = match value {
             crate::model::Value::Integer(v) => {
                 // 根据列的rust_type选择合适的整数类型
                 // tokio-postgres要求Rust类型与PostgreSQL类型严格匹配
                 let use_i64 = matches!(rust_type, "i64" | "u64");
                 if use_i64 {
-                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 } else {
                     // 对于i32列，将值转换为i32
-                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
             crate::model::Value::Text(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Real(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Boolean(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Bytes(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::DateTime(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Json(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Uuid(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::BigInt(v) => {
-                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Null => {
                 // 根据列类型选择NULL的类型
                 match rust_type {
                     "i64" | "u64" => {
                         let null_val: Option<i64> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     "i32" | "i16" | "i8" | "u16" | "u32" | "u8" => {
                         let null_val: Option<i32> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     "String" | "&str" => {
                         let null_val: Option<String> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     "f32" | "f64" => {
                         let null_val: Option<f64> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     _ => {
                         // 默认使用Option<i32>
                         let null_val: Option<i32> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                 }
             }
@@ -1988,48 +2024,48 @@ fn values_to_params_with_types(
 /// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）
 fn values_to_params(
     values: &[crate::model::Value],
-) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>> {
+) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
     // ToSql trait is used in the trait object type above
     #[allow(unused_imports)]
     use tokio_postgres::types::ToSql;
 
-    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
 
     for value in values {
-        let param: Box<dyn tokio_postgres::types::ToSql + Sync> = match value {
+        let param: Box<dyn tokio_postgres::types::ToSql + Sync + Send> = match value {
             crate::model::Value::Integer(v) => {
                 // 使用 i32 作为默认,因为大多数用户定义的列是 INTEGER
                 // 对于聚合函数(COUNT等返回BIGINT)的比较,PostgreSQL会自动提升i32到i64
-                Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Text(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Real(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Boolean(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Bytes(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::DateTime(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Json(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Uuid(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::BigInt(v) => {
-                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Null => {
                 // 使用 Option<i32> 的 None 来表示 NULL
                 let null_val: Option<i32> = None;
-                Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
         };
         params.push(param);
@@ -2068,8 +2104,10 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
     pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params(&params)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            pg_params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
 
         // 从 StreamConnection 获取 client 引用
         let client = match &self.conn {
@@ -2423,11 +2461,12 @@ pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
     executor: RelatedSelectExecutor<'a, T, R>,
 }
 
-impl<'a, T: Model + 'static, R: Model + 'static> std::future::IntoFuture
+impl<'a, T: Model + 'static + Send, R: Model + 'static + Send> std::future::IntoFuture
     for RelatedCollectFuture<'a, T, R>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2572,11 +2611,12 @@ pub struct MultiTableCollectFuture<'a, T: Model, R1: Model, R2: Model> {
     executor: MultiTableSelectExecutor<'a, T, R1, R2>,
 }
 
-impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static> std::future::IntoFuture
-    for MultiTableCollectFuture<'a, T, R1, R2>
+impl<'a, T: Model + 'static + Send, R1: Model + 'static + Send, R2: Model + 'static + Send>
+    std::future::IntoFuture for MultiTableCollectFuture<'a, T, R1, R2>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2722,11 +2762,17 @@ pub struct FourTableCollectFuture<'a, T: Model, R1: Model, R2: Model, R3: Model>
     executor: FourTableSelectExecutor<'a, T, R1, R2, R3>,
 }
 
-impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model + 'static>
-    std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
+impl<
+    'a,
+    T: Model + 'static + Send,
+    R1: Model + 'static + Send,
+    R2: Model + 'static + Send,
+    R3: Model + 'static + Send,
+> std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2787,11 +2833,12 @@ pub struct LeftJoinCollectFuture<'a, T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for LeftJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, Option<J>)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -2802,44 +2849,46 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
             .into_iter()
             .map(|v| match v {
                 crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
             })
             .collect();
 
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-            pg_params.iter().map(|p| p.as_ref()).collect();
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .collect();
 
         let rows = self
             .client
@@ -2989,11 +3038,12 @@ pub struct InnerJoinCollectFuture<'a, T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for InnerJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -3004,44 +3054,46 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
             .into_iter()
             .map(|v| match v {
                 crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
             })
             .collect();
 
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-            pg_params.iter().map(|p| p.as_ref()).collect();
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .collect();
 
         let rows = self
             .client
@@ -3181,11 +3233,12 @@ pub struct GroupedCollectFuture<'a, T: Model, V, C> {
     _marker: PhantomData<(T, V, C)>,
 }
 
-impl<'a, T: Model + 'static, J: Model + 'static> std::future::IntoFuture
+impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(Option<T>, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
@@ -3196,44 +3249,46 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync>> = params
+        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
             .into_iter()
             .map(|v| match v {
                 crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
                 crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync>
+                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
             })
             .collect();
 
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> =
-            pg_params.iter().map(|p| p.as_ref()).collect();
+        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .collect();
 
         let rows = self
             .client
@@ -3467,11 +3522,16 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 }
 
-impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIterator<V> + 'static>
-    std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+impl<
+    'a,
+    T: Model + 'static + Send,
+    V: crate::model::FromRowValues + 'static + Send,
+    C: FromIterator<V> + 'static,
+> std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -3482,54 +3542,57 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static, C: FromIt
             // 否则使用i32
             let use_i64 = sql.contains("::bigint");
 
-            let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = params
+            let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = params
                 .into_iter()
                 .map(|v| match v {
                     crate::model::Value::Integer(i) => {
                         if use_i64 {
-                            Box::new(i) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                            Box::new(i) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                         } else {
-                            Box::new(i as i32) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                            Box::new(i as i32)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                         }
                     }
                     crate::model::Value::Text(t) => {
-                        Box::new(t) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(t) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Real(r) => {
-                        Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Boolean(b) => {
-                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Bytes(b) => {
-                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::DateTime(dt) => {
-                        Box::new(dt) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(dt) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
-                    crate::model::Value::Json(j) => {
-                        Box::new(j.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
-                    }
-                    crate::model::Value::Uuid(u) => {
-                        Box::new(u.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync>
-                    }
+                    crate::model::Value::Json(j) => Box::new(j.to_string())
+                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+                    crate::model::Value::Uuid(u) => Box::new(u.to_string())
+                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
                     crate::model::Value::BigInt(b) => {
-                        Box::new(b as i64) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                        Box::new(b as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Null => {
                         if use_i64 {
                             let null_val: Option<i64> = None;
-                            Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                         } else {
                             let null_val: Option<i32> = None;
-                            Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync>
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                         }
                     }
                 })
                 .collect();
 
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                pg_params.iter().map(|p| p.as_ref()).collect();
+            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
+                .iter()
+                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
 
             let rows = self
                 .executor
