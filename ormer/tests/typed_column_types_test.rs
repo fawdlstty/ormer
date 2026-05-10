@@ -67,7 +67,7 @@ async fn test_typed_column_usize_impl(config: &_test_common::DbConfig) {
 async fn test_typed_column_f32_impl(config: &_test_common::DbConfig) {
     let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<f32> = TypedColumn::new("test_col");
-    let expr = col.ge(3.14);
+    let expr = col.ge(std::f32::consts::PI);
     match get_filter_expr(expr) {
         FilterExpr::Comparison { operator, .. } => assert_eq!(operator, ">="),
         _ => panic!("Expected Comparison"),
@@ -77,7 +77,7 @@ async fn test_typed_column_f32_impl(config: &_test_common::DbConfig) {
 async fn test_typed_column_f64_impl(config: &_test_common::DbConfig) {
     let _config = config; // 仅用于获取数据库类型
     let col: TypedColumn<f64> = TypedColumn::new("test_col");
-    let expr = col.le(2.718);
+    let expr = col.le(std::f64::consts::E);
     match get_filter_expr(expr) {
         FilterExpr::Comparison { operator, .. } => assert_eq!(operator, "<="),
         _ => panic!("Expected Comparison"),

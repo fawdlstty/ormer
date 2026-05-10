@@ -76,71 +76,19 @@ impl FilterFormatter {
                 operator,
                 value,
             } => {
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    prefix.to_string()
+                let full_col_name = if let Some(ref prefix) = self.table_prefix {
+                    format!("{}.{}", prefix, column)
                 } else {
-                    String::new()
+                    column.clone()
                 };
+                use std::fmt::Write;
+                write!(
+                    sql,
+                    "{}",
+                    self.comparison_sql(&full_col_name, operator, param_idx)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
 
-                match self.db_type {
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => {
-                        use std::fmt::Write;
-                        let full_col_name = if !col_name.is_empty() {
-                            format!("{}.{}", col_name, column)
-                        } else {
-                            column.clone()
-                        };
-                        // 如果启用了HAVING类型转换,添加::bigint
-                        let param_placeholder = if self.postgresql_having_cast {
-                            format!("${}::bigint", param_idx)
-                        } else {
-                            format!("${}", param_idx)
-                        };
-                        write!(sql, "{} {} {}", full_col_name, operator, param_placeholder)
-                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
-                    }
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        use std::fmt::Write;
-                        let full_col_name = if !col_name.is_empty() {
-                            format!("{}.{}", col_name, column)
-                        } else {
-                            column.clone()
-                        };
-                        write!(sql, "{} {} ?", full_col_name, operator)
-                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
-                    }
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => {
-                        use std::fmt::Write;
-                        let full_col_name = if !col_name.is_empty() {
-                            format!("{}.{}", col_name, column)
-                        } else {
-                            column.clone()
-                        };
-                        write!(sql, "{} {} ?", full_col_name, operator)
-                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        use std::fmt::Write;
-                        let full_col_name = if !col_name.is_empty() {
-                            format!("{}.{}", col_name, column)
-                        } else {
-                            column.clone()
-                        };
-                        write!(sql, "{} {} @P", full_col_name, operator)
-                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
-                    }
-                    #[cfg(not(any(
-                        feature = "sqlite",
-                        feature = "postgresql",
-                        feature = "mysql",
-                        feature = "mssql"
-                    )))]
-                    _ => panic!("No database backend available"),
-                }
                 // 转换 filter Value 到 ormer Value
                 let ormer_value = Self::convert_filter_value(value);
                 params.push(ormer_value);
@@ -182,35 +130,8 @@ impl FilterFormatter {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    match self.db_type {
-                        #[cfg(feature = "postgresql")]
-                        DbType::PostgreSQL => {
-                            write!(sql, "${}", param_idx).unwrap_or_else(|e| {
-                                panic!("Failed to write parameter placeholder: {}", e)
-                            });
-                        }
-                        #[cfg(feature = "sqlite")]
-                        DbType::Sqlite => {
-                            sql.push('?');
-                        }
-                        #[cfg(feature = "mysql")]
-                        DbType::MySQL => {
-                            sql.push('?');
-                        }
-                        #[cfg(feature = "mssql")]
-                        DbType::MSSQL => {
-                            write!(sql, "@P").unwrap_or_else(|e| {
-                                panic!("Failed to write parameter placeholder: {}", e)
-                            });
-                        }
-                        #[cfg(not(any(
-                            feature = "sqlite",
-                            feature = "postgresql",
-                            feature = "mysql",
-                            feature = "mssql"
-                        )))]
-                        _ => panic!("No database backend available"),
-                    }
+                    write!(sql, "{}", self.in_placeholder(param_idx))
+                        .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
                     // 转换 filter Value 到 ormer Value
                     let ormer_value = Self::convert_filter_value(value);
                     params.push(ormer_value);
@@ -253,6 +174,55 @@ impl FilterFormatter {
         }
     }
 
+    /// 格式化单个比较表达式的 SQL 片段
+    fn comparison_sql(&self, full_col_name: &str, operator: &str, _param_idx: &i32) -> String {
+        match self.db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => {
+                let param_placeholder = if self.postgresql_having_cast {
+                    "$".to_string() + &_param_idx.to_string() + "::bigint"
+                } else {
+                    "$".to_string() + &_param_idx.to_string()
+                };
+                format!("{} {} {}", full_col_name, operator, param_placeholder)
+            }
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => format!("{} {} ?", full_col_name, operator),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => format!("{} {} ?", full_col_name, operator),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => format!("{} {} @P", full_col_name, operator),
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "postgresql",
+                feature = "mysql",
+                feature = "mssql"
+            )))]
+            _ => panic!("No database backend available"),
+        }
+    }
+
+    /// 格式化 IN 子句的单个占位符
+    fn in_placeholder(&self, _param_idx: &i32) -> String {
+        match self.db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "$".to_string() + &_param_idx.to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "?".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "?".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "@P".to_string(),
+            #[cfg(not(any(
+                feature = "sqlite",
+                feature = "postgresql",
+                feature = "mysql",
+                feature = "mssql"
+            )))]
+            _ => panic!("No database backend available"),
+        }
+    }
+
     /// 转换 filter::Value 到 model::Value
     fn convert_filter_value(value: &FilterValue) -> Value {
         match value {
@@ -262,7 +232,7 @@ impl FilterFormatter {
             FilterValue::Real(v) => Value::Real(*v),
             FilterValue::Boolean(v) => Value::Boolean(*v),
             FilterValue::Bytes(v) => Value::Bytes(v.clone()),
-            FilterValue::DateTime(v) => Value::DateTime(v.clone()),
+            FilterValue::DateTime(v) => Value::DateTime(*v),
             FilterValue::Json(v) => Value::Json(v.clone()),
             FilterValue::Uuid(v) => Value::Uuid(*v),
             FilterValue::Null => Value::Null,

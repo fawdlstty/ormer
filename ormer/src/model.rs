@@ -159,7 +159,7 @@ pub trait ModelEnum: ModelEnumProvider {
     }
 }
 
-/// 为 Option<T> 实现 ModelEnumProvider (如果 T 实现了 ModelEnum)
+/// 为 `Option<T>` 实现 ModelEnumProvider (如果 T 实现了 ModelEnum)
 impl<T: ModelEnum> ModelEnumProvider for Option<T> {
     fn enum_variants() -> Option<&'static [&'static str]> {
         Some(T::VARIANTS)
@@ -428,12 +428,6 @@ fn generate_unique_constraints<T: Model>() -> Vec<String> {
     }
 
     constraints
-}
-
-/// 生成索引 SQL
-#[allow(dead_code)]
-fn generate_indexes<T: Model>(db_type: crate::abstract_layer::DbType) -> String {
-    generate_indexes_with_name::<T>(db_type, T::TABLE_NAME)
 }
 
 /// 生成索引 SQL，支持自定义表名

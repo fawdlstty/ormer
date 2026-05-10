@@ -1,3 +1,4 @@
+#[cfg(feature = "sqlite")]
 #[derive(Debug, ormer::Model)]
 #[table = "users"]
 struct User {
@@ -10,9 +11,9 @@ struct User {
     email: Option<String>,
 }
 
+#[cfg(feature = "sqlite")]
 #[derive(Debug, ormer::Model)]
 #[table = "roles"]
-#[allow(dead_code)]
 struct Role {
     #[primary]
     id: i32,
@@ -23,31 +24,33 @@ struct Role {
     name: String,
 }
 
-#[derive(Debug, ormer::Model)]
-#[table = "new_users"]
-#[allow(dead_code)]
-struct NewUser(User);
-
+#[cfg(feature = "sqlite")]
 #[derive(Debug, ormer::Model)]
 #[table = "new_roles"]
-#[allow(dead_code)]
 struct NewRole(Role);
 
+#[cfg(feature = "sqlite")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
-    // db.create_table::<User>().execute().await?;
-    // db.create_table::<NewRole>().execute().await?;
+    let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    db.create_table::<User>().execute().await?;
+    db.create_table::<NewRole>().execute().await?;
 
-    // // insert
-    // db.insert(&User {
-    //     id: 1,
-    //     name: "Alice".to_string(),
-    //     age: 18,
-    //     email: None,
-    // })
-    // .execute()
-    // .await?;
+    // insert
+    db.insert(&User {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 18,
+        email: None,
+    })
+    .execute()
+    .await?;
 
+    println!("Demo completed successfully!");
     Ok(())
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn main() {
+    println!("Please enable the sqlite feature to run the demo.");
 }

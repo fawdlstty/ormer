@@ -87,7 +87,7 @@ async fn test_main_rs_usage_impl(
     // query with order_by
     let users = db
         .select::<TestUser>()
-        .filter(|p| p.age.is_in(&vec![2, 4, 6, 7, 8]))
+        .filter(|p| p.age.is_in(vec![2, 4, 6, 7, 8]))
         .order_by(|p| p.age)
         .range(0..10)
         .collect::<Vec<_>>()
@@ -97,7 +97,7 @@ async fn test_main_rs_usage_impl(
     // query with order_by_desc
     let users = db
         .select::<TestUser>()
-        .filter(|p| p.age.is_in(&vec![2, 4, 6, 7, 8]))
+        .filter(|p| p.age.is_in(vec![2, 4, 6, 7, 8]))
         .order_by_desc(|p| p.age)
         .range(0..10)
         .collect::<Vec<_>>()

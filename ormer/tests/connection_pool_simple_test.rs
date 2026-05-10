@@ -22,6 +22,7 @@ async fn test_pool_basic_impl(
                 .build()
                 .await?
         }
+        #[allow(unreachable_patterns)]
         _ => {
             Database::create_pool(config.0, config.1)
                 .range(0..3) // 其他数据库: max=3

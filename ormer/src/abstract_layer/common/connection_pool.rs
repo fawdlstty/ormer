@@ -165,6 +165,7 @@ impl ManualPool {
                     mssql_backend::Database::connect(self.db_type, &self.connection_string).await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
+            #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
     }

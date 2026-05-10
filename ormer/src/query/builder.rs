@@ -40,7 +40,7 @@ impl From<std::ops::RangeFrom<usize>> for RangeBounds {
 
 /// Select 查询结构体
 ///
-/// 使用方式:Select::<User>().filter(|p| p.age > 12).to_sql()
+/// 使用方式:`Select::<User>`().filter(|p| p.age > 12).to_sql()
 pub struct Select<T: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
@@ -584,7 +584,7 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
-    /// select::<User>().from::<User, Role>()
+    /// `select::<User>`().from::<User, Role>()
     pub fn from<T2, R: Model>(self) -> RelatedSelect<T, R>
     where
         T2: Model + 'static,
@@ -601,7 +601,7 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加关联表查询（支持3个表）
-    /// select::<User>().from3::<User, Role, Permission>()
+    /// `select::<User>`().from3::<User, Role, Permission>()
     pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2>
     where
         T2: Model + 'static,
@@ -616,7 +616,7 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加关联表查询（支持4个表）
-    /// select::<User>().from4::<User, Role, Permission, Department>()
+    /// `select::<User>`().from4::<User, Role, Permission, Department>()
     pub fn from4<T2, R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3>
     where
         T2: Model + 'static,

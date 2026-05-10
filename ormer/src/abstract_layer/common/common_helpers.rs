@@ -1,10 +1,35 @@
-﻿use super::super::DbType;
-use crate::model::{Model, Row, Value};
-use crate::query::filter::FilterExpr;
+﻿use crate::model::{Model, Row, Value};
 use std::collections::HashMap;
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+use super::super::DbType;
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+use crate::query::filter::FilterExpr;
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 use std::fmt::Write;
 
 /// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub fn format_filter(
     filter: &FilterExpr,
     sql: &mut String,
@@ -131,6 +156,12 @@ pub fn format_filter(
 }
 
 /// 通用过滤器格式化函数并收集参数（用于 UPDATE/SELECT）
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub fn format_filter_with_params(
     filter: &FilterExpr,
     sql: &mut String,
@@ -264,6 +295,7 @@ pub fn extract_model_from_row<T: Model>(row_data: &HashMap<String, Value>) -> an
 }
 
 /// 通用列值转换助手 - 根据 rust_type 转换数据库值到 ormer Value
+#[allow(clippy::too_many_arguments)]
 pub fn convert_column_value(
     rust_type: &str,
     is_nullable: bool,
@@ -473,6 +505,7 @@ pub fn collect_batch_insert_values_with_auto_increment<T: Model>(models: &[&T]) 
 /// 统一的列值解析函数 - 严格模式
 ///
 /// 用于流式查询中解析列值,非空字段解析失败时返回错误而非默认值
+#[allow(clippy::too_many_arguments)]
 pub fn parse_column_value_strict(
     rust_type: &str,
     is_nullable: bool,

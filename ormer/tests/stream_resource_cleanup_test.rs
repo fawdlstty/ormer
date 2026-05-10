@@ -3,7 +3,6 @@
 mod _test_common;
 
 // 使用宏定义测试专用模型（每个测试函数使用独立的表名，避免并行执行时的冲突）
-define_test_user_for_range!(StreamCleanupUser, "stream_cleanup_test");
 define_test_user_for_range!(StreamCleanupUserPollution, "stream_cleanup_pollution");
 define_test_user_for_range!(StreamCleanupUserEt, "stream_cleanup_et");
 define_test_user_for_range!(StreamCleanupUserMc, "stream_cleanup_mc");

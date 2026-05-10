@@ -4,12 +4,16 @@
 use ormer::{AfterInsert, AfterUpdate, BeforeInsert, BeforeUpdate, Model};
 #[cfg(feature = "sqlite")]
 use ormer::{Database, DbType};
+#[cfg(feature = "sqlite")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // 全局计数器
+#[cfg(feature = "sqlite")]
 static INSERT_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "sqlite")]
 static UPDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "sqlite")]
 #[derive(Debug, Model)]
 #[table = "hook_demo_users"]
 struct HookDemoUser {
@@ -20,6 +24,7 @@ struct HookDemoUser {
 }
 
 // 实现插入前钩子
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl BeforeInsert for HookDemoUser {
     async fn before_insert(&mut self) {
@@ -29,6 +34,7 @@ impl BeforeInsert for HookDemoUser {
 }
 
 // 实现插入后钩子
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl AfterInsert for HookDemoUser {
     async fn after_insert(&self) {
@@ -40,6 +46,7 @@ impl AfterInsert for HookDemoUser {
 }
 
 // 实现更新前钩子
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl BeforeUpdate for HookDemoUser {
     async fn before_update(&mut self) {
@@ -49,6 +56,7 @@ impl BeforeUpdate for HookDemoUser {
 }
 
 // 实现更新后钩子
+#[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl AfterUpdate for HookDemoUser {
     async fn after_update(&self) {

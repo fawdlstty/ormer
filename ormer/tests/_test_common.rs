@@ -14,6 +14,7 @@ pub type DbConfig = (DbType, &'static str);
 /// 测试函数应该遍历此列表，对每个数据库后端执行测试
 #[allow(dead_code)]
 #[allow(unused_mut)]
+#[allow(clippy::vec_init_then_push)]
 pub fn get_all_db_configs() -> Vec<DbConfig> {
     let mut configs = Vec::new();
 
@@ -25,12 +26,16 @@ pub fn get_all_db_configs() -> Vec<DbConfig> {
     #[cfg(feature = "postgresql")]
     configs.push((
         DbType::PostgreSQL,
-        "postgres://postgres:postgres@localhost:5432/ormer_test",
+        option_env!("ORMER_TEST_POSTGRES")
+            .unwrap_or("postgres://postgres:postgres@localhost:5432/ormer_test"),
     ));
 
     // MySQL 仅在启用 mysql feature 时可用
     #[cfg(feature = "mysql")]
-    configs.push((DbType::MySQL, "mysql://root:root@localhost:3306/ormer_test"));
+    configs.push((
+        DbType::MySQL,
+        option_env!("ORMER_TEST_MYSQL").unwrap_or("mysql://root:root@localhost:3306/ormer_test"),
+    ));
 
     configs
 }
@@ -63,14 +68,18 @@ pub fn sqlite_config() -> DbConfig {
 pub fn postgresql_config() -> DbConfig {
     (
         DbType::PostgreSQL,
-        "postgres://postgres:postgres@localhost:5432/ormer_test",
+        option_env!("ORMER_TEST_POSTGRES")
+            .unwrap_or("postgres://postgres:postgres@localhost:5432/ormer_test"),
     )
 }
 
 #[cfg(feature = "mysql")]
 #[allow(dead_code)]
 pub fn mysql_config() -> DbConfig {
-    (DbType::MySQL, "mysql://root:root@localhost:3306/ormer_test")
+    (
+        DbType::MySQL,
+        option_env!("ORMER_TEST_MYSQL").unwrap_or("mysql://root:root@localhost:3306/ormer_test"),
+    )
 }
 
 /// 宏：为所有数据库后端生成测试（用于返回 () 的函数）

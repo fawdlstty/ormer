@@ -923,36 +923,6 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// 批量插入记录（内部使用）
-    #[allow(dead_code)]
-    async fn insert_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
-        if models.is_empty() {
-            return Ok(());
-        }
-
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
-        let params = values_to_params(&all_values)?;
-
-        if let Some(ref mut conn) = self.conn {
-            conn.exec_drop(&sql, params)
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
-        }
-
-        Ok(())
-    }
-
     /// 批量插入或更新记录（遇到重复键时更新）
     pub async fn insert_or_update_batch<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
@@ -1611,12 +1581,6 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
 
         Ok(conn.affected_rows())
-    }
-
-    #[allow(dead_code)]
-    fn build_sql(&self) -> String {
-        let (sql, _) = self.build_sql_with_params();
-        sql
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
