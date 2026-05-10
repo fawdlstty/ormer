@@ -12,7 +12,12 @@ use bb8_postgres::PostgresConnectionManager;
 use tokio_postgres::NoTls;
 
 // 导入统一的执行器类型
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 use super::unified::{CreateTableExecutor, DropTableExecutor};
 
 /// 连接池插入执行器
@@ -33,6 +38,8 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
             Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
             Some(ConnectionWrapper::MySQL(db)) => db.insert_impl::<I::Model>(&refs).await,
+            #[cfg(feature = "mssql")]
+            Some(ConnectionWrapper::MSSQL(db)) => db.insert_impl::<I::Model>(&refs).await,
             None => Err(anyhow::anyhow!("No connection available")),
         }
     }
@@ -62,6 +69,8 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
             Some(ConnectionWrapper::MySQL(db)) => {
                 db.insert_or_update_batch::<I::Model>(&refs).await
             }
+            #[cfg(feature = "mssql")]
+            Some(ConnectionWrapper::MSSQL(db)) => db.insert_or_update_impl::<I::Model>(&refs).await,
             None => Err(anyhow::anyhow!("No connection available")),
         }
     }
@@ -77,6 +86,9 @@ use super::super::postgresql_backend;
 #[cfg(feature = "mysql")]
 use super::super::mysql_backend;
 
+#[cfg(feature = "mssql")]
+use super::super::mssql_backend;
+
 /// 连接包装器 - 包装各后端的 Database 实例
 enum ConnectionWrapper {
     #[cfg(feature = "sqlite")]
@@ -85,6 +97,8 @@ enum ConnectionWrapper {
     PostgreSQL(postgresql_backend::Database),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::Database),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::Database),
 }
 
 impl ConnectionWrapper {
@@ -97,6 +111,8 @@ impl ConnectionWrapper {
             ConnectionWrapper::PostgreSQL(db) => db.is_valid().await,
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.is_valid().await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db.is_valid(),
         }
     }
 }
@@ -143,13 +159,12 @@ impl ManualPool {
                     .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
-            #[cfg(feature = "mysql")]
-            DbType::MySQL => {
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => {
                 let db =
-                    mysql_backend::Database::connect(self.db_type, &self.connection_string).await?;
-                Ok(ConnectionWrapper::MySQL(db))
+                    mssql_backend::Database::connect(self.db_type, &self.connection_string).await?;
+                Ok(ConnectionWrapper::MSSQL(db))
             }
-            #[cfg(feature = "postgresql")]
             _ => unreachable!(),
         }
     }
@@ -273,7 +288,8 @@ impl PoolBuilder {
         match self.db_type {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
-                let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                let pool =
+                    ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
                     pool.maintain_min_connections().await;
                 }
@@ -281,10 +297,8 @@ impl PoolBuilder {
             }
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
-                let manager = PostgresConnectionManager::new_from_stringlike(
-                    &self.connection_string,
-                    NoTls,
-                )?;
+                let manager =
+                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls)?;
                 let mut builder = bb8::Pool::builder();
                 builder = builder.max_size(self.config.max_size as u32);
                 if self.config.min_size > 0 {
@@ -295,11 +309,19 @@ impl PoolBuilder {
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
-                let pool = ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                let opts = mysql_async::Opts::from_url(&self.connection_string)
+                    .map_err(|e| anyhow::anyhow!("Invalid MySQL connection string: {}", e))?;
+                let pool = mysql_async::Pool::new(opts);
+                Ok(ConnectionPool::MySQL(pool))
+            }
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => {
+                let pool =
+                    ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
                     pool.maintain_min_connections().await;
                 }
-                Ok(ConnectionPool::MySQL(pool))
+                Ok(ConnectionPool::MSSQL(pool))
             }
         }
     }
@@ -312,7 +334,9 @@ pub enum ConnectionPool {
     #[cfg(feature = "postgresql")]
     PostgreSQL(bb8::Pool<PostgresConnectionManager<NoTls>>),
     #[cfg(feature = "mysql")]
-    MySQL(Arc<ManualPool>),
+    MySQL(mysql_async::Pool),
+    #[cfg(feature = "mssql")]
+    MSSQL(Arc<ManualPool>),
 }
 
 impl ConnectionPool {
@@ -349,6 +373,15 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mysql")]
             ConnectionPool::MySQL(pool) => {
+                let db = mysql_backend::Database::from_pool(pool.clone());
+                Ok(PooledConnection {
+                    inner: PooledConnectionInner::MySQL,
+                    connection: Some(ConnectionWrapper::MySQL(db)),
+                    _marker: PhantomData,
+                })
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionPool::MSSQL(pool) => {
                 let _permit = pool
                     .semaphore
                     .acquire()
@@ -356,7 +389,7 @@ impl ConnectionPool {
                     .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
-                    inner: PooledConnectionInner::MySQL(pool.clone()),
+                    inner: PooledConnectionInner::MSSQL(pool.clone()),
                     connection: Some(conn),
                     _marker: PhantomData,
                 })
@@ -373,7 +406,9 @@ enum PooledConnectionInner {
     #[cfg(feature = "postgresql")]
     PostgreSQL,
     #[cfg(feature = "mysql")]
-    MySQL(Arc<ManualPool>),
+    MySQL,
+    #[cfg(feature = "mssql")]
+    MSSQL(Arc<ManualPool>),
 }
 
 impl PooledConnectionInner {
@@ -387,7 +422,12 @@ impl PooledConnectionInner {
                 let _ = conn;
             }
             #[cfg(feature = "mysql")]
-            PooledConnectionInner::MySQL(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::MySQL => {
+                // mysql_async::Pool 自动管理连接生命周期，无需手动归还
+                let _ = conn;
+            }
+            #[cfg(feature = "mssql")]
+            PooledConnectionInner::MSSQL(pool) => pool.return_connection(conn).await,
         }
     }
 }
@@ -443,6 +483,8 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => CreateTableExecutor::MySQL(db.create_table::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => CreateTableExecutor::MSSQL(db.create_table::<T>()),
         }
     }
 
@@ -455,6 +497,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::PostgreSQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db.validate_table::<T>().await,
         }
     }
 
@@ -492,6 +536,8 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => super::unified::SelectExecutor::MySQL(db.select::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => super::unified::SelectExecutor::MSSQL(db.select::<T>()),
         }
     }
 
@@ -513,6 +559,8 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => super::unified::DeleteExecutor::MySQL(db.delete::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => super::unified::DeleteExecutor::MSSQL(db.delete::<T>()),
         }
     }
 
@@ -529,6 +577,8 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => super::unified::UpdateExecutor::MySQL(db.update::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => super::unified::UpdateExecutor::MSSQL(db.update::<T>()),
         }
     }
 
@@ -549,6 +599,10 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => {
                 super::unified::RelatedSelectExecutor::MySQL(db.related::<T, R>())
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => {
+                super::unified::RelatedSelectExecutor::MSSQL(db.related::<T, R>())
             }
         }
     }
@@ -571,6 +625,11 @@ impl<'a> PooledConnection<'a> {
                 let txn = db.begin().await?;
                 Ok(super::unified::Transaction::MySQL(txn))
             }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => {
+                let txn = db.begin().await?;
+                Ok(super::unified::Transaction::MSSQL(txn))
+            }
         }
     }
 
@@ -585,6 +644,8 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => DropTableExecutor::MySQL(db.drop_table::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => DropTableExecutor::MSSQL(db.drop_table::<T>()),
         }
     }
 
@@ -597,6 +658,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::PostgreSQL(db) => db.execute::<T>(sql).await,
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.execute::<T>(sql).await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db.execute::<T>(sql).await,
         }
     }
 
@@ -615,6 +678,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::PostgreSQL(db) => db.exec_non_query(sql).await,
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.exec_non_query(sql).await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db.exec_non_query(sql).await,
         }
     }
 }

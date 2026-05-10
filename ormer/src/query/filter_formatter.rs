@@ -122,12 +122,24 @@ impl FilterFormatter {
                         write!(sql, "{} {} ?", full_col_name, operator)
                             .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
                     }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        use std::fmt::Write;
+                        let full_col_name = if !col_name.is_empty() {
+                            format!("{}.{}", col_name, column)
+                        } else {
+                            column.clone()
+                        };
+                        write!(sql, "{} {} @P", full_col_name, operator)
+                            .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
+                    }
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
-                        feature = "mysql"
+                        feature = "mysql",
+                        feature = "mssql"
                     )))]
-                    DbType::None => panic!("No database backend available"),
+                    _ => panic!("No database backend available"),
                 }
                 // 转换 filter Value 到 ormer Value
                 let ormer_value = Self::convert_filter_value(value);
@@ -185,12 +197,19 @@ impl FilterFormatter {
                         DbType::MySQL => {
                             sql.push('?');
                         }
+                        #[cfg(feature = "mssql")]
+                        DbType::MSSQL => {
+                            write!(sql, "@P").unwrap_or_else(|e| {
+                                panic!("Failed to write parameter placeholder: {}", e)
+                            });
+                        }
                         #[cfg(not(any(
                             feature = "sqlite",
                             feature = "postgresql",
-                            feature = "mysql"
+                            feature = "mysql",
+                            feature = "mssql"
                         )))]
-                        DbType::None => panic!("No database backend available"),
+                        _ => panic!("No database backend available"),
                     }
                     // 转换 filter Value 到 ormer Value
                     let ormer_value = Self::convert_filter_value(value);

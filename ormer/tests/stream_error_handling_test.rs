@@ -20,6 +20,15 @@ fn test_parse_error_variant() {
     let error = result.unwrap_err();
     let error_msg = format!("{}", error);
     assert!(error_msg.contains("Parse error"));
-    assert!(error_msg.contains("Failed to parse non-nullable column"));
-    assert!(error_msg.contains("name"));
+    // 遍历错误链检查内部错误消息
+    let found_column_error = error.chain().any(|e| {
+        e.to_string()
+            .contains("Failed to parse non-nullable column")
+    });
+    assert!(
+        found_column_error,
+        "错误链中应包含 'Failed to parse non-nullable column'"
+    );
+    let found_name = error.chain().any(|e| e.to_string().contains("name"));
+    assert!(found_name, "错误链中应包含 'name'");
 }

@@ -253,17 +253,36 @@ impl<T: Model, V> MappedSelect<T, V> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // RANGE 子句 (LIMIT + OFFSET)
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -282,7 +301,19 @@ impl<T: Model, V> MappedSelect<T, V> {
             feature = "mysql"
         ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -463,17 +494,36 @@ impl<T: Model, V> GroupedSelect<T, V> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // LIMIT/OFFSET
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -492,7 +542,19 @@ impl<T: Model, V> GroupedSelect<T, V> {
             feature = "mysql"
         ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -781,7 +843,19 @@ impl<T: Model> Select<T> {
             feature = "mysql"
         ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
         let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
@@ -823,17 +897,36 @@ impl<T: Model> Select<T> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // RANGE 子句 (LIMIT + OFFSET)
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         // 返回参数
@@ -922,17 +1015,36 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // RANGE 子句 (LIMIT + OFFSET)
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -1015,17 +1127,36 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // RANGE 子句 (LIMIT + OFFSET)
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -1110,17 +1241,36 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
             sql.push_str(&order_strs.join(", "));
         }
 
-        // RANGE 子句 (LIMIT + OFFSET)
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                if self.order_by.is_empty() {
+                    sql.push_str(" ORDER BY (SELECT NULL)");
+                }
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -1582,7 +1732,19 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
             feature = "mysql"
         ))]
         let db_type = DbType::MySQL;
-        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
         let db_type = DbType::None;
 
         let (sql, params) = self.to_sql_with_params(db_type);
@@ -2180,16 +2342,34 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             }
         }
 
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                sql.push_str(" ORDER BY (SELECT NULL)");
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -2268,16 +2448,34 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             }
         }
 
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                sql.push_str(" ORDER BY (SELECT NULL)");
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)
@@ -2356,16 +2554,34 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             }
         }
 
+        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
+        #[cfg(feature = "mssql")]
+        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
         if let Some(end) = self.range_end {
             let limit = if let Some(start) = self.range_start {
                 end - start
             } else {
                 end
             };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            if is_mssql {
+                let start_offset = self.range_start.unwrap_or(0);
+                sql.push_str(" ORDER BY (SELECT NULL)");
+                write!(
+                    &mut sql,
+                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                    start_offset, limit
+                )
+                .expect("Failed to write OFFSET/FETCH clause");
+            } else {
+                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+            }
         }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        if !is_mssql {
+            if let Some(start) = self.range_start {
+                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+            }
         }
 
         (sql, params)

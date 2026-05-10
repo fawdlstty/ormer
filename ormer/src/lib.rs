@@ -4,13 +4,18 @@ pub mod model;
 pub mod query;
 
 // 编译时检查：至少启用一个数据库特性（已移除，允许无特性编译）
-// #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
-// compile_error!("At least one database feature must be enabled: sqlite, postgresql, or mysql");
+// #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql", feature = "mssql")))]
+// compile_error!("At least one database feature must be enabled: sqlite, postgresql, mysql, or mssql");
 
 pub use abstract_layer::DbType;
 
 // 数据库相关类型 - 当启用任一数据库 feature 时可用
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub use abstract_layer::{
     ConnectionPool, CreateTableExecutor, Database, DeleteExecutor, DropTableExecutor,
     MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, PooledConnection,

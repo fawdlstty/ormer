@@ -149,6 +149,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
@@ -168,6 +170,8 @@ macro_rules! impl_unified_select_executor_methods {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
@@ -187,6 +191,8 @@ macro_rules! impl_unified_select_executor_methods {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_desc(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
@@ -202,6 +208,8 @@ macro_rules! impl_unified_select_executor_methods {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
@@ -228,6 +236,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
@@ -241,6 +251,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => exec.execute().await,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.execute().await,
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
@@ -277,6 +289,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
@@ -298,6 +312,8 @@ macro_rules! impl_unified_update_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(field_fn, value)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(field_fn, value)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
@@ -311,6 +327,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => exec.execute().await,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.execute().await,
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
@@ -333,8 +351,11 @@ macro_rules! impl_unified_update_executor {
 #[macro_export]
 macro_rules! impl_unified_collect_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<T> + 'static> std::future::IntoFuture
-            for $future_name<'a, T, C>
+        impl<
+            'a,
+            T: $crate::Model + 'static + std::marker::Send + std::marker::Sync,
+            C: FromIterator<T> + 'static,
+        > std::future::IntoFuture for $future_name<'a, T, C>
         {
             type Output = anyhow::Result<C>;
             type IntoFuture =
@@ -348,6 +369,8 @@ macro_rules! impl_unified_collect_future {
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "mssql")]
+                    $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("CollectFuture not implemented for this backend"),
                 }
@@ -360,8 +383,11 @@ macro_rules! impl_unified_collect_future {
 #[macro_export]
 macro_rules! impl_unified_aggregate_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static + std::marker::Send, R: $crate::model::FromValue + 'static + std::marker::Send>
-            std::future::IntoFuture for $future_name<'a, T, R>
+        impl<
+            'a,
+            T: $crate::Model + 'static + std::marker::Send,
+            R: $crate::model::FromValue + 'static + std::marker::Send,
+        > std::future::IntoFuture for $future_name<'a, T, R>
         {
             type Output = anyhow::Result<R>;
             type IntoFuture =
@@ -375,6 +401,8 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::PostgreSQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(async move { future.await }),
+                    #[cfg(feature = "mssql")]
+                    $future_name::MSSQL(future) => Box::pin(async move { future.await }),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("AggregateFuture not implemented for this backend"),
                 }
@@ -401,6 +429,8 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
@@ -418,6 +448,8 @@ macro_rules! impl_unified_join_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
@@ -430,8 +462,11 @@ macro_rules! impl_unified_join_executor {
 #[macro_export]
 macro_rules! impl_unified_join_collect_future {
     ($future_name:ident, $output_type:ty) => {
-        impl<'a, T: $crate::Model + 'static + std::marker::Send, J: $crate::Model + 'static + std::marker::Send> std::future::IntoFuture
-            for $future_name<'a, T, J>
+        impl<
+            'a,
+            T: $crate::Model + 'static + std::marker::Send,
+            J: $crate::Model + 'static + std::marker::Send,
+        > std::future::IntoFuture for $future_name<'a, T, J>
         {
             type Output = $output_type;
             type IntoFuture =
@@ -445,6 +480,8 @@ macro_rules! impl_unified_join_collect_future {
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "mssql")]
+                    $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("JoinCollectFuture not implemented for this backend"),
                 }
@@ -457,7 +494,7 @@ macro_rules! impl_unified_join_collect_future {
 #[macro_export]
 macro_rules! impl_unified_related_select_executor {
     ($executor_name:ident) => {
-        impl<'a, T: $crate::Model, R: $crate::Model> $executor_name<'a, T, R> {
+        impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> $executor_name<'a, T, R> {
             pub fn filter<F>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
@@ -471,6 +508,8 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.filter(f)),
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
@@ -488,6 +527,8 @@ macro_rules! impl_unified_related_select_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
@@ -509,6 +550,8 @@ macro_rules! impl_unified_related_select_executor {
                     }
                     #[cfg(feature = "mysql")]
                     $executor_name::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => RelatedCollectFuture::MSSQL(exec.exec()),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
@@ -537,8 +580,13 @@ macro_rules! impl_unified_related_select_executor {
 #[macro_export]
 macro_rules! impl_unified_related_collect_future {
     ($future_name:ident) => {
-        impl<'a, T: $crate::Model + 'static + std::marker::Send, R: $crate::Model + 'static + std::marker::Send> std::future::IntoFuture
-            for $future_name<'a, T, R>
+        impl<
+            'a,
+            T: $crate::Model + 'static + std::marker::Send + std::marker::Sync,
+            R: $crate::Model + 'static + std::marker::Send + std::marker::Sync,
+        > std::future::IntoFuture for $future_name<'a, T, R>
+        where
+            Self: 'a,
         {
             type Output = anyhow::Result<Vec<T>>;
             type IntoFuture =
@@ -552,6 +600,8 @@ macro_rules! impl_unified_related_collect_future {
                     $future_name::PostgreSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mysql")]
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "mssql")]
+                    $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("RelatedCollectFuture not implemented for this backend"),
                 }

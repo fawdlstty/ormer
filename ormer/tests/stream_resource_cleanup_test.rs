@@ -2,8 +2,12 @@
 
 mod _test_common;
 
-// 使用宏定义测试专用模型
+// 使用宏定义测试专用模型（每个测试函数使用独立的表名，避免并行执行时的冲突）
 define_test_user_for_range!(StreamCleanupUser, "stream_cleanup_test");
+define_test_user_for_range!(StreamCleanupUserPollution, "stream_cleanup_pollution");
+define_test_user_for_range!(StreamCleanupUserEt, "stream_cleanup_et");
+define_test_user_for_range!(StreamCleanupUserMc, "stream_cleanup_mc");
+define_test_user_for_range!(StreamCleanupUserPool, "stream_cleanup_pool");
 
 /// 测试流式查询中发生错误后，迭代器是否正确污染并终止
 async fn test_stream_pollution_on_error_impl(config: &_test_common::DbConfig) {
@@ -11,16 +15,16 @@ async fn test_stream_pollution_on_error_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_test")
+        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_pollution")
         .await;
-    db.create_table::<StreamCleanupUser>()
+    db.create_table::<StreamCleanupUserPollution>()
         .execute()
         .await
         .unwrap();
 
     // 插入测试数据
     for i in 0..5 {
-        let user = StreamCleanupUser {
+        let user = StreamCleanupUserPollution {
             id: i + 1,
             name: format!("user{}", i),
             age: 20 + i,
@@ -30,7 +34,7 @@ async fn test_stream_pollution_on_error_impl(config: &_test_common::DbConfig) {
 
     // 正常流式查询应该能读取所有数据
     let mut stream = db
-        .select::<StreamCleanupUser>()
+        .select::<StreamCleanupUserPollution>()
         .stream()
         .into_iter()
         .await
@@ -52,16 +56,16 @@ async fn test_stream_early_termination_cleanup_impl(config: &_test_common::DbCon
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_test")
+        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_et")
         .await;
-    db.create_table::<StreamCleanupUser>()
+    db.create_table::<StreamCleanupUserEt>()
         .execute()
         .await
         .unwrap();
 
     // 插入较多数据
     for i in 0..100 {
-        let user = StreamCleanupUser {
+        let user = StreamCleanupUserEt {
             id: i + 1,
             name: format!("user{}", i),
             age: 18 + (i % 50),
@@ -72,7 +76,7 @@ async fn test_stream_early_termination_cleanup_impl(config: &_test_common::DbCon
     // 多次提前终止流式查询，验证连接不会泄漏
     for _iteration in 0..10 {
         let mut stream = db
-            .select::<StreamCleanupUser>()
+            .select::<StreamCleanupUserEt>()
             .stream()
             .into_iter()
             .await
@@ -90,8 +94,8 @@ async fn test_stream_early_termination_cleanup_impl(config: &_test_common::DbCon
     }
 
     // 验证连接仍然可用，执行一次完整查询
-    let all_users: Vec<StreamCleanupUser> =
-        db.select::<StreamCleanupUser>().collect().await.unwrap();
+    let all_users: Vec<StreamCleanupUserEt> =
+        db.select::<StreamCleanupUserEt>().collect().await.unwrap();
 
     assert_eq!(all_users.len(), 100);
     println!(
@@ -105,16 +109,16 @@ async fn test_multiple_consecutive_streams_impl(config: &_test_common::DbConfig)
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_test")
+        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_mc")
         .await;
-    db.create_table::<StreamCleanupUser>()
+    db.create_table::<StreamCleanupUserMc>()
         .execute()
         .await
         .unwrap();
 
     // 插入测试数据
     for i in 0..10 {
-        let user = StreamCleanupUser {
+        let user = StreamCleanupUserMc {
             id: i + 1,
             name: format!("user{}", i),
             age: 20 + i,
@@ -125,7 +129,7 @@ async fn test_multiple_consecutive_streams_impl(config: &_test_common::DbConfig)
     // 连续执行多次流式查询
     for _iteration in 0..5 {
         let mut stream = db
-            .select::<StreamCleanupUser>()
+            .select::<StreamCleanupUserMc>()
             .stream()
             .into_iter()
             .await
@@ -168,17 +172,17 @@ async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = pooled_conn
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_test")
+        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_pool")
         .await;
     pooled_conn
-        .create_table::<StreamCleanupUser>()
+        .create_table::<StreamCleanupUserPool>()
         .execute()
         .await
         .unwrap();
 
     // 插入测试数据
     for i in 0..10 {
-        let user = StreamCleanupUser {
+        let user = StreamCleanupUserPool {
             id: i + 1,
             name: format!("pool_user{}", i),
             age: 18 + i,
@@ -189,7 +193,7 @@ async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
     // 多次流式查询，验证连接池管理正确
     for _iteration in 0..3 {
         let mut stream = pooled_conn
-            .stream::<StreamCleanupUser>()
+            .stream::<StreamCleanupUserPool>()
             .into_iter()
             .await
             .unwrap();

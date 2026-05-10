@@ -47,6 +47,10 @@ pub enum StreamConnection<'a> {
     #[cfg(feature = "mysql")]
     MySQL(mysql_async::Conn),
 
+    /// MSSQL 连接 - 使用Client引用
+    #[cfg(feature = "mssql")]
+    MSSQL(&'a tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>),
+
     /// 空变体，用于未启用任何 feature 时保持枚举有效
     #[doc(hidden)]
     #[allow(dead_code)]
@@ -73,6 +77,12 @@ impl<'a> Drop for StreamConnection<'a> {
                 // mysql_async::Conn 在 Drop 时会自动返回连接池
                 // 显式 drop 确保立即释放
                 let _ = conn;
+            }
+
+            #[cfg(feature = "mssql")]
+            StreamConnection::MSSQL(_) => {
+                // tiberius::Client 引用，生命周期结束时自动释放
+                // 不需要显式操作
             }
 
             // 处理 Phantom 变体

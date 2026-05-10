@@ -273,6 +273,13 @@ impl Database {
         Ok(Self { pool })
     }
 
+    /// 从已有的 mysql_async Pool 创建 Database
+    ///
+    /// mysql_async::Pool 本身就是连接池，内部使用 Arc 管理，clone 是轻量操作。
+    pub fn from_pool(pool: Pool) -> Self {
+        Self { pool }
+    }
+
     /// 创建表 - 返回执行器
     pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
         CreateTableExecutor {

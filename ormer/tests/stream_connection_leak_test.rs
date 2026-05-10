@@ -5,6 +5,7 @@ mod _test_common;
 // 使用宏定义测试专用模型
 define_test_user_for_range!(StreamLeakUser, "stream_leak_test");
 define_test_user_for_range!(StreamEarlyTermUser, "stream_early_term_test");
+define_test_user_for_range!(StreamTxnUser, "stream_txn_test");
 
 /// 测试流式查询后连接是否正确释放
 async fn test_stream_connection_release_impl(config: &_test_common::DbConfig) {
@@ -108,11 +109,11 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
     let _ = db
         .exec_non_query("DROP TABLE IF EXISTS stream_txn_test")
         .await;
-    db.create_table::<StreamLeakUser>().execute().await.unwrap();
+    db.create_table::<StreamTxnUser>().execute().await.unwrap();
 
     // 插入测试数据
     for i in 0..10 {
-        let user = StreamLeakUser {
+        let user = StreamTxnUser {
             id: i + 1,
             name: format!("txn_user{}", i),
             age: 25 + i,
@@ -126,7 +127,7 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
         let txn = db.begin().await.unwrap();
 
         let mut stream = txn
-            .select::<StreamLeakUser>()
+            .select::<StreamTxnUser>()
             .filter(|u| u.age.ge(27))
             .stream()
             .into_iter()

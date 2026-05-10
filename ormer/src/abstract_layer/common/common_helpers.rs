@@ -33,8 +33,18 @@ pub fn format_filter(
                     write!(sql, "{} {} ?", column, operator)
                         .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
+                #[cfg(feature = "mssql")]
+                DbType::MSSQL => {
+                    write!(sql, "{} {} @P", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                }
                 // 无数据库后端时返回错误
-                #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                #[cfg(not(any(
+                    feature = "sqlite",
+                    feature = "postgresql",
+                    feature = "mysql",
+                    feature = "mssql"
+                )))]
                 DbType::None => {
                     return Err(anyhow::anyhow!("No database backend available"));
                 }
@@ -71,13 +81,18 @@ pub fn format_filter(
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        sql.push_str("@P");
+                    }
                     // 无数据库后端时返回错误
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
-                        feature = "mysql"
+                        feature = "mysql",
+                        feature = "mssql"
                     )))]
-                    DbType::None => {
+                    _ => {
                         return Err(anyhow::anyhow!("No database backend available"));
                     }
                 }
@@ -96,8 +111,9 @@ pub fn format_filter(
             // 注意：子查询的参数数量需要累加到 param_idx
             // 但在这个函数中我们不处理参数值，只处理占位符
             // 子查询的 SQL 中已经包含了占位符，我们需要计算占位符数量
-            let placeholder_count =
-                subquery_sql.matches('?').count() + subquery_sql.matches('$').count();
+            let placeholder_count = subquery_sql.matches('?').count()
+                + subquery_sql.matches('$').count()
+                + subquery_sql.matches("@P").count();
             *param_idx += placeholder_count as i32;
         }
         FilterExpr::And(left, right) => {
@@ -144,8 +160,18 @@ pub fn format_filter_with_params(
                     write!(sql, "{} {} ?", column, operator)
                         .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
                 }
+                #[cfg(feature = "mssql")]
+                DbType::MSSQL => {
+                    write!(sql, "{} {} @P", column, operator)
+                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                }
                 // 无数据库后端时返回错误
-                #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
+                #[cfg(not(any(
+                    feature = "sqlite",
+                    feature = "postgresql",
+                    feature = "mysql",
+                    feature = "mssql"
+                )))]
                 DbType::None => {
                     return Err(anyhow::anyhow!("No database backend available"));
                 }
@@ -183,11 +209,16 @@ pub fn format_filter_with_params(
                     DbType::MySQL => {
                         sql.push('?');
                     }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        sql.push_str("@P");
+                    }
                     // 无数据库后端时返回错误
                     #[cfg(not(any(
                         feature = "sqlite",
                         feature = "postgresql",
-                        feature = "mysql"
+                        feature = "mysql",
+                        feature = "mssql"
                     )))]
                     DbType::None => {
                         return Err(anyhow::anyhow!("No database backend available"));
@@ -334,6 +365,29 @@ pub fn build_batch_insert_sql_with_columns(
         }
 
         let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        sql.push_str(&format!("({})", placeholders.join(", ")));
+    }
+
+    (sql, col_count)
+}
+
+/// 构建批量插入 SQL（MSSQL 使用 @P 占位符）
+pub fn build_batch_insert_sql_mssql_with_columns(
+    table_name: &str,
+    columns: &[&str],
+    models_count: usize,
+) -> (String, usize) {
+    let columns_str = columns.join(", ");
+    let col_count = columns.len();
+
+    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
+
+    for idx in 0..models_count {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
         sql.push_str(&format!("({})", placeholders.join(", ")));
     }
 

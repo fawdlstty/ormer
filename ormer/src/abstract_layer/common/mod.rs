@@ -1,5 +1,10 @@
 ﻿/// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub mod connection_pool;
 
 pub mod common_helpers;
@@ -9,15 +14,35 @@ pub mod common_helpers;
 pub mod macros;
 
 /// 流式查询连接管理模块
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub mod stream_connection;
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub use stream_connection::StreamConnection;
 
 /// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 mod unified;
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
     DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, InsertExecutor,
@@ -28,5 +53,10 @@ pub use unified::{
 };
 
 // 连接池类型 - 根据启用的 feature 导出
-#[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 pub use connection_pool::{ConnectionPool, PooledConnection};

@@ -6,7 +6,7 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/fawdlstty/ormer"
 homepage = "https://github.com/fawdlstty/ormer"
-description = "An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL"
+description = "An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL, MSSQL"
 authors = ["fawdlstty<f@fawdlstty.com>"]
 keywords = ["orm", "database"]
 categories = []
@@ -36,6 +36,9 @@ postgres-types = { version = "0.2", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
 # mysql
 mysql_async = { version = "0.34", optional = true }
+# mssql
+tiberius = { version = "0.12", optional = true, features = ["tds73", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 [dev-dependencies]
 paste = "1.0"
@@ -49,10 +52,11 @@ all-features = true
 
 [features]
 default = []
-full = ["sqlite", "postgresql", "mysql"]
+full = ["sqlite", "postgresql", "mysql", "mssql"]
 sqlite = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types", "dep:bb8", "dep:bb8-postgres"]
 mysql = ["dep:mysql_async"]
+mssql = ["dep:tiberius", "dep:tokio-util"]
 
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io
