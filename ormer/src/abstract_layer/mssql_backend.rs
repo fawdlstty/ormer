@@ -103,7 +103,7 @@ impl Database {
 
     pub async fn exec_sql(&self, sql: &str) -> anyhow::Result<u64> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
+        let query = Query::new(sql);
         let result = query.execute(&mut *client).await?;
         Ok(result.total())
     }
@@ -320,7 +320,7 @@ impl Database {
             T::TABLE_NAME
         );
         {
-            let mut query = Query::new(&check_sql);
+            let query = Query::new(&check_sql);
             let stream = query.query(&mut *client).await?;
             let rows = stream.into_first_result().await?;
             if rows.is_empty() {
@@ -339,7 +339,7 @@ impl Database {
             "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
             T::TABLE_NAME
         );
-        let mut query = Query::new(&col_sql);
+        let query = Query::new(&col_sql);
         let stream = query.query(&mut *client).await?;
         let rows = stream.into_first_result().await?;
 
@@ -376,7 +376,7 @@ impl Database {
                 ));
             }
 
-            let (actual_name, actual_type, actual_nullable) = &actual_columns[i];
+            let (actual_name, actual_type, _actual_nullable) = &actual_columns[i];
 
             // 检查列名
             if actual_name != &expected_col.name.to_lowercase() {
@@ -458,7 +458,7 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
+        let query = Query::new(sql);
         let results = query.query(&mut *client).await?;
         let rows = results.into_first_result().await?;
         let mut result = Vec::new();
@@ -478,7 +478,7 @@ impl Database {
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
+        let query = Query::new(sql);
         let result = query.execute(&mut *client).await?;
         Ok(result.total() as u64)
     }
@@ -503,7 +503,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             self.table_name.as_deref(),
         )?;
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&create_sql);
+        let query = Query::new(&create_sql);
         query.execute(&mut *client).await?;
         Ok(())
     }
@@ -519,7 +519,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
+        let query = Query::new(&sql);
         query.execute(&mut *client).await?;
         Ok(())
     }
@@ -724,19 +724,19 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub async fn commit(self) -> anyhow::Result<()> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new("COMMIT");
+        let query = Query::new("COMMIT");
         query.execute(&mut *client).await?;
         Ok(())
     }
 
     pub async fn rollback(self) -> anyhow::Result<()> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new("ROLLBACK");
+        let query = Query::new("ROLLBACK");
         query.execute(&mut *client).await?;
         Ok(())
     }
 
-    pub fn select<T: Model>(&self) -> SelectExecutor<T> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
             pool: self.pool.clone(),
@@ -744,7 +744,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<T, V> {
+    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         GroupedSelectExecutor {
             select: GroupedSelect::<T, V>::new(),
             pool: self.pool.clone(),
@@ -752,7 +752,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             pool: self.pool.clone(),
@@ -760,7 +760,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -772,7 +772,7 @@ impl<'a> Transaction<'a> {
     pub fn insert<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> TransactionInsertExecutor<I> {
+    ) -> TransactionInsertExecutor<'_, I> {
         TransactionInsertExecutor {
             pool: self.pool.clone(),
             models,
@@ -783,7 +783,7 @@ impl<'a> Transaction<'a> {
     pub fn insert_or_update<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> TransactionInsertOrUpdateExecutor<I> {
+    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
         TransactionInsertOrUpdateExecutor {
             pool: self.pool.clone(),
             models,
@@ -2006,6 +2006,7 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Val
 }
 
 // 辅助函数：从 tiberius Row 中提取 i64 值（用于聚合查询）
+#[allow(dead_code)]
 fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Option<i64>> {
     if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
         return Ok(Some(v as i64));
@@ -2020,6 +2021,7 @@ fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Optio
 }
 
 // 辅助函数：从 tiberius Row 中提取 f64 值（用于 AVG 聚合）
+#[allow(dead_code)]
 fn extract_f64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Option<f64>> {
     if let Ok(Some(v)) = row.try_get::<f64, _>(idx) {
         return Ok(Some(v));
