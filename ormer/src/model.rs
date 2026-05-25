@@ -12,6 +12,7 @@ pub struct ColumnSchema {
     pub is_indexed: bool,
     pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
     pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
+    pub data_type: Option<&'static str>, // 数据库类型覆盖
 }
 
 /// 外键信息
@@ -334,9 +335,10 @@ pub fn generate_create_table_sql_with_name<T: Model>(
         let is_composite_primary = primary_key_count > 1;
 
         // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
+        let effective_rust_type = column.data_type.unwrap_or(column.rust_type);
         let sql_type = if is_composite_primary && column.is_primary {
             db_type.sql_type(
-                column.rust_type,
+                effective_rust_type,
                 false, // 不在列级别标记为主键
                 column.is_auto_increment,
                 column.is_nullable,
@@ -344,7 +346,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
             )
         } else {
             db_type.sql_type(
-                column.rust_type,
+                effective_rust_type,
                 column.is_primary,
                 column.is_auto_increment,
                 column.is_nullable,
@@ -955,6 +957,52 @@ impl FromValue for Option<chrono::DateTime<chrono::Utc>> {
             Value::DateTime(v) => Ok(Some(*v)),
             _ => Err(anyhow::anyhow!(
                 "Type mismatch: expected Option<DateTime<Utc>>"
+            )),
+        }
+    }
+}
+
+// chrono::NaiveDateTime 特殊处理
+impl From<chrono::NaiveDateTime> for Value {
+    fn from(v: chrono::NaiveDateTime) -> Self {
+        Value::DateTime(v.and_utc())
+    }
+}
+
+impl FromValue for chrono::NaiveDateTime {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::DateTime(v) => Ok(v.naive_utc()),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected NaiveDateTime")),
+        }
+    }
+}
+
+impl FromRowValues for chrono::NaiveDateTime {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected NaiveDateTime"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl From<Option<chrono::NaiveDateTime>> for Value {
+    fn from(v: Option<chrono::NaiveDateTime>) -> Self {
+        match v {
+            Some(dt) => Value::DateTime(dt.and_utc()),
+            None => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<chrono::NaiveDateTime> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::DateTime(v) => Ok(Some(v.naive_utc())),
+            _ => Err(anyhow::anyhow!(
+                "Type mismatch: expected Option<NaiveDateTime>"
             )),
         }
     }

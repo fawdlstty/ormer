@@ -121,6 +121,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 foreign 属性
         let foreign_key = extract_foreign_key(f);
 
+        // 检查 data_type 属性
+        let data_type = extract_data_type(f);
+
         // 对于枚举类型支持，我们无法在编译时检测类型是否实现了 ModelEnum，
         // 因此采用简单策略：总是传递 None，数据库后端会根据 rust_type 字符串判断
         // 如果未来需要支持，可以考虑使用 specialization 或宏魔法
@@ -139,6 +142,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 is_indexed: #is_indexed,
                 foreign_key: #foreign_key,
                 enum_variants: #enum_variants,
+                data_type: #data_type,
             }
         }
     });
@@ -165,8 +169,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成 field_values 实现
     let field_names_for_values = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        quote! {
-            ::ormer::Value::from(self.#field_name.clone())
+        let data_type = extract_data_type(f);
+        let tokens_str = data_type.to_string();
+        if tokens_str.contains("i32")
+            || tokens_str.contains("i64")
+            || tokens_str.contains("Integer")
+        {
+            quote! {
+                ::ormer::Value::Integer(self.#field_name.clone().0 as i64)
+            }
+        } else {
+            quote! {
+                ::ormer::Value::from(self.#field_name.clone())
+            }
         }
     });
 
@@ -432,6 +447,20 @@ fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
         }
     }
     // 没有 unique 属性
+    quote! { None }
+}
+
+/// 提取 data_type 属性的类型覆盖信息
+/// 支持语法：#[data_type(i32)]
+fn extract_data_type(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if attr.path().is_ident("data_type") {
+            if let Meta::List(list) = &attr.meta {
+                let tokens_str = list.tokens.to_string();
+                return quote! { Some(stringify!(#tokens_str)) };
+            }
+        }
+    }
     quote! { None }
 }
 
