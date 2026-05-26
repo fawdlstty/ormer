@@ -110,11 +110,7 @@ pub struct CreateTableExecutor<'a, T: Model> {
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         // 表不存在，创建新表
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
@@ -122,9 +118,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             self.table_name.as_deref(),
         )?;
 
-        conn.query_drop(&create_sql)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.query_drop(&create_sql).await?;
 
         Ok(())
     }
@@ -139,15 +133,9 @@ pub struct DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        conn.query_drop(&sql)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.query_drop(&sql).await?;
 
         Ok(())
     }
@@ -171,11 +159,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             return Ok(());
         }
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
@@ -189,9 +173,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             );
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.exec_drop(&sql, params).await?;
 
         Ok(())
     }
@@ -215,11 +197,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
             return Ok(());
         }
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
@@ -253,9 +231,54 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.exec_drop(&sql, params).await?;
+
+        Ok(())
+    }
+}
+
+/// 插入或忽略执行器
+pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    pool: &'a Pool,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        self.insert_or_ignore_batch::<I::Model>(&refs).await
+    }
+
+    async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.pool.get_conn().await?;
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+
+        // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
+        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        conn.exec_drop(&sql, params).await?;
 
         Ok(())
     }
@@ -265,8 +288,7 @@ impl Database {
     /// 连接到 MySQL 数据库
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
         // 解析连接字符串
-        let opts = mysql_async::Opts::from_url(connection_string)
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let opts = mysql_async::Opts::from_url(connection_string)?;
 
         let pool = Pool::new(opts);
 
@@ -291,11 +313,7 @@ impl Database {
 
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>(&mut conn).await?;
@@ -318,10 +336,7 @@ impl Database {
     ) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
 
-        let result: Option<u64> = conn
-            .exec_first(sql, (T::TABLE_NAME,))
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result: Option<u64> = conn.exec_first(sql, (T::TABLE_NAME,)).await?;
 
         Ok(result.unwrap_or(0) > 0)
     }
@@ -339,10 +354,7 @@ impl Database {
             ORDER BY ORDINAL_POSITION
         "#;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(sql, (T::TABLE_NAME,))
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, (T::TABLE_NAME,)).await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
@@ -516,17 +528,25 @@ impl Database {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrIgnoreExecutor<'_, I> {
+        InsertOrIgnoreExecutor {
+            pool: &self.pool,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 批量插入记录
     pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
@@ -540,9 +560,7 @@ impl Database {
             );
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.exec_drop(&sql, params).await?;
 
         Ok(())
     }
@@ -553,11 +571,7 @@ impl Database {
             return Ok(());
         }
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let columns = T::COLUMNS.join(", ");
         let col_count = T::COLUMNS.len();
@@ -591,9 +605,41 @@ impl Database {
 
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.exec_drop(&sql, params).await?;
+
+        Ok(())
+    }
+
+    /// 批量插入或忽略记录（遇到重复键时忽略）
+    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.pool.get_conn().await?;
+
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+
+        // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
+        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        conn.exec_drop(&sql, params).await?;
 
         Ok(())
     }
@@ -646,15 +692,9 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        conn.query_drop("START TRANSACTION")
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.query_drop("START TRANSACTION").await?;
 
         Ok(Transaction {
             conn: Some(conn),
@@ -675,16 +715,9 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .query(sql)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.query(sql).await?;
 
         let mut results = Vec::new();
 
@@ -711,15 +744,9 @@ impl Database {
 
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        conn.query_drop(sql)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.query_drop(sql).await?;
 
         // 获取影响的行数
         let affected_rows = conn.affected_rows();
@@ -770,9 +797,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
         let params = values_to_params(&all_values)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&sql, params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            conn.exec_drop(&sql, params).await?;
         }
 
         Ok(())
@@ -820,9 +845,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         let params = values_to_params(&all_values)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&sql, params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            conn.exec_drop(&sql, params).await?;
         }
 
         Ok(())
@@ -838,9 +861,7 @@ impl<'a> Transaction<'a> {
             ));
         }
         if let Some(mut conn) = self.conn.take() {
-            conn.query_drop("COMMIT")
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            conn.query_drop("COMMIT").await?;
         }
         self.committed = true;
         Ok(())
@@ -854,9 +875,7 @@ impl<'a> Transaction<'a> {
             ));
         }
         if let Some(mut conn) = self.conn.take() {
-            conn.query_drop("ROLLBACK")
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            conn.query_drop("ROLLBACK").await?;
         }
         self.rolled_back = true;
         Ok(())
@@ -923,6 +942,18 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+        TransactionInsertOrIgnoreExecutor {
+            conn: &mut self.conn,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 批量插入或更新记录（遇到重复键时更新）
     pub async fn insert_or_update_batch<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
@@ -962,11 +993,52 @@ impl<'a> Transaction<'a> {
         let params = values_to_params(&all_values)?;
 
         if let Some(ref mut conn) = self.conn {
-            conn.exec_drop(&sql, params)
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
+            conn.exec_drop(&sql, params).await?;
+        }
+
+        Ok(())
+    }
+}
+
+/// 事务中的插入或忽略执行器
+pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    conn: &'a mut Option<mysql_async::Conn>,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+
+        // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
+        let mut sql = format!(
+            "INSERT IGNORE INTO {} ({columns}) VALUES ",
+            I::Model::TABLE_NAME
+        );
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        let params = values_to_params(&all_values)?;
+
+        if let Some(conn) = self.conn {
+            conn.exec_drop(&sql, params).await?;
         }
 
         Ok(())
@@ -1066,11 +1138,7 @@ impl<
         Box::pin(async move {
             let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-            let mut conn = self
-                .pool
-                .get_conn()
-                .await
-                .map_err(|e| anyhow::anyhow!(format!("Failed to get connection: {}", e)))?;
+            let mut conn = self.pool.get_conn().await?;
 
             // 将ormer::Value转换为mysql_async::Params
             let mysql_params: Vec<mysql_async::Value> = params
@@ -1104,13 +1172,10 @@ impl<
                 .collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-                conn.query(&sql)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                conn.query(&sql).await?
             } else {
                 conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                    .await?
             };
 
             let mut results = Vec::new();
@@ -1397,13 +1462,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
             let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::MySQL);
 
             // 将ormer::Value转换为mysql_async Value
-            let mut conn = self
-                .pool
-                .get_conn()
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
+            let mut conn = self.pool.get_conn().await?;
 
             // 构建参数
             let mysql_params: Vec<mysql_async::Value> = params
@@ -1436,16 +1495,9 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                 })
                 .collect();
 
-            let mut exec_result =
-                conn.exec_iter(&sql, mysql_params)
-                    .await
-                    .map_err(|e: mysql_async::Error| {
-                        anyhow::anyhow!(e).context("Database operation failed")
-                    })?;
+            let mut exec_result = conn.exec_iter(&sql, mysql_params).await?;
 
-            if let Some(row) = exec_result.next().await.map_err(|e: mysql_async::Error| {
-                anyhow::anyhow!(e).context("Database operation failed")
-            })? {
+            if let Some(row) = exec_result.next().await? {
                 // 获取第一个列的值
                 let value: Option<mysql_async::Value> = row.get(0);
                 let value = value.unwrap_or(mysql_async::Value::NULL);
@@ -1513,18 +1565,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let mysql_params = values_to_params(&params)?;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
 
@@ -1567,18 +1612,12 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql_with_params();
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let mysql_params = values_to_params(&params)?;
 
         // 使用 exec 执行 SQL，然后通过 last_insert_id 和 affected_rows 获取结果
-        conn.exec_drop(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        conn.exec_drop(&sql, mysql_params).await?;
 
         Ok(conn.affected_rows())
     }
@@ -1655,18 +1694,11 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql()?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let mysql_params = values_to_params(&params)?;
 
-        let result = conn
-            .exec_iter(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = conn.exec_iter(&sql, mysql_params).await?;
 
         Ok(result.affected_rows())
     }
@@ -1812,11 +1844,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             .collect();
 
         // 获取连接
-        let conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let conn = self.pool.get_conn().await?;
 
         // 使用 Query::stream() 实现真正的流式查询
         // 该方法返回 'static 的流，流拥有连接的所有权
@@ -1824,8 +1852,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let stream = sql
             .with(mysql_params)
             .stream::<mysql_async::Row, _>(conn)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            .await?;
 
         Ok(SelectStreamIterator {
             stream: Some(stream),
@@ -1953,20 +1980,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
             })
             .collect();
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e: mysql_async::Error| {
-                anyhow::anyhow!(e).context("Database operation failed")
-            })?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> =
-            conn.exec(&sql, mysql_params)
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2171,20 +2187,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
             })
             .collect();
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e: mysql_async::Error| {
-                anyhow::anyhow!(e).context("Database operation failed")
-            })?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> =
-            conn.exec(&sql, mysql_params)
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2361,11 +2366,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
         let mysql_params: Vec<mysql_async::Value> = params
             .iter()
@@ -2395,12 +2396,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             })
             .collect();
 
-        let rows: Vec<mysql_async::Row> =
-            conn.exec(&sql, mysql_params)
-                .await
-                .map_err(|e: mysql_async::Error| {
-                    anyhow::anyhow!(e).context("Database operation failed")
-                })?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2615,16 +2611,9 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
         let mysql_params = values_to_params(&params)?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2790,16 +2779,9 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
         let mysql_params = values_to_params(&params)?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2943,16 +2925,9 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 
         let mysql_params = values_to_params(&params)?;
 
-        let mut conn = self
-            .pool
-            .get_conn()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut conn = self.pool.get_conn().await?;
 
-        let rows: Vec<mysql_async::Row> = conn
-            .exec(&sql, mysql_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3141,13 +3116,7 @@ impl<
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let (sql, params) = self.executor.select.build_sql(DbType::MySQL);
-
-            let mut conn = self
-                .executor
-                .pool
-                .get_conn()
-                .await
-                .map_err(|e| anyhow::anyhow!(format!("Failed to get connection: {}", e)))?;
+            let mut conn = self.executor.pool.get_conn().await?;
 
             // 将ormer::Value转换为mysql_async::Params
             let mysql_params: Vec<mysql_async::Value> = params
@@ -3181,13 +3150,10 @@ impl<
                 .collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-                conn.query(&sql)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                conn.query(&sql).await?
             } else {
                 conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                    .await?
             };
 
             let mut results = Vec::new();

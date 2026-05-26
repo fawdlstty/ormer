@@ -137,6 +137,33 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 统一的 InsertOrIgnoreExecutor 枚举
+pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::InsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::InsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::InsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::InsertOrIgnoreExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertOrIgnoreExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mssql")]
+            InsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+        }
+    }
+}
+
 impl Database {
     /// 连接到数据库,根据 DbType 选择后端
     pub async fn connect(
@@ -227,6 +254,27 @@ impl Database {
             Database::MySQL(db) => InsertOrUpdateExecutor::MySQL(db.insert_or_update::<I>(models)),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrUpdateExecutor::MSSQL(db.insert_or_update::<I>(models)),
+        }
+    }
+
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrIgnoreExecutor<'_, I> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                InsertOrIgnoreExecutor::Sqlite(db.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => {
+                InsertOrIgnoreExecutor::PostgreSQL(db.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => InsertOrIgnoreExecutor::MySQL(db.insert_or_ignore::<I>(models)),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => InsertOrIgnoreExecutor::MSSQL(db.insert_or_ignore::<I>(models)),
         }
     }
 

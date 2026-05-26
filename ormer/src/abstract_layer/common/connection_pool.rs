@@ -76,6 +76,40 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 连接池插入或忽略执行器
+pub struct PooledInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    pooled_conn: &'a PooledConnection<'a>,
+    models: I,
+    _marker: PhantomData<I>,
+}
+
+impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        // 直接调用 PooledConnection 的 insert_or_ignore_batch 方法
+        let refs = self.models.as_refs();
+        match &self.pooled_conn.connection {
+            #[cfg(feature = "sqlite")]
+            Some(ConnectionWrapper::Sqlite(db)) => {
+                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            }
+            #[cfg(feature = "postgresql")]
+            Some(ConnectionWrapper::PostgreSQL(db)) => {
+                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            }
+            #[cfg(feature = "mysql")]
+            Some(ConnectionWrapper::MySQL(db)) => {
+                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            }
+            #[cfg(feature = "mssql")]
+            Some(ConnectionWrapper::MSSQL(db)) => db
+                .insert_or_ignore_impl::<I::Model>(&refs)
+                .await
+                .map(|_| ()),
+            None => Err(anyhow::anyhow!("No connection available")),
+        }
+    }
+}
+
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
 use super::super::sqlite_backend;
@@ -310,8 +344,7 @@ impl PoolBuilder {
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
-                let opts = mysql_async::Opts::from_url(&self.connection_string)
-                    .map_err(|e| anyhow::anyhow!("Invalid MySQL connection string: {}", e))?;
+                let opts = mysql_async::Opts::from_url(&self.connection_string)?;
                 let pool = mysql_async::Pool::new(opts);
                 Ok(ConnectionPool::MySQL(pool))
             }
@@ -350,11 +383,7 @@ impl ConnectionPool {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
                 // 获取信号量 permit
-                let _permit = pool
-                    .semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
+                let _permit = pool.semaphore.acquire().await?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
@@ -383,11 +412,7 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(pool) => {
-                let _permit = pool
-                    .semaphore
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to acquire connection: {}", e))?;
+                let _permit = pool.semaphore.acquire().await?;
                 let conn = pool.get().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MSSQL(pool.clone()),
@@ -518,6 +543,18 @@ impl<'a> PooledConnection<'a> {
         models: I,
     ) -> PooledInsertOrUpdateExecutor<'_, I> {
         PooledInsertOrUpdateExecutor {
+            pooled_conn: self,
+            models,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> PooledInsertOrIgnoreExecutor<'_, I> {
+        PooledInsertOrIgnoreExecutor {
             pooled_conn: self,
             models,
             _marker: PhantomData,

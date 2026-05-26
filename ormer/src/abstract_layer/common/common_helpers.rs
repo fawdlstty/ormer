@@ -45,23 +45,19 @@ pub fn format_filter(
             match db_type {
                 #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
-                    write!(sql, "{} {} ${}", column, operator, param_idx)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ${param_idx}")?;
                 }
                 #[cfg(feature = "sqlite")]
                 DbType::Sqlite => {
-                    write!(sql, "{} {} ?", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ?")?;
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
-                    write!(sql, "{} {} ?", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ?")?;
                 }
                 #[cfg(feature = "mssql")]
                 DbType::MSSQL => {
-                    write!(sql, "{} {} @P", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} @P")?;
                 }
                 // 无数据库后端时返回错误
                 #[cfg(not(any(
@@ -81,13 +77,11 @@ pub fn format_filter(
             operator,
             right_column,
         } => {
-            write!(sql, "{} {} {}", left_column, operator, right_column)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{left_column} {operator} {right_column}")?;
         }
         FilterExpr::In { column, values } => {
             // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{} IN (", column)?;
             for (i, _) in values.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -95,8 +89,7 @@ pub fn format_filter(
                 match db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx)
-                            .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                        write!(sql, "${param_idx}")?;
                     }
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => {
@@ -131,8 +124,7 @@ pub fn format_filter(
             subquery_params: _,
         } => {
             // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{} IN ({})", column, subquery_sql)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{column} IN ({subquery_sql})")?;
             // 注意：子查询的参数数量需要累加到 param_idx
             // 但在这个函数中我们不处理参数值，只处理占位符
             // 子查询的 SQL 中已经包含了占位符，我们需要计算占位符数量
@@ -178,23 +170,19 @@ pub fn format_filter_with_params(
             match db_type {
                 #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
-                    write!(sql, "{} {} ${}", column, operator, param_idx)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ${param_idx}")?;
                 }
                 #[cfg(feature = "sqlite")]
                 DbType::Sqlite => {
-                    write!(sql, "{} {} ?", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ?")?;
                 }
                 #[cfg(feature = "mysql")]
                 DbType::MySQL => {
-                    write!(sql, "{} {} ?", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} ?")?;
                 }
                 #[cfg(feature = "mssql")]
                 DbType::MSSQL => {
-                    write!(sql, "{} {} @P", column, operator)
-                        .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                    write!(sql, "{column} {operator} @P")?;
                 }
                 // 无数据库后端时返回错误
                 #[cfg(not(any(
@@ -215,13 +203,11 @@ pub fn format_filter_with_params(
             operator,
             right_column,
         } => {
-            write!(sql, "{} {} {}", left_column, operator, right_column)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{} {} {}", left_column, operator, right_column)?;
         }
         FilterExpr::In { column, values } => {
             // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{} IN (", column)?;
             for (i, value) in values.iter().enumerate() {
                 if i > 0 {
                     sql.push_str(", ");
@@ -233,8 +219,7 @@ pub fn format_filter_with_params(
                     }
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx)
-                            .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+                        write!(sql, "${}", param_idx)?;
                     }
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => {
@@ -266,8 +251,7 @@ pub fn format_filter_with_params(
             subquery_params,
         } => {
             // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{} IN ({})", column, subquery_sql)
-                .map_err(|e| anyhow::anyhow!("Failed to format SQL: {}", e))?;
+            write!(sql, "{} IN ({})", column, subquery_sql)?;
             // 添加子查询的参数
             for param in subquery_params {
                 params.push(param.clone());

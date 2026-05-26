@@ -112,11 +112,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             self.table_name.as_deref(),
         )?;
 
-        self.db
-            .conn
-            .execute(&create_sql, ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.db.conn.execute(&create_sql, ()).await?;
 
         Ok(())
     }
@@ -131,11 +127,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        self.db
-            .conn
-            .execute(&sql, ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.db.conn.execute(&sql, ()).await?;
         Ok(())
     }
 }
@@ -168,18 +160,26 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 插入或忽略执行器
+pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    db: &'a Database,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        self.db.insert_or_ignore_batch::<I::Model>(&refs).await
+    }
+}
+
 impl Database {
     /// 连接到 Sqlite 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> anyhow::Result<Self> {
-        let db = turso::Builder::new_local(path)
-            .build()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let db = turso::Builder::new_local(path).build().await?;
 
-        let conn = Arc::new(
-            db.connect()
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?,
-        );
+        let conn = Arc::new(db.connect()?);
 
         Ok(Self { conn })
     }
@@ -213,20 +213,10 @@ impl Database {
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
-        let mut rows = self
-            .conn
-            .query(sql, [T::TABLE_NAME])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut rows = self.conn.query(sql, [T::TABLE_NAME]).await?;
 
-        if let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
-            let count = row
-                .get_value(0)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        if let Some(row) = rows.next().await? {
+            let count = row.get_value(0)?;
 
             match count {
                 turso::Value::Integer(c) => Ok(c > 0),
@@ -242,31 +232,15 @@ impl Database {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", T::TABLE_NAME);
 
-        let mut rows = self
-            .conn
-            .query(&sql, ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut rows = self.conn.query(&sql, ()).await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool, bool)> = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
-            let name = row
-                .get_value(1)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
-            let col_type = row
-                .get_value(2)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
-            let notnull = row
-                .get_value(3)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
-            let pk = row
-                .get_value(5)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        while let Some(row) = rows.next().await? {
+            let name = row.get_value(1)?;
+            let col_type = row.get_value(2)?;
+            let notnull = row.get_value(3)?;
+            let pk = row.get_value(5)?;
 
             if let (
                 turso::Value::Text(name),
@@ -423,6 +397,18 @@ impl Database {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrIgnoreExecutor<'_, I> {
+        InsertOrIgnoreExecutor {
+            db: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 批量插入记录
     pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
@@ -441,10 +427,7 @@ impl Database {
             );
         let all_params = values_to_params(&all_values)?;
 
-        self.conn
-            .execute(&sql, all_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute(&sql, all_params).await?;
 
         Ok(())
     }
@@ -495,10 +478,47 @@ impl Database {
             first = false;
         }
 
-        self.conn
-            .execute(&sql, all_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute(&sql, all_params).await?;
+
+        Ok(())
+    }
+
+    /// 批量插入或忽略记录（遇到重复键时忽略）
+    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let columns = T::insert_columns();
+        let col_count = columns.len();
+        let primary_key_columns = T::primary_key_columns();
+        let primary_key = primary_key_columns.join(", ");
+
+        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            T::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_params = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.insert_values();
+            let params = values_to_params(&values)?;
+            all_params.extend(params);
+        }
+
+        // 添加 ON CONFLICT DO NOTHING 子句
+        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+
+        self.conn.execute(&sql, all_params).await?;
 
         Ok(())
     }
@@ -551,10 +571,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> anyhow::Result<Transaction> {
-        self.conn
-            .execute("BEGIN", ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute("BEGIN", ()).await?;
         Ok(Transaction {
             conn: self.conn.clone(),
             committed: false,
@@ -573,24 +590,14 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let mut rows = self
-            .conn
-            .query(sql, ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let mut rows = self.conn.query(sql, ()).await?;
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -611,11 +618,7 @@ impl Database {
 
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let result = self
-            .conn
-            .execute(sql, ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.conn.execute(sql, ()).await?;
         Ok(result)
     }
 
@@ -660,6 +663,20 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 事务中的插入或忽略执行器
+pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    txn: &'a mut Transaction,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        self.txn.insert_or_ignore_impl::<I::Model>(&refs).await
+    }
+}
+
 impl Transaction {
     /// 提交事务
     pub async fn commit(mut self) -> anyhow::Result<()> {
@@ -668,10 +685,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn
-            .execute("COMMIT", ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute("COMMIT", ()).await?;
         self.committed = true;
         Ok(())
     }
@@ -683,10 +697,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn
-            .execute("ROLLBACK", ())
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute("ROLLBACK", ()).await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -752,6 +763,18 @@ impl Transaction {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+        TransactionInsertOrIgnoreExecutor {
+            txn: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 批量插入记录（内部使用）
     async fn insert_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
@@ -770,10 +793,7 @@ impl Transaction {
             );
         let all_params = values_to_params(&all_values)?;
 
-        self.conn
-            .execute(&sql, all_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute(&sql, all_params).await?;
 
         Ok(())
     }
@@ -824,10 +844,47 @@ impl Transaction {
             first = false;
         }
 
-        self.conn
-            .execute(&sql, all_params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.conn.execute(&sql, all_params).await?;
+
+        Ok(())
+    }
+
+    /// 批量插入或忽略记录（遇到重复键时忽略）（内部使用）
+    async fn insert_or_ignore_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let columns = T::insert_columns();
+        let col_count = columns.len();
+        let primary_key_columns = T::primary_key_columns();
+        let primary_key = primary_key_columns.join(", ");
+
+        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            T::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_params = Vec::new();
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.insert_values();
+            let params = values_to_params(&values)?;
+            all_params.extend(params);
+        }
+
+        // 添加 ON CONFLICT DO NOTHING 子句
+        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+
+        self.conn.execute(&sql, all_params).await?;
 
         Ok(())
     }
@@ -1233,30 +1290,18 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1337,30 +1382,18 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1368,9 +1401,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row
-                    .get_value(idx)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(idx)?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1430,25 +1461,15 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut t_data = HashMap::new();
             let mut t_is_null = true;
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
@@ -1466,9 +1487,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row
-                    .get_value(idx)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(idx)?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1526,25 +1545,13 @@ impl<
                 .collect();
 
             let mut rows = if values.is_empty() {
-                self.conn
-                    .query(&sql, ())
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                self.conn.query(&sql, ()).await?
             } else {
-                self.conn
-                    .query(&sql, values)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+                self.conn.query(&sql, values).await?
             };
 
-            if let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-            {
-                let value = row
-                    .get_value(0)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            if let Some(row) = rows.next().await? {
+                let value = row.get_value(0)?;
 
                 // 将turso::Value转换为ormer::Value
                 let ormer_value = match value {
@@ -1697,29 +1704,17 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1774,29 +1769,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1833,11 +1816,7 @@ impl<T: Model> DeleteExecutor<T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql();
 
-        let result = self
-            .conn
-            .execute(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.conn.execute(&sql, params).await?;
 
         Ok(result)
     }
@@ -1919,11 +1898,7 @@ impl<T: Model> UpdateExecutor<T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql()?;
 
-        let result = self
-            .conn
-            .execute(&sql, params)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.conn.execute(&sql, params).await?;
 
         Ok(result)
     }
@@ -2128,31 +2103,19 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             // 获取行中的所有值
             let column_count = self.select.column_names().len();
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2260,31 +2223,19 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn
-                .query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, ()).await?
         } else {
-            self.conn
-                .query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            self.conn.query(&sql, turso_params).await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
-        {
+        while let Some(row) = rows.next().await? {
             // 获取行中的所有值（从 column_count 获取列数）
             let column_count = self.select.column_count();
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let value = row
-                    .get_value(i)
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                let value = row.get_value(i)?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2352,13 +2303,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             .collect();
 
         let rows = if turso_params.is_empty() {
-            conn.query(&sql, ())
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            conn.query(&sql, ()).await?
         } else {
-            conn.query(&sql, turso_params)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?
+            conn.query(&sql, turso_params).await?
         };
 
         Ok(SelectStreamIterator {

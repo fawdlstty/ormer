@@ -148,10 +148,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                     enum_name, enum_name, variants_str
                 );
 
-                self.client
-                    .execute(&create_enum_sql, &[])
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                self.client.execute(&create_enum_sql, &[]).await?;
             }
         }
 
@@ -170,10 +167,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                 continue;
             }
 
-            self.client
-                .execute(sql_part, &[])
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            self.client.execute(sql_part, &[]).await?;
         }
 
         Ok(())
@@ -189,10 +183,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
-        self.client
-            .execute(&sql, &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute(&sql, &[]).await?;
         Ok(())
     }
 }
@@ -225,12 +216,24 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 插入或忽略执行器
+pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    db: &'a Database,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        self.db.insert_or_ignore_batch::<I::Model>(&refs).await
+    }
+}
+
 impl Database {
     /// 连接到 PostgreSQL 数据库
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let (client, connection) = tokio_postgres::connect(connection_string, NoTls).await?;
 
         // 在后台运行连接
         tokio::spawn(async move {
@@ -287,6 +290,18 @@ impl Database {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrIgnoreExecutor<'_, I> {
+        InsertOrIgnoreExecutor {
+            db: self,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         // 检查表是否存在
@@ -307,15 +322,9 @@ impl Database {
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public' AND table_name=$1";
 
-        let row = self
-            .client
-            .query_one(sql, &[&T::TABLE_NAME])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let row = self.client.query_one(sql, &[&T::TABLE_NAME]).await?;
 
-        let count: i64 = row
-            .try_get(0)
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let count: i64 = row.try_get(0)?;
 
         Ok(count > 0)
     }
@@ -330,24 +339,14 @@ impl Database {
             ORDER BY ordinal_position
         "#;
 
-        let rows = self
-            .client
-            .query(sql, &[&T::TABLE_NAME])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(sql, &[&T::TABLE_NAME]).await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
         for row in rows {
-            let name: String = row
-                .try_get(0)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
-            let col_type: String = row
-                .try_get(1)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
-            let is_nullable: String = row
-                .try_get(2)
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            let name: String = row.try_get(0)?;
+            let col_type: String = row.try_get(1)?;
+            let is_nullable: String = row.try_get(2)?;
 
             actual_columns.push((name, col_type, is_nullable == "YES"));
         }
@@ -409,7 +408,17 @@ impl Database {
                     "i8" | "i16" | "u8" => "SMALLINT".to_string(),
                     "i32" | "u16" | "u32" => "INTEGER".to_string(),
                     "i64" | "u64" => "BIGINT".to_string(),
-                    _ => "INTEGER".to_string(),
+                    // 非整数主键（如 NaiveDateTime）使用 sql_type 获取基础类型
+                    _ => {
+                        let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
+                            expected_col.rust_type,
+                            false,
+                            expected_col.is_auto_increment,
+                            expected_col.is_nullable,
+                            expected_col.enum_variants,
+                        );
+                        full_type.replace(" NOT NULL", "")
+                    }
                 }
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
@@ -520,10 +529,7 @@ impl Database {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute(&sql, &param_refs).await?;
 
         Ok(())
     }
@@ -580,11 +586,61 @@ impl Database {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(format!("db error: {}", e)))?;
+        self.client.execute(&sql, &param_refs).await?;
+        Ok(())
+    }
 
+    /// 批量插入或忽略记录（遇到重复键时忽略）
+    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        let columns = T::insert_columns();
+        let col_count = columns.len();
+        let primary_key_columns = T::primary_key_columns();
+        let primary_key = primary_key_columns.join(", ");
+
+        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            T::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_values = Vec::new();
+        let mut param_idx = 1;
+
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+
+            let values = model.insert_values();
+            all_values.extend(values);
+        }
+
+        // 添加 ON CONFLICT DO NOTHING 子句
+        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
+
+        // 获取列的rust_type信息（排除自增主键）
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        self.client.execute(&sql, &param_refs).await?;
         Ok(())
     }
 
@@ -636,10 +692,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
-        self.client
-            .execute("BEGIN", &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute("BEGIN", &[]).await?;
         Ok(Transaction {
             client: &self.client,
             committed: false,
@@ -658,11 +711,7 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let rows = self
-            .client
-            .query(sql, &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(sql, &[]).await?;
 
         let mut results = Vec::new();
 
@@ -689,11 +738,7 @@ impl Database {
 
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let result = self
-            .client
-            .execute(sql, &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.client.execute(sql, &[]).await?;
         Ok(result)
     }
 
@@ -749,10 +794,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute(&sql, &param_refs).await?;
         Ok(())
     }
 }
@@ -818,10 +860,65 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute(&sql, &param_refs).await?;
+        Ok(())
+    }
+}
+
+/// 事务中的插入或忽略执行器
+pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    client: &'a tokio_postgres::Client,
+    models: I,
+    _marker: std::marker::PhantomData<I::Model>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let columns = I::Model::insert_columns();
+        let col_count = columns.len();
+        let primary_key_columns = I::Model::primary_key_columns();
+        let primary_key = primary_key_columns.join(", ");
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            I::Model::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_values = Vec::new();
+        let mut param_idx = 1;
+        for (idx, _model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count)
+                .map(|i| format!("${}", param_idx + i - 1))
+                .collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            param_idx += col_count;
+        }
+        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+        for model in &refs {
+            let values = (*model).insert_values();
+            all_values.extend(values);
+        }
+
+        // 获取列的rust类型信息（排除自增主键）
+        let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_auto_increment)
+            .map(|col| col.rust_type)
+            .collect();
+
+        let params = values_to_params_with_types(&all_values, &rust_types)?;
+        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        self.client.execute(&sql, &param_refs).await?;
         Ok(())
     }
 }
@@ -834,10 +931,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client
-            .execute("COMMIT", &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute("COMMIT", &[]).await?;
         self.committed = true;
         Ok(())
     }
@@ -849,10 +943,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client
-            .execute("ROLLBACK", &[])
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute("ROLLBACK", &[]).await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -918,6 +1009,18 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+        TransactionInsertOrIgnoreExecutor {
+            client: self.client,
+            models,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 批量插入记录
     #[allow(dead_code)]
     pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
@@ -950,12 +1053,7 @@ impl<'a> Transaction<'a> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await.map_err(|e| {
-            anyhow::anyhow!(format!(
-                "Transaction insert_impl failed: {:?}, SQL: {}",
-                e, sql
-            ))
-        })?;
+        self.client.execute(&sql, &param_refs).await?;
 
         Ok(())
     }
@@ -1012,10 +1110,7 @@ impl<'a> Transaction<'a> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        self.client.execute(&sql, &param_refs).await?;
 
         Ok(())
     }
@@ -1119,11 +1214,7 @@ impl<
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
-            let rows = self
-                .client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            let rows = self.client.query(&sql, &param_refs).await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -1468,11 +1559,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                 .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
                 .collect();
 
-            let row = self
-                .client
-                .query_one(&sql, &params_ref)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            let row = self.client.query_one(&sql, &params_ref).await?;
 
             // 获取第一列的值
             use tokio_postgres::types::Type;
@@ -1481,37 +1568,27 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
             // 根据类型获取值
             let ormer_value = match *column_type {
                 Type::INT2 => {
-                    let val: Option<i16> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<i16> = row.try_get(0)?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT4 => {
-                    let val: Option<i32> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<i32> = row.try_get(0)?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT8 => {
-                    let val: Option<i64> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<i64> = row.try_get(0)?;
                     val.map(crate::model::Value::Integer)
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT4 => {
-                    let val: Option<f32> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<f32> = row.try_get(0)?;
                     val.map(|v| crate::model::Value::Real(v as f64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT8 => {
-                    let val: Option<f64> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<f64> = row.try_get(0)?;
                     val.map(crate::model::Value::Real)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1526,9 +1603,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     }
                 }
                 Type::TEXT | Type::VARCHAR => {
-                    let val: Option<String> = row
-                        .try_get(0)
-                        .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+                    let val: Option<String> = row.try_get(0)?;
                     val.map(crate::model::Value::Text)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1563,11 +1638,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &param_refs).await?;
 
         let mut results = Vec::new();
 
@@ -1635,6 +1706,26 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                 None => crate::model::Value::Null,
                             }
                         }
+                        Type::TIMESTAMP => {
+                            let v: Option<chrono::NaiveDateTime> = row.get(i);
+                            match v {
+                                Some(val) => {
+                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                        val,
+                                        chrono::Utc,
+                                    );
+                                    crate::model::Value::DateTime(utc)
+                                }
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        Type::TIMESTAMPTZ => {
+                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::DateTime(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
                         _ => {
                             // 备用方案：使用rust_type
                             match rust_type {
@@ -1664,6 +1755,20 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     match v {
                                         Some(true) => crate::model::Value::Integer(1),
                                         Some(false) => crate::model::Value::Integer(0),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "DateTime" | "chrono::DateTime" | "NaiveDateTime"
+                                | "chrono::NaiveDateTime" => {
+                                    let v: Option<chrono::NaiveDateTime> = row.get(i);
+                                    match v {
+                                        Some(val) => {
+                                            let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                                val,
+                                                chrono::Utc,
+                                            );
+                                            crate::model::Value::DateTime(utc)
+                                        }
                                         None => crate::model::Value::Null,
                                     }
                                 }
@@ -1713,6 +1818,16 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                 crate::model::Value::Integer(0)
                             }
                         }
+                        Type::TIMESTAMP => {
+                            let v: chrono::NaiveDateTime = row.get(i);
+                            let utc =
+                                chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                            crate::model::Value::DateTime(utc)
+                        }
+                        Type::TIMESTAMPTZ => {
+                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                            crate::model::Value::DateTime(v)
+                        }
                         _ => {
                             // 备用方案：使用rust_type
                             match rust_type {
@@ -1735,6 +1850,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     } else {
                                         crate::model::Value::Integer(0)
                                     }
+                                }
+                                "DateTime" | "chrono::DateTime" | "NaiveDateTime"
+                                | "chrono::NaiveDateTime" => {
+                                    let v: chrono::NaiveDateTime = row.get(i);
+                                    let utc =
+                                        chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                                    crate::model::Value::DateTime(utc)
                                 }
                                 _ => {
                                     return Err(anyhow::anyhow!(format!(
@@ -1788,11 +1910,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let result = self
-            .client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.client.execute(&sql, &param_refs).await?;
 
         Ok(result)
     }
@@ -1880,11 +1998,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let result = self
-            .client
-            .execute(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let result = self.client.execute(&sql, &param_refs).await?;
 
         Ok(result)
     }
@@ -1957,11 +2071,19 @@ fn values_to_params_with_types(
                 // 根据列的rust_type选择合适的整数类型
                 // tokio-postgres要求Rust类型与PostgreSQL类型严格匹配
                 let use_i64 = matches!(rust_type, "i64" | "u64");
+                let is_known_int = matches!(
+                    rust_type,
+                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize"
+                );
                 if use_i64 {
                     Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
+                } else if is_known_int {
                     // 对于i32列，将值转换为i32
                     Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else {
+                    // 非标准整数类型（如 flatbuffers newtype），数据库列可能是 TEXT
+                    // 转为字符串传递，避免类型不匹配导致序列化失败
+                    Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
             crate::model::Value::Text(v) => {
@@ -1977,7 +2099,13 @@ fn values_to_params_with_types(
                 Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::DateTime(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                // NaiveDateTime 对应 PostgreSQL TIMESTAMP，DateTime<Utc> 对应 TIMESTAMPTZ
+                // 根据列的 rust_type 决定传递哪种类型，避免类型不匹配导致序列化失败
+                if rust_type == "NaiveDateTime" || rust_type == "chrono::NaiveDateTime" {
+                    Box::new(v.naive_utc()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else {
+                    Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                }
             }
             crate::model::Value::Json(v) => {
                 Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
@@ -2005,6 +2133,10 @@ fn values_to_params_with_types(
                     }
                     "f32" | "f64" => {
                         let null_val: Option<f64> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let null_val: Option<chrono::NaiveDateTime> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     _ => {
@@ -2116,10 +2248,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         };
 
         // 使用 query_raw 获取 RowStream
-        let row_stream = client
-            .query_raw(&sql, param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let row_stream = client.query_raw(&sql, param_refs).await?;
 
         Ok(SelectStreamIterator {
             conn: self.conn,
@@ -2367,11 +2496,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &param_refs).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2517,11 +2642,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &param_refs).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2668,11 +2789,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &param_refs).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2890,11 +3007,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &pg_params_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &pg_params_refs).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3095,11 +3208,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &pg_params_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &pg_params_refs).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3290,11 +3399,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self
-            .client
-            .query(&sql, &pg_params_refs)
-            .await
-            .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+        let rows = self.client.query(&sql, &pg_params_refs).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3458,6 +3563,26 @@ fn convert_postgres_value(
                 });
             }
         }
+        // 日期时间类型
+        Type::TIMESTAMP => {
+            if let Ok(v) = row.try_get::<_, Option<chrono::NaiveDateTime>>(index) {
+                return Ok(match v {
+                    Some(val) => {
+                        let utc = chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
+                        crate::model::Value::DateTime(utc)
+                    }
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        Type::TIMESTAMPTZ => {
+            if let Ok(v) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::DateTime(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         _ => {}
     }
 
@@ -3594,12 +3719,7 @@ impl<
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
-            let rows = self
-                .executor
-                .client
-                .query(&sql, &param_refs)
-                .await
-                .map_err(|e| anyhow::anyhow!(e).context("Database operation failed"))?;
+            let rows = self.executor.client.query(&sql, &param_refs).await?;
 
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();

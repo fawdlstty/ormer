@@ -142,6 +142,17 @@ impl Database {
         }
     }
 
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> InsertOrIgnoreExecutor<'_, I> {
+        InsertOrIgnoreExecutor {
+            pool: self.pool.clone(),
+            models,
+            _marker: PhantomData,
+        }
+    }
+
     pub async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -225,6 +236,55 @@ impl Database {
         }
         query.execute(&mut *client).await?;
         Ok(())
+    }
+
+    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+        let pks = T::primary_key_columns();
+
+        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(&format!(") AS source ({columns}) ON "));
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(&format!("target.{} = source.{}", pk, pk));
+        }
+
+        // 只插入不匹配的记录，不更新已存在的记录
+        sql.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        ));
+        for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("source.{}", col_name));
+        }
+        sql.push_str(");");
+
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&sql);
+        for param in &all_values {
+            bind_value(&mut query, param);
+        }
+        let result = query.execute(&mut *client).await?;
+        Ok(result.total() as u64)
     }
 
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
@@ -637,6 +697,70 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+/// 插入或忽略执行器
+pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    pool: Pool,
+    models: I,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        let refs = self.models.as_refs();
+        self.insert_or_ignore_impl::<I::Model>(&refs).await
+    }
+
+    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+        let columns = T::COLUMNS.join(", ");
+        let col_count = T::COLUMNS.len();
+        let pks = T::primary_key_columns();
+
+        // MSSQL: 使用 MERGE + WHEN NOT MATCHED BY SOURCE 来模拟 INSERT OR IGNORE
+        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
+        let mut all_values = Vec::new();
+        for (idx, model) in models.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(&format!(") AS source ({columns}) ON "));
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(&format!("target.{} = source.{}", pk, pk));
+        }
+
+        // 只插入不匹配的记录，不更新已存在的记录
+        sql.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        ));
+        for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("source.{}", col_name));
+        }
+        sql.push_str(");");
+
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&sql);
+        for param in &all_values {
+            bind_value(&mut query, param);
+        }
+        let result = query.execute(&mut *client).await?;
+        Ok(result.total() as u64)
+    }
+}
+
 /// Select 查询执行器
 pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
@@ -790,6 +914,17 @@ impl<'a> Transaction<'a> {
             _marker: PhantomData,
         }
     }
+
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+        TransactionInsertOrIgnoreExecutor {
+            pool: self.pool.clone(),
+            models,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// 事务插入执行器
@@ -878,6 +1013,68 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             first = false;
         }
 
+        sql.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        ));
+        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("source.{}", col_name));
+        }
+        sql.push_str(");");
+
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&sql);
+        for param in &all_values {
+            bind_value(&mut query, param);
+        }
+        query.execute(&mut *client).await?;
+        Ok(())
+    }
+}
+
+/// 事务插入或忽略执行器
+pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    pool: Pool,
+    models: I,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub async fn execute(self) -> anyhow::Result<()> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let pks = I::Model::primary_key_columns();
+
+        let mut sql = format!(
+            "MERGE INTO {} AS target USING (VALUES ",
+            I::Model::TABLE_NAME
+        );
+        let mut all_values = Vec::new();
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(&format!(") AS source ({columns}) ON "));
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(&format!("target.{} = source.{}", pk, pk));
+        }
+
+        // 只插入不匹配的记录，不更新已存在的记录
         sql.push_str(&format!(
             " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
         ));
