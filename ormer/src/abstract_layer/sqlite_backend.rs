@@ -1982,7 +1982,13 @@ fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
 fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
     match value {
         turso::Value::Integer(v) => Ok(Value::Integer(*v)),
-        turso::Value::Text(v) => Ok(Value::Text(v.clone())),
+        turso::Value::Text(v) => {
+            // 尝试解析为 DateTime
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+                return Ok(Value::DateTime(dt.with_timezone(&chrono::Utc)));
+            }
+            Ok(Value::Text(v.clone()))
+        }
         turso::Value::Real(v) => Ok(Value::Real(*v)),
         turso::Value::Null => Ok(Value::Null),
         _ => Err(anyhow::anyhow!("Unsupported turso value type: {:?}", value)),

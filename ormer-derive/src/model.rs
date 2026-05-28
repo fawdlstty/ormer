@@ -124,6 +124,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 data_type 属性
         let data_type = extract_data_type(f);
 
+        // 检查 hypertable 属性
+        let hypertable = extract_hypertable(f);
+
         // 对于枚举类型支持，我们无法在编译时检测类型是否实现了 ModelEnum，
         // 因此采用简单策略：总是传递 None，数据库后端会根据 rust_type 字符串判断
         // 如果未来需要支持，可以考虑使用 specialization 或宏魔法
@@ -143,6 +146,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 foreign_key: #foreign_key,
                 enum_variants: #enum_variants,
                 data_type: #data_type,
+                hypertable: #hypertable,
             }
         }
     });
@@ -176,7 +180,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             || tokens_str.contains("Integer")
         {
             quote! {
-                ::ormer::Value::Integer(self.#field_name.clone().0 as i64)
+                ::ormer::Value::Integer(self.#field_name.clone() as i64)
             }
         } else {
             quote! {
@@ -456,8 +460,22 @@ fn extract_data_type(field: &syn::Field) -> proc_macro2::TokenStream {
     for attr in &field.attrs {
         if attr.path().is_ident("data_type") {
             if let Meta::List(list) = &attr.meta {
-                let tokens_str = list.tokens.to_string();
-                return quote! { Some(stringify!(#tokens_str)) };
+                let tokens_str = list.tokens.to_string().replace('"', "");
+                return quote! { Some(#tokens_str) };
+            }
+        }
+    }
+    quote! { None }
+}
+
+/// 提取 hypertable 属性的分片时长信息
+/// 支持语法：#[hypertable(Duration::from_hours(1))]
+fn extract_hypertable(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if attr.path().is_ident("hypertable") {
+            if let Meta::List(list) = &attr.meta {
+                let tokens = &list.tokens;
+                return quote! { Some(#tokens) };
             }
         }
     }

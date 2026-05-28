@@ -1,5 +1,54 @@
 use std::collections::HashMap;
 
+/// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
+pub trait DurationToInterval {
+    /// 将 Duration 转换为 PostgreSQL INTERVAL 字符串
+    /// 支持小数形式，自动选择最适配的单位（milliseconds/seconds/minutes/hours/days）
+    fn to_interval_string(&self) -> String;
+}
+
+impl DurationToInterval for std::time::Duration {
+    fn to_interval_string(&self) -> String {
+        let total_secs = self.as_secs_f64();
+        let millis = self.subsec_millis();
+
+        if total_secs < 1.0 && millis > 0 {
+            format!("{} milliseconds", millis)
+        } else if total_secs < 60.0 {
+            // 秒级，支持小数
+            if total_secs.fract() == 0.0 {
+                format!("{} seconds", total_secs as u64)
+            } else {
+                format!("{:.3} seconds", total_secs)
+            }
+        } else if total_secs < 3600.0 {
+            // 分钟级，支持小数
+            let minutes = total_secs / 60.0;
+            if minutes.fract() == 0.0 {
+                format!("{} minutes", minutes as u64)
+            } else {
+                format!("{:.3} minutes", minutes)
+            }
+        } else if total_secs < 86400.0 {
+            // 小时级，支持小数
+            let hours = total_secs / 3600.0;
+            if hours.fract() == 0.0 {
+                format!("{} hours", hours as u64)
+            } else {
+                format!("{:.3} hours", hours)
+            }
+        } else {
+            // 天级，支持小数
+            let days = total_secs / 86400.0;
+            if days.fract() == 0.0 {
+                format!("{} days", days as u64)
+            } else {
+                format!("{:.3} days", days)
+            }
+        }
+    }
+}
+
 /// 字段元数据
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
@@ -12,7 +61,8 @@ pub struct ColumnSchema {
     pub is_indexed: bool,
     pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
     pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
-    pub data_type: Option<&'static str>, // 数据库类型覆盖
+    pub data_type: Option<&'static str>,     // 数据库类型覆盖
+    pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
 }
 
 /// 外键信息
@@ -51,6 +101,16 @@ pub trait Model: Sized {
     const TABLE_NAME: &'static str;
     const COLUMNS: &'static [&'static str];
     const COLUMN_SCHEMA: &'static [ColumnSchema];
+
+    /// 获取 hypertable 时间字段名和分片时长（如果有）
+    fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
+        for col in Self::COLUMN_SCHEMA {
+            if let Some(duration) = col.hypertable {
+                return Some((col.name, duration));
+            }
+        }
+        None
+    }
 
     type QueryBuilder;
     type Where: Default;
@@ -938,6 +998,15 @@ impl FromValue for chrono::DateTime<chrono::Utc> {
             Value::DateTime(v) => Ok(*v),
             _ => Err(anyhow::anyhow!("Type mismatch: expected DateTime<Utc>")),
         }
+    }
+}
+
+impl FromRowValues for chrono::DateTime<chrono::Utc> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected DateTime<Utc>"));
+        }
+        Self::from_value(&values[0])
     }
 }
 

@@ -38,6 +38,19 @@ db.insert_or_update(&vec![user1, user2])
     .await?;
 ```
 
+### Insert or Ignore
+
+Silently ignore duplicates:
+
+```rust
+db.insert_or_ignore(&user)
+    .execute()
+    .await?;
+db.insert_or_ignore(&vec![user1, user2])
+    .execute()
+    .await?;
+```
+
 ## Read (Query)
 
 ```rust

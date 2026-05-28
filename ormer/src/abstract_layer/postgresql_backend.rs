@@ -1,6 +1,6 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
-use crate::model::{DbBackendTypeMapper, Model, Row, Value};
+use crate::model::{DbBackendTypeMapper, DurationToInterval, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
@@ -82,9 +82,8 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
             // 日期时间类型（如果使用 chrono crate）
-            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                "TIMESTAMP"
-            }
+            "DateTime" | "chrono::DateTime" => "TIMESTAMPTZ",
+            "NaiveDateTime" | "chrono::NaiveDateTime" => "TIMESTAMP",
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
             // JSON 类型
@@ -168,6 +167,46 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             }
 
             self.client.execute(sql_part, &[]).await?;
+        }
+
+        // If the model is marked as a hypertable, create a TimescaleDB hypertable
+        if let Some((time_column, chunk_interval)) = T::hypertable_info() {
+            let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
+
+            // Check whether the TimescaleDB extension is enabled
+            let ext_check = self
+                .client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+                    &[],
+                )
+                .await?;
+            let tsdb_enabled: bool = ext_check.get(0);
+            if !tsdb_enabled {
+                anyhow::bail!(
+                    "Model '{}' is marked as hypertable, but the TimescaleDB extension is not installed",
+                    T::TABLE_NAME
+                );
+            }
+
+            // Check whether this table is already a hypertable
+            let ht_check = self
+                .client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM _timescaledb_catalog.hypertable WHERE schema_name = 'public' AND table_name = $1)",
+                    &[&table_name],
+                )
+                .await?;
+            let is_hypertable: bool = ht_check.get(0);
+
+            if !is_hypertable {
+                let interval_str = chunk_interval.to_interval_string();
+                let hypertable_sql = format!(
+                    "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}')",
+                    table_name, time_column, interval_str
+                );
+                self.client.execute(&hypertable_sql, &[]).await?;
+            }
         }
 
         Ok(())
@@ -516,11 +555,11 @@ impl Database {
                 models,
             );
 
-        // 获取列的rust_type信息（排除自增主键）
+        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
@@ -579,7 +618,10 @@ impl Database {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
+            .collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -628,11 +670,11 @@ impl Database {
         // 添加 ON CONFLICT DO NOTHING 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
 
-        // 获取列的rust_type信息（排除自增主键）
+        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
@@ -1040,11 +1082,11 @@ impl<'a> Transaction<'a> {
                 models,
             );
 
-        // 获取列的rust_type信息（排除自增主键）
+        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
-            .map(|col| col.rust_type)
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
 
         let params = values_to_params_with_types(&all_values, &rust_types)?;
@@ -1103,7 +1145,10 @@ impl<'a> Transaction<'a> {
         }
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
+            .collect();
         let params = values_to_params_with_types(&all_values, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
             .iter()
@@ -1647,7 +1692,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 // 根据列的类型获取值
                 let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
+                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
                 let is_nullable = column_info.is_nullable;
 
                 let ormer_value = if is_nullable {
@@ -1758,8 +1803,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                         None => crate::model::Value::Null,
                                     }
                                 }
-                                "DateTime" | "chrono::DateTime" | "NaiveDateTime"
-                                | "chrono::NaiveDateTime" => {
+                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
                                     let v: Option<chrono::NaiveDateTime> = row.get(i);
                                     match v {
                                         Some(val) => {
@@ -1769,6 +1813,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                             );
                                             crate::model::Value::DateTime(utc)
                                         }
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "DateTime" | "chrono::DateTime" => {
+                                    let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::DateTime(val),
                                         None => crate::model::Value::Null,
                                     }
                                 }
@@ -1820,8 +1871,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                         }
                         Type::TIMESTAMP => {
                             let v: chrono::NaiveDateTime = row.get(i);
-                            let utc =
-                                chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
                             crate::model::Value::DateTime(utc)
                         }
                         Type::TIMESTAMPTZ => {
@@ -1851,12 +1901,15 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                         crate::model::Value::Integer(0)
                                     }
                                 }
-                                "DateTime" | "chrono::DateTime" | "NaiveDateTime"
-                                | "chrono::NaiveDateTime" => {
+                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
                                     let v: chrono::NaiveDateTime = row.get(i);
                                     let utc =
                                         chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
                                     crate::model::Value::DateTime(utc)
+                                }
+                                "DateTime" | "chrono::DateTime" => {
+                                    let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                                    crate::model::Value::DateTime(v)
                                 }
                                 _ => {
                                     return Err(anyhow::anyhow!(format!(
@@ -1903,7 +1956,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         let (sql, params) = self.build_sql_with_params();
 
         // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA.iter().map(|col| col.rust_type).collect();
+        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
+            .iter()
+            .map(|col| col.data_type.unwrap_or(col.rust_type))
+            .collect();
         let pg_params = values_to_params_with_types(&params, &rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
@@ -2104,7 +2160,8 @@ fn values_to_params_with_types(
                 if rust_type == "NaiveDateTime" || rust_type == "chrono::NaiveDateTime" {
                     Box::new(v.naive_utc()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 } else {
-                    Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    // DateTime<Utc> 需要传递 chrono::DateTime<chrono::Utc> 类型
+                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
             crate::model::Value::Json(v) => {
@@ -2135,7 +2192,11 @@ fn values_to_params_with_types(
                         let null_val: Option<f64> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
-                    "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                    "DateTime" | "chrono::DateTime" => {
+                        let null_val: Option<chrono::DateTime<chrono::Utc>> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
                         let null_val: Option<chrono::NaiveDateTime> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
@@ -2503,7 +2564,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
+                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
                 let is_nullable = column_info.is_nullable;
 
                 let ormer_value = if is_nullable {
@@ -2649,7 +2710,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
+                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
                 let is_nullable = column_info.is_nullable;
 
                 let ormer_value = if is_nullable {
@@ -2796,7 +2857,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
+                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
                 let is_nullable = column_info.is_nullable;
 
                 let ormer_value = if is_nullable {

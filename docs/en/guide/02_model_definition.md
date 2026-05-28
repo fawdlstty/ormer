@@ -23,6 +23,8 @@ struct User {
 - `#[unique]` - Unique constraint (supports `group` parameter for composite unique)
 - `#[index]` - Index
 - `#[foreign(Type)]` - Foreign key relationship
+- `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
+- `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
 
 ## Field Attributes
 

@@ -39,6 +39,20 @@ db.insert_or_update(&vec![user1, user2])
     .await?;
 ```
 
+### 插入或忽略
+
+存在重复主键时静默忽略：
+
+```rust
+db.insert_or_ignore(&user)
+    .execute()
+    .await?;
+
+db.insert_or_ignore(&vec![user1, user2])
+    .execute()
+    .await?;
+```
+
 ## 查询 (Read)
 
 ```rust

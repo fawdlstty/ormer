@@ -23,6 +23,8 @@ struct User {
 - `#[unique]` - 唯一约束（支持 `group` 参数创建联合唯一）
 - `#[index]` - 索引
 - `#[foreign(Type)]` - 外键关系
+- `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
+- `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
 
 ## 字段属性
 
