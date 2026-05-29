@@ -5,67 +5,47 @@
 
 English | [简体中文](README.zh.md)
 
-An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL.
+A minimalist ORM framework that supports SQLite, PostgreSQL, MySQL, and SqlServer.
 
 [Online Documentation](https://ormer.fawdlstty.com/en/)
 
-## Comparison with Other Rust ORMs
+## Quick Example
 
-> **Note**: Ormer is a relatively new ORM framework focused on providing a clean API and type-safe query experience. The following comparison is based on the current state of each framework to help developers choose the right tool for their project needs.
+```rust
+#[derive(Debug, ormer::Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    age: i32,
+    email: Option<String>,
+}
 
-### Feature Comparison
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // connect to database and create table
+    let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    db.create_table::<User>().execute().await?;
 
-| Feature | Ormer | SeaORM | Diesel | Toasty |
-|---------|-------|--------|--------|--------|
-| Async Support | ✅ Native | ✅ Native | ❌ Requires extra config | ✅ Native |
-| Compile-time Checking | ✅ Strong typing | ⚠️ Partial | ✅ Strong typing | ✅ Strong typing |
-| Multi-Database Support | ✅ 3 databases | ✅ Multiple | ✅ Multiple | ✅ Multiple |
-| Migration System | ❌ Pending | ✅ Built-in | ✅ Built-in | ✅ Supported |
-| Streaming Queries | ✅ Supported | ✅ Supported | ❌ Not supported | ✅ Supported |
-| Complex Conditional Expressions | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
-| JOIN Types | ✅ Complete | ✅ Complete | ✅ Complete | ✅ Complete |
-| Relationship Loading Strategy | ⚠️ Basic | ✅ Eager/Lazy | ✅ Supported | ✅ Supported |
-| Database Type Extensions | ✅ Rich | ✅ Rich | ✅ Rich | ✅ Rich |
-| Batch Operations | ✅ Complete | ✅ Complete | ✅ Complete | ✅ Complete |
-| Testing Support | ⚠️ Multi-db | ✅ Mock Database | ⚠️ Manual | ⚠️ Manual |
-| Hooks & Callbacks | ✅ Supported | ✅ Supported | ❌ Not supported | ✅ Supported |
-| Soft Delete | ❌ Pending | ✅ Supported | ❌ Not supported | ❌ Not supported |
-| Composite Primary Key | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
-| Enum Types | ✅ Supported | ✅ Supported | ✅ Supported | ✅ Supported |
+    // insert data
+    db.insert(&User {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 18,
+        email: None,
+    })
+    .execute()
+    .await?;
 
-### Developer Experience Comparison
+    // query data
+    let users = db
+        .select::<User>()
+        .filter(|p| p.age.ge(18))
+        .collect::<Vec<_>>()
+        .await?;
+    println!("users: {users:?}");
 
-| Dimension | Ormer | SeaORM | Diesel | Toasty |
-|-----------|-------|--------|--------|--------|
-| **Model Definition** | ✅ Define once | ⚠️ Requires code generation | ❌ Define twice | ⚠️ Requires code generation |
-| **Table SQL** | ✅ Auto-generated | ⚠️ Requires migration files | ❌ Manual writing | ⚠️ Requires migration files |
-| **Learning Curve** | ✅ Low (1 day) | ⚠️ Medium (3-5 days) | ❌ High (1-2 weeks) | ⚠️ Medium (3-5 days) |
-| **API Simplicity** | ✅ Minimal | ⚠️ Moderate | ❌ Complex | ⚠️ Moderate |
-| **Code Duplication** | ✅ Very low | ⚠️ Moderate | ❌ High | ⚠️ Moderate |
-| **Query Syntax** | ✅ LINQ-style | ⚠️ Chain calls | ❌ DSL nesting | ⚠️ Chain calls |
-| **Type Inference** | ✅ Complete | ⚠️ Partial | ✅ Complete | ✅ Complete |
-| **IDE Support** | ✅ Excellent | ⚠️ Good | ⚠️ Good | ⚠️ Good |
-| **Error Messages** | ✅ Clear at compile-time | ⚠️ More at runtime | ✅ Strict at compile-time | ⚠️ Mixed |
-| **Debugging Difficulty** | ✅ Low | ⚠️ Medium | ❌ High | ⚠️ Medium |
-
-### Engineering Capability Comparison
-
-| Dimension | Ormer | SeaORM | Diesel | Toasty |
-|-----------|-------|--------|--------|--------|
-| **Ecosystem Maturity** | ⭐⭐ Developing | ⭐⭐⭐⭐⭐ Mature | ⭐⭐⭐⭐⭐ Mature | ⭐⭐ Developing |
-| **Documentation Quality** | ⭐⭐⭐ Good | ⭐⭐⭐⭐⭐ Comprehensive | ⭐⭐⭐⭐⭐ Comprehensive | ⭐⭐⭐ Good |
-| **Community Activity** | ⭐⭐ Growing | ⭐⭐⭐⭐⭐ Active | ⭐⭐⭐⭐⭐ Active | ⭐⭐ Growing |
-| **Production Ready** | ⚠️ Simple scenarios | ✅ Complex scenarios | ✅ Complex scenarios | ⚠️ Simple scenarios |
-| **Performance** | ⭐⭐⭐⭐ Excellent | ⭐⭐⭐⭐ Excellent | ⭐⭐⭐⭐⭐ Outstanding | ⭐⭐⭐⭐ Excellent |
-| **Package Size** | ✅ Lightweight | ⚠️ Heavier | ⚠️ Heavier | ✅ Lightweight |
-| **Compilation Speed** | ✅ Fast | ⚠️ Moderate | ❌ Slow (complex macros) | ✅ Fast |
-
-### Framework Characteristics Summary
-
-#### Ormer Advantages ✅
-- **Rapid Prototyping**: Define models once, auto-generate table SQL, no extra tools needed
-- **Low Learning Cost**: Intuitive LINQ-style API, get started in 1 day
-- **Code Simplicity**: No code duplication, no need to maintain multiple definitions or migration files (basic scenarios)
-- **Compile-time Safety**: Complete type inference, errors caught at compile-time
-- **Lightweight Projects**: Small package size, fast compilation, ideal for microservices and small projects
-- **Multi-Database Switching**: Unified API, switch databases without modifying business code
+    Ok(())
+}
+```

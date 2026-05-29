@@ -1,12 +1,12 @@
 [package]
 name = "ormer"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/fawdlstty/ormer"
 homepage = "https://github.com/fawdlstty/ormer"
-description = "An ORM framework with a usage style similar to Linq, supporting Sqlite, PostgresQL, MySQL, MSSQL"
+description = "A minimalist ORM framework that supports SQLite, PostgreSQL, MySQL, and SqlServer"
 authors = ["fawdlstty<f@fawdlstty.com>"]
 keywords = ["orm", "database"]
 categories = []
@@ -21,7 +21,7 @@ path = "src/lib.rs"
 anyhow = "1.0.102"
 async-trait = "0.1"
 futures = "0.3"
-ormer-derive = { version = "0.1.10", path = "../ormer-derive" }
+ormer-derive = { version = "0.1.11", path = "../ormer-derive" }
 paste = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }

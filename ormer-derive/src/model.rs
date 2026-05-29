@@ -173,19 +173,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成 field_values 实现
     let field_names_for_values = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let data_type = extract_data_type(f);
-        let tokens_str = data_type.to_string();
-        if tokens_str.contains("i32")
-            || tokens_str.contains("i64")
-            || tokens_str.contains("Integer")
-        {
-            quote! {
-                ::ormer::Value::Integer(self.#field_name.clone() as i64)
-            }
-        } else {
-            quote! {
-                ::ormer::Value::from(self.#field_name.clone())
-            }
+        quote! {
+            ::ormer::Value::from(self.#field_name.clone())
         }
     });
 
