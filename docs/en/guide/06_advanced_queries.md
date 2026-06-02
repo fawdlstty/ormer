@@ -148,6 +148,37 @@ let admin_users: Vec<(User, Role)> = db
     .await?;
 ```
 
+### JOIN with Right-Table Sorting and Pagination (LATERAL JOIN)
+
+When `order_by` / `order_by_desc` or `range` is used in the JOIN condition, the framework automatically generates **LATERAL JOIN** SQL to enable sorting and pagination on the right table.
+
+```rust
+// Right table sorted by role_name desc, take only the first row
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).order_by_desc(r.role_name).range(..1))
+    .collect()
+    .await?;
+
+// Sort only
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).order_by_desc(r.role_name))
+    .collect()
+    .await?;
+
+// Pagination only
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).range(..3))
+    .collect()
+    .await?;
+```
+
+Supported JOIN types: `left_join`, `inner_join`, `right_join`.
+
+Can be combined with `filter`, `range`, and other methods on the main query.
+
 ## Multi-Table Joins
 
 ### Two Tables (from)

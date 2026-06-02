@@ -1297,6 +1297,12 @@ impl<T: Model> WhereColumn<T> {
 /// 支持链式调用和逻辑组合
 pub struct WhereExpr {
     inner: FilterExpr,
+    /// LATERAL JOIN 子查询的排序条件
+    join_order_by: Vec<OrderBy>,
+    /// LATERAL JOIN 子查询的范围起始
+    join_range_start: Option<usize>,
+    /// LATERAL JOIN 子查询的范围结束
+    join_range_end: Option<usize>,
 }
 
 impl From<WhereExpr> for FilterExpr {
@@ -1306,19 +1312,70 @@ impl From<WhereExpr> for FilterExpr {
 }
 
 impl WhereExpr {
+    fn defaults() -> Self {
+        Self {
+            inner: FilterExpr::Comparison {
+                column: String::new(),
+                operator: String::new(),
+                value: crate::query::filter::Value::Null,
+            },
+            join_order_by: Vec::new(),
+            join_range_start: None,
+            join_range_end: None,
+        }
+    }
+
     pub fn from_filter(inner: FilterExpr) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            ..Self::defaults()
+        }
+    }
+
+    /// 检查是否包含 LATERAL JOIN 信息
+    pub fn is_lateral(&self) -> bool {
+        !self.join_order_by.is_empty()
+            || self.join_range_start.is_some()
+            || self.join_range_end.is_some()
+    }
+
+    /// 添加升序排序（用于 LATERAL JOIN 子查询）
+    pub fn order_by(mut self, col: impl Into<OrderBy>) -> Self {
+        self.join_order_by.push(col.into());
+        self
+    }
+
+    /// 添加降序排序（用于 LATERAL JOIN 子查询）
+    pub fn order_by_desc(mut self, col: impl Into<OrderBy>) -> Self {
+        let mut order = col.into();
+        order.direction = crate::query::filter::OrderDirection::Desc;
+        self.join_order_by.push(order);
+        self
+    }
+
+    /// 设置范围限制（用于 LATERAL JOIN 子查询）
+    pub fn range(mut self, range: impl Into<RangeBounds>) -> Self {
+        let bounds = range.into();
+        self.join_range_start = bounds.start;
+        self.join_range_end = bounds.end;
+        self
     }
 
     pub fn and(self, other: WhereExpr) -> Self {
         Self {
             inner: FilterExpr::And(Box::new(self.inner), Box::new(other.inner)),
+            join_order_by: self.join_order_by,
+            join_range_start: self.join_range_start,
+            join_range_end: self.join_range_end,
         }
     }
 
     pub fn or(self, other: WhereExpr) -> Self {
         Self {
             inner: FilterExpr::Or(Box::new(self.inner), Box::new(other.inner)),
+            join_order_by: self.join_order_by,
+            join_range_start: self.join_range_start,
+            join_range_end: self.join_range_end,
         }
     }
 }
@@ -1346,6 +1403,7 @@ impl AgeColumn {
                 operator: ">=".to_string(),
                 value: crate::query::filter::Value::Integer(value as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1356,6 +1414,7 @@ impl AgeColumn {
                 operator: ">".to_string(),
                 value: crate::query::filter::Value::Integer(value as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1366,6 +1425,7 @@ impl AgeColumn {
                 operator: "<=".to_string(),
                 value: crate::query::filter::Value::Integer(value as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1376,6 +1436,7 @@ impl AgeColumn {
                 operator: "<".to_string(),
                 value: crate::query::filter::Value::Integer(value as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -1609,6 +1670,17 @@ impl ColumnValueType for &str {
     }
 }
 
+// 为 chrono::NaiveDateTime 实现 ColumnValueType
+impl ColumnValueType for chrono::NaiveDateTime {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        crate::query::filter::Value::DateTime(value.and_utc())
+    }
+
+    fn supports_comparison() -> bool {
+        true // 日期时间支持比较操作
+    }
+}
+
 // ==================== 统一的 IsInValue Trait ====================
 // 使用泛型支持所有类型的 IN 语句
 
@@ -1696,6 +1768,7 @@ where
                     .map(|v| ColumnValueType::to_filter_value(v.to_in_value()))
                     .collect(),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -1714,6 +1787,7 @@ impl<T: ColumnValueType> IsInValues<T> for SubqueryParam {
                 subquery_sql: self.sql,
                 subquery_params: self.params,
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -1754,6 +1828,7 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
                 subquery_sql: sql,
                 subquery_params: params,
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -1872,6 +1947,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                     operator: "=".to_string(),
                     value: v,
                 },
+                ..WhereExpr::defaults()
             },
             ColumnValue::ColumnRef(other_column) => WhereExpr {
                 inner: FilterExpr::ColumnComparison {
@@ -1879,6 +1955,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                     operator: "=".to_string(),
                     right_column: other_column,
                 },
+                ..WhereExpr::defaults()
             },
         }
     }
@@ -1908,6 +1985,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                 operator: ">=".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1928,6 +2006,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                 operator: ">".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1948,6 +2027,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                 operator: "<=".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
+            ..WhereExpr::defaults()
         }
     }
 
@@ -1968,6 +2048,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
                 operator: "<".to_string(),
                 value: ColumnValueType::to_filter_value(value),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -2037,6 +2118,7 @@ impl std::ops::BitOr<i32> for ColumnProxy {
                 operator: ">=".to_string(),
                 value: crate::query::filter::Value::Integer(rhs as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -2052,6 +2134,7 @@ impl std::ops::Shr<i32> for ColumnProxy {
                 operator: ">".to_string(),
                 value: crate::query::filter::Value::Integer(rhs as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -2067,6 +2150,7 @@ impl std::ops::Shl<i32> for ColumnProxy {
                 operator: "<".to_string(),
                 value: crate::query::filter::Value::Integer(rhs as i64),
             },
+            ..WhereExpr::defaults()
         }
     }
 }
@@ -2143,6 +2227,14 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
+    /// 是否为 LATERAL JOIN
+    lateral: bool,
+    /// LATERAL JOIN 子查询的排序条件
+    join_order_by: Vec<OrderBy>,
+    /// LATERAL JOIN 子查询的范围起始
+    join_range_start: Option<usize>,
+    /// LATERAL JOIN 子查询的范围结束
+    join_range_end: Option<usize>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2156,6 +2248,10 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
+            lateral: self.lateral,
+            join_order_by: self.join_order_by.clone(),
+            join_range_start: self.join_range_start,
+            join_range_end: self.join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2171,6 +2267,14 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
+    /// 是否为 LATERAL JOIN
+    lateral: bool,
+    /// LATERAL JOIN 子查询的排序条件
+    join_order_by: Vec<OrderBy>,
+    /// LATERAL JOIN 子查询的范围起始
+    join_range_start: Option<usize>,
+    /// LATERAL JOIN 子查询的范围结束
+    join_range_end: Option<usize>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2184,6 +2288,10 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
+            lateral: self.lateral,
+            join_order_by: self.join_order_by.clone(),
+            join_range_start: self.join_range_start,
+            join_range_end: self.join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2199,6 +2307,14 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
+    /// 是否为 LATERAL JOIN
+    lateral: bool,
+    /// LATERAL JOIN 子查询的排序条件
+    join_order_by: Vec<OrderBy>,
+    /// LATERAL JOIN 子查询的范围起始
+    join_range_start: Option<usize>,
+    /// LATERAL JOIN 子查询的范围结束
+    join_range_end: Option<usize>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2212,6 +2328,10 @@ impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
+            lateral: self.lateral,
+            join_order_by: self.join_order_by.clone(),
+            join_range_start: self.join_range_start,
+            join_range_end: self.join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2227,6 +2347,11 @@ impl<T: Model> Select<T> {
         let j_where = J::Where::default();
         let expr = f(t_where, j_where);
 
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
         LeftJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
@@ -2235,6 +2360,10 @@ impl<T: Model> Select<T> {
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2248,6 +2377,11 @@ impl<T: Model> Select<T> {
         let j_where = J::Where::default();
         let expr = f(t_where, j_where);
 
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
         InnerJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
@@ -2256,6 +2390,10 @@ impl<T: Model> Select<T> {
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2269,6 +2407,11 @@ impl<T: Model> Select<T> {
         let j_where = J::Where::default();
         let expr = f(t_where, j_where);
 
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
         RightJoinedSelect {
             filters: self.filters,
             order_by: self.order_by,
@@ -2277,6 +2420,10 @@ impl<T: Model> Select<T> {
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
             _marker: PhantomData,
         }
     }
@@ -2302,6 +2449,15 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
 
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        if self.lateral {
+            self.to_lateral_sql_with_params(db_type)
+        } else {
+            self.to_plain_sql_with_params(db_type)
+        }
+    }
+
+    /// 生成普通 LEFT JOIN SQL
+    fn to_plain_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -2375,6 +2531,93 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         (sql, params)
     }
 
+    /// 生成 LATERAL LEFT JOIN SQL
+    fn to_lateral_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {}, {} FROM {} AS t0 LEFT JOIN LATERAL (SELECT * FROM {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+        )
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
+
+        // LATERAL 子查询内的 WHERE 条件
+        // left_column 是主表列(需 t0 前缀), right_column 是 join 表列(在子查询内无前缀)
+        let formatter = FilterFormatter::new(db_type).with_table_prefix("t0");
+        let condition_sql = formatter.format(&self.on_condition, &mut param_idx, &mut params);
+        write!(&mut sql, " WHERE {}", condition_sql)
+            .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
+
+        // ORDER BY
+        if !self.join_order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_clauses: Vec<String> =
+                self.join_order_by.iter().map(|o| o.to_sql()).collect();
+            sql.push_str(&order_clauses.join(", "));
+        }
+
+        // LIMIT / OFFSET
+        if let Some(end) = self.join_range_end {
+            let limit = if let Some(start) = self.join_range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.join_range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        }
+
+        // 关闭子查询并写 ON true
+        write!(&mut sql, ") AS {} ON true", self.join_alias)
+            .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
+
+        // 主查询的 WHERE 条件
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let outer_formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // 主查询的 RANGE
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        }
+
+        (sql, params)
+    }
+
     fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
         if let FilterExpr::ColumnComparison {
             left_column,
@@ -2408,6 +2651,15 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
     }
 
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        if self.lateral {
+            self.to_lateral_sql_with_params(db_type)
+        } else {
+            self.to_plain_sql_with_params(db_type)
+        }
+    }
+
+    /// 生成普通 INNER JOIN SQL
+    fn to_plain_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -2481,6 +2733,93 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         (sql, params)
     }
 
+    /// 生成 LATERAL INNER JOIN SQL
+    fn to_lateral_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {}, {} FROM {} AS t0 INNER JOIN LATERAL (SELECT * FROM {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+        )
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
+
+        // LATERAL 子查询内的 WHERE 条件
+        // left_column 是主表列(需 t0 前缀), right_column 是 join 表列(在子查询内无前缀)
+        let formatter = FilterFormatter::new(db_type).with_table_prefix("t0");
+        let condition_sql = formatter.format(&self.on_condition, &mut param_idx, &mut params);
+        write!(&mut sql, " WHERE {}", condition_sql)
+            .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
+
+        // ORDER BY
+        if !self.join_order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_clauses: Vec<String> =
+                self.join_order_by.iter().map(|o| o.to_sql()).collect();
+            sql.push_str(&order_clauses.join(", "));
+        }
+
+        // LIMIT / OFFSET
+        if let Some(end) = self.join_range_end {
+            let limit = if let Some(start) = self.join_range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.join_range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        }
+
+        // 关闭子查询并写 ON true
+        write!(&mut sql, ") AS {} ON true", self.join_alias)
+            .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
+
+        // 主查询的 WHERE 条件
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let outer_formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // 主查询的 RANGE
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        }
+
+        (sql, params)
+    }
+
     fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
         if let FilterExpr::ColumnComparison {
             left_column,
@@ -2514,6 +2853,15 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
     }
 
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        if self.lateral {
+            self.to_lateral_sql_with_params(db_type)
+        } else {
+            self.to_plain_sql_with_params(db_type)
+        }
+    }
+
+    /// 生成普通 RIGHT JOIN SQL
+    fn to_plain_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
@@ -2582,6 +2930,93 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             if let Some(start) = self.range_start {
                 write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
             }
+        }
+
+        (sql, params)
+    }
+
+    /// 生成 LATERAL RIGHT JOIN SQL
+    fn to_lateral_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+
+        write!(
+            &mut sql,
+            "SELECT {}, {} FROM {} AS t0 RIGHT JOIN LATERAL (SELECT * FROM {}",
+            T::COLUMNS
+                .iter()
+                .map(|c| format!("t0.{}", c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            J::COLUMNS
+                .iter()
+                .map(|c| format!("t1.{} as j_{}", c, c))
+                .collect::<Vec<_>>()
+                .join(", "),
+            T::TABLE_NAME,
+            self.join_table,
+        )
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
+
+        // LATERAL 子查询内的 WHERE 条件
+        // left_column 是主表列(需 t0 前缀), right_column 是 join 表列(在子查询内无前缀)
+        let formatter = FilterFormatter::new(db_type).with_table_prefix("t0");
+        let condition_sql = formatter.format(&self.on_condition, &mut param_idx, &mut params);
+        write!(&mut sql, " WHERE {}", condition_sql)
+            .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
+
+        // ORDER BY
+        if !self.join_order_by.is_empty() {
+            sql.push_str(" ORDER BY ");
+            let order_clauses: Vec<String> =
+                self.join_order_by.iter().map(|o| o.to_sql()).collect();
+            sql.push_str(&order_clauses.join(", "));
+        }
+
+        // LIMIT / OFFSET
+        if let Some(end) = self.join_range_end {
+            let limit = if let Some(start) = self.join_range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.join_range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+        }
+
+        // 关闭子查询并写 ON true
+        write!(&mut sql, ") AS {} ON true", self.join_alias)
+            .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
+
+        // 主查询的 WHERE 条件
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let outer_formatter = FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1");
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        // 主查询的 RANGE
+        if let Some(end) = self.range_end {
+            let limit = if let Some(start) = self.range_start {
+                end - start
+            } else {
+                end
+            };
+            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
+        }
+        if let Some(start) = self.range_start {
+            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
         }
 
         (sql, params)

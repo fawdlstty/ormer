@@ -148,6 +148,37 @@ let admin_users: Vec<(User, Role)> = db
     .await?;
 ```
 
+### JOIN 右表排序与分页 (LATERAL JOIN)
+
+当 JOIN 条件中使用了 `order_by` / `order_by_desc` 或 `range` 时，框架会自动生成 **LATERAL JOIN** SQL，实现对右表的排序和分页。
+
+```rust
+// 右表按 role_name 降序，只取第1条
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).order_by_desc(r.role_name).range(..1))
+    .collect()
+    .await?;
+
+// 仅排序
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).order_by_desc(r.role_name))
+    .collect()
+    .await?;
+
+// 仅分页
+let user_roles: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id).range(..3))
+    .collect()
+    .await?;
+```
+
+支持的 JOIN 类型：`left_join`、`inner_join`、`right_join`。
+
+可与主查询的 `filter`、`range` 等方法组合使用。
+
 ## 多表关联
 
 ### 两表 (from)
