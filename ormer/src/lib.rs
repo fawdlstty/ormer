@@ -24,8 +24,8 @@ pub use abstract_layer::{
 pub use anyhow::Result;
 pub use model::{
     AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, FromRowValues,
-    FromSingleValue, FromValue, Insertable, Model, ModelEnum, ModelEnumProvider, Row, Value,
-    generate_create_table_sql, generate_create_table_sql_with_name,
+    FromSingleValue, FromValue, Insertable, Model, ModelEnum, ModelEnumProvider, PrimaryKey, Row,
+    Value, generate_create_table_sql, generate_create_table_sql_with_name,
 };
 pub use ormer_derive::{Model, ModelEnum};
 pub use query::builder::{

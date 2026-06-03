@@ -6,7 +6,7 @@ Ormer 是极简、高性能的 Rust ORM 框架,提供类型安全的数据库操
 
 - **类型安全**: 编译期类型检查,强类型查询构建器
 - **高性能**: 零成本抽象,异步运行时,连接池支持
-- **多数据库**: Sqlite、PostgreSQL、MySQL
+- **多数据库**: Sqlite、PostgreSQL、MySQL、MSSQL
 - **优雅 API**: 链式查询,宏驱动模型,直观语法
 
 ## 查询能力

@@ -6,7 +6,7 @@ Ormer is a minimal, high-performance Rust ORM framework providing type-safe data
 
 - **Type Safety**: Compile-time type checking, strongly-typed query builder
 - **High Performance**: Zero-cost abstraction, async runtime, connection pool support
-- **Multi-Database**: Sqlite, PostgreSQL, MySQL
+- **Multi-Database**: Sqlite, PostgreSQL, MySQL, MSSQL
 - **Elegant API**: Chainable queries, macro-driven models, intuitive syntax
 
 ## Query Capabilities

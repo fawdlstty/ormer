@@ -25,6 +25,7 @@ struct User {
 - `#[foreign(Type)]` - Foreign key relationship
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
+- `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
 
 ## Field Attributes
 
@@ -95,13 +96,14 @@ struct User {
 
 ## Supported Types
 
-| Rust Type | SQL Type (SQLite) | SQL Type (PostgreSQL) | SQL Type (MySQL) |
-|-----------|-------------------|----------------------|------------------|
-| `i32` | INTEGER | INTEGER | INT |
-| `i64` | INTEGER | BIGINT | BIGINT |
-| `f64` | REAL | DOUBLE | DOUBLE |
-| `String` | TEXT | TEXT | TEXT |
-| `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN |
+| Rust Type | SQL Type (SQLite) | SQL Type (PostgreSQL) | SQL Type (MySQL) | SQL Type (MSSQL) |
+|-----------|-------------------|----------------------|------------------|------------------|
+| `i32` | INTEGER | INTEGER | INT | INT |
+| `i64` | INTEGER | BIGINT | BIGINT | BIGINT |
+| `f64` | REAL | DOUBLE | DOUBLE | FLOAT |
+| `String` | TEXT | TEXT | TEXT | NVARCHAR(255) |
+| `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN | BIT |
+| `Vec<u8>` | BLOB | BYTEA | BLOB | VARBINARY(MAX) |
 
 All basic types can be wrapped with `Option<T>` for nullable fields.
 

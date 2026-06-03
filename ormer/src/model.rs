@@ -63,6 +63,7 @@ pub struct ColumnSchema {
     pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
     pub data_type: Option<&'static str>,     // 数据库类型覆盖
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
+    pub compress: bool,                      // 是否启用数据库级压缩（PostgreSQL: COMPRESSION pglz）
 }
 
 /// 外键信息
@@ -94,6 +95,56 @@ pub trait DbBackendTypeMapper {
         is_nullable: bool,
         enum_variants: Option<&[&str]>,
     ) -> String;
+}
+
+/// 主键 trait - 用于 find_by_id 方法
+/// 支持单主键和复合主键
+pub trait PrimaryKey: Sized {
+    fn into_values(self) -> Vec<Value>;
+}
+
+// 为 i32 实现 PrimaryKey（最常见的单主键类型）
+impl PrimaryKey for i32 {
+    fn into_values(self) -> Vec<Value> {
+        vec![Value::from(self)]
+    }
+}
+
+// 为 String 实现 PrimaryKey
+impl PrimaryKey for String {
+    fn into_values(self) -> Vec<Value> {
+        vec![Value::from(self)]
+    }
+}
+
+// 为 &str 实现 PrimaryKey（方便使用字符串字面量）
+impl PrimaryKey for &str {
+    fn into_values(self) -> Vec<Value> {
+        vec![Value::from(self.to_string())]
+    }
+}
+
+// 为两元素元组实现 PrimaryKey（复合主键）
+impl<A, B> PrimaryKey for (A, B)
+where
+    A: Into<Value>,
+    B: Into<Value>,
+{
+    fn into_values(self) -> Vec<Value> {
+        vec![self.0.into(), self.1.into()]
+    }
+}
+
+// 为三元素元组实现 PrimaryKey（复合主键）
+impl<A, B, C> PrimaryKey for (A, B, C)
+where
+    A: Into<Value>,
+    B: Into<Value>,
+    C: Into<Value>,
+{
+    fn into_values(self) -> Vec<Value> {
+        vec![self.0.into(), self.1.into(), self.2.into()]
+    }
 }
 
 /// 模型 trait,所有 ORM 模型必须实现
@@ -271,7 +322,22 @@ macro_rules! impl_enum_provider_for_non_enum {
 }
 
 impl_enum_provider_for_non_enum!(
-    i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64, bool, String, &str,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    isize,
+    usize,
+    f32,
+    f64,
+    bool,
+    String,
+    &str,
+    Vec<u8>,
 );
 
 /// 用于 insert/insert_or_update 的参数类型 trait
@@ -414,7 +480,27 @@ pub fn generate_create_table_sql_with_name<T: Model>(
             )
         };
 
-        sql.push_str(&format!("{} {sql_type}", column.name));
+        // 添加压缩属性（仅 PostgreSQL 支持，且必须在 NOT NULL 之前）
+        let is_postgresql = {
+            #[cfg(feature = "postgresql")]
+            {
+                matches!(db_type, crate::abstract_layer::DbType::PostgreSQL)
+            }
+            #[cfg(not(feature = "postgresql"))]
+            {
+                false
+            }
+        };
+        if column.compress && is_postgresql {
+            if sql_type.ends_with(" NOT NULL") {
+                let base = &sql_type[..sql_type.len() - " NOT NULL".len()];
+                sql.push_str(&format!("{} {base} COMPRESSION pglz NOT NULL", column.name));
+            } else {
+                sql.push_str(&format!("{} {sql_type} COMPRESSION pglz", column.name));
+            }
+        } else {
+            sql.push_str(&format!("{} {sql_type}", column.name));
+        }
 
         // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
         if column.unique_group.is_some() {

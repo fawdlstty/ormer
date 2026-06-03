@@ -3014,9 +3014,23 @@ fn convert_mysql_value(
     index: usize,
 ) -> anyhow::Result<crate::model::Value> {
     use mysql_async::Value;
+    use mysql_async::consts::ColumnType;
 
     // 获取原始值
     let value = row.get::<Option<Value>, _>(index).unwrap_or(None);
+
+    // 检查列类型是否为二进制类型（BLOB / TINYBLOB / MEDIUMBLOB / LONGBLOB / BINARY / VARBINARY）
+    let is_binary_col = row.columns().get(index).is_some_and(|col| {
+        matches!(
+            col.column_type(),
+            ColumnType::MYSQL_TYPE_TINY_BLOB
+                | ColumnType::MYSQL_TYPE_BLOB
+                | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+                | ColumnType::MYSQL_TYPE_LONG_BLOB
+                | ColumnType::MYSQL_TYPE_STRING
+                | ColumnType::MYSQL_TYPE_VAR_STRING
+        ) && col.character_set() == 63 // 63 = binary charset
+    });
 
     match value {
         Some(Value::NULL) | None => Ok(crate::model::Value::Null),
@@ -3024,10 +3038,13 @@ fn convert_mysql_value(
         Some(Value::UInt(u)) => Ok(crate::model::Value::Integer(u as i64)),
         Some(Value::Float(f)) => Ok(crate::model::Value::Real(f as f64)),
         Some(Value::Double(d)) => Ok(crate::model::Value::Real(d)),
+        Some(Value::Bytes(b)) if is_binary_col => {
+            // 二进制列（BLOB/BINARY）直接作为 Bytes 返回
+            Ok(crate::model::Value::Bytes(b))
+        }
         Some(Value::Bytes(b)) => {
-            // 尝试将字节解析为数值（MySQL聚合函数可能返回字符串形式的数值）
+            // 文本列：尝试将字节解析为数值（MySQL聚合函数可能返回字符串形式的数值）
             if let Ok(s) = String::from_utf8(b.clone()) {
-                // 尝试解析为整数
                 if let Ok(i) = s.parse::<i64>() {
                     Ok(crate::model::Value::Integer(i))
                 } else if let Ok(f) = s.parse::<f64>() {
@@ -3036,8 +3053,8 @@ fn convert_mysql_value(
                     Ok(crate::model::Value::Text(s))
                 }
             } else {
-                // 如果不是UTF-8，尝试作为二进制数据处理（这里暂时返回空字符串）
-                Ok(crate::model::Value::Text(String::new()))
+                // 非 UTF-8 字节，作为二进制数据处理
+                Ok(crate::model::Value::Bytes(b))
             }
         }
         _ => Err(anyhow::anyhow!(format!(

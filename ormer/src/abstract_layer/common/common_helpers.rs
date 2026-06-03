@@ -118,6 +118,45 @@ pub fn format_filter(
             }
             sql.push(')');
         }
+        FilterExpr::NotIn { column, values } => {
+            // 生成 NOT IN 语句: column NOT IN (?, ?, ...)
+            write!(sql, "{} NOT IN (", column)?;
+            for (i, _) in values.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        write!(sql, "${param_idx}")?;
+                    }
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        sql.push_str("@P");
+                    }
+                    // 无数据库后端时返回错误
+                    #[cfg(not(any(
+                        feature = "sqlite",
+                        feature = "postgresql",
+                        feature = "mysql",
+                        feature = "mssql"
+                    )))]
+                    _ => {
+                        return Err(anyhow::anyhow!("No database backend available"));
+                    }
+                }
+                *param_idx += 1;
+            }
+            sql.push(')');
+        }
         FilterExpr::InSubquery {
             column,
             subquery_sql,
@@ -133,6 +172,19 @@ pub fn format_filter(
                 + subquery_sql.matches("@P").count();
             *param_idx += placeholder_count as i32;
         }
+        FilterExpr::NotInSubquery {
+            column,
+            subquery_sql,
+            subquery_params: _,
+        } => {
+            // 生成子查询 NOT IN 语句: column NOT IN (SELECT ...)
+            write!(sql, "{column} NOT IN ({subquery_sql})")?;
+            // 注意：子查询的参数数量需要累加到 param_idx
+            let placeholder_count = subquery_sql.matches('?').count()
+                + subquery_sql.matches('$').count()
+                + subquery_sql.matches("@P").count();
+            *param_idx += placeholder_count as i32;
+        }
         FilterExpr::And(left, right) => {
             format_filter(left, sql, param_idx, db_type)?;
             sql.push_str(" AND ");
@@ -142,6 +194,46 @@ pub fn format_filter(
             format_filter(left, sql, param_idx, db_type)?;
             sql.push_str(" OR ");
             format_filter(right, sql, param_idx, db_type)?;
+        }
+        FilterExpr::IsNull { column } => {
+            write!(sql, "{column} IS NULL")?;
+        }
+        FilterExpr::IsNotNull { column } => {
+            write!(sql, "{column} IS NOT NULL")?;
+        }
+        FilterExpr::Between {
+            column,
+            min: _,
+            max: _,
+        } => {
+            match db_type {
+                #[cfg(feature = "postgresql")]
+                DbType::PostgreSQL => {
+                    write!(sql, "{column} BETWEEN ${param_idx} AND ${}", *param_idx + 1)?;
+                }
+                #[cfg(feature = "sqlite")]
+                DbType::Sqlite => {
+                    write!(sql, "{column} BETWEEN ? AND ?")?;
+                }
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => {
+                    write!(sql, "{column} BETWEEN ? AND ?")?;
+                }
+                #[cfg(feature = "mssql")]
+                DbType::MSSQL => {
+                    write!(sql, "{column} BETWEEN @P AND @P")?;
+                }
+                #[cfg(not(any(
+                    feature = "sqlite",
+                    feature = "postgresql",
+                    feature = "mysql",
+                    feature = "mssql"
+                )))]
+                DbType::None => {
+                    return Err(anyhow::anyhow!("No database backend available"));
+                }
+            }
+            *param_idx += 2;
         }
     }
     Ok(())
@@ -245,6 +337,46 @@ pub fn format_filter_with_params(
             }
             sql.push(')');
         }
+        FilterExpr::NotIn { column, values } => {
+            // 生成 NOT IN 语句: column NOT IN (?, ?, ...)
+            write!(sql, "{} NOT IN (", column)?;
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                match db_type {
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        write!(sql, "${}", param_idx)?;
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
+                        sql.push('?');
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        sql.push_str("@P");
+                    }
+                    // 无数据库后端时返回错误
+                    #[cfg(not(any(
+                        feature = "sqlite",
+                        feature = "postgresql",
+                        feature = "mysql",
+                        feature = "mssql"
+                    )))]
+                    DbType::None => {
+                        return Err(anyhow::anyhow!("No database backend available"));
+                    }
+                }
+                params.push(value.clone().into());
+                *param_idx += 1;
+            }
+            sql.push(')');
+        }
         FilterExpr::InSubquery {
             column,
             subquery_sql,
@@ -252,6 +384,19 @@ pub fn format_filter_with_params(
         } => {
             // 生成子查询 IN 语句: column IN (SELECT ...)
             write!(sql, "{} IN ({})", column, subquery_sql)?;
+            // 添加子查询的参数
+            for param in subquery_params {
+                params.push(param.clone());
+                *param_idx += 1;
+            }
+        }
+        FilterExpr::NotInSubquery {
+            column,
+            subquery_sql,
+            subquery_params,
+        } => {
+            // 生成子查询 NOT IN 语句: column NOT IN (SELECT ...)
+            write!(sql, "{} NOT IN ({})", column, subquery_sql)?;
             // 添加子查询的参数
             for param in subquery_params {
                 params.push(param.clone());
@@ -267,6 +412,44 @@ pub fn format_filter_with_params(
             format_filter_with_params(left, sql, param_idx, params, db_type)?;
             sql.push_str(" OR ");
             format_filter_with_params(right, sql, param_idx, params, db_type)?;
+        }
+        FilterExpr::IsNull { column } => {
+            write!(sql, "{column} IS NULL")?;
+        }
+        FilterExpr::IsNotNull { column } => {
+            write!(sql, "{column} IS NOT NULL")?;
+        }
+        FilterExpr::Between { column, min, max } => {
+            match db_type {
+                #[cfg(feature = "postgresql")]
+                DbType::PostgreSQL => {
+                    write!(sql, "{column} BETWEEN ${param_idx} AND ${}", *param_idx + 1)?;
+                }
+                #[cfg(feature = "sqlite")]
+                DbType::Sqlite => {
+                    write!(sql, "{column} BETWEEN ? AND ?")?;
+                }
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => {
+                    write!(sql, "{column} BETWEEN ? AND ?")?;
+                }
+                #[cfg(feature = "mssql")]
+                DbType::MSSQL => {
+                    write!(sql, "{column} BETWEEN @P AND @P")?;
+                }
+                #[cfg(not(any(
+                    feature = "sqlite",
+                    feature = "postgresql",
+                    feature = "mysql",
+                    feature = "mssql"
+                )))]
+                DbType::None => {
+                    return Err(anyhow::anyhow!("No database backend available"));
+                }
+            }
+            params.push(min.clone().into());
+            params.push(max.clone().into());
+            *param_idx += 2;
         }
     }
     Ok(())

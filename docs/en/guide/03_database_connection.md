@@ -5,6 +5,7 @@
 - Sqlite
 - PostgreSQL
 - MySQL
+- MSSQL
 
 ## Enable Features
 
@@ -25,6 +26,9 @@ ormer = { version = "0.1", features = ["sqlite"] }
 
 **MySQL:**
 - `mysql://user:password@localhost/dbname`
+
+**MSSQL:**
+- `mssql://user:password@localhost/dbname`
 
 ## Example
 

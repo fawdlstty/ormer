@@ -3624,6 +3624,15 @@ fn convert_postgres_value(
                 });
             }
         }
+        // 字节类型
+        Type::BYTEA => {
+            if let Ok(v) = row.try_get::<_, Option<Vec<u8>>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Bytes(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         // 日期时间类型
         Type::TIMESTAMP => {
             if let Ok(v) = row.try_get::<_, Option<chrono::NaiveDateTime>>(index) {

@@ -127,6 +127,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 hypertable 属性
         let hypertable = extract_hypertable(f);
 
+        // 检查 compress 属性
+        let compress = f.attrs.iter().any(|attr| attr.path().is_ident("compress"));
+
         // 对于枚举类型支持，我们无法在编译时检测类型是否实现了 ModelEnum，
         // 因此采用简单策略：总是传递 None，数据库后端会根据 rust_type 字符串判断
         // 如果未来需要支持，可以考虑使用 specialization 或宏魔法
@@ -147,6 +150,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 enum_variants: #enum_variants,
                 data_type: #data_type,
                 hypertable: #hypertable,
+                compress: #compress,
             }
         }
     });

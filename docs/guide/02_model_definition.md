@@ -25,6 +25,7 @@ struct User {
 - `#[foreign(Type)]` - 外键关系
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
+- `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
 
 ## 字段属性
 
@@ -95,13 +96,14 @@ struct User {
 
 ## 支持的类型
 
-| Rust 类型 | SQL 类型 (SQLite) | SQL 类型 (PostgreSQL) | SQL 类型 (MySQL) |
-|-----------|-------------------|----------------------|------------------|
-| `i32` | INTEGER | INTEGER | INT |
-| `i64` | INTEGER | BIGINT | BIGINT |
-| `f64` | REAL | DOUBLE | DOUBLE |
-| `String` | TEXT | TEXT | TEXT |
-| `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN |
+| Rust 类型 | SQL 类型 (SQLite) | SQL 类型 (PostgreSQL) | SQL 类型 (MySQL) | SQL 类型 (MSSQL) |
+|-----------|-------------------|----------------------|------------------|------------------|
+| `i32` | INTEGER | INTEGER | INT | INT |
+| `i64` | INTEGER | BIGINT | BIGINT | BIGINT |
+| `f64` | REAL | DOUBLE | DOUBLE | FLOAT |
+| `String` | TEXT | TEXT | TEXT | NVARCHAR(255) |
+| `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN | BIT |
+| `Vec<u8>` | BLOB | BYTEA | BLOB | VARBINARY(MAX) |
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
 

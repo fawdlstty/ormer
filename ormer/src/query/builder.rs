@@ -1753,6 +1753,11 @@ pub trait IsInValues<T> {
     fn to_in_expr(self, column: String) -> WhereExpr;
 }
 
+/// IsNotInValues trait - 支持集合和子查询作为 is_not_in 的参数
+pub trait IsNotInValues<T> {
+    fn to_not_in_expr(self, column: String) -> WhereExpr;
+}
+
 // 为集合类型实现 IsInValues
 impl<T: ColumnValueType, I, V> IsInValues<T> for I
 where
@@ -1762,6 +1767,26 @@ where
     fn to_in_expr(self, column: String) -> WhereExpr {
         WhereExpr {
             inner: FilterExpr::In {
+                column,
+                values: self
+                    .into_iter()
+                    .map(|v| ColumnValueType::to_filter_value(v.to_in_value()))
+                    .collect(),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+}
+
+// 为集合类型实现 IsNotInValues
+impl<T: ColumnValueType, I, V> IsNotInValues<T> for I
+where
+    I: IntoIterator<Item = V>,
+    V: IsInValue<T>,
+{
+    fn to_not_in_expr(self, column: String) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::NotIn {
                 column,
                 values: self
                     .into_iter()
@@ -1783,6 +1808,19 @@ impl<T: ColumnValueType> IsInValues<T> for SubqueryParam {
     fn to_in_expr(self, column: String) -> WhereExpr {
         WhereExpr {
             inner: FilterExpr::InSubquery {
+                column,
+                subquery_sql: self.sql,
+                subquery_params: self.params,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+}
+
+impl<T: ColumnValueType> IsNotInValues<T> for SubqueryParam {
+    fn to_not_in_expr(self, column: String) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::NotInSubquery {
                 column,
                 subquery_sql: self.sql,
                 subquery_params: self.params,
@@ -1824,6 +1862,47 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
         let (sql, params) = self.to_sql_with_params(db_type);
         WhereExpr {
             inner: FilterExpr::InSubquery {
+                column,
+                subquery_sql: sql,
+                subquery_params: params,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+}
+
+// 为 MappedSelect 实现 IsNotInValues（子查询）
+impl<T: Model, V: ColumnValueType> IsNotInValues<V> for MappedSelect<T, V> {
+    fn to_not_in_expr(self, column: String) -> WhereExpr {
+        // 使用第一个可用的数据库类型
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
+        let db_type = DbType::MySQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
+        let db_type = DbType::None;
+
+        let (sql, params) = self.to_sql_with_params(db_type);
+        WhereExpr {
+            inner: FilterExpr::NotInSubquery {
                 column,
                 subquery_sql: sql,
                 subquery_params: params,
@@ -1910,21 +1989,9 @@ pub enum ColumnValue {
     ColumnRef(String),
 }
 
-impl From<i32> for ColumnValue {
-    fn from(v: i32) -> Self {
-        ColumnValue::Literal(crate::query::filter::Value::Integer(v as i64))
-    }
-}
-
-impl From<String> for ColumnValue {
-    fn from(v: String) -> Self {
-        ColumnValue::Literal(crate::query::filter::Value::Text(v))
-    }
-}
-
-impl From<&str> for ColumnValue {
-    fn from(v: &str) -> Self {
-        ColumnValue::Literal(crate::query::filter::Value::Text(v.to_string()))
+impl<T: ColumnValueType> From<T> for ColumnValue {
+    fn from(v: T) -> Self {
+        ColumnValue::Literal(T::to_filter_value(v))
     }
 }
 
@@ -1963,6 +2030,53 @@ impl<T: ColumnValueType> TypedColumn<T> {
     /// IN 语句 - 支持多种集合类型和子查询
     pub fn is_in(self, values: impl IsInValues<T>) -> WhereExpr {
         values.to_in_expr(self.column_name.to_string())
+    }
+
+    /// NOT IN 语句 - 支持多种集合类型和子查询
+    pub fn is_not_in(self, values: impl IsNotInValues<T>) -> WhereExpr {
+        values.to_not_in_expr(self.column_name.to_string())
+    }
+
+    /// IS NULL 判断
+    pub fn is_null(self) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::IsNull {
+                column: self.column_name.to_string(),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    /// IS NOT NULL 判断
+    pub fn is_not_null(self) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::IsNotNull {
+                column: self.column_name.to_string(),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    /// 不等于比较 - 支持字面量或列引用
+    pub fn ne(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        match value.into() {
+            ColumnValue::Literal(v) => WhereExpr {
+                inner: FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: "!=".to_string(),
+                    value: v,
+                },
+                ..WhereExpr::defaults()
+            },
+            ColumnValue::ColumnRef(other_column) => WhereExpr {
+                inner: FilterExpr::ColumnComparison {
+                    left_column: self.column_name.to_string(),
+                    operator: "!=".to_string(),
+                    right_column: other_column,
+                },
+                ..WhereExpr::defaults()
+            },
+        }
     }
 }
 
@@ -2050,6 +2164,77 @@ impl<T: ColumnValueType> TypedColumn<T> {
             },
             ..WhereExpr::defaults()
         }
+    }
+
+    /// BETWEEN 范围查询
+    ///
+    /// ```ignore
+    /// .filter(|p| p.age.between(18, 30))
+    /// ```
+    pub fn between(self, min: T, max: T) -> WhereExpr {
+        debug_assert!(
+            T::supports_comparison(),
+            "Type does not support comparison operations"
+        );
+        let column_name = if let Some(ref func) = self.aggregate_func {
+            format!("{}({})", func, self.column_name)
+        } else {
+            self.column_name.to_string()
+        };
+        WhereExpr {
+            inner: FilterExpr::Between {
+                column: column_name,
+                min: ColumnValueType::to_filter_value(min),
+                max: ColumnValueType::to_filter_value(max),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+}
+
+// 为 TypedColumn<String> 实现字符串模糊查询方法
+impl TypedColumn<String> {
+    /// LIKE 模糊查询 - 直接使用 SQL LIKE 模式
+    ///
+    /// ```ignore
+    /// .filter(|p| p.name.like("%alice%"))
+    /// ```
+    pub fn like(self, pattern: &str) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: self.column_name.to_string(),
+                operator: "LIKE".to_string(),
+                value: crate::query::filter::Value::Text(pattern.to_string()),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    /// 包含子串 - 等价于 LIKE '%pattern%'
+    ///
+    /// ```ignore
+    /// .filter(|p| p.name.contains("alice"))
+    /// ```
+    pub fn contains(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("%{}%", pattern))
+    }
+
+    /// 前缀匹配 - 等价于 LIKE 'pattern%'
+    ///
+    /// ```ignore
+    /// .filter(|p| p.name.starts_with("al"))
+    /// ```
+    pub fn starts_with(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("{}%", pattern))
+    }
+
+    /// 后缀匹配 - 等价于 LIKE '%pattern'
+    ///
+    /// ```ignore
+    /// .filter(|p| p.name.ends_with("ce"))
+    /// ```
+    pub fn ends_with(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("%{}", pattern))
     }
 }
 
@@ -2170,6 +2355,8 @@ pub trait ColumnBuilder {
     fn ne(self, value: impl Into<FilterValue>) -> FilterExpr;
     fn like(self, pattern: &str) -> FilterExpr;
     fn contains(self, pattern: &str) -> FilterExpr;
+    fn starts_with(self, pattern: &str) -> FilterExpr;
+    fn ends_with(self, pattern: &str) -> FilterExpr;
     fn into_some(self) -> FilterExpr;
     fn into_none(self) -> FilterExpr;
     fn asc(self) -> OrderBy;

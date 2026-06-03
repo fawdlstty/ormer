@@ -139,6 +139,37 @@ async fn test_is_in_string_impl(config: &_test_common::DbConfig) {
     }
 }
 
+// 测试 ne() 不等于
+async fn test_ne_i32_impl(config: &_test_common::DbConfig) {
+    let _config = config;
+    let col: TypedColumn<i32> = TypedColumn::new("status");
+    let expr = col.ne(0);
+    match get_filter_expr(expr) {
+        FilterExpr::Comparison {
+            column, operator, ..
+        } => {
+            assert_eq!(column, "status");
+            assert_eq!(operator, "!=");
+        }
+        _ => panic!("Expected Comparison"),
+    }
+}
+
+async fn test_ne_string_impl(config: &_test_common::DbConfig) {
+    let _config = config;
+    let col: TypedColumn<String> = TypedColumn::new("status");
+    let expr = col.ne("deleted");
+    match get_filter_expr(expr) {
+        FilterExpr::Comparison {
+            column, operator, ..
+        } => {
+            assert_eq!(column, "status");
+            assert_eq!(operator, "!=");
+        }
+        _ => panic!("Expected Comparison"),
+    }
+}
+
 test_on_all_dbs!(test_typed_column_i8_impl);
 test_on_all_dbs!(test_typed_column_i16_impl);
 test_on_all_dbs!(test_typed_column_u32_impl);
@@ -151,3 +182,5 @@ test_on_all_dbs!(test_typed_column_str_ref_impl);
 test_on_all_dbs!(test_is_in_i32_impl);
 test_on_all_dbs!(test_is_in_i64_impl);
 test_on_all_dbs!(test_is_in_string_impl);
+test_on_all_dbs!(test_ne_i32_impl);
+test_on_all_dbs!(test_ne_string_impl);

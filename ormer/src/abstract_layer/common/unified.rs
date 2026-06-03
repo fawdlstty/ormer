@@ -278,6 +278,80 @@ impl Database {
         }
     }
 
+    /// 根据主键查找单条记录
+    /// 支持单主键和复合主键
+    /// ```
+    /// // 单主键
+    /// let user: Option<User> = db.find_by_id::<User>(1).await?;
+    /// // 复合主键
+    /// let record: Option<OrderItem> = db.find_by_id::<OrderItem>((1, 2)).await?;
+    /// ```
+    pub async fn find_by_id<T: Model + 'static + std::marker::Send + std::marker::Sync>(
+        &self,
+        key: impl crate::model::PrimaryKey,
+    ) -> anyhow::Result<Option<T>> {
+        let pk_columns = T::primary_key_columns();
+        let pk_values = key.into_values();
+
+        if pk_columns.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Model {} does not have a primary key",
+                T::TABLE_NAME
+            ));
+        }
+        if pk_columns.len() != pk_values.len() {
+            return Err(anyhow::anyhow!(
+                "Primary key column count ({}) does not match value count ({})",
+                pk_columns.len(),
+                pk_values.len()
+            ));
+        }
+
+        // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
+        let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
+        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+            let filter_val = match val {
+                crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
+                crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
+                crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
+                crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
+                crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
+                crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
+                crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
+                crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
+                crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
+                crate::model::Value::Null => crate::query::filter::Value::Null,
+            };
+            filters.push(crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: filter_val,
+            });
+        }
+
+        // 组合所有条件为 AND
+        let filter = if filters.len() == 1 {
+            filters.into_iter().next().unwrap()
+        } else {
+            filters
+                .into_iter()
+                .reduce(|a, b| crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b)))
+                .unwrap()
+        };
+
+        let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
+
+        // 执行查询并取第一条
+        let results = self
+            .select::<T>()
+            .filter(|_| where_expr)
+            .range(..1)
+            .execute()
+            .await?;
+
+        Ok(results.into_iter().next())
+    }
+
     /// 创建 Select 查询执行器
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         match self {
@@ -1055,6 +1129,73 @@ impl<'a> Transaction<'a> {
             Transaction::MSSQL(txn) => txn.rollback().await,
             Transaction::_Phantom(_) => unreachable!(),
         }
+    }
+
+    /// 根据主键查找单条记录（事务中）
+    pub async fn find_by_id<T: Model + 'static + std::marker::Send + std::marker::Sync>(
+        &self,
+        key: impl crate::model::PrimaryKey,
+    ) -> anyhow::Result<Option<T>> {
+        let pk_columns = T::primary_key_columns();
+        let pk_values = key.into_values();
+
+        if pk_columns.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Model {} does not have a primary key",
+                T::TABLE_NAME
+            ));
+        }
+        if pk_columns.len() != pk_values.len() {
+            return Err(anyhow::anyhow!(
+                "Primary key column count ({}) does not match value count ({})",
+                pk_columns.len(),
+                pk_values.len()
+            ));
+        }
+
+        // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
+        let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
+        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+            let filter_val = match val {
+                crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
+                crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
+                crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
+                crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
+                crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
+                crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
+                crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
+                crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
+                crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
+                crate::model::Value::Null => crate::query::filter::Value::Null,
+            };
+            filters.push(crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: filter_val,
+            });
+        }
+
+        // 组合所有条件为 AND
+        let filter = if filters.len() == 1 {
+            filters.into_iter().next().unwrap()
+        } else {
+            filters
+                .into_iter()
+                .reduce(|a, b| crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b)))
+                .unwrap()
+        };
+
+        let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
+
+        // 执行查询并取第一条
+        let results = self
+            .select::<T>()
+            .filter(|_| where_expr)
+            .range(..1)
+            .execute()
+            .await?;
+
+        Ok(results.into_iter().next())
     }
 
     /// 创建 Select 查询执行器

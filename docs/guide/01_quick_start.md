@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["full"] }
 - `Sqlite` - Sqlite/libSQL/SQLite
 - `postgresql` - PostgreSQL
 - `mysql` - MySQL
+- `mssql` - Microsoft SQL Server
 
 ## 完整示例
 
@@ -115,6 +116,12 @@ let db = Database::connect(
 let db = Database::connect(
     DbType::MySQL, 
     "mysql://user:pass@localhost/dbname"
+).await?;
+
+// MSSQL
+let db = Database::connect(
+    DbType::MSSQL, 
+    "mssql://user:pass@localhost/dbname"
 ).await?;
 ```
 

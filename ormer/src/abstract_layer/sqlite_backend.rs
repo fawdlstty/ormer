@@ -1991,6 +1991,7 @@ fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
         }
         turso::Value::Real(v) => Ok(Value::Real(*v)),
         turso::Value::Null => Ok(Value::Null),
+        turso::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
         _ => Err(anyhow::anyhow!("Unsupported turso value type: {:?}", value)),
     }
 }

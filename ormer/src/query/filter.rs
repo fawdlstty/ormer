@@ -15,8 +15,16 @@ pub enum FilterExpr {
     },
     /// IN 语句:column IN (value1, value2, ...)
     In { column: String, values: Vec<Value> },
+    /// NOT IN 语句:column NOT IN (value1, value2, ...)
+    NotIn { column: String, values: Vec<Value> },
     /// 子查询 IN: column IN (subquery)
     InSubquery {
+        column: String,
+        subquery_sql: String,
+        subquery_params: Vec<crate::model::Value>,
+    },
+    /// 子查询 NOT IN: column NOT IN (subquery)
+    NotInSubquery {
         column: String,
         subquery_sql: String,
         subquery_params: Vec<crate::model::Value>,
@@ -25,6 +33,16 @@ pub enum FilterExpr {
     And(Box<FilterExpr>, Box<FilterExpr>),
     /// OR 连接
     Or(Box<FilterExpr>, Box<FilterExpr>),
+    /// IS NULL
+    IsNull { column: String },
+    /// IS NOT NULL
+    IsNotNull { column: String },
+    /// BETWEEN min AND max
+    Between {
+        column: String,
+        min: Value,
+        max: Value,
+    },
 }
 
 /// 值类型（用于过滤）
