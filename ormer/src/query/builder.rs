@@ -830,6 +830,14 @@ impl<T: Model> Select<T> {
         self
     }
 
+    /// 限制只返回第一条记录
+    /// 自动设置 range_end = Some(1) 并清除 range_start
+    pub fn first(mut self) -> Self {
+        self.range_start = None;
+        self.range_end = Some(1);
+        self
+    }
+
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
         // 使用第一个可用的数据库类型用于调试

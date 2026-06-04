@@ -101,7 +101,7 @@ mod tuple_wrapper_tests {
             age: 30,
             email: Some("bob@example.com".to_string()),
         });
-        db.insert(&archive_user).execute().await?;
+        let _ = db.insert(&archive_user).execute().await?;
         println!("✓ Inserted into archive_users");
 
         // 使用包装器类型查询归档表

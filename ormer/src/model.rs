@@ -163,6 +163,11 @@ pub trait Model: Sized {
         None
     }
 
+    /// 自增主键类型
+    /// 如果模型有自增主键（#[primary(auto)]），此类型为主键的 Rust 类型（如 i32, i64）
+    /// 如果没有自增主键，此类型为 ()
+    type AutoIncrementKeyType: Default + 'static;
+
     type QueryBuilder;
     type Where: Default;
 

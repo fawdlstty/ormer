@@ -85,7 +85,7 @@ async fn test_hooks_demo() {
         // 未来版本将支持自动触发
         let mut user = user;
         user.before_insert().await;
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
         user.after_insert().await;
 
         assert_eq!(INSERT_COUNT.load(Ordering::SeqCst), 1);

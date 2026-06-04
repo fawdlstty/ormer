@@ -48,21 +48,21 @@ async fn test_enum_basic() {
             status: UserStatus::Active,
             name: "Alice".to_string(),
         };
-        db.insert(&user1).execute().await.unwrap();
+        let _ = db.insert(&user1).execute().await.unwrap();
 
         let user2 = TestEnumUser {
             id: 2,
             status: UserStatus::Inactive,
             name: "Bob".to_string(),
         };
-        db.insert(&user2).execute().await.unwrap();
+        let _ = db.insert(&user2).execute().await.unwrap();
 
         let user3 = TestEnumUser {
             id: 3,
             status: UserStatus::Banned,
             name: "Charlie".to_string(),
         };
-        db.insert(&user3).execute().await.unwrap();
+        let _ = db.insert(&user3).execute().await.unwrap();
 
         // 查询所有用户 - 验证枚举可以正确读取
         let users = db
@@ -103,14 +103,14 @@ async fn test_enum_optional() {
             status: Some(UserStatus::Active),
             name: "Alice".to_string(),
         };
-        db.insert(&user1).execute().await.unwrap();
+        let _ = db.insert(&user1).execute().await.unwrap();
 
         let user2 = TestEnumUserOptional {
             id: 2,
             status: None,
             name: "Bob".to_string(),
         };
-        db.insert(&user2).execute().await.unwrap();
+        let _ = db.insert(&user2).execute().await.unwrap();
 
         // 查询所有用户 - 验证 Option<Enum> 可以正确读取
         let users = db

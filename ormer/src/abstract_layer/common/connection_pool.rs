@@ -28,7 +28,9 @@ pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(
+        self,
+    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
         // 直接调用 PooledConnection 的 insert_impl 方法
         let refs = self.models.as_refs();
         match &self.pooled_conn.connection {

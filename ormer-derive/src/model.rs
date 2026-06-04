@@ -60,6 +60,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let primary_key_field = &primary_keys[0].0;
     let is_auto_increment = primary_keys[0].1;
 
+    // 生成 AutoIncrementKeyType
+    // 如果有自增主键，类型为第一个主键的 Rust 类型；否则为 ()
+    let auto_increment_key_type = if is_auto_increment {
+        let pk_type = &fields
+            .iter()
+            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
+            .map(|f| &f.ty)
+            .expect("Primary key field not found");
+        quote! { #pk_type }
+    } else {
+        quote! { () }
+    };
+
     // 生成主键列名列表（支持复合主键）
     let primary_key_field_names: Vec<_> = primary_keys
         .iter()
@@ -219,6 +232,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
             const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
 
+            type AutoIncrementKeyType = #auto_increment_key_type;
+
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = #where_name;
 
@@ -311,6 +326,8 @@ fn derive_model_tuple_wrapper(
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
             const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = <#inner_type as ::ormer::Model>::COLUMN_SCHEMA;
+
+            type AutoIncrementKeyType = <#inner_type as ::ormer::Model>::AutoIncrementKeyType;
 
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = <#inner_type as ::ormer::Model>::Where;

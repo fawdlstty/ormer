@@ -28,7 +28,7 @@ async fn test_stream_pollution_on_error_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 20 + i,
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 正常流式查询应该能读取所有数据
@@ -69,7 +69,7 @@ async fn test_stream_early_termination_cleanup_impl(config: &_test_common::DbCon
             name: format!("user{}", i),
             age: 18 + (i % 50),
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 多次提前终止流式查询，验证连接不会泄漏
@@ -122,7 +122,7 @@ async fn test_multiple_consecutive_streams_impl(config: &_test_common::DbConfig)
             name: format!("user{}", i),
             age: 20 + i,
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 连续执行多次流式查询
@@ -186,7 +186,7 @@ async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
             name: format!("pool_user{}", i),
             age: 18 + i,
         };
-        pooled_conn.insert(&user).execute().await.unwrap();
+        let _ = pooled_conn.insert(&user).execute().await.unwrap();
     }
 
     // 多次流式查询，验证连接池管理正确

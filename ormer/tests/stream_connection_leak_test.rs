@@ -24,7 +24,7 @@ async fn test_stream_connection_release_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 20 + i,
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 执行多次流式查询，检查连接是否正确释放
@@ -70,7 +70,7 @@ async fn test_stream_early_termination_impl(config: &_test_common::DbConfig) {
             name: format!("user{}", i),
             age: 20 + i,
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 提前终止流，测试连接是否正确释放
@@ -118,7 +118,7 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
             name: format!("txn_user{}", i),
             age: 25 + i,
         };
-        db.insert(&user).execute().await.unwrap();
+        let _ = db.insert(&user).execute().await.unwrap();
     }
 
     // 在事务中执行流式查询

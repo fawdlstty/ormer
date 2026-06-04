@@ -96,7 +96,9 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(
+        self,
+    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.execute().await,
@@ -105,7 +107,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
-            InsertExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+            InsertExecutor::MSSQL(exec) => exec.execute().await,
         }
     }
 }
@@ -713,6 +715,23 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         self.collect::<Vec<T>>()
     }
 
+    /// 执行查询并返回第一条记录
+    pub fn first(self) -> FirstFuture<'a, T>
+    where
+        T: 'static,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => FirstFuture::Sqlite(exec.first()),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => FirstFuture::PostgreSQL(exec.first()),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => FirstFuture::MySQL(exec.first()),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => FirstFuture::MSSQL(exec.first()),
+        }
+    }
+
     /// COUNT 聚合函数
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
@@ -857,6 +876,18 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
     MySQL(mysql_backend::CollectFuture<'a, T, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::CollectFuture<'a, T, C>),
+}
+
+/// 统一的 FirstFuture 枚举
+pub enum FirstFuture<'a, T: Model> {
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::FirstFuture<'a, T>),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::FirstFuture<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::FirstFuture<'a, T>),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::FirstFuture<'a, T>),
 }
 
 /// 统一的 AggregateFuture 枚举
@@ -1013,6 +1044,27 @@ pub enum RightJoinCollectFuture<'a, T: Model, J: Model> {
 
 crate::impl_unified_collect_future!(CollectFuture);
 
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
+    for FirstFuture<'a, T>
+{
+    type Output = anyhow::Result<Option<T>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        match self {
+            #[cfg(feature = "sqlite")]
+            FirstFuture::Sqlite(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "postgresql")]
+            FirstFuture::PostgreSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "mysql")]
+            FirstFuture::MySQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "mssql")]
+            FirstFuture::MSSQL(future) => Box::pin(future.into_future()),
+        }
+    }
+}
+
 crate::impl_unified_related_select_executor!(RelatedSelectExecutor);
 
 /// 统一的 RelatedCollectFuture 枚举
@@ -1059,7 +1111,9 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(
+        self,
+    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertExecutor::Sqlite(exec) => exec.execute().await,

@@ -10,6 +10,38 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+/// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
+/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
+fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
+    // 使用 any downcast 模式进行类型转换
+    // 这是一个类型擦除的转换，基于 K 的实际类型
+    let result = std::any::TypeId::of::<K>();
+    if result == std::any::TypeId::of::<()>() {
+        let val: () = ();
+        // SAFETY: 我们已经验证了类型匹配
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<i32>() {
+        let val: i32 = last_id as i32;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<i64>() {
+        let val: i64 = last_id;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<u32>() {
+        let val: u32 = last_id as u32;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<u64>() {
+        let val: u64 = last_id as u64;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<usize>() {
+        let val: usize = last_id as usize;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize and () are supported."
+        ))
+    }
+}
+
 // 导入宏
 use crate::impl_backend_executor_methods;
 use crate::impl_backend_join_executor_methods;
@@ -140,7 +172,7 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         self.db.insert_impl::<I::Model>(&refs).await
     }
@@ -409,10 +441,14 @@ impl Database {
         }
     }
 
-    /// 批量插入记录
-    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
+    /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
+    pub(crate) async fn insert_impl<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> anyhow::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
-            return Ok(());
+            return Ok(T::AutoIncrementKeyType::default());
         }
 
         let columns = T::insert_columns();
@@ -429,7 +465,16 @@ impl Database {
 
         self.conn.execute(&sql, all_params).await?;
 
-        Ok(())
+        // 获取自增ID（如果有自增主键）
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.conn.last_insert_rowid();
+            // 将 i64 转换为对应的主键类型
+            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            Ok(result)
+        } else {
+            Ok(T::AutoIncrementKeyType::default())
+        }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
@@ -643,7 +688,7 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         self.txn.insert_impl::<I::Model>(&refs).await
     }
@@ -775,10 +820,13 @@ impl Transaction {
         }
     }
 
-    /// 批量插入记录（内部使用）
-    async fn insert_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
+    /// 批量插入记录（内部使用），返回自增主键值（如果有自增主键）或 ()
+    async fn insert_impl<T: Model>(
+        &mut self,
+        models: &[&T],
+    ) -> anyhow::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
-            return Ok(());
+            return Ok(T::AutoIncrementKeyType::default());
         }
 
         let columns = T::insert_columns();
@@ -795,7 +843,15 @@ impl Transaction {
 
         self.conn.execute(&sql, all_params).await?;
 
-        Ok(())
+        // 获取自增ID（如果有自增主键）
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.conn.last_insert_rowid();
+            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            Ok(result)
+        } else {
+            Ok(T::AutoIncrementKeyType::default())
+        }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）（内部使用）
@@ -1105,6 +1161,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         T: 'static,
     {
         self.collect::<Vec<T>>()
+    }
+
+    /// 执行查询并返回第一条记录
+    pub fn first(self) -> FirstFuture<'a, T> {
+        FirstFuture { executor: self }
     }
 
     /// COUNT 聚合函数
@@ -1509,6 +1570,14 @@ pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
 // and the async operations are all await-based which ensures thread safety
 unsafe impl<'a, T: Model + Send, C: FromIterator<T> + Send> Send for CollectFuture<'a, T, C> {}
 
+/// First future for单条记录查询
+pub struct FirstFuture<'a, T: Model> {
+    executor: SelectExecutor<'a, T>,
+}
+
+// SAFETY: FirstFuture contains SelectExecutor which references Database (Send + Sync)
+unsafe impl<'a, T: Model + Send> Send for FirstFuture<'a, T> {}
+
 /// Aggregate future for聚合函数执行
 pub struct AggregateFuture<T: Model, R> {
     aggregate_select: crate::query::builder::AggregateSelect<T, R>,
@@ -1616,6 +1685,21 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, C: FromIter
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
+    for FirstFuture<'a, T>
+{
+    type Output = anyhow::Result<Option<T>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let results: Vec<T> = self.executor.collect_inner().await?;
+            Ok(results.into_iter().next())
+        })
     }
 }
 

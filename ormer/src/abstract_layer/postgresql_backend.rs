@@ -10,6 +10,35 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio_postgres::NoTls;
 
+/// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
+/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
+fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
+    let result = std::any::TypeId::of::<K>();
+    if result == std::any::TypeId::of::<()>() {
+        let val: () = ();
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<i32>() {
+        let val: i32 = last_id as i32;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<i64>() {
+        let val: i64 = last_id;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<u32>() {
+        let val: u32 = last_id as u32;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<u64>() {
+        let val: u64 = last_id as u64;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<usize>() {
+        let val: usize = last_id as usize;
+        Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize and () are supported."
+        ))
+    }
+}
+
 // 导入宏
 // use crate::impl_backend_executor_methods_with_lifetime;
 // use crate::impl_backend_join_executor_methods_with_lifetime;
@@ -235,7 +264,7 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         self.db.insert_impl::<I::Model>(&refs).await
     }
@@ -537,11 +566,17 @@ impl Database {
         normalize(actual) == normalize(expected)
     }
 
-    /// 批量插入记录
-    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
+    /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
+    pub(crate) async fn insert_impl<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> anyhow::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
-            return Ok(());
+            return Ok(T::AutoIncrementKeyType::default());
         }
+
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
 
         let columns = T::insert_columns();
         let (sql, _) =
@@ -568,9 +603,26 @@ impl Database {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
-
-        Ok(())
+        if has_auto_increment {
+            // 获取自增主键列名
+            let pk_col = T::COLUMN_SCHEMA
+                .iter()
+                .find(|c| c.is_auto_increment)
+                .map(|c| c.name)
+                .unwrap_or("id");
+            // 使用 RETURNING 子句获取插入的ID
+            let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
+            let row = self
+                .client
+                .query_one(&sql_with_returning, &param_refs)
+                .await?;
+            let id: i64 = row.get(0);
+            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            Ok(result)
+        } else {
+            self.client.execute(&sql, &param_refs).await?;
+            Ok(T::AutoIncrementKeyType::default())
+        }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
@@ -805,12 +857,15 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         // 直接调用批量插入逻辑，使用 client 引用
         if refs.is_empty() {
-            return Ok(());
+            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
         }
+
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+
         let columns = I::Model::insert_columns();
         let (sql, _) =
             super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
@@ -836,8 +891,27 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
-        Ok(())
+        if has_auto_increment {
+            // 获取自增主键列名
+            let pk_col = I::Model::COLUMN_SCHEMA
+                .iter()
+                .find(|c| c.is_auto_increment)
+                .map(|c| c.name)
+                .unwrap_or("id");
+            // 使用 RETURNING 子句获取插入的ID
+            let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
+            let row = self
+                .client
+                .query_one(&sql_with_returning, &param_refs)
+                .await?;
+            let id: i64 = row.get(0);
+            let result =
+                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)?;
+            Ok(result)
+        } else {
+            self.client.execute(&sql, &param_refs).await?;
+            Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
+        }
     }
 }
 
@@ -1065,11 +1139,15 @@ impl<'a> Transaction<'a> {
 
     /// 批量插入记录
     #[allow(dead_code)]
-    pub(crate) async fn insert_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub(crate) async fn insert_impl<T: Model>(
+        &self,
+        models: &[&T],
+    ) -> anyhow::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
-            return Ok(());
+            return Ok(T::AutoIncrementKeyType::default());
         }
 
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let columns = T::insert_columns();
         let (sql, _) =
             super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
@@ -1095,9 +1173,26 @@ impl<'a> Transaction<'a> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
-
-        Ok(())
+        if has_auto_increment {
+            // 获取自增主键列名
+            let pk_col = T::COLUMN_SCHEMA
+                .iter()
+                .find(|c| c.is_auto_increment)
+                .map(|c| c.name)
+                .unwrap_or("id");
+            // 使用 RETURNING 子句获取插入的ID
+            let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
+            let row = self
+                .client
+                .query_one(&sql_with_returning, &param_refs)
+                .await?;
+            let id: i64 = row.get(0);
+            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            Ok(result)
+        } else {
+            self.client.execute(&sql, &param_refs).await?;
+            Ok(T::AutoIncrementKeyType::default())
+        }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
@@ -1409,6 +1504,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// 执行查询并返回第一条记录
+    pub fn first(self) -> FirstFuture<'a, T> {
+        FirstFuture { executor: self }
+    }
+
     /// COUNT 聚合函数
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
@@ -1524,6 +1624,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     executor: SelectExecutor<'a, T>,
     _marker: PhantomData<C>,
+}
+
+/// First future for单条记录查询
+pub struct FirstFuture<'a, T: Model> {
+    executor: SelectExecutor<'a, T>,
 }
 
 /// Aggregate future for聚合函数执行
@@ -1670,6 +1775,21 @@ impl<'a, T: Model + 'static + Send, C: FromIterator<T> + 'static> std::future::I
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.executor.collect_inner().await })
+    }
+}
+
+impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
+    for FirstFuture<'a, T>
+{
+    type Output = anyhow::Result<Option<T>>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let results: Vec<T> = self.executor.collect_inner().await?;
+            Ok(results.into_iter().next())
+        })
     }
 }
 
