@@ -200,6 +200,27 @@ pub trait Model: Sized {
         self.primary_key_values()[0].clone()
     }
 
+    /// 获取非主键字段的 (列名, 值) 对，用于 set_model
+    fn non_pk_field_values(&self) -> Vec<(&'static str, Value)> {
+        let all_values = self.field_values();
+        Self::COLUMN_SCHEMA
+            .iter()
+            .filter(|col| !col.is_primary)
+            .filter_map(|col| {
+                Self::COLUMNS
+                    .iter()
+                    .position(|&c| c == col.name)
+                    .and_then(|idx| {
+                        if idx < all_values.len() {
+                            Some((col.name, all_values[idx].clone()))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect()
+    }
+
     /// 获取需要插入的列名（排除自增主键）
     fn insert_columns() -> Vec<&'static str> {
         Self::COLUMN_SCHEMA

@@ -19,17 +19,55 @@ let user: Vec<User> = db
 
 ```rust
 .filter(|u| u.name.eq("Alice".to_string()))
-.filter(|u| u.age.ge(18))
-.filter(|u| u.age.gt(18))
-.filter(|u| u.age.le(65))
-.filter(|u| u.age.lt(65))
+.filter(|u| u.age.ne(18))          // != 不等
+.filter(|u| u.age.ge(18))          // >= 大于等于
+.filter(|u| u.age.gt(18))          // > 大于
+.filter(|u| u.age.le(65))          // <= 小于等于
+.filter(|u| u.age.lt(65))          // < 小于
 ```
 
-### IN 查询
+### LIKE 模糊匹配
+
+```rust
+.filter(|u| u.name.like("Al%"))           // 自定义模式
+.filter(|u| u.name.contains("alice"))      // 包含
+.filter(|u| u.name.starts_with("Al"))      // 以...开头
+.filter(|u| u.name.ends_with("ce"))        // 以...结尾
+```
+
+可与其他条件组合：
+
+```rust
+.filter(|u| u.name.contains("li").and(u.age.gt(29)))
+```
+
+### NULL 判断
+
+```rust
+.filter(|u| u.email.is_null())       // IS NULL
+.filter(|u| u.email.is_not_null())   // IS NOT NULL
+```
+
+### BETWEEN 范围
+
+```rust
+.filter(|u| u.age.between(18, 30))  // age BETWEEN 18 AND 30
+```
+
+### IN 与 NOT IN
 
 ```rust
 .filter(|u| u.age.is_in(&vec![18, 20, 22]))
 .filter(|u| u.name.is_in(&vec!["Alice".to_string(), "Bob".to_string()]))
+
+.filter(|u| u.age.is_not_in(&vec![18, 20]))   // NOT IN
+```
+
+`is_in` 和 `is_not_in` 也支持子查询：
+
+```rust
+.filter(|u| u.id.is_in(db.select::<Role>().map_to(|r| r.user_id)))
+.filter(|u| u.id.is_not_in(db.select::<Role>().map_to(|r| r.user_id)))
 ```
 
 ### 组合条件
@@ -60,6 +98,25 @@ let user: Vec<User> = db
 .range(10..20)
 .range(..5)
 .range(10..)
+```
+
+## 去重查询
+
+```rust
+// SELECT DISTINCT *
+let users = db.select::<User>().distinct().collect().await?;
+
+// SELECT DISTINCT name
+let names: Vec<String> = db.select::<User>().distinct().map_to(|u| u.name).collect().await?;
+```
+
+可与 `filter`、`order_by`、`range` 等组合使用。
+
+## 单条查询
+
+```rust
+// 等价于 range(..1)，只取第一条
+let user: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
 ```
 
 ## 流式查询 (stream)

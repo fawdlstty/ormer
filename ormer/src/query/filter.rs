@@ -43,6 +43,16 @@ pub enum FilterExpr {
         min: Value,
         max: Value,
     },
+    /// EXISTS 子查询: EXISTS (SELECT 1 FROM ... WHERE ...)
+    Exists {
+        subquery_sql: String,
+        subquery_params: Vec<crate::model::Value>,
+    },
+    /// NOT EXISTS 子查询: NOT EXISTS (SELECT 1 FROM ... WHERE ...)
+    NotExists {
+        subquery_sql: String,
+        subquery_params: Vec<crate::model::Value>,
+    },
 }
 
 /// 值类型（用于过滤）

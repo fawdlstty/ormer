@@ -233,6 +233,78 @@ let users: Vec<User> = db
     .await?;
 ```
 
+### EXISTS / NOT EXISTS
+
+Use `Select::exists()` and `Select::not_exists()` to build subquery expressions:
+
+```rust
+let users_with_roles: Vec<User> = db
+    .select::<User>()
+    .filter(|_u| {
+        Select::<Role>::new()
+            .filter(|r| r.name.eq("admin"))
+            .exists()  // or .not_exists()
+    })
+    .collect()
+    .await?;
+```
+
+Can be combined with outer conditions:
+
+```rust
+.filter(|p| p.age.ge(18).or(
+    Select::<Role>::new().filter(|r| r.uid.eq(p.id)).exists()
+))
+```
+
+## Set Operations
+
+### UNION / UNION ALL
+
+```rust
+// UNION
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .union(Select::<User>::new().filter(|u| u.age.lt(18)))
+    .to_sql();
+
+// UNION ALL
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .union_all(Select::<User>::new().filter(|u| u.age.lt(18)))
+    .to_sql();
+```
+
+### INTERSECT / EXCEPT
+
+```rust
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(18))
+    .intersect(Select::<User>::new().filter(|u| u.age.lt(65)))
+    .to_sql();
+
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(18))
+    .except(Select::<User>::new().filter(|u| u.name.eq("admin")))
+    .to_sql();
+```
+
+Set operations support chained `order_by` and `range`:
+
+```rust
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .order_by(|u| u.name)
+    .range(..10)
+    .union(
+        Select::<User>::new()
+            .filter(|u| u.age.lt(18))
+            .order_by_desc(|u| u.age)
+            .range(..5),
+    )
+    .to_sql();
+```
+
 ## Complete Example
 
 ```rust

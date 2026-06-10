@@ -235,6 +235,26 @@ pub fn format_filter(
             }
             *param_idx += 2;
         }
+        FilterExpr::Exists {
+            subquery_sql,
+            subquery_params: _,
+        } => {
+            write!(sql, "EXISTS ({subquery_sql})")?;
+            let placeholder_count = subquery_sql.matches('?').count()
+                + subquery_sql.matches('$').count()
+                + subquery_sql.matches("@P").count();
+            *param_idx += placeholder_count as i32;
+        }
+        FilterExpr::NotExists {
+            subquery_sql,
+            subquery_params: _,
+        } => {
+            write!(sql, "NOT EXISTS ({subquery_sql})")?;
+            let placeholder_count = subquery_sql.matches('?').count()
+                + subquery_sql.matches('$').count()
+                + subquery_sql.matches("@P").count();
+            *param_idx += placeholder_count as i32;
+        }
     }
     Ok(())
 }
@@ -451,6 +471,26 @@ pub fn format_filter_with_params(
             params.push(max.clone().into());
             *param_idx += 2;
         }
+        FilterExpr::Exists {
+            subquery_sql,
+            subquery_params,
+        } => {
+            write!(sql, "EXISTS ({})", subquery_sql)?;
+            for param in subquery_params {
+                params.push(param.clone());
+                *param_idx += 1;
+            }
+        }
+        FilterExpr::NotExists {
+            subquery_sql,
+            subquery_params,
+        } => {
+            write!(sql, "NOT EXISTS ({})", subquery_sql)?;
+            for param in subquery_params {
+                params.push(param.clone());
+                *param_idx += 1;
+            }
+        }
     }
     Ok(())
 }
@@ -525,6 +565,22 @@ pub fn convert_column_value(
             }
             _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
         }
+    }
+}
+
+/// 将 model::Value 转换为 filter::Value
+pub fn value_to_filter_value(val: &Value) -> crate::query::filter::Value {
+    match val {
+        Value::Integer(v) => crate::query::filter::Value::Integer(*v),
+        Value::BigInt(v) => crate::query::filter::Value::BigInt(*v),
+        Value::Text(v) => crate::query::filter::Value::Text(v.clone()),
+        Value::Real(v) => crate::query::filter::Value::Real(*v),
+        Value::Boolean(v) => crate::query::filter::Value::Boolean(*v),
+        Value::Bytes(v) => crate::query::filter::Value::Bytes(v.clone()),
+        Value::DateTime(v) => crate::query::filter::Value::DateTime(*v),
+        Value::Json(v) => crate::query::filter::Value::Json(v.clone()),
+        Value::Uuid(v) => crate::query::filter::Value::Uuid(*v),
+        Value::Null => crate::query::filter::Value::Null,
     }
 }
 

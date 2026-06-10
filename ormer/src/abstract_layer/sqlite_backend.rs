@@ -36,9 +36,12 @@ fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Res
     } else if result == std::any::TypeId::of::<usize>() {
         let val: usize = last_id as usize;
         Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<Option<i64>>() {
+        let val: Option<i64> = Some(last_id);
+        Ok(unsafe { std::mem::transmute_copy(&val) })
     } else {
         Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize and () are supported."
+            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
         ))
     }
 }
@@ -176,6 +179,44 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         self.db.insert_impl::<I::Model>(&refs).await
+    }
+
+    /// 执行插入并返回插入的行数据（SQLite RETURNING 支持）
+    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+        let all_params = values_to_params(&all_values)?;
+
+        let sql_with_returning = format!("{} RETURNING *", sql);
+        let mut rows = self.db.conn.query(&sql_with_returning, all_params).trace().await?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let mut data = HashMap::new();
+            for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+                let value = row.get_value(i)?;
+                let ormer_value = convert_turso_value(&value)?;
+                data.insert(col_name.to_string(), ormer_value);
+            }
+            let ormer_row = Row::new(data);
+            let model = I::Model::from_row(&ormer_row)?;
+            results.push(model);
+        }
+
+        Ok(results)
     }
 }
 
@@ -601,6 +642,7 @@ impl Database {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
+            model_updates: Vec::new(),
             conn: self.conn.clone(),
             _marker: PhantomData,
         }
@@ -670,7 +712,7 @@ impl Database {
 
     /// 检查连接是否有效
     pub async fn is_valid(&self) -> bool {
-        self.conn.execute("SELECT 1", ()).await.is_ok()
+        self.conn.execute("SELECT 1", ()).trace().await.is_ok()
     }
 }
 
@@ -780,6 +822,7 @@ impl Transaction {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
+            model_updates: Vec::new(),
             conn: self.conn.clone(),
             _marker: PhantomData,
         }
@@ -1906,6 +1949,29 @@ impl<T: Model> DeleteExecutor<T> {
         Ok(result)
     }
 
+    /// 执行删除并返回被删除的行数据（SQLite RETURNING 支持）
+    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+        let (sql, params) = self.build_sql();
+
+        let sql_with_returning = format!("{} RETURNING *", sql);
+        let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let mut data = HashMap::new();
+            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let value = row.get_value(i)?;
+                let ormer_value = convert_turso_value(&value)?;
+                data.insert(col_name.to_string(), ormer_value);
+            }
+            let ormer_row = Row::new(data);
+            let model = T::from_row(&ormer_row)?;
+            results.push(model);
+        }
+
+        Ok(results)
+    }
+
     /// 执行删除操作并返回影响的行数（execute 的别名）
     pub async fn exec(self) -> anyhow::Result<u64> {
         self.execute().await
@@ -1950,6 +2016,7 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for DeleteE
 pub struct UpdateExecutor<T: Model> {
     sets: Vec<(String, Value)>,
     filters: Vec<FilterExpr>,
+    model_updates: Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>,
     conn: Arc<turso::Connection>,
     _marker: PhantomData<T>,
 }
@@ -1979,13 +2046,67 @@ impl<T: Model> UpdateExecutor<T> {
         self
     }
 
+    /// 从模型实例设置所有非主键字段，并自动添加主键作为 WHERE 条件
+    ///
+    /// ```ignore
+    /// let user = User { id: 1, name: "Bob".into(), age: 25, email: Some("bob@test.com".into()) };
+    /// db.update::<User>().set_model(&user).execute().await?;
+    /// ```
+    pub fn set_model(mut self, model: &T) -> Self {
+        let mut model_sets = Vec::new();
+        for (col_name, value) in model.non_pk_field_values() {
+            model_sets.push((col_name.to_string(), value));
+        }
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let mut model_filters = Vec::new();
+        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+            let filter_val = common_helpers::value_to_filter_value(&val);
+            model_filters.push(crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: filter_val,
+            });
+        }
+        self.model_updates.push((model_sets, model_filters));
+        self
+    }
+
     /// 执行更新操作
     pub async fn execute(self) -> anyhow::Result<u64> {
-        let (sql, params) = self.build_sql()?;
+        let statements = self.build_all_sql()?;
+        let mut total: u64 = 0;
+        for (sql, params) in &statements {
+            let result = self.conn.execute(sql, params.clone()).trace().await?;
+            total += result;
+        }
+        Ok(total)
+    }
 
-        let result = self.conn.execute(&sql, params).trace().await?;
-
-        Ok(result)
+    /// 执行更新并返回被更新的行数据（SQLite RETURNING 支持）
+    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+        let statements = self.build_all_sql()?;
+        let mut results = Vec::new();
+        for (sql, params) in &statements {
+            let sql_with_returning = format!("{} RETURNING *", sql);
+            let mut rows = self
+                .conn
+                .query(&sql_with_returning, params.clone())
+                .trace()
+                .await?;
+            while let Some(row) = rows.next().trace().await? {
+                let mut data = HashMap::new();
+                for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                    let value = row.get_value(i)?;
+                    let ormer_value = convert_turso_value(&value)?;
+                    data.insert(col_name.to_string(), ormer_value);
+                }
+                let ormer_row = Row::new(data);
+                let model = T::from_row(&ormer_row)?;
+                results.push(model);
+            }
+        }
+        Ok(results)
     }
 
     /// 执行更新操作（execute 的别名）
@@ -1993,41 +2114,76 @@ impl<T: Model> UpdateExecutor<T> {
         self.execute().await
     }
 
-    fn build_sql(&self) -> anyhow::Result<(String, Vec<turso::Value>)> {
-        let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
-        let mut ormer_params = Vec::new();
+    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<turso::Value>)>> {
+        let mut statements = Vec::new();
 
-        // 构建 SET 子句
-        let mut first = true;
-        for (col_name, value) in &self.sets {
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{col_name} = ?"));
-            ormer_params.push(value.clone());
-            first = false;
-        }
-
-        // 构建 WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx = ormer_params.len() + 1;
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
+        // Base UPDATE from sets/filters
+        if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
+            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut ormer_params = Vec::new();
+            let mut first = true;
+            for (col_name, value) in &self.sets {
+                if !first {
+                    sql.push_str(", ");
                 }
-                let _ = common_helpers::format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut ormer_params,
-                    DbType::Sqlite,
-                );
+                sql.push_str(&format!("{col_name} = ?"));
+                ormer_params.push(value.clone());
+                first = false;
             }
+            if !self.filters.is_empty() {
+                sql.push_str(" WHERE ");
+                let mut param_idx = ormer_params.len() + 1;
+                for (i, filter) in self.filters.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    let _ = common_helpers::format_filter_with_params(
+                        filter,
+                        &mut sql,
+                        &mut param_idx,
+                        &mut ormer_params,
+                        DbType::Sqlite,
+                    );
+                }
+            }
+            let turso_params = values_to_params(&ormer_params)?;
+            statements.push((sql, turso_params));
         }
 
-        let turso_params = values_to_params(&ormer_params)?;
-        Ok((sql, turso_params))
+        // Model UPDATE statements
+        for (model_sets, model_filters) in &self.model_updates {
+            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut ormer_params = Vec::new();
+            let mut first = true;
+            for (col_name, value) in model_sets {
+                if !first {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("{col_name} = ?"));
+                ormer_params.push(value.clone());
+                first = false;
+            }
+            if !model_filters.is_empty() {
+                sql.push_str(" WHERE ");
+                let mut param_idx = ormer_params.len() + 1;
+                for (i, filter) in model_filters.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    let _ = common_helpers::format_filter_with_params(
+                        filter,
+                        &mut sql,
+                        &mut param_idx,
+                        &mut ormer_params,
+                        DbType::Sqlite,
+                    );
+                }
+            }
+            let turso_params = values_to_params(&ormer_params)?;
+            statements.push((sql, turso_params));
+        }
+
+        Ok(statements)
     }
 }
 

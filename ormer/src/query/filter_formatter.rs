@@ -259,6 +259,30 @@ impl FilterFormatter {
                 params.push(ormer_min);
                 params.push(ormer_max);
             }
+            FilterExpr::Exists {
+                subquery_sql,
+                subquery_params,
+            } => {
+                use std::fmt::Write;
+                write!(sql, "EXISTS ({})", subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write EXISTS clause: {}", e));
+                for param in subquery_params {
+                    params.push(param.clone());
+                    *param_idx += 1;
+                }
+            }
+            FilterExpr::NotExists {
+                subquery_sql,
+                subquery_params,
+            } => {
+                use std::fmt::Write;
+                write!(sql, "NOT EXISTS ({})", subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write NOT EXISTS clause: {}", e));
+                for param in subquery_params {
+                    params.push(param.clone());
+                    *param_idx += 1;
+                }
+            }
         }
     }
 

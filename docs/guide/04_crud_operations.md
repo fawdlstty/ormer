@@ -15,6 +15,16 @@ db.insert(&User {
 .await?;
 ```
 
+> `execute()` 返回自增ID：若模型主键标注了 `#[primary(auto)]`，`execute()` 返回自动生成的ID（如 `i32`），而非影响行数。
+
+### 插入并返回 (RETURNING)
+
+插入后返回所有插入的行数据（支持 PostgreSQL、SQLite）：
+
+```rust
+let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
+```
+
 ### 批量插入
 
 ```rust
@@ -70,6 +80,29 @@ let page: Vec<User> = db
     .range(0..10)
     .collect()
     .await?;
+
+// 只取第一条
+let first: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
+```
+
+### 根据主键查找
+
+支持单主键和复合主键：
+
+```rust
+// 单主键
+let user: Option<User> = db.find_by_id::<User>(1).await?;
+
+// 复合主键
+let item: Option<OrderItem> = db.find_by_id::<OrderItem>((1, 100)).await?;
+```
+
+也可在事务中使用：
+
+```rust
+let txn = db.begin().await?;
+let user: Option<User> = txn.find_by_id::<User>(1).await?;
+txn.commit().await?;
 ```
 
 ## 更新 (Update)
@@ -86,6 +119,12 @@ db.update::<User>()
     .filter(|u| u.id.eq(1))
     .set(|u| u.name, "New Name".to_string())
     .set(|u| u.age, 26)
+    .execute()
+    .await?;
+
+// 使用模型实例更新（自动跳过主键字段）
+db.update::<User>()
+    .set_model(&updated_user)
     .execute()
     .await?;
 ```

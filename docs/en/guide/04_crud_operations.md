@@ -15,6 +15,16 @@ db.insert(&User {
 .await?;
 ```
 
+> `execute()` returns the auto-increment ID: if the model's primary key has `#[primary(auto)]`, `execute()` returns the auto-generated ID (e.g. `i32`) instead of the affected row count.
+
+### Insert with RETURNING
+
+Insert and return all inserted rows (PostgreSQL, SQLite):
+
+```rust
+let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
+```
+
 ### Batch Insert
 
 ```rust
@@ -68,6 +78,29 @@ let page: Vec<User> = db
     .range(0..10)
     .collect()
     .await?;
+
+// Get only the first record
+let first: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
+```
+
+### Find by ID
+
+Supports single and composite primary keys:
+
+```rust
+// Single primary key
+let user: Option<User> = db.find_by_id::<User>(1).await?;
+
+// Composite primary key
+let item: Option<OrderItem> = db.find_by_id::<OrderItem>((1, 100)).await?;
+```
+
+Can also be used within transactions:
+
+```rust
+let txn = db.begin().await?;
+let user: Option<User> = txn.find_by_id::<User>(1).await?;
+txn.commit().await?;
 ```
 
 ## Update
@@ -85,6 +118,12 @@ db.update::<User>()
     .filter(|u| u.id.eq(1))
     .set(|u| u.name, "New Name".to_string())
     .set(|u| u.age, 26)
+    .execute()
+    .await?;
+
+// Update using a model instance (auto-skips primary key fields)
+db.update::<User>()
+    .set_model(&updated_user)
     .execute()
     .await?;
 ```

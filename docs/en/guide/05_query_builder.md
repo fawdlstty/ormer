@@ -19,17 +19,55 @@ let user: Vec<User> = db
 
 ```rust
 .filter(|u| u.name.eq("Alice".to_string()))
-.filter(|u| u.age.ge(18))
-.filter(|u| u.age.gt(18))
-.filter(|u| u.age.le(65))
-.filter(|u| u.age.lt(65))
+.filter(|u| u.age.ne(18))          // != not equal
+.filter(|u| u.age.ge(18))          // >= greater than or equal
+.filter(|u| u.age.gt(18))          // > greater than
+.filter(|u| u.age.le(65))          // <= less than or equal
+.filter(|u| u.age.lt(65))          // < less than
 ```
 
-### IN Queries
+### LIKE Pattern Matching
+
+```rust
+.filter(|u| u.name.like("Al%"))           // custom pattern
+.filter(|u| u.name.contains("alice"))      // contains substring
+.filter(|u| u.name.starts_with("Al"))      // starts with
+.filter(|u| u.name.ends_with("ce"))        // ends with
+```
+
+Can be combined with other conditions:
+
+```rust
+.filter(|u| u.name.contains("li").and(u.age.gt(29)))
+```
+
+### NULL Checks
+
+```rust
+.filter(|u| u.email.is_null())       // IS NULL
+.filter(|u| u.email.is_not_null())   // IS NOT NULL
+```
+
+### BETWEEN Range
+
+```rust
+.filter(|u| u.age.between(18, 30))  // age BETWEEN 18 AND 30
+```
+
+### IN and NOT IN
 
 ```rust
 .filter(|u| u.age.is_in(&vec![18, 20, 22]))
 .filter(|u| u.name.is_in(&vec!["Alice".to_string(), "Bob".to_string()]))
+
+.filter(|u| u.age.is_not_in(&vec![18, 20]))   // NOT IN
+```
+
+`is_in` and `is_not_in` also support subqueries:
+
+```rust
+.filter(|u| u.id.is_in(db.select::<Role>().map_to(|r| r.user_id)))
+.filter(|u| u.id.is_not_in(db.select::<Role>().map_to(|r| r.user_id)))
 ```
 
 ### Combined Conditions
@@ -60,6 +98,25 @@ let user: Vec<User> = db
 .range(10..20)
 .range(..5)
 .range(10..)
+```
+
+## Distinct Queries
+
+```rust
+// SELECT DISTINCT *
+let users = db.select::<User>().distinct().collect().await?;
+
+// SELECT DISTINCT name
+let names: Vec<String> = db.select::<User>().distinct().map_to(|u| u.name).collect().await?;
+```
+
+Can be combined with `filter`, `order_by`, `range`, etc.
+
+## Single Record Query
+
+```rust
+// Equivalent to range(..1), returns only the first record
+let user: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
 ```
 
 ## Streaming Queries (stream)

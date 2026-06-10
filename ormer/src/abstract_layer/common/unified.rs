@@ -110,6 +110,19 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             InsertExecutor::MSSQL(exec) => exec.execute().await,
         }
     }
+
+    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => exec.returning().await,
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => exec.returning().await,
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => exec.returning().await,
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => exec.returning().await,
+        }
+    }
 }
 
 /// 统一的 InsertOrUpdateExecutor 枚举
@@ -282,7 +295,7 @@ impl Database {
 
     /// 根据主键查找单条记录
     /// 支持单主键和复合主键
-    /// ```text
+    /// ```ignore
     /// // 单主键
     /// let user: Option<User> = db.find_by_id::<User>(1).await?;
     /// // 复合主键

@@ -83,6 +83,14 @@ fn collect_filter_param_rust_types<T: Model>(
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
         | FilterExpr::IsNotNull { .. } => {}
+        FilterExpr::Exists {
+            subquery_params, ..
+        }
+        | FilterExpr::NotExists {
+            subquery_params, ..
+        } => {
+            rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
+        }
     }
 }
 
@@ -143,6 +151,7 @@ pub struct Select<T: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    distinct: bool,
     _marker: PhantomData<T>,
 }
 
@@ -153,6 +162,7 @@ impl<T: Model> Clone for Select<T> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            distinct: self.distinct,
             _marker: PhantomData,
         }
     }
@@ -201,6 +211,7 @@ pub struct MappedSelect<T: Model, V> {
     range_end: Option<usize>,
     column_names: Vec<String>,        // 要查询的字段名列表（支持多字段）
     alias_names: Option<Vec<String>>, // 别名列表（用于映射到目标Model）
+    distinct: bool,
     _marker: PhantomData<(T, V)>,
 }
 
@@ -226,6 +237,7 @@ impl<T: Model, V> Clone for MappedSelect<T, V> {
             range_end: self.range_end,
             column_names: self.column_names.clone(),
             alias_names: self.alias_names.clone(),
+            distinct: self.distinct,
             _marker: PhantomData,
         }
     }
@@ -330,8 +342,15 @@ impl<T: Model, V> MappedSelect<T, V> {
         } else {
             self.column_names.join(", ")
         };
-        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME)
-            .expect("Failed to write SELECT clause");
+        let distinct_str = if self.distinct { "DISTINCT " } else { "" };
+        write!(
+            &mut sql,
+            "SELECT {}{} FROM {}",
+            distinct_str,
+            columns,
+            T::TABLE_NAME
+        )
+        .expect("Failed to write SELECT clause");
 
         // WHERE 子句
         if !self.filters.is_empty() {
@@ -680,6 +699,7 @@ impl<T: Model> Select<T> {
             order_by: Vec::new(),
             range_start: None,
             range_end: None,
+            distinct: false,
             _marker: PhantomData,
         }
     }
@@ -824,6 +844,7 @@ impl<T: Model> Select<T> {
             range_end: self.range_end,
             column_names: result.column_names(),
             alias_names: None,
+            distinct: self.distinct,
             _marker: PhantomData,
         }
     }
@@ -848,6 +869,7 @@ impl<T: Model> Select<T> {
             range_end: self.range_end,
             column_names: vec![column.column_name.to_string()],
             alias_names: Some(alias_names),
+            distinct: self.distinct,
             _marker: PhantomData,
         }
     }
@@ -939,6 +961,103 @@ impl<T: Model> Select<T> {
         self
     }
 
+    /// 启用 DISTINCT 去重
+    /// 生成的 SQL 将使用 SELECT DISTINCT
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+
+    /// 将此查询转换为 EXISTS 子查询表达式
+    ///
+    /// 生成 SQL: `EXISTS (SELECT 1 FROM table WHERE ...)`
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let users_with_orders = db.select::<User>()
+    ///     .filter(|p| {
+    ///         Select::<Order>::new()
+    ///             .filter(|o| o.user_id.eq(p.id))
+    ///             .exists()
+    ///     })
+    ///     .collect::<Vec<_>>().await?;
+    /// ```
+    pub fn exists(self) -> WhereExpr {
+        let (sql, params) = self.to_exists_sql_with_params();
+        WhereExpr {
+            inner: FilterExpr::Exists {
+                subquery_sql: sql,
+                subquery_params: params,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    /// 将此查询转换为 NOT EXISTS 子查询表达式
+    ///
+    /// 生成 SQL: `NOT EXISTS (SELECT 1 FROM table WHERE ...)`
+    pub fn not_exists(self) -> WhereExpr {
+        let (sql, params) = self.to_exists_sql_with_params();
+        WhereExpr {
+            inner: FilterExpr::NotExists {
+                subquery_sql: sql,
+                subquery_params: params,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    /// 生成 EXISTS 子查询专用 SQL（SELECT 1 FROM ...）
+    fn to_exists_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
+        // 使用第一个可用的数据库类型
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
+        let db_type = DbType::MySQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
+        let db_type = DbType::None;
+
+        let mut sql = String::new();
+        let mut params = Vec::new();
+
+        write!(&mut sql, "SELECT 1 FROM {}", T::TABLE_NAME)
+            .unwrap_or_else(|e| panic!("Failed to write EXISTS subquery SQL: {}", e));
+
+        // WHERE 子句
+        if !self.filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let mut param_idx = 1;
+            let formatter = FilterFormatter::new(db_type);
+            for (i, filter) in self.filters.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" AND ");
+                }
+                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
+                sql.push_str(&filter_sql);
+            }
+        }
+
+        (sql, params)
+    }
+
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
         // 使用第一个可用的数据库类型用于调试
@@ -977,9 +1096,11 @@ impl<T: Model> Select<T> {
         let mut params = Vec::new();
 
         // SELECT 子句
+        let distinct_str = if self.distinct { "DISTINCT " } else { "" };
         write!(
             &mut sql,
-            "SELECT {} FROM {}",
+            "SELECT {}{} FROM {}",
+            distinct_str,
             T::COLUMNS.join(", "),
             T::TABLE_NAME
         )
@@ -1051,6 +1172,139 @@ impl<T: Model> Select<T> {
 impl<T: Model> Default for Select<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ==================== UNION / INTERSECT / EXCEPT 功能 ====================
+
+/// 集合操作类型
+#[derive(Debug, Clone, Copy)]
+pub enum SetOp {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+impl SetOp {
+    fn as_sql(&self) -> &'static str {
+        match self {
+            SetOp::Union => "UNION",
+            SetOp::UnionAll => "UNION ALL",
+            SetOp::Intersect => "INTERSECT",
+            SetOp::Except => "EXCEPT",
+        }
+    }
+}
+
+/// 集合操作查询结构体
+///
+/// 将两个 SELECT 查询通过 UNION/INTERSECT/EXCEPT 组合
+///
+/// # 示例
+/// ```ignore
+/// let combined = db.select::<User>()
+///     .filter(|p| p.age.gt(30))
+///     .union(
+///         db.select::<User>().filter(|p| p.name.like("%admin%"))
+///     )
+///     .collect::<Vec<_>>().await?;
+/// // 生成: SELECT ... WHERE age > 30 UNION SELECT ... WHERE name LIKE '%admin%'
+/// ```
+pub struct UnionSelect<T: Model> {
+    left: Select<T>,
+    right: Select<T>,
+    op: SetOp,
+}
+
+impl<T: Model> Clone for UnionSelect<T> {
+    fn clone(&self) -> Self {
+        Self {
+            left: self.left.clone(),
+            right: self.right.clone(),
+            op: self.op,
+        }
+    }
+}
+
+impl<T: Model> UnionSelect<T> {
+    /// 生成 SQL
+    pub fn to_sql(&self) -> String {
+        #[cfg(feature = "sqlite")]
+        let db_type = DbType::Sqlite;
+        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
+        let db_type = DbType::PostgreSQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            feature = "mysql"
+        ))]
+        let db_type = DbType::MySQL;
+        #[cfg(all(
+            not(feature = "sqlite"),
+            not(feature = "postgresql"),
+            not(feature = "mysql"),
+            feature = "mssql"
+        ))]
+        let db_type = DbType::MSSQL;
+        #[cfg(not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        )))]
+        let db_type = DbType::None;
+
+        let (sql, _) = self.to_sql_with_params(db_type);
+        sql
+    }
+
+    /// 生成 SQL 和参数
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let (left_sql, mut params) = self.left.to_sql_with_params(db_type);
+        let (right_sql, right_params) = self.right.to_sql_with_params(db_type);
+        params.extend(right_params);
+
+        let sql = format!("{} {} {}", left_sql, self.op.as_sql(), right_sql);
+        (sql, params)
+    }
+}
+
+impl<T: Model> Select<T> {
+    /// UNION - 合并两个查询结果（去重）
+    pub fn union(self, other: Select<T>) -> UnionSelect<T> {
+        UnionSelect {
+            left: self,
+            right: other,
+            op: SetOp::Union,
+        }
+    }
+
+    /// UNION ALL - 合并两个查询结果（保留重复）
+    pub fn union_all(self, other: Select<T>) -> UnionSelect<T> {
+        UnionSelect {
+            left: self,
+            right: other,
+            op: SetOp::UnionAll,
+        }
+    }
+
+    /// INTERSECT - 取两个查询结果的交集
+    pub fn intersect(self, other: Select<T>) -> UnionSelect<T> {
+        UnionSelect {
+            left: self,
+            right: other,
+            op: SetOp::Intersect,
+        }
+    }
+
+    /// EXCEPT - 取两个查询结果的差集
+    pub fn except(self, other: Select<T>) -> UnionSelect<T> {
+        UnionSelect {
+            left: self,
+            right: other,
+            op: SetOp::Except,
+        }
     }
 }
 
@@ -1408,6 +1662,7 @@ impl<T: Model> WhereColumn<T> {
 /// WhereExpr - WHERE 表达式
 ///
 /// 支持链式调用和逻辑组合
+#[derive(Clone)]
 pub struct WhereExpr {
     inner: FilterExpr,
     /// LATERAL JOIN 子查询的排序条件

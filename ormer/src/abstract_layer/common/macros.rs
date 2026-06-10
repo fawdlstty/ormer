@@ -214,6 +214,22 @@ macro_rules! impl_unified_select_executor_methods {
                     _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
+
+            /// 启用 DISTINCT 去重
+            pub fn distinct(self) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.distinct()),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.distinct()),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.distinct()),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.distinct()),
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("SelectExecutor not implemented for this backend"),
+                }
+            }
         }
     };
 }
@@ -253,6 +269,21 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
+                }
+            }
+
+            pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.returning().await,
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.returning().await,
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => exec.returning().await,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.returning().await,
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
@@ -319,6 +350,47 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
+            /// 从模型实例设置所有非主键字段，并自动添加主键作为 WHERE 条件
+            ///
+            /// 支持传入单个对象或对象数组（任何实现了 `Insertable` trait 的类型）
+            ///
+            /// ```ignore
+            /// // 单个对象
+            /// let user = User { id: 1, name: "Bob".into(), age: 25, email: Some("bob@test.com".into()) };
+            /// db.update::<User>().set_model(&user).execute().await?;
+            ///
+            /// // 多个对象
+            /// let users = vec![user1, user2, user3];
+            /// db.update::<User>().set_model(&users).execute().await?;
+            /// ```
+            pub fn set_model<I: $crate::model::Insertable<Model = T>>(self, models: I) -> Self {
+                let refs = models.as_refs();
+                let mut result = self;
+                for model_ref in refs {
+                    match result {
+                        #[cfg(feature = "sqlite")]
+                        $executor_name::Sqlite(exec, phantom) => {
+                            result = $executor_name::Sqlite(exec.set_model(model_ref), phantom);
+                        }
+                        #[cfg(feature = "postgresql")]
+                        $executor_name::PostgreSQL(exec) => {
+                            result = $executor_name::PostgreSQL(exec.set_model(model_ref));
+                        }
+                        #[cfg(feature = "mysql")]
+                        $executor_name::MySQL(exec) => {
+                            result = $executor_name::MySQL(exec.set_model(model_ref));
+                        }
+                        #[cfg(feature = "mssql")]
+                        $executor_name::MSSQL(exec) => {
+                            result = $executor_name::MSSQL(exec.set_model(model_ref));
+                        }
+                        #[allow(unreachable_patterns)]
+                        _ => unreachable!("UpdateExecutor not implemented for this backend"),
+                    }
+                }
+                result
+            }
+
             pub async fn execute(self) -> anyhow::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -329,6 +401,21 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
+                    #[allow(unreachable_patterns)]
+                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
+                }
+            }
+
+            pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.returning().await,
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.returning().await,
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => exec.returning().await,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.returning().await,
                     #[allow(unreachable_patterns)]
                     _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
@@ -659,6 +746,15 @@ macro_rules! impl_backend_executor_methods {
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 Self {
                     select: self.select.range(range),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                }
+            }
+
+            /// 启用 DISTINCT 去重
+            pub fn distinct(self) -> Self {
+                Self {
+                    select: self.select.distinct(),
                     $conn_field: self.$conn_field,
                     _marker: std::marker::PhantomData,
                 }

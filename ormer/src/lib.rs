@@ -32,6 +32,7 @@ pub use ormer_derive::{Model, ModelEnum};
 pub use query::builder::{
     AgeColumn, GroupByColumns, GroupedSelect, InnerJoinedSelect, IsInValue, IsInValues,
     LeftJoinedSelect, MapToResult, MappedSelect, MultiTableSelect, NumericColumn, RelatedSelect,
-    RightJoinedSelect, Select, SelectColumnResult, SubqueryParam, WhereColumn, WhereExpr,
+    RightJoinedSelect, Select, SelectColumnResult, SetOp, SubqueryParam, UnionSelect, WhereColumn,
+    WhereExpr,
 };
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};

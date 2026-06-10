@@ -34,9 +34,12 @@ fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Res
     } else if result == std::any::TypeId::of::<usize>() {
         let val: usize = last_id as usize;
         Ok(unsafe { std::mem::transmute_copy(&val) })
+    } else if result == std::any::TypeId::of::<Option<i64>>() {
+        let val: Option<i64> = Some(last_id);
+        Ok(unsafe { std::mem::transmute_copy(&val) })
     } else {
         Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize and () are supported."
+            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
         ))
     }
 }
@@ -416,6 +419,7 @@ impl Database {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
+            model_updates: Vec::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -655,6 +659,10 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
         self.insert_impl::<I::Model>(&refs).await
+    }
+
+    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
+        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
     }
 
     async fn insert_impl<T: Model>(
@@ -921,6 +929,7 @@ pub struct DeleteExecutor<'a, T: Model> {
 pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<(String, Value)>,
     filters: Vec<crate::query::filter::FilterExpr>,
+    model_updates: Vec<(Vec<(String, Value)>, Vec<crate::query::filter::FilterExpr>)>,
     pool: Pool,
     _marker: PhantomData<(T, &'a ())>,
 }
@@ -974,6 +983,7 @@ impl<'a> Transaction<'a> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
+            model_updates: Vec::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1317,6 +1327,15 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// 启用 DISTINCT 去重
+    pub fn distinct(self) -> Self {
+        Self {
+            select: self.select.distinct(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn order_by<F, O>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> O,
@@ -1597,6 +1616,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         Ok(result.total() as u64)
     }
 
+    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
+    }
+
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
         let mut params = Vec::new();
@@ -1646,49 +1669,122 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
-        let (sql, params) = self.build_sql()?;
-        let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &params {
-            bind_value(&mut query, param);
+    /// 从模型实例设置所有非主键字段，并自动添加主键作为 WHERE 条件
+    ///
+    /// ```ignore
+    /// let user = User { id: 1, name: "Bob".into(), age: 25, email: Some("bob@test.com".into()) };
+    /// db.update::<User>().set_model(&user).execute().await?;
+    /// ```
+    pub fn set_model(mut self, model: &T) -> Self {
+        let mut model_sets = Vec::new();
+        for (col_name, value) in model.non_pk_field_values() {
+            model_sets.push((col_name.to_string(), value));
         }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let mut model_filters = Vec::new();
+        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+            let filter_val =
+                crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
+            model_filters.push(crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: filter_val,
+            });
+        }
+        self.model_updates.push((model_sets, model_filters));
+        self
     }
 
-    fn build_sql(&self) -> anyhow::Result<(String, Vec<Value>)> {
-        let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
-        let mut params = Vec::new();
-
-        let mut first = true;
-        for (col_name, value) in &self.sets {
-            if !first {
-                sql.push_str(", ");
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        let statements = self.build_all_sql()?;
+        let mut client = self.pool.lock().await;
+        let mut total: u64 = 0;
+        for (sql, params) in &statements {
+            let mut query = Query::new(sql);
+            for param in params {
+                bind_value(&mut query, param);
             }
-            sql.push_str(&format!("{} = @P", col_name));
-            params.push(value.clone());
-            first = false;
+            let result = query.execute(&mut *client).trace().await?;
+            total += result.total() as u64;
         }
+        Ok(total)
+    }
 
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx: usize = 1;
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
+    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
+    }
+
+    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<Value>)>> {
+        let mut statements = Vec::new();
+
+        // Base UPDATE from sets/filters (manual .set()/.filter() calls)
+        if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
+            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut params = Vec::new();
+            let mut first = true;
+            for (col_name, value) in &self.sets {
+                if !first {
+                    sql.push_str(", ");
                 }
-                let _ = crate::abstract_layer::common::common_helpers::format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    DbType::MSSQL,
-                );
+                sql.push_str(&format!("{} = @P", col_name));
+                params.push(value.clone());
+                first = false;
             }
+            if !self.filters.is_empty() {
+                sql.push_str(" WHERE ");
+                let mut param_idx: usize = 1;
+                for (i, filter) in self.filters.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    let _ =
+                        crate::abstract_layer::common::common_helpers::format_filter_with_params(
+                            filter,
+                            &mut sql,
+                            &mut param_idx,
+                            &mut params,
+                            DbType::MSSQL,
+                        );
+                }
+            }
+            statements.push((sql, params));
         }
 
-        Ok((sql, params))
+        // Model UPDATE statements
+        for (model_sets, model_filters) in &self.model_updates {
+            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut params = Vec::new();
+            let mut first = true;
+            for (col_name, value) in model_sets {
+                if !first {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("{} = @P", col_name));
+                params.push(value.clone());
+                first = false;
+            }
+            if !model_filters.is_empty() {
+                sql.push_str(" WHERE ");
+                let mut param_idx: usize = params.len() + 1;
+                for (i, filter) in model_filters.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    let _ =
+                        crate::abstract_layer::common::common_helpers::format_filter_with_params(
+                            filter,
+                            &mut sql,
+                            &mut param_idx,
+                            &mut params,
+                            DbType::MSSQL,
+                        );
+                }
+            }
+            statements.push((sql, params));
+        }
+
+        Ok(statements)
     }
 }
 
