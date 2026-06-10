@@ -12,6 +12,16 @@ struct FindByIdUser {
     age: i32,
 }
 
+// 定义事务测试模型，使用独立表避免并发测试互相 drop/create 同一张表
+#[derive(Debug, ormer::Model, Clone, PartialEq)]
+#[table = "test_find_by_id_txn_users"]
+struct FindByIdTxnUser {
+    #[primary]
+    id: i32,
+    name: String,
+    age: i32,
+}
+
 // 定义复合主键测试模型
 #[derive(Debug, ormer::Model, Clone, PartialEq)]
 #[table = "test_find_by_id_order_items"]
@@ -144,11 +154,11 @@ async fn test_find_by_id_in_transaction_impl(
     let db = _test_common::create_db_connection(config).await?;
 
     // 清理并创建表
-    let _ = db.drop_table::<FindByIdUser>().execute().await;
-    db.create_table::<FindByIdUser>().execute().await?;
+    let _ = db.drop_table::<FindByIdTxnUser>().execute().await;
+    db.create_table::<FindByIdTxnUser>().execute().await?;
 
     // 插入测试数据
-    db.insert(&FindByIdUser {
+    db.insert(&FindByIdTxnUser {
         id: 1,
         name: "Alice".to_string(),
         age: 25,
@@ -158,7 +168,7 @@ async fn test_find_by_id_in_transaction_impl(
 
     // 在事务中测试 find_by_id
     let txn = db.begin().await?;
-    let user = txn.find_by_id::<FindByIdUser>(1).await?;
+    let user = txn.find_by_id::<FindByIdTxnUser>(1).await?;
     assert!(user.is_some());
     let user = user.unwrap();
     assert_eq!(user.id, 1);
@@ -166,7 +176,7 @@ async fn test_find_by_id_in_transaction_impl(
     txn.commit().await?;
 
     // 清理
-    db.drop_table::<FindByIdUser>().execute().await?;
+    db.drop_table::<FindByIdTxnUser>().execute().await?;
 
     Ok(())
 }

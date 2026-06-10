@@ -8,6 +8,14 @@ mod _test_common;
 define_test_user!(TestUser, "create_table_users_1");
 define_test_complete_types!(TestCompleteTypes, "create_table_complete_types_1");
 
+#[derive(Debug, ormer::Model)]
+#[table = "create_table_datetime_pk_1"]
+struct TestDateTimePrimaryKey {
+    #[primary]
+    update_time: chrono::NaiveDateTime,
+    message: String,
+}
+
 #[cfg(test)]
 mod create_table_tests {
     use super::*;
@@ -357,6 +365,16 @@ mod create_table_tests {
         };
         println!("{} Complete Types SQL: {}", db_type_name, sql);
         Ok(())
+    }
+
+    #[cfg(feature = "postgresql")]
+    #[test]
+    fn test_postgresql_datetime_primary_key_sql() {
+        let sql =
+            generate_create_table_sql::<TestDateTimePrimaryKey>(ormer::DbType::PostgreSQL).unwrap();
+
+        assert!(sql.contains("update_time TIMESTAMP PRIMARY KEY"));
+        assert!(!sql.contains("update_time INTEGER PRIMARY KEY"));
     }
 
     test_on_all_dbs_result!(test_turso_create_table_sql_impl);

@@ -4,6 +4,7 @@ use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
+use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tiberius::{Client, Config, Query};
@@ -113,10 +114,12 @@ pub struct Database {
 
 impl Database {
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
-        let config = Config::from_ado_string(connection_string)?;
-        let tcp = TcpStream::connect(config.get_addr()).await?;
-        tcp.set_nodelay(true)?;
-        let client = Client::connect(config, tcp.compat_write()).await?;
+        let config = Config::from_ado_string(connection_string)
+            .trace_for("tiberius::Config::from_ado_string")?;
+        let tcp = TcpStream::connect(config.get_addr()).trace().await?;
+        tcp.set_nodelay(true)
+            .trace_for("tokio::net::TcpStream::set_nodelay")?;
+        let client = Client::connect(config, tcp.compat_write()).trace().await?;
         Ok(Self {
             pool: Arc::new(Mutex::new(client)),
         })
@@ -133,7 +136,7 @@ impl Database {
     pub async fn exec_sql(&self, sql: &str) -> anyhow::Result<u64> {
         let mut client = self.pool.lock().await;
         let query = Query::new(sql);
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total())
     }
 
@@ -217,8 +220,8 @@ impl Database {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let row = stream.into_row().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
             let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
@@ -227,7 +230,7 @@ impl Database {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            query.execute(&mut *client).await?;
+            query.execute(&mut *client).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
@@ -290,7 +293,7 @@ impl Database {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 
@@ -339,7 +342,7 @@ impl Database {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 
@@ -437,8 +440,8 @@ impl Database {
         );
         {
             let query = Query::new(&check_sql);
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
             if rows.is_empty() {
                 return Err(anyhow::anyhow!("Table {} does not exist", T::TABLE_NAME));
             }
@@ -456,8 +459,8 @@ impl Database {
             T::TABLE_NAME
         );
         let query = Query::new(&col_sql);
-        let stream = query.query(&mut *client).await?;
-        let rows = stream.into_first_result().await?;
+        let stream = query.query(&mut *client).trace().await?;
+        let rows = stream.into_first_result().trace().await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
@@ -564,7 +567,7 @@ impl Database {
     pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
         let mut client = self.pool.lock().await;
         let query = Query::new("BEGIN TRANSACTION");
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(Transaction {
             pool: self.pool.clone(),
             _marker: PhantomData,
@@ -575,8 +578,8 @@ impl Database {
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
         let mut client = self.pool.lock().await;
         let query = Query::new(sql);
-        let results = query.query(&mut *client).await?;
-        let rows = results.into_first_result().await?;
+        let results = query.query(&mut *client).trace().await?;
+        let rows = results.into_first_result().trace().await?;
         let mut result = Vec::new();
         for row in rows {
             let mut data = std::collections::HashMap::new();
@@ -595,7 +598,7 @@ impl Database {
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
         let mut client = self.pool.lock().await;
         let query = Query::new(sql);
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 }
@@ -620,7 +623,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         )?;
         let mut client = self.pool.lock().await;
         let query = Query::new(&create_sql);
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 }
@@ -636,7 +639,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
         let mut client = self.pool.lock().await;
         let query = Query::new(&sql);
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 }
@@ -689,8 +692,8 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let row = stream.into_row().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
             let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
@@ -699,7 +702,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            query.execute(&mut *client).await?;
+            query.execute(&mut *client).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
@@ -775,7 +778,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 }
@@ -839,7 +842,7 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 }
@@ -932,14 +935,14 @@ impl<'a> Transaction<'a> {
     pub async fn commit(self) -> anyhow::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("COMMIT");
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 
     pub async fn rollback(self) -> anyhow::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("ROLLBACK");
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 
@@ -1051,8 +1054,8 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let row = stream.into_row().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
             let result =
                 convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)?;
@@ -1062,7 +1065,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             for param in &all_values {
                 bind_value(&mut query, param);
             }
-            query.execute(&mut *client).await?;
+            query.execute(&mut *client).trace().await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }
     }
@@ -1137,7 +1140,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 }
@@ -1199,7 +1202,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
         for param in &all_values {
             bind_value(&mut query, param);
         }
-        query.execute(&mut *client).await?;
+        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 }
@@ -1590,7 +1593,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         for param in &params {
             bind_value(&mut query, param);
         }
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 
@@ -1650,7 +1653,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         for param in &params {
             bind_value(&mut query, param);
         }
-        let result = query.execute(&mut *client).await?;
+        let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
     }
 
@@ -1918,8 +1921,8 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -1956,8 +1959,8 @@ impl<
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
             if rows.is_empty() {
                 return Err(anyhow::anyhow!("Aggregate query returned no rows"));
             }
@@ -1984,8 +1987,8 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2037,8 +2040,8 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2081,8 +2084,8 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2138,8 +2141,8 @@ where
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2178,8 +2181,8 @@ impl<
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2217,8 +2220,8 @@ impl<
             for param in &params {
                 bind_value(&mut query, param);
             }
-            let stream = query.query(&mut *client).await?;
-            let rows = stream.into_first_result().await?;
+            let stream = query.query(&mut *client).trace().await?;
+            let rows = stream.into_first_result().trace().await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2246,8 +2249,8 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         for param in &params {
             bind_value(&mut query, param);
         }
-        let stream = query.query(&mut *client).await?;
-        let rows = stream.into_first_result().await?;
+        let stream = query.query(&mut *client).trace().await?;
+        let rows = stream.into_first_result().trace().await?;
 
         let mut results = Vec::new();
         for row in rows {

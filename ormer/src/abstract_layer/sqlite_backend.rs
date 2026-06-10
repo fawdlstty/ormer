@@ -6,6 +6,7 @@ use crate::query::builder::{
     MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -144,7 +145,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
             self.table_name.as_deref(),
         )?;
 
-        self.db.conn.execute(&create_sql, ()).await?;
+        self.db.conn.execute(&create_sql, ()).trace().await?;
 
         Ok(())
     }
@@ -159,7 +160,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        self.db.conn.execute(&sql, ()).await?;
+        self.db.conn.execute(&sql, ()).trace().await?;
         Ok(())
     }
 }
@@ -209,9 +210,9 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
 impl Database {
     /// 连接到 Sqlite 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> anyhow::Result<Self> {
-        let db = turso::Builder::new_local(path).build().await?;
+        let db = turso::Builder::new_local(path).build().trace().await?;
 
-        let conn = Arc::new(db.connect()?);
+        let conn = Arc::new(db.connect().trace_for("turso::Database::connect")?);
 
         Ok(Self { conn })
     }
@@ -228,7 +229,7 @@ impl Database {
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().await?;
+        let table_exists = self.check_table_exists::<T>().trace().await?;
 
         if !table_exists {
             return Err(anyhow::anyhow!(
@@ -245,10 +246,10 @@ impl Database {
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
-        let mut rows = self.conn.query(sql, [T::TABLE_NAME]).await?;
+        let mut rows = self.conn.query(sql, [T::TABLE_NAME]).trace().await?;
 
-        if let Some(row) = rows.next().await? {
-            let count = row.get_value(0)?;
+        if let Some(row) = rows.next().trace().await? {
+            let count = row.get_value(0).trace_for("turso::Row::get_value")?;
 
             match count {
                 turso::Value::Integer(c) => Ok(c > 0),
@@ -264,15 +265,15 @@ impl Database {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", T::TABLE_NAME);
 
-        let mut rows = self.conn.query(&sql, ()).await?;
+        let mut rows = self.conn.query(&sql, ()).trace().await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool, bool)> = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let name = row.get_value(1)?;
-            let col_type = row.get_value(2)?;
-            let notnull = row.get_value(3)?;
-            let pk = row.get_value(5)?;
+        while let Some(row) = rows.next().trace().await? {
+            let name = row.get_value(1).trace_for("turso::Row::get_value")?;
+            let col_type = row.get_value(2).trace_for("turso::Row::get_value")?;
+            let notnull = row.get_value(3).trace_for("turso::Row::get_value")?;
+            let pk = row.get_value(5).trace_for("turso::Row::get_value")?;
 
             if let (
                 turso::Value::Text(name),
@@ -463,7 +464,7 @@ impl Database {
             );
         let all_params = values_to_params(&all_values)?;
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -523,7 +524,7 @@ impl Database {
             first = false;
         }
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -563,7 +564,7 @@ impl Database {
         // 添加 ON CONFLICT DO NOTHING 子句
         sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -616,7 +617,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> anyhow::Result<Transaction> {
-        self.conn.execute("BEGIN", ()).await?;
+        self.conn.execute("BEGIN", ()).trace().await?;
         Ok(Transaction {
             conn: self.conn.clone(),
             committed: false,
@@ -635,14 +636,14 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.conn.query(sql, ()).trace().await?;
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -663,7 +664,7 @@ impl Database {
 
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let result = self.conn.execute(sql, ()).await?;
+        let result = self.conn.execute(sql, ()).trace().await?;
         Ok(result)
     }
 
@@ -730,7 +731,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn.execute("COMMIT", ()).await?;
+        self.conn.execute("COMMIT", ()).trace().await?;
         self.committed = true;
         Ok(())
     }
@@ -742,7 +743,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn.execute("ROLLBACK", ()).await?;
+        self.conn.execute("ROLLBACK", ()).trace().await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -841,7 +842,7 @@ impl Transaction {
             );
         let all_params = values_to_params(&all_values)?;
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -900,7 +901,7 @@ impl Transaction {
             first = false;
         }
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -940,7 +941,7 @@ impl Transaction {
         // 添加 ON CONFLICT DO NOTHING 子句
         sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
 
-        self.conn.execute(&sql, all_params).await?;
+        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -1351,18 +1352,18 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1443,18 +1444,18 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -1462,7 +1463,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row.get_value(idx)?;
+                let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1522,15 +1523,15 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut t_data = HashMap::new();
             let mut t_is_null = true;
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
@@ -1548,7 +1549,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row.get_value(idx)?;
+                let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
                 j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
             }
             let j_model = J::from_row(&Row::new(j_data))?;
@@ -1614,13 +1615,13 @@ impl<
                 .collect();
 
             let mut rows = if values.is_empty() {
-                self.conn.query(&sql, ()).await?
+                self.conn.query(&sql, ()).trace().await?
             } else {
-                self.conn.query(&sql, values).await?
+                self.conn.query(&sql, values).trace().await?
             };
 
-            if let Some(row) = rows.next().await? {
-                let value = row.get_value(0)?;
+            if let Some(row) = rows.next().trace().await? {
+                let value = row.get_value(0).trace_for("turso::Row::get_value")?;
 
                 // 将turso::Value转换为ormer::Value
                 let ormer_value = match value {
@@ -1788,17 +1789,17 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1853,17 +1854,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 let ormer_value = convert_turso_value(&value)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
@@ -1900,7 +1901,7 @@ impl<T: Model> DeleteExecutor<T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql();
 
-        let result = self.conn.execute(&sql, params).await?;
+        let result = self.conn.execute(&sql, params).trace().await?;
 
         Ok(result)
     }
@@ -1982,7 +1983,7 @@ impl<T: Model> UpdateExecutor<T> {
     pub async fn execute(self) -> anyhow::Result<u64> {
         let (sql, params) = self.build_sql()?;
 
-        let result = self.conn.execute(&sql, params).await?;
+        let result = self.conn.execute(&sql, params).trace().await?;
 
         Ok(result)
     }
@@ -2076,7 +2077,6 @@ fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
         turso::Value::Real(v) => Ok(Value::Real(*v)),
         turso::Value::Null => Ok(Value::Null),
         turso::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
-        _ => Err(anyhow::anyhow!("Unsupported turso value type: {:?}", value)),
     }
 }
 
@@ -2135,7 +2135,7 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let results: Vec<V> = self.executor.collect_inner().await?;
+            let results: Vec<V> = self.executor.collect_inner().trace().await?;
             Ok(results.into_iter().map(|v| (self.transform)(v)).collect())
         })
     }
@@ -2194,19 +2194,19 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             // 获取行中的所有值
             let column_count = self.select.column_names().len();
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2284,7 +2284,7 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let results: Vec<V> = self.executor.collect_inner().await?;
+            let results: Vec<V> = self.executor.collect_inner().trace().await?;
             Ok(results.into_iter().collect())
         })
     }
@@ -2314,19 +2314,19 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             .collect();
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).await?
+            self.conn.query(&sql, ()).trace().await?
         } else {
-            self.conn.query(&sql, turso_params).await?
+            self.conn.query(&sql, turso_params).trace().await?
         };
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().await? {
+        while let Some(row) = rows.next().trace().await? {
             // 获取行中的所有值（从 column_count 获取列数）
             let column_count = self.select.column_count();
             let mut values = Vec::with_capacity(column_count);
             for i in 0..column_count {
-                let value = row.get_value(i)?;
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 let ormer_value = convert_turso_value(&value)?;
                 values.push(ormer_value);
             }
@@ -2347,8 +2347,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 ///
 /// # 示例
 ///
-/// ```rust,ignore
-/// let mut stream = db.select::<User>().stream().into_iter().await?;
+/// ```text
+/// let mut stream = db.select::<User>().stream().into_iter().trace().await?;
 /// while let Some(result) = stream.next().await {
 ///     let user = result?;
 ///     println!("User: {:?}", user);
@@ -2394,9 +2394,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             .collect();
 
         let rows = if turso_params.is_empty() {
-            conn.query(&sql, ()).await?
+            conn.query(&sql, ()).trace().await?
         } else {
-            conn.query(&sql, turso_params).await?
+            conn.query(&sql, turso_params).trace().await?
         };
 
         Ok(SelectStreamIterator {
@@ -2446,7 +2446,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             return None;
         }
 
-        match self.rows.next().await {
+        match self.rows.next().trace_for("turso::Rows::next").await {
             Ok(Some(row)) => {
                 // 解析行数据为 Model
                 let mut data = HashMap::new();
@@ -2463,9 +2463,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                         },
                         Err(e) => {
                             self.polluted = true;
-                            return Some(Err(
-                                anyhow::anyhow!(e).context("Database operation failed")
-                            ));
+                            return Some(Err(anyhow::anyhow!("turso::Row::get_value failed: {e}")));
                         }
                     }
                 }
@@ -2475,7 +2473,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             Ok(None) => None,
             Err(e) => {
                 self.polluted = true;
-                Some(Err(anyhow::anyhow!(e).context("Database operation failed")))
+                Some(Err(e))
             }
         }
     }

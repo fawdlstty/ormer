@@ -853,7 +853,7 @@ macro_rules! impl_backend_related_executor_methods_with_lifetime {
 
 /// 示例用法 (在实际代码中使用):
 ///
-/// ```ignore
+/// ```text
 /// // 在 sqlite_backend.rs 中:
 /// ormer::impl_join_executor_methods!(LeftJoinedSelectExecutor, conn, Arc<Sqlite::Connection>);
 /// ormer::impl_join_executor_methods!(InnerJoinedSelectExecutor, conn, Arc<Sqlite::Connection>);

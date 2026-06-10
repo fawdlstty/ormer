@@ -8,7 +8,7 @@ struct SpecialFieldModel {
     #[primary]
     id: i32,
     #[data_type(i64)]
-    big_count: i64,
+    big_count: i32,
     name: String,
 }
 
@@ -32,6 +32,7 @@ async fn test_data_type_override_impl(
         ormer::DbType::MySQL => {
             assert!(sql.contains("big_count BIGINT NOT NULL"));
         }
+        #[allow(unreachable_patterns)]
         _ => {}
     }
 
@@ -43,6 +44,10 @@ async fn test_data_type_crud_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
     db.create_table::<SpecialFieldModel>().execute().await?;
+    #[cfg(feature = "postgresql")]
+    if matches!(config.0, ormer::DbType::PostgreSQL) {
+        db.validate_table::<SpecialFieldModel>().await?;
+    }
 
     db.insert(&SpecialFieldModel {
         id: 1,

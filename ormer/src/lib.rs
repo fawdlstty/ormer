@@ -2,6 +2,7 @@ pub mod abstract_layer;
 pub mod hooks;
 pub mod model;
 pub mod query;
+pub mod utils;
 
 // 编译时检查：至少启用一个数据库特性（已移除，允许无特性编译）
 // #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql", feature = "mssql")))]

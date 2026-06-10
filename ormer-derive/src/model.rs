@@ -103,7 +103,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let column_schema_entries = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
         let field_type = &f.ty;
-        let type_str = quote! { #field_type }.to_string();
+        let type_str = normalize_type_string(quote! { #field_type }.to_string());
 
         // 检查是否是主键字段
         let is_primary = f.attrs.iter().any(|attr| attr.path().is_ident("primary"));
@@ -112,13 +112,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
 
         // 检查是否是 Option<T>
-        let is_nullable = type_str.starts_with("Option <");
+        let is_nullable = type_str.starts_with("Option<");
 
         // 提取基础 Rust 类型
         let rust_type = if is_nullable {
             type_str
-                .trim_start_matches("Option <")
-                .trim_end_matches(">")
+                .strip_prefix("Option<")
+                .and_then(|ty| ty.strip_suffix('>'))
+                .unwrap_or(&type_str)
                 .trim()
                 .to_string()
         } else {
@@ -297,6 +298,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
     }
+}
+
+fn normalize_type_string(type_str: String) -> String {
+    type_str
+        .replace(" :: ", "::")
+        .replace(" < ", "<")
+        .replace(" >", ">")
+        .replace(" , ", ",")
 }
 
 /// 为元组结构体包装模型生成实现（例如：struct NewUser(User);）

@@ -26,7 +26,7 @@ use std::sync::Arc;
 ///
 /// 流式查询完成后，连接会自动释放：
 ///
-/// ```rust,ignore
+/// ```text
 /// let mut stream = db.select::<User>().stream().into_iter().await?;
 /// while let Some(result) = stream.next().await {
 ///     let user = result?;

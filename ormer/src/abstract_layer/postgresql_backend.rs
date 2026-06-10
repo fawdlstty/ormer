@@ -6,6 +6,7 @@ use crate::query::builder::{
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio_postgres::NoTls;
@@ -66,27 +67,6 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             );
         }
 
-        // 首先处理主键类型（主键自动 NOT NULL）
-        if is_primary {
-            if is_auto_increment {
-                let serial_type = match rust_type {
-                    "i8" | "i16" | "i32" => "SERIAL",
-                    "i64" | "u16" | "u32" | "u64" => "BIGSERIAL",
-                    "u8" => "SMALLSERIAL", // PostgreSQL 最小序列类型
-                    _ => "SERIAL",         // 默认使用 SERIAL
-                };
-                return format!("{serial_type} PRIMARY KEY");
-            } else {
-                let int_type = match rust_type {
-                    "i8" | "i16" | "u8" => "SMALLINT",
-                    "i32" | "u16" | "u32" => "INTEGER",
-                    "i64" | "u64" => "BIGINT",
-                    _ => "INTEGER",
-                };
-                return format!("{int_type} PRIMARY KEY");
-            }
-        }
-
         // 基础类型映射
         let base_type = match rust_type {
             // 整数类型
@@ -120,6 +100,21 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             // 默认使用 TEXT
             _ => "TEXT",
         };
+
+        // 首先处理主键类型（主键自动 NOT NULL）
+        if is_primary {
+            if is_auto_increment {
+                let serial_type = match rust_type {
+                    "i8" | "i16" | "i32" => "SERIAL",
+                    "i64" | "u16" | "u32" | "u64" => "BIGSERIAL",
+                    "u8" => "SMALLSERIAL", // PostgreSQL 最小序列类型
+                    _ => "SERIAL",         // 默认使用 SERIAL
+                };
+                return format!("{serial_type} PRIMARY KEY");
+            } else {
+                return format!("{base_type} PRIMARY KEY");
+            }
+        }
 
         let mut sql_type = base_type.to_string();
 
@@ -176,7 +171,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                     enum_name, enum_name, variants_str
                 );
 
-                self.client.execute(&create_enum_sql, &[]).await?;
+                self.client.execute(&create_enum_sql, &[]).trace().await?;
             }
         }
 
@@ -195,7 +190,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                 continue;
             }
 
-            self.client.execute(sql_part, &[]).await?;
+            self.client.execute(sql_part, &[]).trace().await?;
         }
 
         // If the model is marked as a hypertable, create a TimescaleDB hypertable
@@ -209,6 +204,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                     "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
                     &[],
                 )
+                .trace()
                 .await?;
             let tsdb_enabled: bool = ext_check.get(0);
             if !tsdb_enabled {
@@ -225,7 +221,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                     "SELECT EXISTS (SELECT 1 FROM _timescaledb_catalog.hypertable WHERE schema_name = 'public' AND table_name = $1)",
                     &[&table_name],
                 )
-                .await?;
+                .trace().await?;
             let is_hypertable: bool = ht_check.get(0);
 
             if !is_hypertable {
@@ -234,7 +230,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
                     "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}')",
                     table_name, time_column, interval_str
                 );
-                self.client.execute(&hypertable_sql, &[]).await?;
+                self.client.execute(&hypertable_sql, &[]).trace().await?;
             }
         }
 
@@ -251,7 +247,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub async fn execute(self) -> anyhow::Result<()> {
         let sql = format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME);
-        self.client.execute(&sql, &[]).await?;
+        self.client.execute(&sql, &[]).trace().await?;
         Ok(())
     }
 }
@@ -301,11 +297,18 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
 impl Database {
     /// 连接到 PostgreSQL 数据库
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
+            .trace()
+            .await?;
 
         // 在后台运行连接
         tokio::spawn(async move {
-            let _ = connection.await;
+            if let Err(err) = connection
+                .trace_for("tokio_postgres::Connection::poll")
+                .await
+            {
+                eprintln!("[ormer] {err}");
+            }
         });
 
         Ok(Self { client })
@@ -373,7 +376,7 @@ impl Database {
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().await?;
+        let table_exists = self.check_table_exists::<T>().trace().await?;
 
         if !table_exists {
             return Err(anyhow::anyhow!(
@@ -390,9 +393,13 @@ impl Database {
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public' AND table_name=$1";
 
-        let row = self.client.query_one(sql, &[&T::TABLE_NAME]).await?;
+        let row = self
+            .client
+            .query_one(sql, &[&T::TABLE_NAME])
+            .trace()
+            .await?;
 
-        let count: i64 = row.try_get(0)?;
+        let count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
 
         Ok(count > 0)
     }
@@ -407,14 +414,14 @@ impl Database {
             ORDER BY ordinal_position
         "#;
 
-        let rows = self.client.query(sql, &[&T::TABLE_NAME]).await?;
+        let rows = self.client.query(sql, &[&T::TABLE_NAME]).trace().await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
         for row in rows {
-            let name: String = row.try_get(0)?;
-            let col_type: String = row.try_get(1)?;
-            let is_nullable: String = row.try_get(2)?;
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let col_type: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let is_nullable: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
 
             actual_columns.push((name, col_type, is_nullable == "YES"));
         }
@@ -452,9 +459,11 @@ impl Database {
                 ));
             }
 
+            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
+
             // 检查列类型（只比较基础类型，不包含约束）
             let expected_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                expected_col.rust_type,
+                effective_rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
@@ -464,7 +473,7 @@ impl Database {
             // 对于类型比较，我们需要提取基础类型（不包含 SERIAL, PRIMARY KEY, NOT NULL 等约束）
             let type_to_compare = if expected_col.is_primary && expected_col.is_auto_increment {
                 // SERIAL类型在PostgreSQL中实际存储为integer/bigint
-                match expected_col.rust_type {
+                match effective_rust_type {
                     "i8" | "i16" | "u8" => "SMALLINT".to_string(), // SMALLSERIAL -> SMALLINT
                     "i32" | "u16" | "u32" => "INTEGER".to_string(), // SERIAL -> INTEGER
                     "i64" | "u64" => "BIGINT".to_string(),         // BIGSERIAL -> BIGINT
@@ -472,14 +481,14 @@ impl Database {
                 }
             } else if expected_col.is_primary {
                 // 主键的基础类型
-                match expected_col.rust_type {
+                match effective_rust_type {
                     "i8" | "i16" | "u8" => "SMALLINT".to_string(),
                     "i32" | "u16" | "u32" => "INTEGER".to_string(),
                     "i64" | "u64" => "BIGINT".to_string(),
                     // 非整数主键（如 NaiveDateTime）使用 sql_type 获取基础类型
                     _ => {
                         let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                            expected_col.rust_type,
+                            effective_rust_type,
                             false,
                             expected_col.is_auto_increment,
                             expected_col.is_nullable,
@@ -491,7 +500,7 @@ impl Database {
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
                 let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                    expected_col.rust_type,
+                    effective_rust_type,
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
@@ -615,12 +624,13 @@ impl Database {
             let row = self
                 .client
                 .query_one(&sql_with_returning, &param_refs)
+                .trace()
                 .await?;
             let id: i64 = row.get(0);
             let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&sql, &param_refs).await?;
+            self.client.execute(&sql, &param_refs).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
@@ -680,7 +690,7 @@ impl Database {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
+        self.client.execute(&sql, &param_refs).trace().await?;
         Ok(())
     }
 
@@ -734,7 +744,7 @@ impl Database {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
+        self.client.execute(&sql, &param_refs).trace().await?;
         Ok(())
     }
 
@@ -786,7 +796,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
-        self.client.execute("BEGIN", &[]).await?;
+        self.client.execute("BEGIN", &[]).trace().await?;
         Ok(Transaction {
             client: &self.client,
             committed: false,
@@ -805,7 +815,7 @@ impl Database {
     /// 执行原生 SQL 查询并返回模型列表
     /// 执行原生 SQL 查询并返回模型列表
     pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let rows = self.client.query(sql, &[]).await?;
+        let rows = self.client.query(sql, &[]).trace().await?;
 
         let mut results = Vec::new();
 
@@ -832,7 +842,7 @@ impl Database {
 
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let result = self.client.execute(sql, &[]).await?;
+        let result = self.client.execute(sql, &[]).trace().await?;
         Ok(result)
     }
 
@@ -903,13 +913,14 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             let row = self
                 .client
                 .query_one(&sql_with_returning, &param_refs)
+                .trace()
                 .await?;
             let id: i64 = row.get(0);
             let result =
                 convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&sql, &param_refs).await?;
+            self.client.execute(&sql, &param_refs).trace().await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }
     }
@@ -976,7 +987,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
+        self.client.execute(&sql, &param_refs).trace().await?;
         Ok(())
     }
 }
@@ -1034,7 +1045,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
+        self.client.execute(&sql, &param_refs).trace().await?;
         Ok(())
     }
 }
@@ -1047,7 +1058,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client.execute("COMMIT", &[]).await?;
+        self.client.execute("COMMIT", &[]).trace().await?;
         self.committed = true;
         Ok(())
     }
@@ -1059,7 +1070,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client.execute("ROLLBACK", &[]).await?;
+        self.client.execute("ROLLBACK", &[]).trace().await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -1185,12 +1196,13 @@ impl<'a> Transaction<'a> {
             let row = self
                 .client
                 .query_one(&sql_with_returning, &param_refs)
+                .trace()
                 .await?;
             let id: i64 = row.get(0);
             let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&sql, &param_refs).await?;
+            self.client.execute(&sql, &param_refs).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
@@ -1250,7 +1262,7 @@ impl<'a> Transaction<'a> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&sql, &param_refs).await?;
+        self.client.execute(&sql, &param_refs).trace().await?;
 
         Ok(())
     }
@@ -1347,14 +1359,15 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            let param_rust_types = self.select.param_rust_types();
             let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-            let pg_params = values_to_params(&params)?;
+            let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
             let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
                 .iter()
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
-            let rows = self.client.query(&sql, &param_refs).await?;
+            let rows = self.client.query(&sql, &param_refs).trace().await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -1709,7 +1722,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                 .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
                 .collect();
 
-            let row = self.client.query_one(&sql, &params_ref).await?;
+            let row = self.client.query_one(&sql, &params_ref).trace().await?;
 
             // 获取第一列的值
             use tokio_postgres::types::Type;
@@ -1718,27 +1731,32 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
             // 根据类型获取值
             let ormer_value = match *column_type {
                 Type::INT2 => {
-                    let val: Option<i16> = row.try_get(0)?;
+                    let val: Option<i16> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT4 => {
-                    let val: Option<i32> = row.try_get(0)?;
+                    let val: Option<i32> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(|v| crate::model::Value::Integer(v as i64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::INT8 => {
-                    let val: Option<i64> = row.try_get(0)?;
+                    let val: Option<i64> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(crate::model::Value::Integer)
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT4 => {
-                    let val: Option<f32> = row.try_get(0)?;
+                    let val: Option<f32> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(|v| crate::model::Value::Real(v as f64))
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT8 => {
-                    let val: Option<f64> = row.try_get(0)?;
+                    let val: Option<f64> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(crate::model::Value::Real)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1753,7 +1771,8 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     }
                 }
                 Type::TEXT | Type::VARCHAR => {
-                    let val: Option<String> = row.try_get(0)?;
+                    let val: Option<String> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(crate::model::Value::Text)
                         .unwrap_or(crate::model::Value::Null)
                 }
@@ -1795,15 +1814,16 @@ impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
-        let pg_params = values_to_params(&params)?;
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &param_refs).await?;
+        let rows = self.client.query(&sql, &param_refs).trace().await?;
 
         let mut results = Vec::new();
 
@@ -1871,6 +1891,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                 None => crate::model::Value::Null,
                             }
                         }
+                        Type::BYTEA => {
+                            let v: Option<Vec<u8>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Bytes(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
                         Type::TIMESTAMP => {
                             let v: Option<chrono::NaiveDateTime> = row.get(i);
                             match v {
@@ -1920,6 +1947,16 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     match v {
                                         Some(true) => crate::model::Value::Integer(1),
                                         Some(false) => crate::model::Value::Integer(0),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "Vec<u8>"
+                                | "std::vec::Vec<u8>"
+                                | "alloc::vec::Vec<u8>"
+                                | "&[u8]" => {
+                                    let v: Option<Vec<u8>> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Bytes(val),
                                         None => crate::model::Value::Null,
                                     }
                                 }
@@ -1989,6 +2026,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                 crate::model::Value::Integer(0)
                             }
                         }
+                        Type::BYTEA => {
+                            let v: Vec<u8> = row.get(i);
+                            crate::model::Value::Bytes(v)
+                        }
                         Type::TIMESTAMP => {
                             let v: chrono::NaiveDateTime = row.get(i);
                             let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
@@ -2020,6 +2061,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                                     } else {
                                         crate::model::Value::Integer(0)
                                     }
+                                }
+                                "Vec<u8>"
+                                | "std::vec::Vec<u8>"
+                                | "alloc::vec::Vec<u8>"
+                                | "&[u8]" => {
+                                    let v: Vec<u8> = row.get(i);
+                                    crate::model::Value::Bytes(v)
                                 }
                                 "NaiveDateTime" | "chrono::NaiveDateTime" => {
                                     let v: chrono::NaiveDateTime = row.get(i);
@@ -2086,7 +2134,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let result = self.client.execute(&sql, &param_refs).await?;
+        let result = self.client.execute(&sql, &param_refs).trace().await?;
 
         Ok(result)
     }
@@ -2174,7 +2222,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let result = self.client.execute(&sql, &param_refs).await?;
+        let result = self.client.execute(&sql, &param_refs).trace().await?;
 
         Ok(result)
     }
@@ -2312,6 +2360,14 @@ fn values_to_params_with_types(
                         let null_val: Option<f64> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
+                    "bool" => {
+                        let null_val: Option<bool> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let null_val: Option<Vec<u8>> = None;
+                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
                     "DateTime" | "chrono::DateTime" => {
                         let null_val: Option<chrono::DateTime<chrono::Utc>> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
@@ -2332,6 +2388,17 @@ fn values_to_params_with_types(
     }
 
     Ok(params)
+}
+
+fn values_to_params_for_query(
+    values: &[crate::model::Value],
+    rust_types: &[&str],
+) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
+    if values.len() == rust_types.len() {
+        values_to_params_with_types(values, rust_types)
+    } else {
+        values_to_params(values)
+    }
 }
 
 /// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）
@@ -2415,8 +2482,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器  
     pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params(&params)?;
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -2429,7 +2497,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         };
 
         // 使用 query_raw 获取 RowStream
-        let row_stream = client.query_raw(&sql, param_refs).await?;
+        let row_stream = client.query_raw(&sql, param_refs).trace().await?;
 
         Ok(SelectStreamIterator {
             conn: self.conn,
@@ -2630,7 +2698,9 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                 let ormer_row = crate::model::Row::new(data);
                 Some(T::from_row(&ormer_row))
             }
-            Some(Err(e)) => Some(Err(anyhow::anyhow!(e).context("Database operation failed"))),
+            Some(Err(e)) => Some(Err(anyhow::anyhow!(
+                "tokio_postgres::RowStream::next failed: {e}"
+            ))),
             None => None,
         }
     }
@@ -2665,7 +2735,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     }
 
     pub async fn collect<C: FromIterator<T>>(self) -> anyhow::Result<C> {
-        let results = self.collect_inner().await?;
+        let results = self.collect_inner().trace().await?;
         Ok(results.into_iter().collect())
     }
 
@@ -2677,7 +2747,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &param_refs).await?;
+        let rows = self.client.query(&sql, &param_refs).trace().await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2823,7 +2893,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &param_refs).await?;
+        let rows = self.client.query(&sql, &param_refs).trace().await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2970,7 +3040,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &param_refs).await?;
+        let rows = self.client.query(&sql, &param_refs).trace().await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -3188,7 +3258,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &pg_params_refs).await?;
+        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3389,7 +3459,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &pg_params_refs).await?;
+        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3580,7 +3650,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
             .collect();
 
-        let rows = self.client.query(&sql, &pg_params_refs).await?;
+        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3909,7 +3979,12 @@ impl<
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
 
-            let rows = self.executor.client.query(&sql, &param_refs).await?;
+            let rows = self
+                .executor
+                .client
+                .query(&sql, &param_refs)
+                .trace()
+                .await?;
 
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();

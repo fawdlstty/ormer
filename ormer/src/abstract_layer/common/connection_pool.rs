@@ -1,5 +1,6 @@
-﻿use super::super::DbType;
+use super::super::DbType;
 use crate::model::Model;
+use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -192,13 +193,15 @@ impl ManualPool {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
                 let db = sqlite_backend::Database::connect(self.db_type, &self.connection_string)
+                    .trace()
                     .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
             #[cfg(feature = "mssql")]
             DbType::MSSQL => {
-                let db =
-                    mssql_backend::Database::connect(self.db_type, &self.connection_string).await?;
+                let db = mssql_backend::Database::connect(self.db_type, &self.connection_string)
+                    .trace()
+                    .await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
             #[allow(unreachable_patterns)]
@@ -225,7 +228,7 @@ impl ManualPool {
         let current_total = self.total_connections.load(Ordering::SeqCst);
         if current_total < self.config.max_size {
             // 可以增加连接数
-            let conn = self.create_connection().await?;
+            let conn = self.create_connection().trace().await?;
             self.total_connections.fetch_add(1, Ordering::SeqCst);
             return Ok(conn);
         }
@@ -335,18 +338,22 @@ impl PoolBuilder {
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
                 let manager =
-                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls)?;
+                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls)
+                        .trace_for(
+                            "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
+                        )?;
                 let mut builder = bb8::Pool::builder();
                 builder = builder.max_size(self.config.max_size as u32);
                 if self.config.min_size > 0 {
                     builder = builder.min_idle(Some(self.config.min_size as u32));
                 }
-                let pool = builder.build(manager).await?;
+                let pool = builder.build(manager).trace().await?;
                 Ok(ConnectionPool::PostgreSQL(pool))
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
-                let opts = mysql_async::Opts::from_url(&self.connection_string)?;
+                let opts = mysql_async::Opts::from_url(&self.connection_string)
+                    .trace_for("mysql_async::Opts::from_url")?;
                 let pool = mysql_async::Pool::new(opts);
                 Ok(ConnectionPool::MySQL(pool))
             }
@@ -385,8 +392,8 @@ impl ConnectionPool {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
                 // 获取信号量 permit
-                let _permit = pool.semaphore.acquire().await?;
-                let conn = pool.get().await?;
+                let _permit = pool.semaphore.acquire().trace().await?;
+                let conn = pool.get().trace().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
                     connection: Some(conn),
@@ -395,7 +402,7 @@ impl ConnectionPool {
             }
             #[cfg(feature = "postgresql")]
             ConnectionPool::PostgreSQL(pool) => {
-                let pooled = pool.get().await?;
+                let pooled = pool.get().trace().await?;
                 let db = postgresql_backend::Database::from_pooled_connection(pooled);
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::PostgreSQL,
@@ -414,8 +421,8 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(pool) => {
-                let _permit = pool.semaphore.acquire().await?;
-                let conn = pool.get().await?;
+                let _permit = pool.semaphore.acquire().trace().await?;
+                let conn = pool.get().trace().await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MSSQL(pool.clone()),
                     connection: Some(conn),
@@ -652,22 +659,22 @@ impl<'a> PooledConnection<'a> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                let txn = db.begin().await?;
+                let txn = db.begin().trace().await?;
                 Ok(super::unified::Transaction::Sqlite(txn))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
-                let txn = db.begin().await?;
+                let txn = db.begin().trace().await?;
                 Ok(super::unified::Transaction::PostgreSQL(txn))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => {
-                let txn = db.begin().await?;
+                let txn = db.begin().trace().await?;
                 Ok(super::unified::Transaction::MySQL(txn))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
-                let txn = db.begin().await?;
+                let txn = db.begin().trace().await?;
                 Ok(super::unified::Transaction::MSSQL(txn))
             }
         }

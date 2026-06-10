@@ -38,6 +38,103 @@ impl From<std::ops::RangeFrom<usize>> for RangeBounds {
     }
 }
 
+fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Vec<&'static str> {
+    let mut rust_types = Vec::new();
+    for filter in filters {
+        collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+    }
+    rust_types
+}
+
+fn collect_filter_param_rust_types<T: Model>(
+    filter: &FilterExpr,
+    rust_types: &mut Vec<&'static str>,
+) {
+    match filter {
+        FilterExpr::Comparison { column, value, .. } => {
+            rust_types.push(
+                model_column_rust_type::<T>(column)
+                    .unwrap_or_else(|| infer_filter_value_rust_type(value)),
+            );
+        }
+        FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
+            let rust_type = model_column_rust_type::<T>(column);
+            for value in values {
+                rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(value)));
+            }
+        }
+        FilterExpr::InSubquery {
+            subquery_params, ..
+        }
+        | FilterExpr::NotInSubquery {
+            subquery_params, ..
+        } => {
+            rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
+        }
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            collect_filter_param_rust_types::<T>(left, rust_types);
+            collect_filter_param_rust_types::<T>(right, rust_types);
+        }
+        FilterExpr::Between { column, min, max } => {
+            let rust_type = model_column_rust_type::<T>(column);
+            rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(min)));
+            rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(max)));
+        }
+        FilterExpr::ColumnComparison { .. }
+        | FilterExpr::IsNull { .. }
+        | FilterExpr::IsNotNull { .. } => {}
+    }
+}
+
+fn model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
+    let column = normalize_filter_column_name(column);
+    T::COLUMN_SCHEMA
+        .iter()
+        .find(|schema| schema.name == column)
+        .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
+}
+
+fn normalize_filter_column_name(column: &str) -> &str {
+    let column = column.rsplit('.').next().unwrap_or(column);
+    if let Some(open_idx) = column.find('(')
+        && let Some(close_idx) = column.rfind(')')
+        && close_idx > open_idx + 1
+    {
+        return &column[open_idx + 1..close_idx];
+    }
+    column
+}
+
+fn infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'static str {
+    match value {
+        crate::query::filter::Value::Integer(_) => "i32",
+        crate::query::filter::Value::BigInt(_) => "i64",
+        crate::query::filter::Value::Text(_) => "String",
+        crate::query::filter::Value::Real(_) => "f64",
+        crate::query::filter::Value::Boolean(_) => "bool",
+        crate::query::filter::Value::Bytes(_) => "Vec<u8>",
+        crate::query::filter::Value::DateTime(_) => "NaiveDateTime",
+        crate::query::filter::Value::Json(_) => "String",
+        crate::query::filter::Value::Uuid(_) => "String",
+        crate::query::filter::Value::Null => "i32",
+    }
+}
+
+fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
+    match value {
+        crate::model::Value::Integer(_) => "i32",
+        crate::model::Value::BigInt(_) => "i64",
+        crate::model::Value::Text(_) => "String",
+        crate::model::Value::Real(_) => "f64",
+        crate::model::Value::Boolean(_) => "bool",
+        crate::model::Value::Bytes(_) => "Vec<u8>",
+        crate::model::Value::DateTime(_) => "NaiveDateTime",
+        crate::model::Value::Json(_) => "String",
+        crate::model::Value::Uuid(_) => "String",
+        crate::model::Value::Null => "i32",
+    }
+}
+
 /// Select 查询结构体
 ///
 /// 使用方式:`Select::<User>`().filter(|p| p.age > 12).to_sql()
@@ -204,6 +301,10 @@ impl<T: Model, V> MappedSelect<T, V> {
     /// 获取列名列表
     pub fn column_names(&self) -> &[String] {
         &self.column_names
+    }
+
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_model_filter_param_rust_types::<T>(&self.filters)
     }
 
     /// 设置别名列表（用于映射到目标Model）
@@ -939,6 +1040,10 @@ impl<T: Model> Select<T> {
 
         // 返回参数
         (sql, params)
+    }
+
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_model_filter_param_rust_types::<T>(&self.filters)
     }
 }
 
@@ -2176,7 +2281,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
 
     /// BETWEEN 范围查询
     ///
-    /// ```ignore
+    /// ```text
     /// .filter(|p| p.age.between(18, 30))
     /// ```
     pub fn between(self, min: T, max: T) -> WhereExpr {
@@ -2204,7 +2309,7 @@ impl<T: ColumnValueType> TypedColumn<T> {
 impl TypedColumn<String> {
     /// LIKE 模糊查询 - 直接使用 SQL LIKE 模式
     ///
-    /// ```ignore
+    /// ```text
     /// .filter(|p| p.name.like("%alice%"))
     /// ```
     pub fn like(self, pattern: &str) -> WhereExpr {
@@ -2220,7 +2325,7 @@ impl TypedColumn<String> {
 
     /// 包含子串 - 等价于 LIKE '%pattern%'
     ///
-    /// ```ignore
+    /// ```text
     /// .filter(|p| p.name.contains("alice"))
     /// ```
     pub fn contains(self, pattern: &str) -> WhereExpr {
@@ -2229,7 +2334,7 @@ impl TypedColumn<String> {
 
     /// 前缀匹配 - 等价于 LIKE 'pattern%'
     ///
-    /// ```ignore
+    /// ```text
     /// .filter(|p| p.name.starts_with("al"))
     /// ```
     pub fn starts_with(self, pattern: &str) -> WhereExpr {
@@ -2238,7 +2343,7 @@ impl TypedColumn<String> {
 
     /// 后缀匹配 - 等价于 LIKE '%pattern'
     ///
-    /// ```ignore
+    /// ```text
     /// .filter(|p| p.name.ends_with("ce"))
     /// ```
     pub fn ends_with(self, pattern: &str) -> WhereExpr {

@@ -282,7 +282,7 @@ impl Database {
 
     /// 根据主键查找单条记录
     /// 支持单主键和复合主键
-    /// ```
+    /// ```text
     /// // 单主键
     /// let user: Option<User> = db.find_by_id::<User>(1).await?;
     /// // 复合主键

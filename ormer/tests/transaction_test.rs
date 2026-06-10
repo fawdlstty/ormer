@@ -39,9 +39,7 @@ async fn test_transaction_commit_impl(
         email: "alice@example.com".to_string(),
     };
 
-    txn.insert(&user1)
-    .execute()
-    .await?;
+    txn.insert(&user1).execute().await?;
 
     // 提交事务
     txn.commit().await?;
@@ -87,9 +85,7 @@ async fn test_transaction_rollback_impl(
         name: "Initial".to_string(),
         email: "initial@example.com".to_string(),
     };
-    db.insert(&initial_user)
-    .execute()
-    .await?;
+    db.insert(&initial_user).execute().await?;
 
     // 开始事务
     let mut txn = db.begin().await?;
@@ -101,9 +97,7 @@ async fn test_transaction_rollback_impl(
         email: "rollback@example.com".to_string(),
     };
 
-    txn.insert(&user1)
-    .execute()
-    .await?;
+    txn.insert(&user1).execute().await?;
 
     // 回滚事务
     txn.rollback().await?;
@@ -153,9 +147,7 @@ async fn test_transaction_with_query_impl(
         email: "query@example.com".to_string(),
     };
 
-    txn.insert(&user)
-    .execute()
-    .await?;
+    txn.insert(&user).execute().await?;
 
     // 在事务中查询（应该能看到未提交的数据）
     let users: Vec<TestUser> = txn.select::<TestUser>().collect::<Vec<TestUser>>().await?;
@@ -206,9 +198,7 @@ async fn test_transaction_with_update_impl(
         name: "Original".to_string(),
         email: "original@example.com".to_string(),
     };
-    db.insert(&user)
-    .execute()
-    .await?;
+    db.insert(&user).execute().await?;
 
     // 开始事务
     let txn = db.begin().await?;

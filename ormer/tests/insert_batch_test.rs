@@ -68,9 +68,7 @@ async fn test_insert_single_and_batch_impl(
             age: 28,
         },
     ];
-    db.insert(&users_array)
-    .execute()
-    .await?;
+    db.insert(&users_array).execute().await?;
     println!("插入数组切片成功");
 
     // 查询验证
