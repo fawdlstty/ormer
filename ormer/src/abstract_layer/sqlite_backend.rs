@@ -6,7 +6,7 @@ use crate::query::builder::{
     MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
-use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -201,7 +201,12 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
         let all_params = values_to_params(&all_values)?;
 
         let sql_with_returning = format!("{} RETURNING *", sql);
-        let mut rows = self.db.conn.query(&sql_with_returning, all_params).trace().await?;
+        let mut rows = self
+            .db
+            .conn
+            .query(&sql_with_returning, all_params)
+            .trace()
+            .await?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {

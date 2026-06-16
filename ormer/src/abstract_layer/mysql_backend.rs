@@ -6,7 +6,7 @@ use crate::query::builder::{
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
-use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use chrono::{Datelike, Timelike};
 use mysql_async::Pool;
 use mysql_async::prelude::*;

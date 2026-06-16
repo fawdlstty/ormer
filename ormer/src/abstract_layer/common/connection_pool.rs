@@ -1,6 +1,6 @@
 use super::super::DbType;
 use crate::model::Model;
-use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::sync::Arc;

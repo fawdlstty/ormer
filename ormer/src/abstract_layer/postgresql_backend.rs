@@ -6,7 +6,7 @@ use crate::query::builder::{
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
-use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio_postgres::NoTls;
@@ -190,45 +190,13 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         // 分离 CREATE TABLE 和 CREATE INDEX 语句
         let sql_parts: Vec<&str> = create_sql.split(';').collect();
 
-        // 使用 batch_execute 原子化执行 DROP + CREATE TABLE（处理并行测试间竞态条件）
-        // tokio_postgres 的 batch_execute 在单一网络往返中执行多条语句，
-        // PostgreSQL 按连接串行处理，因此其他连接的并行 DDL 操作无法插入到 DROP 和 CREATE 之间
+        // 执行 CREATE TABLE IF NOT EXISTS（幂等操作，不会删除已有数据）
         let first_part = sql_parts[0].trim();
         if !first_part.is_empty() {
-            let atomic_sql = format!(
-                "DROP TABLE IF EXISTS {} CASCADE; {};",
-                table_name, first_part
-            );
-            // 重试最多 3 次，处理并发 DDL 操作的竞态条件
-            let mut last_error = None;
-            for attempt in 0..3 {
-                let result = self.client.batch_execute(&atomic_sql).await;
-                match result {
-                    Ok(_) => {
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        // 显式清理残留类型后重试
-                        let _ = self
-                            .client
-                            .execute(&format!("DROP TYPE IF EXISTS {} CASCADE", table_name), &[])
-                            .await;
-                        if attempt >= 2 {
-                            break;
-                        }
-                        // 短暂等待后重试
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            if let Some(e) = last_error {
-                return Err(e.into());
-            }
+            self.client.execute(first_part, &[]).trace().await?;
         }
 
-        // 执行剩余的 CREATE INDEX 语句
+        // 执行剩余的 CREATE INDEX 语句（使用 IF NOT EXISTS，幂等）
         for sql_part in sql_parts.iter().skip(1) {
             let sql_part = sql_part.trim();
             if sql_part.is_empty() {
@@ -406,6 +374,12 @@ impl Database {
                 eprintln!("[ormer] {err}");
             }
         });
+
+        // 将服务端消息级别设为 WARNING，过滤掉 NOTICE/INFO/LOG/DEBUG（如 "关系已存在, 跳过"）
+        client
+            .execute("SET client_min_messages TO WARNING;", &[])
+            .trace()
+            .await?;
 
         Ok(Self { client })
     }
@@ -2902,6 +2876,36 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                         None => crate::model::Value::Null,
                                     }
                                 }
+                                "Vec<u8>"
+                                | "std::vec::Vec<u8>"
+                                | "alloc::vec::Vec<u8>"
+                                | "&[u8]" => {
+                                    let v: Option<Vec<u8>> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::Bytes(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                                    let v: Option<chrono::NaiveDateTime> = row.get(i);
+                                    match v {
+                                        Some(val) => {
+                                            let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                                val,
+                                                chrono::Utc,
+                                            );
+                                            crate::model::Value::DateTime(utc)
+                                        }
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
+                                "DateTime" | "chrono::DateTime" => {
+                                    let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                                    match v {
+                                        Some(val) => crate::model::Value::DateTime(val),
+                                        None => crate::model::Value::Null,
+                                    }
+                                }
                                 _ => {
                                     return Some(Err(anyhow::anyhow!(format!(
                                         "Unsupported nullable column type: {rust_type}"
@@ -2968,6 +2972,48 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                                     None => {
                                         return Some(Err(anyhow::anyhow!(format!(
                                             "Failed to parse non-nullable column '{}' (expected bool type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
+                            }
+                            "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                                let v: Option<Vec<u8>> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::Bytes(val),
+                                    None => {
+                                        return Some(Err(anyhow::anyhow!(format!(
+                                            "Failed to parse non-nullable column '{}' (expected Vec<u8> type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
+                            }
+                            "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                                let v: Option<chrono::NaiveDateTime> = row.get(i);
+                                match v {
+                                    Some(val) => {
+                                        let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                            val,
+                                            chrono::Utc,
+                                        );
+                                        crate::model::Value::DateTime(utc)
+                                    }
+                                    None => {
+                                        return Some(Err(anyhow::anyhow!(format!(
+                                            "Failed to parse non-nullable column '{}' (expected NaiveDateTime type)",
+                                            col_name
+                                        ))));
+                                    }
+                                }
+                            }
+                            "DateTime" | "chrono::DateTime" => {
+                                let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                                match v {
+                                    Some(val) => crate::model::Value::DateTime(val),
+                                    None => {
+                                        return Some(Err(anyhow::anyhow!(format!(
+                                            "Failed to parse non-nullable column '{}' (expected DateTime type)",
                                             col_name
                                         ))));
                                     }
@@ -3076,6 +3122,33 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                                 None => crate::model::Value::Null,
                             }
                         }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Option<Vec<u8>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Bytes(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: Option<chrono::NaiveDateTime> = row.get(i);
+                            match v {
+                                Some(val) => {
+                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                        val,
+                                        chrono::Utc,
+                                    );
+                                    crate::model::Value::DateTime(utc)
+                                }
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::DateTime(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
@@ -3103,6 +3176,19 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                             } else {
                                 crate::model::Value::Integer(0)
                             }
+                        }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Vec<u8> = row.get(i);
+                            crate::model::Value::Bytes(v)
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: chrono::NaiveDateTime = row.get(i);
+                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                            crate::model::Value::DateTime(utc)
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                            crate::model::Value::DateTime(v)
                         }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
@@ -3222,6 +3308,33 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                                 None => crate::model::Value::Null,
                             }
                         }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Option<Vec<u8>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Bytes(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: Option<chrono::NaiveDateTime> = row.get(i);
+                            match v {
+                                Some(val) => {
+                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                        val,
+                                        chrono::Utc,
+                                    );
+                                    crate::model::Value::DateTime(utc)
+                                }
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::DateTime(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
@@ -3249,6 +3362,19 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                             } else {
                                 crate::model::Value::Integer(0)
                             }
+                        }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Vec<u8> = row.get(i);
+                            crate::model::Value::Bytes(v)
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: chrono::NaiveDateTime = row.get(i);
+                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                            crate::model::Value::DateTime(utc)
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                            crate::model::Value::DateTime(v)
                         }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
@@ -3369,6 +3495,33 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                                 None => crate::model::Value::Null,
                             }
                         }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Option<Vec<u8>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::Bytes(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: Option<chrono::NaiveDateTime> = row.get(i);
+                            match v {
+                                Some(val) => {
+                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
+                                        val,
+                                        chrono::Utc,
+                                    );
+                                    crate::model::Value::DateTime(utc)
+                                }
+                                None => crate::model::Value::Null,
+                            }
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
+                            match v {
+                                Some(val) => crate::model::Value::DateTime(val),
+                                None => crate::model::Value::Null,
+                            }
+                        }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
                                 "Unsupported nullable column type: {rust_type}"
@@ -3396,6 +3549,19 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                             } else {
                                 crate::model::Value::Integer(0)
                             }
+                        }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let v: Vec<u8> = row.get(i);
+                            crate::model::Value::Bytes(v)
+                        }
+                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                            let v: chrono::NaiveDateTime = row.get(i);
+                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                            crate::model::Value::DateTime(utc)
+                        }
+                        "DateTime" | "chrono::DateTime" => {
+                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                            crate::model::Value::DateTime(v)
                         }
                         _ => {
                             return Err(anyhow::anyhow!(format!(
@@ -3572,6 +3738,37 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                         let v: Option<f64> = row.try_get(i).ok().flatten();
                         crate::model::Value::Real(v.unwrap_or(0.0))
                     }
+                    "bool" => {
+                        let v: Option<bool> = row.try_get(i).ok().flatten();
+                        match v {
+                            Some(true) => crate::model::Value::Integer(1),
+                            Some(false) => crate::model::Value::Integer(0),
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Option<Vec<u8>> = row.try_get(i).ok().flatten();
+                        crate::model::Value::Bytes(v.unwrap_or_default())
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: Option<chrono::NaiveDateTime> = row.try_get(i).ok().flatten();
+                        match v {
+                            Some(val) => {
+                                let utc =
+                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
+                                crate::model::Value::DateTime(utc)
+                            }
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: Option<chrono::DateTime<chrono::Utc>> =
+                            row.try_get(i).ok().flatten();
+                        match v {
+                            Some(val) => crate::model::Value::DateTime(val),
+                            None => crate::model::Value::Null,
+                        }
+                    }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
@@ -3616,6 +3813,49 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                             j_is_null = false;
                         }
                         crate::model::Value::Real(v.unwrap_or(0.0))
+                    }
+                    "bool" => {
+                        let v: Option<bool> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        match v {
+                            Some(true) => crate::model::Value::Integer(1),
+                            Some(false) => crate::model::Value::Integer(0),
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Option<Vec<u8>> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        crate::model::Value::Bytes(v.unwrap_or_default())
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: Option<chrono::NaiveDateTime> = row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        match v {
+                            Some(val) => {
+                                let utc =
+                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
+                                crate::model::Value::DateTime(utc)
+                            }
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: Option<chrono::DateTime<chrono::Utc>> =
+                            row.try_get(idx).ok().flatten();
+                        if v.is_some() {
+                            j_is_null = false;
+                        }
+                        match v {
+                            Some(val) => crate::model::Value::DateTime(val),
+                            None => crate::model::Value::Null,
+                        }
                     }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
@@ -3773,6 +4013,27 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                         let v: f64 = row.get(i);
                         crate::model::Value::Real(v)
                     }
+                    "bool" => {
+                        let v: bool = row.get(i);
+                        if v {
+                            crate::model::Value::Integer(1)
+                        } else {
+                            crate::model::Value::Integer(0)
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Vec<u8> = row.get(i);
+                        crate::model::Value::Bytes(v)
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: chrono::NaiveDateTime = row.get(i);
+                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                        crate::model::Value::DateTime(utc)
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: chrono::DateTime<chrono::Utc> = row.get(i);
+                        crate::model::Value::DateTime(v)
+                    }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
@@ -3803,6 +4064,27 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                     "f32" | "f64" => {
                         let v: f64 = row.get(idx);
                         crate::model::Value::Real(v)
+                    }
+                    "bool" => {
+                        let v: bool = row.get(idx);
+                        if v {
+                            crate::model::Value::Integer(1)
+                        } else {
+                            crate::model::Value::Integer(0)
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Vec<u8> = row.get(idx);
+                        crate::model::Value::Bytes(v)
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: chrono::NaiveDateTime = row.get(idx);
+                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                        crate::model::Value::DateTime(utc)
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: chrono::DateTime<chrono::Utc> = row.get(idx);
+                        crate::model::Value::DateTime(v)
                     }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
@@ -3977,6 +4259,49 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                         }
                         crate::model::Value::Real(v.unwrap_or(0.0))
                     }
+                    "bool" => {
+                        let v: Option<bool> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        match v {
+                            Some(true) => crate::model::Value::Integer(1),
+                            Some(false) => crate::model::Value::Integer(0),
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Option<Vec<u8>> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        crate::model::Value::Bytes(v.unwrap_or_default())
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: Option<chrono::NaiveDateTime> = row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        match v {
+                            Some(val) => {
+                                let utc =
+                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
+                                crate::model::Value::DateTime(utc)
+                            }
+                            None => crate::model::Value::Null,
+                        }
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: Option<chrono::DateTime<chrono::Utc>> =
+                            row.try_get(i).ok().flatten();
+                        if v.is_some() {
+                            t_is_null = false;
+                        }
+                        match v {
+                            Some(val) => crate::model::Value::DateTime(val),
+                            None => crate::model::Value::Null,
+                        }
+                    }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
                             "Unsupported column type: {rust_type}"
@@ -4012,6 +4337,27 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                     "f32" | "f64" => {
                         let v: f64 = row.get(idx);
                         crate::model::Value::Real(v)
+                    }
+                    "bool" => {
+                        let v: bool = row.get(idx);
+                        if v {
+                            crate::model::Value::Integer(1)
+                        } else {
+                            crate::model::Value::Integer(0)
+                        }
+                    }
+                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                        let v: Vec<u8> = row.get(idx);
+                        crate::model::Value::Bytes(v)
+                    }
+                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        let v: chrono::NaiveDateTime = row.get(idx);
+                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
+                        crate::model::Value::DateTime(utc)
+                    }
+                    "DateTime" | "chrono::DateTime" => {
+                        let v: chrono::DateTime<chrono::Utc> = row.get(idx);
+                        crate::model::Value::DateTime(v)
                     }
                     _ => {
                         return Err(anyhow::anyhow!(format!(
