@@ -22,8 +22,22 @@ async fn test_pool_basic_impl(
                 .build()
                 .await?
         }
-        #[allow(unreachable_patterns)]
-        _ => {
+        #[cfg(feature = "postgresql")]
+        ormer::DbType::PostgreSQL => {
+            Database::create_pool(config.0, config.1)
+                .range(0..3) // 其他数据库: max=3
+                .build()
+                .await?
+        }
+        #[cfg(feature = "mysql")]
+        ormer::DbType::MySQL => {
+            Database::create_pool(config.0, config.1)
+                .range(0..3) // 其他数据库: max=3
+                .build()
+                .await?
+        }
+        #[cfg(feature = "mssql")]
+        ormer::DbType::MSSQL => {
             Database::create_pool(config.0, config.1)
                 .range(0..3) // 其他数据库: max=3
                 .build()

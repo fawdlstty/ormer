@@ -304,13 +304,6 @@ impl FilterFormatter {
             DbType::MySQL => format!("{} {} ?", full_col_name, operator),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => format!("{} {} @P", full_col_name, operator),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            _ => panic!("No database backend available"),
         }
     }
 
@@ -325,13 +318,6 @@ impl FilterFormatter {
             DbType::MySQL => "?".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "@P".to_string(),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            _ => panic!("No database backend available"),
         }
     }
 
@@ -346,13 +332,6 @@ impl FilterFormatter {
             DbType::MySQL => "?".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "@P".to_string(),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            _ => panic!("No database backend available"),
         }
     }
 
@@ -361,6 +340,7 @@ impl FilterFormatter {
         match value {
             FilterValue::Integer(v) => Value::Integer(*v),
             FilterValue::BigInt(v) => Value::BigInt(*v),
+            FilterValue::Duration(v) => Value::Duration(*v),
             FilterValue::Text(v) => Value::Text(v.clone()),
             FilterValue::Real(v) => Value::Real(*v),
             FilterValue::Boolean(v) => Value::Boolean(*v),

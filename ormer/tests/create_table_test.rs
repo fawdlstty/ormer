@@ -27,10 +27,7 @@ mod create_table_tests {
         let sql = generate_create_table_sql::<TestUser>(config.0)?;
 
         // 根据不同的数据库类型进行不同的断言
-        #[allow(unreachable_patterns)]
         match config.0 {
-            #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
-            ormer::DbType::None => panic!("No database backend available"),
             #[cfg(feature = "sqlite")]
             ormer::DbType::Sqlite => {
                 assert!(sql.contains("id INTEGER PRIMARY KEY"));
@@ -54,8 +51,8 @@ mod create_table_tests {
                 assert!(sql.contains("age INT NOT NULL"));
                 assert!(sql.contains("email VARCHAR(255)")); // Option 类型，不加 NOT NULL
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
 
         let db_type_name = match config.0 {
@@ -65,8 +62,8 @@ mod create_table_tests {
             ormer::DbType::PostgreSQL => "PostgreSQL",
             #[cfg(feature = "mysql")]
             ormer::DbType::MySQL => "MySQL",
-            #[allow(unreachable_patterns)]
-            _ => "Unknown",
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => "MSSQL",
         };
         println!("{} SQL: {}", db_type_name, sql);
         Ok(())
@@ -111,8 +108,8 @@ mod create_table_tests {
                 assert!(sql.contains("email VARCHAR(255)"));
                 println!("MySQL SQL: {}", sql);
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
         Ok(())
     }
@@ -156,8 +153,8 @@ mod create_table_tests {
                 assert!(sql.contains("email VARCHAR(255)"));
                 println!("MySQL SQL: {}", sql);
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
         Ok(())
     }
@@ -258,8 +255,8 @@ mod create_table_tests {
                 assert!(sql.contains("optional_bool TINYINT(1)"));
                 println!("MySQL Complete Types SQL: {}", sql);
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
         Ok(())
     }
@@ -307,8 +304,8 @@ mod create_table_tests {
                 assert!(sql.contains("optional_bool TINYINT(1)"));
                 println!("MySQL Complete Types SQL: {}", sql);
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
         Ok(())
     }
@@ -349,8 +346,8 @@ mod create_table_tests {
                 assert!(sql.contains("bool_val TINYINT(1) NOT NULL"));
                 assert!(sql.contains("optional_bool TINYINT(1)"));
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => {}
         }
 
         let db_type_name = match config.0 {
@@ -360,8 +357,8 @@ mod create_table_tests {
             ormer::DbType::PostgreSQL => "PostgreSQL",
             #[cfg(feature = "mysql")]
             ormer::DbType::MySQL => "MySQL",
-            #[allow(unreachable_patterns)]
-            _ => "Unknown",
+            #[cfg(feature = "mssql")]
+            ormer::DbType::MSSQL => "MSSQL",
         };
         println!("{} Complete Types SQL: {}", db_type_name, sql);
         Ok(())

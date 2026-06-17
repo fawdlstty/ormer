@@ -32,8 +32,10 @@ async fn test_data_type_override_impl(
         ormer::DbType::MySQL => {
             assert!(sql.contains("big_count BIGINT NOT NULL"));
         }
-        #[allow(unreachable_patterns)]
-        _ => {}
+        #[cfg(feature = "mssql")]
+        ormer::DbType::MSSQL => {
+            assert!(sql.contains("big_count BIGINT NOT NULL"));
+        }
     }
 
     Ok(())

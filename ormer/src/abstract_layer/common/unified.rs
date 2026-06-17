@@ -1,6 +1,7 @@
 ﻿/// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
+use super::SqlStatement;
 use crate::model::Model;
 use crate::query::builder::WhereExpr;
 
@@ -42,6 +43,19 @@ pub enum CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            CreateTableExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            CreateTableExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            CreateTableExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            CreateTableExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -69,6 +83,19 @@ pub enum DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            DropTableExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            DropTableExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            DropTableExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            DropTableExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -96,6 +123,19 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(
         self,
     ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
@@ -138,6 +178,19 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertOrUpdateExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -165,6 +218,19 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertOrIgnoreExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -328,6 +394,7 @@ impl Database {
             let filter_val = match val {
                 crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
+                crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
                 crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
@@ -1124,6 +1191,19 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(
         self,
     ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
@@ -1153,6 +1233,19 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            TransactionInsertOrUpdateExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1163,6 +1256,46 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await,
+        }
+    }
+}
+
+/// 事务中的插入或忽略执行器
+pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
+    #[cfg(feature = "sqlite")]
+    Sqlite(sqlite_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+}
+
+impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            TransactionInsertOrIgnoreExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            TransactionInsertOrIgnoreExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mssql")]
+            TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await,
         }
     }
 }
@@ -1226,6 +1359,7 @@ impl<'a> Transaction<'a> {
             let filter_val = match val {
                 crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
+                crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
                 crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
@@ -1376,6 +1510,32 @@ impl<'a> Transaction<'a> {
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
+
+    /// 插入或忽略记录 - 返回执行器
+    pub fn insert_or_ignore<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn) => {
+                TransactionInsertOrIgnoreExecutor::Sqlite(txn.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => {
+                TransactionInsertOrIgnoreExecutor::PostgreSQL(txn.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(txn) => {
+                TransactionInsertOrIgnoreExecutor::MySQL(txn.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "mssql")]
+            Transaction::MSSQL(txn) => {
+                TransactionInsertOrIgnoreExecutor::MSSQL(txn.insert_or_ignore::<I>(models))
+            }
+            Transaction::_Phantom(_) => unreachable!(),
+        }
+    }
 }
 
 crate::impl_unified_join_executor!(LeftJoinedSelectExecutor);
@@ -1518,13 +1678,6 @@ pub enum MappedSelectExecutor<'a, T: Model, V> {
     MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::MappedSelectExecutor<'a, T, V>),
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
 /// 统一的 GroupedSelectExecutor 枚举
@@ -1537,13 +1690,6 @@ pub enum GroupedSelectExecutor<'a, T: Model, V> {
     MySQL(mysql_backend::GroupedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    NotImplemented(std::marker::PhantomData<&'a (T, V)>),
 }
 
 impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
@@ -1565,13 +1711,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.group_by(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.group_by(f)),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
 
@@ -1592,13 +1731,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.having(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.having(f)),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
 
@@ -1619,13 +1751,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.filter(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.filter(f)),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            GroupedSelectExecutor::NotImplemented(_) => self,
         }
     }
 
@@ -1649,15 +1774,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedCollectFuture::MySQL(exec.collect::<C>()),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            GroupedSelectExecutor::NotImplemented(_) => {
-                unimplemented!("GroupedSelectExecutor::collect is not implemented for this backend")
-            }
         }
     }
 
@@ -1688,15 +1804,6 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MSSQL(exec) => {
                 MappedSelectExecutor::MSSQL(exec.clone_with_pool())
             }
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            MappedSelectExecutor::NotImplemented(phantom) => {
-                MappedSelectExecutor::NotImplemented(*phantom)
-            }
         }
     }
 }
@@ -1711,13 +1818,6 @@ pub enum MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator
     MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::MappedCollectFuture<'a, T, V, C>),
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
 /// 统一的 GroupedCollectFuture 枚举
@@ -1730,13 +1830,6 @@ pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     MySQL(mysql_backend::GroupedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    NotImplemented(std::marker::PhantomData<&'a (T, V, C)>),
 }
 
 impl<
@@ -1760,15 +1853,6 @@ impl<
             GroupedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
             GroupedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            GroupedCollectFuture::NotImplemented(_) => Box::pin(std::future::ready(Err(
-                anyhow::anyhow!("No database backend available"),
-            ))),
         }
     }
 }
@@ -1795,13 +1879,6 @@ pub enum ModelCollectWithFuture<'a, T: Model + 'static, V: 'static, C, M, F> {
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    NotImplemented(std::marker::PhantomData<&'a (T, V, C, M, F)>),
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -1824,8 +1901,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => MappedSelectExecutor::MySQL(exec.map_to(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => MappedSelectExecutor::MSSQL(exec.map_to(f)),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("MappedSelectExecutor not implemented for this backend"),
         }
     }
 
@@ -1847,8 +1922,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.select_column(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.select_column(f)),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("GroupedSelectExecutor not implemented for this backend"),
         }
     }
 }
@@ -1874,15 +1947,6 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             #[cfg(feature = "mssql")]
             MappedSelectExecutor::MSSQL(exec) => {
                 MappedCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
-            }
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            MappedSelectExecutor::NotImplemented(_) => {
-                unimplemented!("MappedSelectExecutor::collect is not implemented for this backend")
             }
         }
     }
@@ -1925,17 +1989,6 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 let future = exec_clone.collect::<Vec<V>>();
                 ModelCollectWithFuture::MSSQLCollect(future, f, std::marker::PhantomData)
             }
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            MappedSelectExecutor::NotImplemented(_) => {
-                unimplemented!(
-                    "MappedSelectExecutor::collect_with is not implemented for this backend"
-                )
-            }
         }
     }
 }
@@ -1952,17 +2005,6 @@ impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a
             MappedSelectExecutor::MySQL(exec) => exec.to_subquery_sql(),
             #[cfg(feature = "mssql")]
             MappedSelectExecutor::MSSQL(exec) => exec.to_subquery_sql(),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            MappedSelectExecutor::NotImplemented(_) => {
-                unimplemented!(
-                    "MappedSelectExecutor::to_subquery_sql is not implemented for this backend"
-                )
-            }
         }
     }
 }
@@ -2028,15 +2070,6 @@ impl<
             MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
             MappedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            MappedCollectFuture::NotImplemented(_) => {
-                unimplemented!("MappedCollectFuture is not implemented for this backend")
-            }
         }
     }
 }
@@ -2072,15 +2105,6 @@ where
                 let vec = future.await?;
                 Ok(vec.into_iter().map(mapper).collect())
             }),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            ModelCollectWithFuture::NotImplemented(_) => {
-                unimplemented!("ModelCollectWithFuture is not implemented for this backend")
-            }
         }
     }
 }
@@ -2109,8 +2133,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => SelectStream::MySQL(exec.stream()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => SelectStream::MSSQL(exec.stream()),
-            #[allow(unreachable_patterns)]
-            _ => unreachable!("SelectStream not implemented for this backend"),
         }
     }
 }
@@ -2151,13 +2173,6 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 let iter = stream.into_iter().await?;
                 Ok(SelectStreamIterator::MSSQL(iter))
             }
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            _ => unimplemented!("SelectStream is not implemented for this backend"),
         }
     }
 }
@@ -2174,13 +2189,6 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             SelectStreamIterator::MySQL(iter) => iter.next().await,
             #[cfg(feature = "mssql")]
             SelectStreamIterator::MSSQL(iter) => iter.next().await,
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            _ => unimplemented!("SelectStreamIterator is not implemented for this backend"),
         }
     }
 }

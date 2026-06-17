@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -16,12 +16,15 @@ exclude = ["src/main.rs"]
 [lib]
 name = "ormer"
 path = "src/lib.rs"
+doctest = false
 
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1"
+byteorder = "1.5"
+bytes = "1"
 futures = "0.3"
-ormer-derive = { version = "0.1.17", path = "../ormer-derive" }
+ormer-derive = { version = "0.1.19", path = "../ormer-derive" }
 paste = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }

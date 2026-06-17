@@ -100,16 +100,14 @@ macro_rules! test_on_all_dbs {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
-                        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
-                        ormer::DbType::None => "Unknown",
                         #[cfg(feature = "sqlite")]
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
                         #[cfg(feature = "mysql")]
                         ormer::DbType::MySQL => "MySQL",
-                        #[allow(unreachable_patterns)]
-                        _ => "Unknown",
+                        #[cfg(feature = "mssql")]
+                        ormer::DbType::MSSQL => "MSSQL",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);
@@ -132,16 +130,14 @@ macro_rules! test_on_all_dbs_result {
 
                 for (idx, config) in configs.iter().enumerate() {
                     let db_type_name = match config.0 {
-                        #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql")))]
-                        ormer::DbType::None => "Unknown",
                         #[cfg(feature = "sqlite")]
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
                         #[cfg(feature = "mysql")]
                         ormer::DbType::MySQL => "MySQL",
-                        #[allow(unreachable_patterns)]
-                        _ => "Unknown",
+                        #[cfg(feature = "mssql")]
+                        ormer::DbType::MSSQL => "MSSQL",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);

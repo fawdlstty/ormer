@@ -151,8 +151,6 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -172,8 +170,6 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -193,8 +189,6 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_desc(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -210,8 +204,6 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -226,8 +218,6 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.distinct()),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.distinct()),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("SelectExecutor not implemented for this backend"),
                 }
             }
         }
@@ -254,8 +244,19 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
+                }
+            }
+
+            pub fn to_sql(&self) -> anyhow::Result<$crate::SqlStatement> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.to_sql(),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.to_sql(),
                 }
             }
 
@@ -269,8 +270,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
             }
 
@@ -284,8 +283,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.returning().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.returning().await,
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("DeleteExecutor not implemented for this backend"),
                 }
             }
         }
@@ -322,8 +319,6 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
 
@@ -345,8 +340,6 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(field_fn, value)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(field_fn, value)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
 
@@ -384,11 +377,22 @@ macro_rules! impl_unified_update_executor {
                         $executor_name::MSSQL(exec) => {
                             result = $executor_name::MSSQL(exec.set_model(model_ref));
                         }
-                        #[allow(unreachable_patterns)]
-                        _ => unreachable!("UpdateExecutor not implemented for this backend"),
                     }
                 }
                 result
+            }
+
+            pub fn to_sql(&self) -> anyhow::Result<$crate::SqlStatement> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, _) => exec.to_sql(),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.to_sql(),
+                }
             }
 
             pub async fn execute(self) -> anyhow::Result<u64> {
@@ -401,8 +405,6 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
 
@@ -416,8 +418,6 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.returning().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.returning().await,
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("UpdateExecutor not implemented for this backend"),
                 }
             }
         }
@@ -458,8 +458,6 @@ macro_rules! impl_unified_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("CollectFuture not implemented for this backend"),
                 }
             }
         }
@@ -490,8 +488,6 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::MySQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(async move { future.await }),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("AggregateFuture not implemented for this backend"),
                 }
             }
         }
@@ -518,8 +514,6 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
             }
 
@@ -537,8 +531,6 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("JoinExecutor not implemented for this backend"),
                 }
             }
         }
@@ -569,8 +561,6 @@ macro_rules! impl_unified_join_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("JoinCollectFuture not implemented for this backend"),
                 }
             }
         }
@@ -597,8 +587,6 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -616,8 +604,6 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -639,8 +625,6 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => RelatedCollectFuture::MSSQL(exec.exec()),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("RelatedSelectExecutor not implemented for this backend"),
                 }
             }
 
@@ -689,8 +673,6 @@ macro_rules! impl_unified_related_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
-                    #[allow(unreachable_patterns)]
-                    _ => unreachable!("RelatedCollectFuture not implemented for this backend"),
                 }
             }
         }

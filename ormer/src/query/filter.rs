@@ -60,6 +60,7 @@ pub enum FilterExpr {
 pub enum Value {
     Integer(i64),
     BigInt(i128),
+    Duration(std::time::Duration),
     Text(String),
     Real(f64),
     Boolean(bool),

@@ -1,35 +1,10 @@
-﻿use crate::model::{Model, Row, Value};
-use std::collections::HashMap;
-
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
-use super::super::DbType;
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
+﻿use super::super::DbType;
+use crate::model::{Model, Row, Value};
 use crate::query::filter::FilterExpr;
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
 pub fn format_filter(
     filter: &FilterExpr,
     sql: &mut String,
@@ -58,16 +33,6 @@ pub fn format_filter(
                 #[cfg(feature = "mssql")]
                 DbType::MSSQL => {
                     write!(sql, "{column} {operator} @P")?;
-                }
-                // 无数据库后端时返回错误
-                #[cfg(not(any(
-                    feature = "sqlite",
-                    feature = "postgresql",
-                    feature = "mysql",
-                    feature = "mssql"
-                )))]
-                DbType::None => {
-                    return Err(anyhow::anyhow!("No database backend available"));
                 }
             }
             *param_idx += 1;
@@ -103,16 +68,6 @@ pub fn format_filter(
                     DbType::MSSQL => {
                         sql.push_str("@P");
                     }
-                    // 无数据库后端时返回错误
-                    #[cfg(not(any(
-                        feature = "sqlite",
-                        feature = "postgresql",
-                        feature = "mysql",
-                        feature = "mssql"
-                    )))]
-                    _ => {
-                        return Err(anyhow::anyhow!("No database backend available"));
-                    }
                 }
                 *param_idx += 1;
             }
@@ -141,16 +96,6 @@ pub fn format_filter(
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => {
                         sql.push_str("@P");
-                    }
-                    // 无数据库后端时返回错误
-                    #[cfg(not(any(
-                        feature = "sqlite",
-                        feature = "postgresql",
-                        feature = "mysql",
-                        feature = "mssql"
-                    )))]
-                    _ => {
-                        return Err(anyhow::anyhow!("No database backend available"));
                     }
                 }
                 *param_idx += 1;
@@ -223,15 +168,6 @@ pub fn format_filter(
                 DbType::MSSQL => {
                     write!(sql, "{column} BETWEEN @P AND @P")?;
                 }
-                #[cfg(not(any(
-                    feature = "sqlite",
-                    feature = "postgresql",
-                    feature = "mysql",
-                    feature = "mssql"
-                )))]
-                DbType::None => {
-                    return Err(anyhow::anyhow!("No database backend available"));
-                }
             }
             *param_idx += 2;
         }
@@ -260,12 +196,6 @@ pub fn format_filter(
 }
 
 /// 通用过滤器格式化函数并收集参数（用于 UPDATE/SELECT）
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
 pub fn format_filter_with_params(
     filter: &FilterExpr,
     sql: &mut String,
@@ -295,16 +225,6 @@ pub fn format_filter_with_params(
                 #[cfg(feature = "mssql")]
                 DbType::MSSQL => {
                     write!(sql, "{column} {operator} @P")?;
-                }
-                // 无数据库后端时返回错误
-                #[cfg(not(any(
-                    feature = "sqlite",
-                    feature = "postgresql",
-                    feature = "mysql",
-                    feature = "mssql"
-                )))]
-                DbType::None => {
-                    return Err(anyhow::anyhow!("No database backend available"));
                 }
             }
             params.push(value.clone().into());
@@ -341,16 +261,6 @@ pub fn format_filter_with_params(
                     DbType::MSSQL => {
                         sql.push_str("@P");
                     }
-                    // 无数据库后端时返回错误
-                    #[cfg(not(any(
-                        feature = "sqlite",
-                        feature = "postgresql",
-                        feature = "mysql",
-                        feature = "mssql"
-                    )))]
-                    DbType::None => {
-                        return Err(anyhow::anyhow!("No database backend available"));
-                    }
                 }
                 params.push(value.clone().into());
                 *param_idx += 1;
@@ -380,16 +290,6 @@ pub fn format_filter_with_params(
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => {
                         sql.push_str("@P");
-                    }
-                    // 无数据库后端时返回错误
-                    #[cfg(not(any(
-                        feature = "sqlite",
-                        feature = "postgresql",
-                        feature = "mysql",
-                        feature = "mssql"
-                    )))]
-                    DbType::None => {
-                        return Err(anyhow::anyhow!("No database backend available"));
                     }
                 }
                 params.push(value.clone().into());
@@ -456,15 +356,6 @@ pub fn format_filter_with_params(
                 #[cfg(feature = "mssql")]
                 DbType::MSSQL => {
                     write!(sql, "{column} BETWEEN @P AND @P")?;
-                }
-                #[cfg(not(any(
-                    feature = "sqlite",
-                    feature = "postgresql",
-                    feature = "mysql",
-                    feature = "mssql"
-                )))]
-                DbType::None => {
-                    return Err(anyhow::anyhow!("No database backend available"));
                 }
             }
             params.push(min.clone().into());
@@ -558,6 +449,9 @@ pub fn convert_column_value(
                 Ok(Value::Boolean(v == 1))
             }
             "Vec<u8>" | "&[u8]" => Ok(Value::Bytes(get_bytes().unwrap_or_default())),
+            "Duration" | "std::time::Duration" => Ok(Value::Duration(
+                std::time::Duration::from_micros(get_int().unwrap_or(0).max(0) as u64),
+            )),
             "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
                 Ok(Value::DateTime(get_datetime().unwrap_or_else(|| {
                     chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
@@ -573,6 +467,7 @@ pub fn value_to_filter_value(val: &Value) -> crate::query::filter::Value {
     match val {
         Value::Integer(v) => crate::query::filter::Value::Integer(*v),
         Value::BigInt(v) => crate::query::filter::Value::BigInt(*v),
+        Value::Duration(v) => crate::query::filter::Value::Duration(*v),
         Value::Text(v) => crate::query::filter::Value::Text(v.clone()),
         Value::Real(v) => crate::query::filter::Value::Real(*v),
         Value::Boolean(v) => crate::query::filter::Value::Boolean(*v),

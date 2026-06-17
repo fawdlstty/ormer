@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+#[cfg(feature = "sqlite")]
 use std::sync::Arc;
 
 /// 统一的流式查询连接持有者
@@ -51,10 +53,26 @@ pub enum StreamConnection<'a> {
     #[cfg(feature = "mssql")]
     MSSQL(&'a tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>),
 
-    /// 空变体，用于未启用任何 feature 时保持枚举有效
     #[doc(hidden)]
-    #[allow(dead_code)]
-    __Phantom(std::marker::PhantomData<&'a ()>),
+    __Lifetime(PhantomData<&'a ()>),
+}
+
+impl<'a> StreamConnection<'a> {
+    #[cfg(feature = "sqlite")]
+    pub fn expect_sqlite(&self) -> &Arc<turso::Connection> {
+        match self {
+            StreamConnection::Sqlite(conn) => conn,
+            _ => unreachable!("Expected Sqlite connection"),
+        }
+    }
+
+    #[cfg(feature = "postgresql")]
+    pub fn expect_postgresql(&self) -> &&'a tokio_postgres::Client {
+        match self {
+            StreamConnection::PostgreSQL(client) => client,
+            _ => unreachable!("Expected PostgreSQL connection"),
+        }
+    }
 }
 
 impl<'a> Drop for StreamConnection<'a> {
@@ -85,8 +103,7 @@ impl<'a> Drop for StreamConnection<'a> {
                 // 不需要显式操作
             }
 
-            // 处理 Phantom 变体
-            StreamConnection::__Phantom(_) => {}
+            StreamConnection::__Lifetime(_) => {}
         }
     }
 }

@@ -1,11 +1,5 @@
 /// 数据库抽象层模块
 /// 根据运行时指定的数据库类型选择对应的数据库后端
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
 use crate::model::DbBackendTypeMapper;
 
 #[cfg(feature = "sqlite")]
@@ -38,14 +32,6 @@ pub enum DbType {
     /// MSSQL 数据库
     #[cfg(feature = "mssql")]
     MSSQL,
-    /// 空变体，当没有启用任何特性时使用（仅用于编译通过）
-    #[cfg(not(any(
-        feature = "sqlite",
-        feature = "postgresql",
-        feature = "mysql",
-        feature = "mssql"
-    )))]
-    None,
 }
 
 impl DbType {
@@ -93,41 +79,19 @@ impl DbType {
                 _is_nullable,
                 _enum_variants,
             ),
-            #[cfg(not(any(
-                feature = "sqlite",
-                feature = "postgresql",
-                feature = "mysql",
-                feature = "mssql"
-            )))]
-            DbType::None => {
-                // 当没有启用任何特性时，返回空字符串（仅用于编译通过）
-                String::new()
-            }
         }
     }
 }
 
-// 统一使用 common 模块提供接口，当启用任一数据库 feature 时可用
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
 pub use common::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
     DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, InsertExecutor,
     InsertOrUpdateExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
     MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
-    SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
+    SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
+    SqlStatement,
+    Transaction, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
     TransactionInsertOrUpdateExecutor, UpdateExecutor,
 };
 
-// 连接池类型 - 根据启用的 feature 导出
-#[cfg(any(
-    feature = "sqlite",
-    feature = "postgresql",
-    feature = "mysql",
-    feature = "mssql"
-))]
 pub use common::{ConnectionPool, PooledConnection};

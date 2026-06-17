@@ -11,7 +11,12 @@ enum UserStatus {
 // 注意: 枚举类型需要实现 ColumnValueType 才能用于 filter
 // 这需要额外的实现,暂时跳过 filter 测试
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 #[derive(Debug, Model, PartialEq)]
 #[table = "test_enum_users_1"]
 struct TestEnumUser {
@@ -21,7 +26,12 @@ struct TestEnumUser {
     name: String,
 }
 
-#[cfg(feature = "sqlite")]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
 #[derive(Debug, Model, PartialEq)]
 #[table = "test_enum_users_optional_1"]
 struct TestEnumUserOptional {
@@ -140,4 +150,53 @@ fn test_enum_variants() {
     assert_eq!(UserStatus::Banned.name(), "Banned");
 
     println!("✓ Enum variants test passed!");
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+#[test]
+fn test_enum_column_schema_metadata() {
+    let status_col = TestEnumUser::COLUMN_SCHEMA
+        .iter()
+        .find(|col| col.name == "status")
+        .unwrap();
+    assert_eq!(status_col.rust_type, "UserStatus");
+    assert_eq!(status_col.enum_variants, Some(UserStatus::VARIANTS));
+
+    let optional_status_col = TestEnumUserOptional::COLUMN_SCHEMA
+        .iter()
+        .find(|col| col.name == "status")
+        .unwrap();
+    assert_eq!(optional_status_col.rust_type, "UserStatus");
+    assert_eq!(optional_status_col.enum_variants, Some(UserStatus::VARIANTS));
+}
+
+#[cfg(feature = "postgresql")]
+#[test]
+fn test_postgresql_enum_create_sql() {
+    let sql = ormer::generate_create_table_sql::<TestEnumUser>(ormer::DbType::PostgreSQL)
+        .unwrap();
+    assert!(sql.contains("status user_status NOT NULL"));
+    assert!(!sql.contains("status TEXT"));
+
+    let optional_sql =
+        ormer::generate_create_table_sql::<TestEnumUserOptional>(ormer::DbType::PostgreSQL)
+            .unwrap();
+    assert!(optional_sql.contains("status user_status"));
+    assert!(!optional_sql.contains("status TEXT"));
+}
+
+#[cfg(feature = "mysql")]
+#[test]
+fn test_mysql_enum_create_sql() {
+    let sql = ormer::generate_create_table_sql::<TestEnumUser>(ormer::DbType::MySQL).unwrap();
+    assert!(sql.contains("status ENUM('Active', 'Inactive', 'Banned') NOT NULL"));
+
+    let optional_sql =
+        ormer::generate_create_table_sql::<TestEnumUserOptional>(ormer::DbType::MySQL).unwrap();
+    assert!(optional_sql.contains("status ENUM('Active', 'Inactive', 'Banned')"));
 }

@@ -1,4 +1,5 @@
 use crate::abstract_layer::DbType;
+use crate::abstract_layer::common::{SqlExecutor, SqlStatement};
 use crate::model::{DbBackendTypeMapper, Model, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
@@ -88,6 +89,7 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             "u64" => "BIGINT",
             "f32" => "REAL",
             "f64" => "FLOAT",
+            "Duration" | "std::time::Duration" => "BIGINT",
             "String" => "NVARCHAR(255)",
             "bool" => "BIT",
             "Vec<u8>" | "&[u8]" => "VARBINARY(MAX)",
@@ -620,14 +622,34 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         self
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::MSSQL,
             self.table_name.as_deref(),
         )?;
+        Ok(SqlStatement::single(DbType::MSSQL, create_sql, Vec::new()))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        CreateTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         let mut client = self.pool.lock().await;
-        let query = Query::new(&create_sql);
-        query.execute(&mut *client).trace().await?;
+        for statement in sql.statements {
+            Query::new(&statement.sql)
+                .execute(&mut *client)
+                .trace()
+                .await?;
+        }
         Ok(())
     }
 }
@@ -639,11 +661,34 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            DbType::MSSQL,
+            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            Vec::new(),
+        ))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DropTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         let mut client = self.pool.lock().await;
-        let query = Query::new(&sql);
-        query.execute(&mut *client).trace().await?;
+        for statement in sql.statements {
+            Query::new(&statement.sql)
+                .execute(&mut *client)
+                .trace()
+                .await?;
+        }
         Ok(())
     }
 }
@@ -656,9 +701,39 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+        }
+
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+        let sql = if has_auto_increment {
+            let pk_col = I::Model::COLUMN_SCHEMA
+                .iter()
+                .find(|c| c.is_auto_increment)
+                .map(|c| c.name)
+                .unwrap_or("id");
+            format!("{} OUTPUT inserted.{}", sql, pk_col)
+        } else {
+            sql
+        };
+
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
@@ -716,6 +791,38 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     }
 }
 
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let statement = &sql.statements[0];
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param);
+        }
+
+        if has_auto_increment {
+            let stream = query.query(&mut *client).trace().await?;
+            let row = stream.into_row().trace().await?;
+            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
+            return convert_auto_increment_key::<Self::Output>(id);
+        }
+
+        query.execute(&mut *client).trace().await?;
+        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+    }
+}
+
 /// 插入或更新执行器
 pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
@@ -724,9 +831,64 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_or_update_batch::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+        }
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let pks = I::Model::primary_key_columns();
+
+        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(&format!(") AS source ({columns}) ON "));
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(&format!("target.{} = source.{}", pk, pk));
+        }
+
+        sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+        let mut first = true;
+        for col_name in I::Model::COLUMNS.iter() {
+            if pks.contains(col_name) {
+                continue;
+            }
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{} = source.{}", col_name, col_name));
+            first = false;
+        }
+
+        sql.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        ));
+        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("source.{}", col_name));
+        }
+        sql.push_str(");");
+
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
@@ -791,6 +953,28 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        let statement = &sql.statements[0];
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param);
+        }
+        let result = query.execute(&mut *client).trace().await?;
+        Ok(result.total() as u64)
+    }
+}
+
 /// 插入或忽略执行器
 pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
@@ -799,9 +983,51 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_or_ignore_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+        }
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let pks = I::Model::primary_key_columns();
+
+        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(&format!(") AS source ({columns}) ON "));
+        for (i, pk) in pks.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(&format!("target.{} = source.{}", pk, pk));
+        }
+
+        sql.push_str(&format!(
+            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        ));
+        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("source.{}", col_name));
+        }
+        sql.push_str(");");
+
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
@@ -848,6 +1074,28 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
         for param in &all_values {
+            bind_value(&mut query, param);
+        }
+        let result = query.execute(&mut *client).trace().await?;
+        Ok(result.total() as u64)
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        let statement = &sql.statements[0];
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
             bind_value(&mut query, param);
         }
         let result = query.execute(&mut *client).trace().await?;
@@ -1031,10 +1279,10 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -1048,22 +1296,46 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
                 I::Model,
             >(&refs);
-
-        let mut client = self.pool.lock().await;
-
-        if has_auto_increment {
-            // 获取自增主键列名
+        let sql = if has_auto_increment {
             let pk_col = I::Model::COLUMN_SCHEMA
                 .iter()
                 .find(|c| c.is_auto_increment)
                 .map(|c| c.name)
                 .unwrap_or("id");
-            // 使用 OUTPUT 子句获取插入的ID
-            let sql_with_output = format!("{} OUTPUT inserted.{}", sql, pk_col);
-            let mut query = Query::new(&sql_with_output);
-            for param in &all_values {
-                bind_value(&mut query, param);
-            }
+            format!("{} OUTPUT inserted.{}", sql, pk_col)
+        } else {
+            sql
+        };
+
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertExecutor<'a, I> {
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+        }
+
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let statement = &sql.statements[0];
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param);
+        }
+
+        if has_auto_increment {
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
@@ -1071,10 +1343,6 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
                 convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            let mut query = Query::new(&sql);
-            for param in &all_values {
-                bind_value(&mut query, param);
-            }
             query.execute(&mut *client).trace().await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }
@@ -1089,10 +1357,10 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(());
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
@@ -1145,9 +1413,29 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         }
         sql.push_str(");");
 
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrUpdateExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
             bind_value(&mut query, param);
         }
         query.execute(&mut *client).trace().await?;
@@ -1163,10 +1451,10 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(());
+            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
@@ -1195,7 +1483,6 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
             sql.push_str(&format!("target.{} = source.{}", pk, pk));
         }
 
-        // 只插入不匹配的记录，不更新已存在的记录
         sql.push_str(&format!(
             " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
         ));
@@ -1207,9 +1494,29 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
         }
         sql.push_str(");");
 
+        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrIgnoreExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
             bind_value(&mut query, param);
         }
         query.execute(&mut *client).trace().await?;
@@ -1605,15 +1912,13 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let (sql, params) = self.build_sql_with_params();
-        let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        Ok(SqlStatement::single(DbType::MSSQL, sql, params))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
@@ -1642,6 +1947,28 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         }
 
         (sql, params)
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        let statement = &sql.statements[0];
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param);
+        }
+        let result = query.execute(&mut *client).trace().await?;
+        Ok(result.total() as u64)
     }
 }
 
@@ -1696,19 +2023,19 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
-        let mut client = self.pool.lock().await;
-        let mut total: u64 = 0;
-        for (sql, params) in &statements {
-            let mut query = Query::new(sql);
-            for param in params {
-                bind_value(&mut query, param);
-            }
-            let result = query.execute(&mut *client).trace().await?;
-            total += result.total() as u64;
-        }
-        Ok(total)
+        Ok(SqlStatement::batch(
+            DbType::MSSQL,
+            statements
+                .into_iter()
+                .map(|(sql, params)| crate::abstract_layer::common::SingleSqlStatement::new(sql, params))
+                .collect(),
+        ))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<u64> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
@@ -1785,6 +2112,28 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         }
 
         Ok(statements)
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        UpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let mut client = self.pool.lock().await;
+        let mut total: u64 = 0;
+        for statement in &sql.statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param);
+            }
+            let result = query.execute(&mut *client).trace().await?;
+            total += result.total() as u64;
+        }
+        Ok(total)
     }
 }
 
@@ -2466,6 +2815,10 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
         Value::Integer(v) => query.bind(*v),
         Value::BigInt(v) => query.bind(*v as i64),
         Value::Real(v) => query.bind(*v),
+        Value::Duration(v) => {
+            let micros = v.as_micros().min(i64::MAX as u128) as i64;
+            query.bind(micros)
+        }
         Value::Text(v) => query.bind(v.as_str()),
         Value::Bytes(v) => query.bind(v.as_slice()),
         Value::DateTime(v) => query.bind(v.naive_utc()),

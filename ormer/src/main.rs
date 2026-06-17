@@ -1,3 +1,4 @@
+#[cfg(feature = "sqlite")]
 #[derive(Debug, ormer::Model)]
 #[table = "users"]
 struct User {
@@ -8,6 +9,7 @@ struct User {
     email: Option<String>,
 }
 
+#[cfg(feature = "sqlite")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 连接数据库并创建表
@@ -33,4 +35,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("users: {users:?}");
 
     Ok(())
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn main() {
+    eprintln!("Enable the `sqlite` feature to run this example binary.");
 }

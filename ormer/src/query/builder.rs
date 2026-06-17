@@ -38,6 +38,7 @@ impl From<std::ops::RangeFrom<usize>> for RangeBounds {
     }
 }
 
+#[cfg(feature = "postgresql")]
 fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Vec<&'static str> {
     let mut rust_types = Vec::new();
     for filter in filters {
@@ -46,6 +47,7 @@ fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Ve
     rust_types
 }
 
+#[cfg(feature = "postgresql")]
 fn collect_filter_param_rust_types<T: Model>(
     filter: &FilterExpr,
     rust_types: &mut Vec<&'static str>,
@@ -94,6 +96,7 @@ fn collect_filter_param_rust_types<T: Model>(
     }
 }
 
+#[cfg(feature = "postgresql")]
 fn model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
     let column = normalize_filter_column_name(column);
     T::COLUMN_SCHEMA
@@ -102,6 +105,7 @@ fn model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
         .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
 }
 
+#[cfg(feature = "postgresql")]
 fn normalize_filter_column_name(column: &str) -> &str {
     let column = column.rsplit('.').next().unwrap_or(column);
     if let Some(open_idx) = column.find('(')
@@ -113,10 +117,12 @@ fn normalize_filter_column_name(column: &str) -> &str {
     column
 }
 
+#[cfg(feature = "postgresql")]
 fn infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'static str {
     match value {
         crate::query::filter::Value::Integer(_) => "i32",
         crate::query::filter::Value::BigInt(_) => "i64",
+        crate::query::filter::Value::Duration(_) => "Duration",
         crate::query::filter::Value::Text(_) => "String",
         crate::query::filter::Value::Real(_) => "f64",
         crate::query::filter::Value::Boolean(_) => "bool",
@@ -128,10 +134,12 @@ fn infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'static
     }
 }
 
+#[cfg(feature = "postgresql")]
 fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
     match value {
         crate::model::Value::Integer(_) => "i32",
         crate::model::Value::BigInt(_) => "i64",
+        crate::model::Value::Duration(_) => "Duration",
         crate::model::Value::Text(_) => "String",
         crate::model::Value::Real(_) => "f64",
         crate::model::Value::Boolean(_) => "bool",
@@ -315,6 +323,7 @@ impl<T: Model, V> MappedSelect<T, V> {
         &self.column_names
     }
 
+    #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         collect_model_filter_param_rust_types::<T>(&self.filters)
     }
@@ -428,13 +437,6 @@ impl<T: Model, V> MappedSelect<T, V> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -669,13 +671,6 @@ impl<T: Model, V> GroupedSelect<T, V> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -1027,13 +1022,6 @@ impl<T: Model> Select<T> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let mut sql = String::new();
         let mut params = Vec::new();
@@ -1078,13 +1066,6 @@ impl<T: Model> Select<T> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -1163,6 +1144,7 @@ impl<T: Model> Select<T> {
         (sql, params)
     }
 
+    #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         collect_model_filter_param_rust_types::<T>(&self.filters)
     }
@@ -1247,13 +1229,6 @@ impl<T: Model> UnionSelect<T> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, _) = self.to_sql_with_params(db_type);
         sql
@@ -2049,6 +2024,16 @@ impl ColumnValueType for chrono::NaiveDateTime {
     }
 }
 
+impl ColumnValueType for std::time::Duration {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        crate::query::filter::Value::Duration(value)
+    }
+
+    fn supports_comparison() -> bool {
+        true
+    }
+}
+
 // ==================== 统一的 IsInValue Trait ====================
 // 使用泛型支持所有类型的 IN 语句
 
@@ -2219,13 +2204,6 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, params) = self.to_sql_with_params(db_type);
         WhereExpr {
@@ -2260,13 +2238,6 @@ impl<T: Model, V: ColumnValueType> IsNotInValues<V> for MappedSelect<T, V> {
             feature = "mssql"
         ))]
         let db_type = DbType::MSSQL;
-        #[cfg(not(any(
-            feature = "sqlite",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        )))]
-        let db_type = DbType::None;
 
         let (sql, params) = self.to_sql_with_params(db_type);
         WhereExpr {

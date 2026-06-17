@@ -1,5 +1,6 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
+use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
@@ -100,6 +101,8 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
             // 浮点类型
             "f32" => "FLOAT",
             "f64" => "DOUBLE",
+            // 时长类型
+            "Duration" | "std::time::Duration" => "BIGINT",
             // 字符串类型
             "String" => "VARCHAR(255)",
             // 布尔类型
@@ -142,17 +145,31 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub async fn execute(self) -> anyhow::Result<()> {
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        // 表不存在，创建新表
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::MySQL,
             self.table_name.as_deref(),
         )?;
+        Ok(SqlStatement::single(DbType::MySQL, create_sql, Vec::new()))
+    }
 
-        conn.query_drop(&create_sql).trace().await?;
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
 
+impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        CreateTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        for statement in sql.statements {
+            conn.query_drop(&statement.sql).trace().await?;
+        }
         Ok(())
     }
 }
@@ -164,12 +181,31 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            DbType::MySQL,
+            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            Vec::new(),
+        ))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DropTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         let mut conn = self.pool.get_conn().trace().await?;
-
-        conn.query_drop(&sql).trace().await?;
-
+        for statement in sql.statements {
+            conn.query_drop(&statement.sql).trace().await?;
+        }
         Ok(())
     }
 }
@@ -182,9 +218,28 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
@@ -227,6 +282,33 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     }
 }
 
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        let mut conn = self.pool.get_conn().trace().await?;
+        conn.exec_drop(&statement.sql, params).trace().await?;
+
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = conn.last_insert_id().unwrap_or(0);
+            return convert_auto_increment_key::<Self::Output>(last_id);
+        }
+
+        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+    }
+}
+
 /// 插入或更新执行器
 pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     pool: &'a Pool,
@@ -235,9 +317,44 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_or_update_batch::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+        }
+
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        sql.push_str(" ON DUPLICATE KEY UPDATE ");
+        let mut first = true;
+        for col_name in I::Model::COLUMNS.iter() {
+            if !first {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            first = false;
+        }
+
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
@@ -285,6 +402,25 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        let mut conn = self.pool.get_conn().trace().await?;
+        conn.exec_drop(&statement.sql, params).trace().await?;
+        Ok(())
+    }
+}
+
 /// 插入或忽略执行器
 pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     pool: &'a Pool,
@@ -293,9 +429,34 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        self.insert_or_ignore_batch::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+        }
+
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+
+            let values = model.field_values();
+            all_values.extend(values);
+        }
+
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
@@ -328,6 +489,25 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
 
         conn.exec_drop(&sql, params).trace().await?;
 
+        Ok(())
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        let mut conn = self.pool.get_conn().trace().await?;
+        conn.exec_drop(&statement.sql, params).trace().await?;
         Ok(())
     }
 }
@@ -841,10 +1021,10 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
@@ -856,18 +1036,39 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
             super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
                 I::Model,
             >(&refs);
-        let params = values_to_params(&all_values)?;
+
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertExecutor<'a, I> {
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&sql, params).trace().await?;
+            conn.exec_drop(&statement.sql, params).trace().await?;
 
-            // 获取自增ID（如果有自增主键）
             let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
             if has_auto_increment {
                 let last_id = conn.last_insert_id().unwrap_or(0);
-                let result = convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
-                    last_id,
-                )?;
+                let result =
+                    convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
+                        last_id,
+                    )?;
                 return Ok(result);
             }
         }
@@ -884,10 +1085,10 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(());
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
@@ -914,10 +1115,30 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             first = false;
         }
 
-        let params = values_to_params(&all_values)?;
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrUpdateExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&sql, params).trace().await?;
+            conn.exec_drop(&statement.sql, params).trace().await?;
         }
 
         Ok(())
@@ -1081,15 +1302,13 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(());
+            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
-
-        // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
         let mut sql = format!(
             "INSERT IGNORE INTO {} ({columns}) VALUES ",
             I::Model::TABLE_NAME
@@ -1108,10 +1327,30 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
             all_values.extend(values);
         }
 
-        let params = values_to_params(&all_values)?;
+        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrIgnoreExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        TransactionInsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
 
         if let Some(conn) = self.conn {
-            conn.exec_drop(&sql, params).trace().await?;
+            conn.exec_drop(&statement.sql, params).trace().await?;
         }
 
         Ok(())
@@ -1222,6 +1461,9 @@ impl<
                     crate::model::Value::Real(r) => mysql_async::Value::Double(r),
                     crate::model::Value::Boolean(b) => {
                         mysql_async::Value::Int(if b { 1 } else { 0 })
+                    }
+                    crate::model::Value::Duration(d) => {
+                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
                     }
                     crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                     crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
@@ -1567,6 +1809,9 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     crate::model::Value::Boolean(b) => {
                         mysql_async::Value::Int(if b { 1 } else { 0 })
                     }
+                    crate::model::Value::Duration(d) => {
+                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
+                    }
                     crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                     crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
                         dt.year() as u16,
@@ -1716,18 +1961,14 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self
     }
 
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let (sql, params) = self.build_sql_with_params();
+        Ok(SqlStatement::single(DbType::MySQL, sql, params))
+    }
+
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> anyhow::Result<u64> {
-        let (sql, params) = self.build_sql_with_params();
-
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        let mysql_params = values_to_params(&params)?;
-
-        // 使用 exec 执行 SQL，然后通过 last_insert_id 和 affected_rows 获取结果
-        conn.exec_drop(&sql, mysql_params).trace().await?;
-
-        Ok(conn.affected_rows())
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
@@ -1756,6 +1997,26 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         }
 
         (sql, params)
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+
+        let statement = &sql.statements[0];
+        let mysql_params = values_to_params(&statement.params)?;
+        let mut conn = self.pool.get_conn().trace().await?;
+        conn.exec_drop(&statement.sql, mysql_params).trace().await?;
+        Ok(conn.affected_rows())
     }
 }
 
@@ -1830,17 +2091,20 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let statements = self.build_all_sql()?;
+        Ok(SqlStatement::batch(
+            DbType::MySQL,
+            statements
+                .into_iter()
+                .map(|(sql, params)| SingleSqlStatement::new(sql, params))
+                .collect(),
+        ))
+    }
+
     /// 执行更新操作
     pub async fn execute(self) -> anyhow::Result<u64> {
-        let statements = self.build_all_sql()?;
-        let mut conn = self.pool.get_conn().trace().await?;
-        let mut total: u64 = 0;
-        for (sql, params) in &statements {
-            let mysql_params = values_to_params(params)?;
-            let result = conn.exec_iter(sql, mysql_params).trace().await?;
-            total += result.affected_rows();
-        }
-        Ok(total)
+        <Self as SqlExecutor>::execute(self).await
     }
 
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
@@ -1918,6 +2182,25 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 }
 
+impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        UpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let mut total: u64 = 0;
+        for statement in &sql.statements {
+            let mysql_params = values_to_params(&statement.params)?;
+            let result = conn.exec_iter(&statement.sql, mysql_params).trace().await?;
+            total += result.affected_rows();
+        }
+        Ok(total)
+    }
+}
+
 impl<'a, T: Model + 'static + Send> std::future::IntoFuture for UpdateExecutor<'a, T> {
     type Output = anyhow::Result<u64>;
     type IntoFuture =
@@ -1938,6 +2221,9 @@ fn values_to_params(values: &[crate::model::Value]) -> anyhow::Result<Vec<mysql_
             crate::model::Value::Text(v) => mysql_async::Value::Bytes(v.as_bytes().to_vec()),
             crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
             crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
+            crate::model::Value::Duration(v) => {
+                mysql_async::Value::Int(v.as_micros().min(i64::MAX as u128) as i64)
+            }
             crate::model::Value::Bytes(v) => mysql_async::Value::Bytes(v.clone()),
             crate::model::Value::DateTime(v) => mysql_async::Value::Date(
                 v.year() as u16,
@@ -2000,6 +2286,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
                 crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
                 crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
+                crate::model::Value::Duration(d) => {
+                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                 crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
                     dt.year() as u16,
@@ -2140,6 +2429,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
                 crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
                 crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
                 crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
+                crate::model::Value::Duration(d) => {
+                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                 crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
                     dt.year() as u16,
@@ -2347,6 +2639,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
                 crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
                 crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
                 crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
+                crate::model::Value::Duration(d) => {
+                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                 crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
                     dt.year() as u16,
@@ -2556,6 +2851,9 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
                 crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
                 crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
                 crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
+                crate::model::Value::Duration(d) => {
+                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                 crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
                     dt.year() as u16,
@@ -3325,6 +3623,9 @@ impl<
                     crate::model::Value::Real(r) => mysql_async::Value::Double(r),
                     crate::model::Value::Boolean(b) => {
                         mysql_async::Value::Int(if b { 1 } else { 0 })
+                    }
+                    crate::model::Value::Duration(d) => {
+                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
                     }
                     crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
                     crate::model::Value::DateTime(dt) => mysql_async::Value::Date(

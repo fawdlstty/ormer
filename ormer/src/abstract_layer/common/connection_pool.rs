@@ -1,11 +1,16 @@
 use super::super::DbType;
+use super::common_helpers;
+use super::{SqlExecutor, SqlStatement};
 use crate::model::Model;
-use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::collections::VecDeque;
 use std::marker::PhantomData;
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::sync::Arc;
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::sync::{Mutex, Semaphore};
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
+use tokio::sync::Mutex;
 
 #[cfg(feature = "postgresql")]
 use bb8_postgres::PostgresConnectionManager;
@@ -29,21 +34,130 @@ pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(db_type_for_connection(self.pooled_conn.get_connection()), Vec::new()));
+        }
+
+        match self.pooled_conn.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(_) => {
+                let columns = I::Model::insert_columns();
+                let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
+                    I::Model::TABLE_NAME,
+                    &columns,
+                    refs.len(),
+                );
+                let all_values =
+                    common_helpers::collect_batch_insert_values_with_auto_increment::<I::Model>(&refs);
+                let has_auto_increment =
+                    I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+                let sql = if has_auto_increment {
+                    format!("{sql} RETURNING rowid")
+                } else {
+                    sql
+                };
+                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+            }
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(_) => {
+                let has_auto_increment =
+                    I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+                let columns = I::Model::insert_columns();
+                let (sql, _) =
+                    common_helpers::build_batch_insert_sql_postgresql_with_columns(
+                        I::Model::TABLE_NAME,
+                        &columns,
+                        refs.len(),
+                    );
+                let all_values =
+                    common_helpers::collect_batch_insert_values_with_auto_increment::<I::Model>(&refs);
+                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
+                    .iter()
+                    .filter(|col| !col.is_auto_increment)
+                    .map(|col| col.data_type.unwrap_or(col.rust_type))
+                    .collect();
+                let sql = if has_auto_increment {
+                    let pk_col = I::Model::COLUMN_SCHEMA
+                        .iter()
+                        .find(|c| c.is_auto_increment)
+                        .map(|c| c.name)
+                        .unwrap_or("id");
+                    format!("{sql} RETURNING {pk_col}")
+                } else {
+                    sql
+                };
+                Ok(SqlStatement::batch(
+                    DbType::PostgreSQL,
+                    vec![super::SingleSqlStatement::new(sql, all_values)
+                        .with_param_rust_types(rust_types)],
+                ))
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(_) => {
+                let columns = I::Model::insert_columns();
+                let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
+                    I::Model::TABLE_NAME,
+                    &columns,
+                    refs.len(),
+                );
+                let all_values =
+                    common_helpers::collect_batch_insert_values_with_auto_increment::<I::Model>(&refs);
+                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(_) => {
+                let has_auto_increment =
+                    I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+                let columns = I::Model::insert_columns();
+                let (sql, _) = common_helpers::build_batch_insert_sql_mssql_with_columns(
+                    I::Model::TABLE_NAME,
+                    &columns,
+                    refs.len(),
+                );
+                let all_values =
+                    common_helpers::collect_batch_insert_values_with_auto_increment::<I::Model>(&refs);
+                let sql = if has_auto_increment {
+                    let pk_col = I::Model::COLUMN_SCHEMA
+                        .iter()
+                        .find(|c| c.is_auto_increment)
+                        .map(|c| c.name)
+                        .unwrap_or("id");
+                    format!("{} OUTPUT inserted.{}", sql, pk_col)
+                } else {
+                    sql
+                };
+                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+            }
+        }
+    }
+
     pub async fn execute(
         self,
     ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
-        // 直接调用 PooledConnection 的 insert_impl 方法
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertExecutor<'a, I> {
+    type Output = <I::Model as crate::model::Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        PooledInsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
         let refs = self.models.as_refs();
-        match &self.pooled_conn.connection {
+        match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
-            Some(ConnectionWrapper::Sqlite(db)) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::Sqlite(db) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "postgresql")]
-            Some(ConnectionWrapper::PostgreSQL(db)) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::PostgreSQL(db) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "mysql")]
-            Some(ConnectionWrapper::MySQL(db)) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::MySQL(db) => db.insert_impl::<I::Model>(&refs).await,
             #[cfg(feature = "mssql")]
-            Some(ConnectionWrapper::MSSQL(db)) => db.insert_impl::<I::Model>(&refs).await,
-            None => Err(anyhow::anyhow!("No connection available")),
+            ConnectionWrapper::MSSQL(db) => db.insert_impl::<I::Model>(&refs).await,
         }
     }
 }
@@ -56,25 +170,202 @@ pub struct PooledInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
-        // 直接调用 PooledConnection 的 insert_or_update_batch 方法
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        match &self.pooled_conn.connection {
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(db_type_for_connection(self.pooled_conn.get_connection()), Vec::new()));
+        }
+
+        match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
-            Some(ConnectionWrapper::Sqlite(db)) => {
-                db.insert_or_update_batch::<I::Model>(&refs).await
+            ConnectionWrapper::Sqlite(_) => {
+                let columns = I::Model::insert_columns();
+                let col_count = columns.len();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let mut sql = format!(
+                    "INSERT INTO {} ({}) VALUES ",
+                    I::Model::TABLE_NAME,
+                    columns.join(", ")
+                );
+                let mut all_values = Vec::new();
+
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "?".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.insert_values());
+                }
+
+                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
+                let mut first = true;
+                for col_name in columns.iter() {
+                    if primary_key_columns.contains(col_name) {
+                        continue;
+                    }
+                    if !first {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("{col_name} = excluded.{col_name}"));
+                    first = false;
+                }
+
+                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
             }
             #[cfg(feature = "postgresql")]
-            Some(ConnectionWrapper::PostgreSQL(db)) => {
-                db.insert_or_update_batch::<I::Model>(&refs).await
+            ConnectionWrapper::PostgreSQL(_) => {
+                let columns = I::Model::insert_columns();
+                let col_count = columns.len();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let mut sql = format!(
+                    "INSERT INTO {} ({}) VALUES ",
+                    I::Model::TABLE_NAME,
+                    columns.join(", ")
+                );
+                let mut all_values = Vec::new();
+                let mut param_idx = 1;
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> = (1..=col_count)
+                        .map(|i| format!("${}", param_idx + i - 1))
+                        .collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    param_idx += col_count;
+                    all_values.extend(model.insert_values());
+                }
+                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
+                let mut first = true;
+                for col_name in columns.iter() {
+                    if primary_key_columns.contains(col_name) {
+                        continue;
+                    }
+                    if !first {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+                    first = false;
+                }
+                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
+                    .iter()
+                    .filter(|col| !col.is_auto_increment)
+                    .map(|col| col.data_type.unwrap_or(col.rust_type))
+                    .collect();
+                Ok(SqlStatement::batch(
+                    DbType::PostgreSQL,
+                    vec![super::SingleSqlStatement::new(sql, all_values)
+                        .with_param_rust_types(rust_types)],
+                ))
             }
             #[cfg(feature = "mysql")]
-            Some(ConnectionWrapper::MySQL(db)) => {
-                db.insert_or_update_batch::<I::Model>(&refs).await
+            ConnectionWrapper::MySQL(_) => {
+                let columns = I::Model::COLUMNS.join(", ");
+                let col_count = I::Model::COLUMNS.len();
+                let mut sql =
+                    format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+                let mut all_values = Vec::new();
+
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "?".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.field_values());
+                }
+
+                sql.push_str(" ON DUPLICATE KEY UPDATE ");
+                let mut first = true;
+                for col_name in I::Model::COLUMNS.iter() {
+                    if !first {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+                    first = false;
+                }
+
+                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
             }
             #[cfg(feature = "mssql")]
-            Some(ConnectionWrapper::MSSQL(db)) => db.insert_or_update_impl::<I::Model>(&refs).await,
-            None => Err(anyhow::anyhow!("No connection available")),
+            ConnectionWrapper::MSSQL(_) => {
+                let columns = I::Model::COLUMNS.join(", ");
+                let col_count = I::Model::COLUMNS.len();
+                let pks = I::Model::primary_key_columns();
+                let mut sql =
+                    format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+                let mut all_values = Vec::new();
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "@P".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.field_values());
+                }
+                sql.push_str(&format!(") AS source ({columns}) ON "));
+                for (i, pk) in pks.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    sql.push_str(&format!("target.{} = source.{}", pk, pk));
+                }
+                sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+                let mut first = true;
+                for col_name in I::Model::COLUMNS.iter() {
+                    if pks.contains(col_name) {
+                        continue;
+                    }
+                    if !first {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("{} = source.{}", col_name, col_name));
+                    first = false;
+                }
+                sql.push_str(&format!(
+                    " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+                ));
+                for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("source.{}", col_name));
+                }
+                sql.push_str(");");
+                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+            }
+        }
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        PooledInsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let refs = self.models.as_refs();
+        match self.pooled_conn.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db.insert_or_update_impl::<I::Model>(&refs).await,
         }
     }
 }
@@ -87,28 +378,173 @@ pub struct PooledInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
-    pub async fn execute(self) -> anyhow::Result<()> {
-        // 直接调用 PooledConnection 的 insert_or_ignore_batch 方法
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        match &self.pooled_conn.connection {
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(db_type_for_connection(self.pooled_conn.get_connection()), Vec::new()));
+        }
+
+        match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
-            Some(ConnectionWrapper::Sqlite(db)) => {
-                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            ConnectionWrapper::Sqlite(_) => {
+                let columns = I::Model::insert_columns();
+                let col_count = columns.len();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let mut sql = format!(
+                    "INSERT INTO {} ({}) VALUES ",
+                    I::Model::TABLE_NAME,
+                    columns.join(", ")
+                );
+                let mut all_values = Vec::new();
+
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "?".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.insert_values());
+                }
+
+                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
             }
             #[cfg(feature = "postgresql")]
-            Some(ConnectionWrapper::PostgreSQL(db)) => {
-                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            ConnectionWrapper::PostgreSQL(_) => {
+                let columns = I::Model::insert_columns();
+                let col_count = columns.len();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let mut sql = format!(
+                    "INSERT INTO {} ({}) VALUES ",
+                    I::Model::TABLE_NAME,
+                    columns.join(", ")
+                );
+                let mut all_values = Vec::new();
+                let mut param_idx = 1;
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> = (1..=col_count)
+                        .map(|i| format!("${}", param_idx + i - 1))
+                        .collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    param_idx += col_count;
+                    all_values.extend(model.insert_values());
+                }
+                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
+                    .iter()
+                    .filter(|col| !col.is_auto_increment)
+                    .map(|col| col.data_type.unwrap_or(col.rust_type))
+                    .collect();
+                Ok(SqlStatement::batch(
+                    DbType::PostgreSQL,
+                    vec![super::SingleSqlStatement::new(sql, all_values)
+                        .with_param_rust_types(rust_types)],
+                ))
             }
             #[cfg(feature = "mysql")]
-            Some(ConnectionWrapper::MySQL(db)) => {
-                db.insert_or_ignore_batch::<I::Model>(&refs).await
+            ConnectionWrapper::MySQL(_) => {
+                let columns = I::Model::COLUMNS.join(", ");
+                let col_count = I::Model::COLUMNS.len();
+                let mut sql =
+                    format!("INSERT IGNORE INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+                let mut all_values = Vec::new();
+
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "?".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.field_values());
+                }
+
+                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
             }
             #[cfg(feature = "mssql")]
-            Some(ConnectionWrapper::MSSQL(db)) => db
+            ConnectionWrapper::MSSQL(_) => {
+                let columns = I::Model::COLUMNS.join(", ");
+                let col_count = I::Model::COLUMNS.len();
+                let pks = I::Model::primary_key_columns();
+                let mut sql =
+                    format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+                let mut all_values = Vec::new();
+                for (idx, model) in refs.iter().enumerate() {
+                    if idx > 0 {
+                        sql.push_str(", ");
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=col_count).map(|_| "@P".to_string()).collect();
+                    sql.push_str(&format!("({})", placeholders.join(", ")));
+                    all_values.extend(model.field_values());
+                }
+                sql.push_str(&format!(") AS source ({columns}) ON "));
+                for (i, pk) in pks.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(" AND ");
+                    }
+                    sql.push_str(&format!("target.{} = source.{}", pk, pk));
+                }
+                sql.push_str(&format!(
+                    " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+                ));
+                for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("source.{}", col_name));
+                }
+                sql.push_str(");");
+                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+            }
+        }
+    }
+
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
+    match connection {
+        #[cfg(feature = "sqlite")]
+        ConnectionWrapper::Sqlite(_) => DbType::Sqlite,
+        #[cfg(feature = "postgresql")]
+        ConnectionWrapper::PostgreSQL(_) => DbType::PostgreSQL,
+        #[cfg(feature = "mysql")]
+        ConnectionWrapper::MySQL(_) => DbType::MySQL,
+        #[cfg(feature = "mssql")]
+        ConnectionWrapper::MSSQL(_) => DbType::MSSQL,
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        PooledInsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let refs = self.models.as_refs();
+        match self.pooled_conn.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => db
                 .insert_or_ignore_impl::<I::Model>(&refs)
                 .await
                 .map(|_| ()),
-            None => Err(anyhow::anyhow!("No connection available")),
         }
     }
 }
@@ -138,8 +574,10 @@ enum ConnectionWrapper {
     MSSQL(mssql_backend::Database),
 }
 
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 impl ConnectionWrapper {
     /// 检查连接是否有效
+    #[cfg(any(feature = "sqlite", feature = "mssql"))]
     async fn is_valid(&self) -> bool {
         match self {
             #[cfg(feature = "sqlite")]
@@ -158,11 +596,10 @@ impl ConnectionWrapper {
 ///
 /// 注意：对于 SQLite 后端，由于其嵌入式特性不支持多线程共享连接，
 /// 建议设置 max_size=1。如需并发支持，可考虑启用 MVCC 模式。
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 pub struct ManualPool {
     /// 空闲连接队列
     idle_connections: Mutex<VecDeque<ConnectionWrapper>>,
-    /// 控制最大连接数的信号量
-    semaphore: Semaphore,
     /// 当前连接总数(包括使用中和空闲的)
     total_connections: AtomicU32,
     /// 连接池配置
@@ -173,13 +610,12 @@ pub struct ManualPool {
     connection_string: String,
 }
 
+#[cfg(any(feature = "sqlite", feature = "mssql"))]
 impl ManualPool {
     /// 创建新的连接池
     fn new(db_type: DbType, connection_string: String, config: PoolConfig) -> Arc<Self> {
-        let max_size = config.max_size;
         Arc::new(Self {
             idle_connections: Mutex::new(VecDeque::new()),
-            semaphore: Semaphore::new(max_size as usize),
             total_connections: AtomicU32::new(0),
             config,
             db_type,
@@ -192,20 +628,28 @@ impl ManualPool {
         match self.db_type {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
-                let db = sqlite_backend::Database::connect(self.db_type, &self.connection_string)
-                    .trace()
-                    .await?;
+                let db = crate::utils::AnyhowFutureTraceExt::trace(
+                    sqlite_backend::Database::connect(self.db_type, &self.connection_string),
+                )
+                .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => Err(anyhow::anyhow!(
+                "Build the pool through PoolBuilder/ConnectionPool"
+            )),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => Err(anyhow::anyhow!(
+                "Build the pool through PoolBuilder/ConnectionPool"
+            )),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => {
-                let db = mssql_backend::Database::connect(self.db_type, &self.connection_string)
-                    .trace()
-                    .await?;
+                let db = crate::utils::AnyhowFutureTraceExt::trace(
+                    mssql_backend::Database::connect(self.db_type, &self.connection_string),
+                )
+                .await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
-            #[allow(unreachable_patterns)]
-            _ => unreachable!(),
         }
     }
 
@@ -228,7 +672,7 @@ impl ManualPool {
         let current_total = self.total_connections.load(Ordering::SeqCst);
         if current_total < self.config.max_size {
             // 可以增加连接数
-            let conn = self.create_connection().trace().await?;
+            let conn = crate::utils::AnyhowFutureTraceExt::trace(self.create_connection()).await?;
             self.total_connections.fetch_add(1, Ordering::SeqCst);
             return Ok(conn);
         }
@@ -259,8 +703,6 @@ impl ManualPool {
             self.total_connections.fetch_sub(1, Ordering::SeqCst);
             // 连接失效时不放入空闲队列，会自动被丢弃
         }
-        // 释放信号量 permit，允许新的连接请求
-        self.semaphore.add_permits(1);
     }
 
     /// 维护最小连接数
@@ -337,23 +779,24 @@ impl PoolBuilder {
             }
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
-                let manager =
-                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls)
-                        .trace_for(
-                            "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
-                        )?;
+                let manager = crate::utils::ResultTraceExt::trace_for(
+                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls),
+                    "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
+                )?;
                 let mut builder = bb8::Pool::builder();
                 builder = builder.max_size(self.config.max_size as u32);
                 if self.config.min_size > 0 {
                     builder = builder.min_idle(Some(self.config.min_size as u32));
                 }
-                let pool = builder.build(manager).trace().await?;
+                let pool = crate::utils::FutureTraceExt::trace(builder.build(manager)).await?;
                 Ok(ConnectionPool::PostgreSQL(pool))
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
-                let opts = mysql_async::Opts::from_url(&self.connection_string)
-                    .trace_for("mysql_async::Opts::from_url")?;
+                let opts = crate::utils::ResultTraceExt::trace_for(
+                    mysql_async::Opts::from_url(&self.connection_string),
+                    "mysql_async::Opts::from_url",
+                )?;
                 let pool = mysql_async::Pool::new(opts);
                 Ok(ConnectionPool::MySQL(pool))
             }
@@ -391,9 +834,7 @@ impl ConnectionPool {
         match self {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
-                // 获取信号量 permit
-                let _permit = pool.semaphore.acquire().trace().await?;
-                let conn = pool.get().trace().await?;
+                let conn = crate::utils::AnyhowFutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
                     connection: Some(conn),
@@ -402,7 +843,7 @@ impl ConnectionPool {
             }
             #[cfg(feature = "postgresql")]
             ConnectionPool::PostgreSQL(pool) => {
-                let pooled = pool.get().trace().await?;
+                let pooled = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 let db = postgresql_backend::Database::from_pooled_connection(pooled);
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::PostgreSQL,
@@ -421,8 +862,7 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(pool) => {
-                let _permit = pool.semaphore.acquire().trace().await?;
-                let conn = pool.get().trace().await?;
+                let conn = crate::utils::AnyhowFutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MSSQL(pool.clone()),
                     connection: Some(conn),
@@ -659,22 +1099,22 @@ impl<'a> PooledConnection<'a> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                let txn = db.begin().trace().await?;
+                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::Sqlite(txn))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
-                let txn = db.begin().trace().await?;
+                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::PostgreSQL(txn))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => {
-                let txn = db.begin().trace().await?;
+                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::MySQL(txn))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
-                let txn = db.begin().trace().await?;
+                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::MSSQL(txn))
             }
         }

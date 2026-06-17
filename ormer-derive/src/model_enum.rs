@@ -228,9 +228,7 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
             }
 
             impl ::ormer::model::ModelEnumProvider for #name {
-                fn enum_variants() -> Option<&'static [&'static str]> {
-                    Some(#name::VARIANTS)
-                }
+                const ENUM_VARIANTS: Option<&'static [&'static str]> = Some(#name::VARIANTS);
             }
         }
     };

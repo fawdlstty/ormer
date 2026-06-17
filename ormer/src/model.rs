@@ -256,8 +256,12 @@ pub trait Model: Sized {
 /// 枚举类型提供者 trait (可选实现)
 /// 如果类型实现了此 trait,则会被识别为枚举类型并生成 ENUM SQL
 pub trait ModelEnumProvider {
+    const ENUM_VARIANTS: Option<&'static [&'static str]>;
+
     /// 获取枚举的所有变体名称
-    fn enum_variants() -> Option<&'static [&'static str]>;
+    fn enum_variants() -> Option<&'static [&'static str]> {
+        Self::ENUM_VARIANTS
+    }
 }
 
 /// ModelEnum trait - 用于标记枚举类型 (由派生宏自动实现)
@@ -297,11 +301,9 @@ pub trait ModelEnum: ModelEnumProvider {
     }
 }
 
-/// 为 `Option<T>` 实现 ModelEnumProvider (如果 T 实现了 ModelEnum)
-impl<T: ModelEnum> ModelEnumProvider for Option<T> {
-    fn enum_variants() -> Option<&'static [&'static str]> {
-        Some(T::VARIANTS)
-    }
+/// 为 `Option<T>` 实现 ModelEnumProvider，透传内部类型的枚举信息
+impl<T: ModelEnumProvider> ModelEnumProvider for Option<T> {
+    const ENUM_VARIANTS: Option<&'static [&'static str]> = T::ENUM_VARIANTS;
 }
 
 // 为 Option<T> where T: ModelEnum 实现 From<Option<T>> for Value
@@ -339,9 +341,7 @@ macro_rules! impl_enum_provider_for_non_enum {
     ($($t:ty),* $(,)?) => {
         $(
             impl ModelEnumProvider for $t {
-                fn enum_variants() -> Option<&'static [&'static str]> {
-                    None
-                }
+                const ENUM_VARIANTS: Option<&'static [&'static str]> = None;
             }
         )*
     };
@@ -364,6 +364,11 @@ impl_enum_provider_for_non_enum!(
     String,
     &str,
     Vec<u8>,
+    std::time::Duration,
+    chrono::DateTime<chrono::Utc>,
+    chrono::NaiveDateTime,
+    serde_json::Value,
+    uuid::Uuid,
 );
 
 /// 用于 insert/insert_or_update 的参数类型 trait
@@ -695,6 +700,7 @@ impl Row {
 pub enum Value {
     Integer(i64),
     BigInt(i128),
+    Duration(std::time::Duration),
     Text(String),
     Real(f64),
     Boolean(bool),
@@ -770,6 +776,24 @@ impl FromRowValues for i64 {
     fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
             return Err(anyhow::anyhow!("Type mismatch: expected i64"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl FromValue for std::time::Duration {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Duration(v) => Ok(*v),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Duration")),
+        }
+    }
+}
+
+impl FromRowValues for std::time::Duration {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Duration"));
         }
         Self::from_value(&values[0])
     }
@@ -987,6 +1011,12 @@ impl From<f64> for Value {
     }
 }
 
+impl From<std::time::Duration> for Value {
+    fn from(v: std::time::Duration) -> Self {
+        Value::Duration(v)
+    }
+}
+
 // String 特殊处理
 impl From<String> for Value {
     fn from(v: String) -> Self {
@@ -1044,12 +1074,22 @@ impl From<Option<bool>> for Value {
     }
 }
 
+impl From<Option<std::time::Duration>> for Value {
+    fn from(v: Option<std::time::Duration>) -> Self {
+        match v {
+            Some(duration) => Value::Duration(duration),
+            None => Value::Null,
+        }
+    }
+}
+
 // 为 FilterValue 实现 Into<Value>
 impl From<crate::query::filter::Value> for Value {
     fn from(value: crate::query::filter::Value) -> Self {
         match value {
             crate::query::filter::Value::Integer(v) => Value::Integer(v),
             crate::query::filter::Value::BigInt(v) => Value::BigInt(v),
+            crate::query::filter::Value::Duration(v) => Value::Duration(v),
             crate::query::filter::Value::Text(v) => Value::Text(v),
             crate::query::filter::Value::Real(v) => Value::Real(v),
             crate::query::filter::Value::Boolean(v) => Value::Boolean(v),
@@ -1058,6 +1098,16 @@ impl From<crate::query::filter::Value> for Value {
             crate::query::filter::Value::Json(v) => Value::Json(v),
             crate::query::filter::Value::Uuid(v) => Value::Uuid(v),
             crate::query::filter::Value::Null => Value::Null,
+        }
+    }
+}
+
+impl FromValue for Option<std::time::Duration> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Duration(v) => Ok(Some(*v)),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<Duration>")),
         }
     }
 }

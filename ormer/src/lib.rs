@@ -4,9 +4,15 @@ pub mod model;
 pub mod query;
 pub mod utils;
 
-// 编译时检查：至少启用一个数据库特性（已移除，允许无特性编译）
-// #[cfg(not(any(feature = "sqlite", feature = "postgresql", feature = "mysql", feature = "mssql")))]
-// compile_error!("At least one database feature must be enabled: sqlite, postgresql, mysql, or mssql");
+#[cfg(not(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+)))]
+compile_error!(
+    "At least one database feature must be enabled: sqlite, postgresql, mysql, or mssql"
+);
 
 pub use abstract_layer::DbType;
 
@@ -20,7 +26,8 @@ pub use abstract_layer::DbType;
 pub use abstract_layer::{
     ConnectionPool, CreateTableExecutor, Database, DeleteExecutor, DropTableExecutor,
     MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, PooledConnection,
-    SelectStream, SelectStreamIterator, Transaction,
+    SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
+    TransactionInsertOrIgnoreExecutor,
 };
 pub use anyhow::Result;
 pub use model::{

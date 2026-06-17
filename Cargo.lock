@@ -1743,12 +1743,14 @@ dependencies = [
 
 [[package]]
 name = "ormer"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
  "bb8",
  "bb8-postgres",
+ "byteorder",
+ "bytes",
  "chrono",
  "futures",
  "mysql_async",
@@ -1766,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "ormer-derive"
-version = "0.1.17"
+version = "0.1.19"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -1,5 +1,6 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
+use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect,
@@ -10,6 +11,13 @@ use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+/// 判断错误是否为约束冲突错误（如主键/唯一键重复）
+/// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
+fn is_constraint_error(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("UNIQUE constraint failed") || msg.contains("constraint")
+}
 
 /// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
 /// 支持 i32, i64, u32, u64 等整数类型，以及 ()
@@ -87,6 +95,8 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "INTEGER",
             // 浮点类型
             "f32" | "f64" => "REAL",
+            // 时长类型
+            "Duration" | "std::time::Duration" => "INTEGER",
             // 字符串类型
             "String" => "TEXT",
             // 布尔类型（SQLite 没有原生 bool，用 INTEGER 存储）
@@ -141,15 +151,30 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub async fn execute(self) -> anyhow::Result<()> {
-        // 表不存在，创建新表
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::Sqlite,
             self.table_name.as_deref(),
         )?;
+        Ok(SqlStatement::single(DbType::Sqlite, create_sql, Vec::new()))
+    }
 
-        self.db.conn.execute(&create_sql, ()).trace().await?;
+    pub async fn execute(self) -> anyhow::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
 
+impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        CreateTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        for statement in sql.statements {
+            self.db.conn.execute(&statement.sql, ()).trace().await?;
+        }
         Ok(())
     }
 }
@@ -161,9 +186,30 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            DbType::Sqlite,
+            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            Vec::new(),
+        ))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
-        let sql = format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME);
-        self.db.conn.execute(&sql, ()).trace().await?;
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DropTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        for statement in sql.statements {
+            self.db.conn.execute(&statement.sql, ()).trace().await?;
+        }
         Ok(())
     }
 }
@@ -176,9 +222,56 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
-        self.db.insert_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+        let all_params = values_to_params(&all_values)?;
+
+        self.db.conn.execute(&sql, all_params).trace().await?;
+
+        // 获取自增ID（如果有自增主键）
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.db.conn.last_insert_rowid();
+            let result =
+                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)?;
+            Ok(result)
+        } else {
+            Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+        }
     }
 
     /// 执行插入并返回插入的行数据（SQLite RETURNING 支持）
@@ -225,6 +318,35 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     }
 }
 
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+
+        self.db.conn.execute(&statement.sql, params).trace().await?;
+
+        // 获取自增ID（如果有自增主键）
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.db.conn.last_insert_rowid();
+            let result = convert_auto_increment_key::<Self::Output>(last_id)?;
+            return Ok(result);
+        }
+
+        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+    }
+}
+
 /// 插入或更新执行器
 pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     db: &'a Database,
@@ -233,9 +355,94 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
+        // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            all_values.extend(model.field_values());
+        }
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.db.insert_or_update_batch::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let columns = I::Model::COLUMNS;
+        let col_count = columns.len();
+        let table_name = I::Model::TABLE_NAME;
+        let pk_columns = I::Model::primary_key_columns();
+
+        let columns_str = columns.join(", ");
+        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            insert_placeholders.join(", ")
+        );
+
+        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let delete_sql = format!(
+            "DELETE FROM {table_name} WHERE {}",
+            where_clauses.join(" AND ")
+        );
+
+        for model in refs.iter() {
+            // 先删除已有记录
+            let pk_values = model.primary_key_values();
+            let delete_params = values_to_params(&pk_values)?;
+            self.db
+                .conn
+                .execute(&delete_sql, delete_params)
+                .trace()
+                .await?;
+
+            // 然后插入新记录
+            let all_values = model.field_values();
+            let insert_params = values_to_params(&all_values)?;
+            self.db
+                .conn
+                .execute(&insert_sql, insert_params)
+                .trace()
+                .await?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        self.db.conn.execute(&statement.sql, params).trace().await?;
+        Ok(())
     }
 }
 
@@ -247,9 +454,85 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::insert_columns();
+        let col_count = columns.len();
+        // turso 不支持 INSERT OR IGNORE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
+        // 在执行阶段捕获约束冲突错误并忽略。
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            I::Model::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_values = Vec::new();
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            all_values.extend(model.insert_values());
+        }
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.db.insert_or_ignore_batch::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let columns = I::Model::insert_columns();
+        let col_count = columns.len();
+        let table_name = I::Model::TABLE_NAME;
+        let columns_str = columns.join(", ");
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let placeholders_str = placeholders.join(", ");
+        let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
+
+        for model in refs.iter() {
+            let values = model.insert_values();
+            let params = values_to_params(&values)?;
+            match self.db.conn.execute(&sql, params).trace().await {
+                Ok(_) => {}
+                Err(e) if is_constraint_error(&e) => {
+                    // 忽略约束冲突（重复主键/唯一键）
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
+    type Output = ();
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        InsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(());
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        match self.db.conn.execute(&statement.sql, params).trace().await {
+            Ok(_) => {}
+            Err(e) if is_constraint_error(&e) => {
+                // 忽略约束冲突（重复主键/唯一键）
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(())
     }
 }
 
@@ -525,6 +808,7 @@ impl Database {
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
+    /// turso 不支持 ON CONFLICT，因此通过 DELETE + INSERT 实现 upsert 语义。
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -532,50 +816,43 @@ impl Database {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let primary_key_columns = T::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
+        let pk_columns = T::primary_key_columns();
+        let table_name = T::TABLE_NAME;
 
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            T::TABLE_NAME,
-            columns.join(", ")
+        let columns_str = columns.join(", ");
+        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            insert_placeholders.join(", ")
         );
-        let mut all_params = Vec::new();
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
+        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let delete_sql = format!(
+            "DELETE FROM {table_name} WHERE {}",
+            where_clauses.join(" AND ")
+        );
 
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
+        for model in models.iter() {
+            let pk_values = model.primary_key_values();
+            let delete_params = values_to_params(&pk_values)?;
+            self.conn
+                .execute(&delete_sql, delete_params)
+                .trace()
+                .await?;
 
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            all_params.extend(params);
+            let all_values = model.insert_values();
+            let insert_params = values_to_params(&all_values)?;
+            self.conn
+                .execute(&insert_sql, insert_params)
+                .trace()
+                .await?;
         }
-
-        // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-        let mut first = true;
-        for col_name in columns.iter() {
-            if primary_key_columns.contains(col_name) {
-                continue; // 跳过主键
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{col_name} = excluded.{col_name}"));
-            first = false;
-        }
-
-        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
 
     /// 批量插入或忽略记录（遇到重复键时忽略）
+    /// turso 不支持 ON CONFLICT，因此通过捕获约束错误实现忽略语义。
     pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -583,34 +860,26 @@ impl Database {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let primary_key_columns = T::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
+        let table_name = T::TABLE_NAME;
 
-        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            T::TABLE_NAME,
-            columns.join(", ")
+        let columns_str = columns.join(", ");
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            placeholders.join(", ")
         );
-        let mut all_params = Vec::new();
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
+        for model in models.iter() {
             let values = model.insert_values();
             let params = values_to_params(&values)?;
-            all_params.extend(params);
+            match self.conn.execute(&insert_sql, params).trace().await {
+                Ok(_) => {}
+                Err(e) if is_constraint_error(&e) => {
+                    // 忽略约束冲突（重复主键/唯一键）
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // 添加 ON CONFLICT DO NOTHING 子句
-        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-
-        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -736,9 +1005,56 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let refs = self.models.as_refs();
-        self.txn.insert_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let columns = I::Model::insert_columns();
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
+            I::Model::TABLE_NAME,
+            &columns,
+            refs.len(),
+        );
+        let all_values =
+            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
+                I::Model,
+            >(&refs);
+        let all_params = values_to_params(&all_values)?;
+
+        self.txn.conn.execute(&sql, all_params).trace().await?;
+
+        // 获取自增ID（如果有自增主键）
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.txn.conn.last_insert_rowid();
+            let result =
+                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)?;
+            Ok(result)
+        } else {
+            Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+        }
     }
 }
 
@@ -750,9 +1066,72 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::COLUMNS.join(", ");
+        let col_count = I::Model::COLUMNS.len();
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            all_values.extend(model.field_values());
+        }
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.txn.insert_or_update_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let columns = I::Model::COLUMNS;
+        let col_count = columns.len();
+        let table_name = I::Model::TABLE_NAME;
+        let pk_columns = I::Model::primary_key_columns();
+
+        let columns_str = columns.join(", ");
+        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            insert_placeholders.join(", ")
+        );
+
+        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let delete_sql = format!(
+            "DELETE FROM {table_name} WHERE {}",
+            where_clauses.join(" AND ")
+        );
+
+        for model in refs.iter() {
+            let pk_values = model.primary_key_values();
+            let delete_params = values_to_params(&pk_values)?;
+            self.txn
+                .conn
+                .execute(&delete_sql, delete_params)
+                .trace()
+                .await?;
+
+            let all_values = model.field_values();
+            let insert_params = values_to_params(&all_values)?;
+            self.txn
+                .conn
+                .execute(&insert_sql, insert_params)
+                .trace()
+                .await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -764,9 +1143,65 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let refs = self.models.as_refs();
+        if refs.is_empty() {
+            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+        }
+
+        let columns = I::Model::insert_columns();
+        let col_count = columns.len();
+
+        let mut sql = format!(
+            "INSERT INTO {} ({}) VALUES ",
+            I::Model::TABLE_NAME,
+            columns.join(", ")
+        );
+        let mut all_values = Vec::new();
+
+        for (idx, model) in refs.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+
+            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+            sql.push_str(&format!("({})", placeholders.join(", ")));
+            all_values.extend(model.insert_values());
+        }
+
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+    }
+
     pub async fn execute(self) -> anyhow::Result<()> {
         let refs = self.models.as_refs();
-        self.txn.insert_or_ignore_impl::<I::Model>(&refs).await
+        if refs.is_empty() {
+            return Ok(());
+        }
+
+        let columns = I::Model::insert_columns();
+        let col_count = columns.len();
+        let table_name = I::Model::TABLE_NAME;
+
+        let columns_str = columns.join(", ");
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            placeholders.join(", ")
+        );
+
+        for model in refs.iter() {
+            let values = model.insert_values();
+            let params = values_to_params(&values)?;
+            match self.txn.conn.execute(&insert_sql, params).trace().await {
+                Ok(_) => {}
+                Err(e) if is_constraint_error(&e) => {
+                    // 忽略约束冲突（重复主键/唯一键）
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -870,6 +1305,7 @@ impl Transaction {
     }
 
     /// 批量插入记录（内部使用），返回自增主键值（如果有自增主键）或 ()
+    #[allow(dead_code)]
     async fn insert_impl<T: Model>(
         &mut self,
         models: &[&T],
@@ -904,6 +1340,7 @@ impl Transaction {
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）（内部使用）
+    #[allow(dead_code)]
     async fn insert_or_update_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -911,45 +1348,37 @@ impl Transaction {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let primary_key_columns = T::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
+        let pk_columns = T::primary_key_columns();
+        let table_name = T::TABLE_NAME;
 
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            T::TABLE_NAME,
-            columns.join(", ")
+        let columns_str = columns.join(", ");
+        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            insert_placeholders.join(", ")
         );
-        let mut all_params = Vec::new();
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
+        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let delete_sql = format!(
+            "DELETE FROM {table_name} WHERE {}",
+            where_clauses.join(" AND ")
+        );
 
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
+        for model in models.iter() {
+            let pk_values = model.primary_key_values();
+            let delete_params = values_to_params(&pk_values)?;
+            self.conn
+                .execute(&delete_sql, delete_params)
+                .trace()
+                .await?;
 
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            all_params.extend(params);
+            let all_values = model.insert_values();
+            let insert_params = values_to_params(&all_values)?;
+            self.conn
+                .execute(&insert_sql, insert_params)
+                .trace()
+                .await?;
         }
-
-        // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-        let mut first = true;
-        for col_name in columns.iter() {
-            if primary_key_columns.contains(col_name) {
-                continue; // 跳过主键
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{col_name} = excluded.{col_name}"));
-            first = false;
-        }
-
-        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -962,34 +1391,26 @@ impl Transaction {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let primary_key_columns = T::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
+        let table_name = T::TABLE_NAME;
 
-        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            T::TABLE_NAME,
-            columns.join(", ")
+        let columns_str = columns.join(", ");
+        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
+        let insert_sql = format!(
+            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
+            placeholders.join(", ")
         );
-        let mut all_params = Vec::new();
 
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
+        for model in models.iter() {
             let values = model.insert_values();
             let params = values_to_params(&values)?;
-            all_params.extend(params);
+            match self.conn.execute(&insert_sql, params).trace().await {
+                Ok(_) => {}
+                Err(e) if is_constraint_error(&e) => {
+                    // 忽略约束冲突（重复主键/唯一键）
+                }
+                Err(e) => return Err(e),
+            }
         }
-
-        // 添加 ON CONFLICT DO NOTHING 子句
-        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-
-        self.conn.execute(&sql, all_params).trace().await?;
 
         Ok(())
     }
@@ -1391,6 +1812,9 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1483,6 +1907,9 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1562,6 +1989,9 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1654,6 +2084,9 @@ impl<
                     crate::model::Value::Real(r) => turso::Value::Real(r),
                     crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                     crate::model::Value::Bytes(b) => turso::Value::Blob(b),
+                    crate::model::Value::Duration(d) => {
+                        turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                    }
                     crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                     crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                     crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1828,6 +2261,9 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1893,6 +2329,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -1945,20 +2384,23 @@ impl<T: Model> DeleteExecutor<T> {
         self
     }
 
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let (sql, params) = self.build_ormer_sql();
+        Ok(SqlStatement::single(DbType::Sqlite, sql, params))
+    }
+
     /// 执行删除操作并返回影响的行数
     pub async fn execute(self) -> anyhow::Result<u64> {
-        let (sql, params) = self.build_sql();
-
-        let result = self.conn.execute(&sql, params).trace().await?;
-
-        Ok(result)
+        <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行删除并返回被删除的行数据（SQLite RETURNING 支持）
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
-        let (sql, params) = self.build_sql();
+        let sql = self.to_sql()?;
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
 
-        let sql_with_returning = format!("{} RETURNING *", sql);
+        let sql_with_returning = format!("{} RETURNING *", statement.sql);
         let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
 
         let mut results = Vec::new();
@@ -1982,7 +2424,7 @@ impl<T: Model> DeleteExecutor<T> {
         self.execute().await
     }
 
-    fn build_sql(&self) -> (String, Vec<turso::Value>) {
+    fn build_ormer_sql(&self) -> (String, Vec<Value>) {
         let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
         let mut ormer_params = Vec::new();
 
@@ -2003,8 +2445,32 @@ impl<T: Model> DeleteExecutor<T> {
             }
         }
 
+        (sql, ormer_params)
+    }
+
+    #[allow(dead_code)]
+    fn build_sql(&self) -> (String, Vec<turso::Value>) {
+        let (sql, ormer_params) = self.build_ormer_sql();
         let turso_params = values_to_params(&ormer_params).unwrap_or_default();
         (sql, turso_params)
+    }
+}
+
+impl<T: Model> SqlExecutor for DeleteExecutor<T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        DeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        let result = self.conn.execute(&statement.sql, params).trace().await?;
+        Ok(result)
     }
 }
 
@@ -2077,28 +2543,30 @@ impl<T: Model> UpdateExecutor<T> {
         self
     }
 
+    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        let statements = self.build_all_ormer_sql()?;
+        Ok(SqlStatement::batch(
+            DbType::Sqlite,
+            statements
+                .into_iter()
+                .map(|(sql, params)| SingleSqlStatement::new(sql, params))
+                .collect(),
+        ))
+    }
+
     /// 执行更新操作
     pub async fn execute(self) -> anyhow::Result<u64> {
-        let statements = self.build_all_sql()?;
-        let mut total: u64 = 0;
-        for (sql, params) in &statements {
-            let result = self.conn.execute(sql, params.clone()).trace().await?;
-            total += result;
-        }
-        Ok(total)
+        <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行更新并返回被更新的行数据（SQLite RETURNING 支持）
     pub async fn returning(self) -> anyhow::Result<Vec<T>> {
-        let statements = self.build_all_sql()?;
+        let statements = self.to_sql()?;
         let mut results = Vec::new();
-        for (sql, params) in &statements {
-            let sql_with_returning = format!("{} RETURNING *", sql);
-            let mut rows = self
-                .conn
-                .query(&sql_with_returning, params.clone())
-                .trace()
-                .await?;
+        for statement in &statements.statements {
+            let params = values_to_params(&statement.params)?;
+            let sql_with_returning = format!("{} RETURNING *", statement.sql);
+            let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
             while let Some(row) = rows.next().trace().await? {
                 let mut data = HashMap::new();
                 for (i, col_name) in T::COLUMNS.iter().enumerate() {
@@ -2119,10 +2587,9 @@ impl<T: Model> UpdateExecutor<T> {
         self.execute().await
     }
 
-    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<turso::Value>)>> {
+    fn build_all_ormer_sql(&self) -> anyhow::Result<Vec<(String, Vec<Value>)>> {
         let mut statements = Vec::new();
 
-        // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
             let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
             let mut ormer_params = Vec::new();
@@ -2151,11 +2618,9 @@ impl<T: Model> UpdateExecutor<T> {
                     );
                 }
             }
-            let turso_params = values_to_params(&ormer_params)?;
-            statements.push((sql, turso_params));
+            statements.push((sql, ormer_params));
         }
 
-        // Model UPDATE statements
         for (model_sets, model_filters) in &self.model_updates {
             let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
             let mut ormer_params = Vec::new();
@@ -2184,11 +2649,35 @@ impl<T: Model> UpdateExecutor<T> {
                     );
                 }
             }
-            let turso_params = values_to_params(&ormer_params)?;
-            statements.push((sql, turso_params));
+            statements.push((sql, ormer_params));
         }
 
         Ok(statements)
+    }
+
+    #[allow(dead_code)]
+    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<turso::Value>)>> {
+        self.build_all_ormer_sql()?
+            .into_iter()
+            .map(|(sql, ormer_params)| Ok((sql, values_to_params(&ormer_params)?)))
+            .collect()
+    }
+}
+
+impl<T: Model> SqlExecutor for UpdateExecutor<T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+        UpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+        let mut total = 0;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            total += self.conn.execute(&statement.sql, params).trace().await?;
+        }
+        Ok(total)
     }
 }
 
@@ -2212,6 +2701,7 @@ fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
             Value::Real(v) => turso::Value::Real(*v),
             Value::Boolean(v) => turso::Value::Integer(if *v { 1 } else { 0 }),
             Value::Bytes(v) => turso::Value::Blob(v.clone()),
+            Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
             Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
             Value::Json(v) => turso::Value::Text(v.to_string()),
             Value::Uuid(v) => turso::Value::Text(v.to_string()),
@@ -2346,6 +2836,9 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -2466,6 +2959,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
@@ -2532,10 +3028,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 从 StreamConnection 获取连接
-        let conn = match &self.conn {
-            super::common::StreamConnection::Sqlite(c) => c.clone(),
-            _ => unreachable!("Expected Sqlite connection"),
-        };
+        let conn = self.conn.expect_sqlite().clone();
 
         // 将 ormer::Value 转换为 turso::Value
         let turso_params: Vec<turso::Value> = params
@@ -2546,6 +3039,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
+                crate::model::Value::Duration(d) => {
+                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
+                }
                 crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
