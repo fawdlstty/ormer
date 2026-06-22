@@ -154,6 +154,26 @@ impl ToSql for PgMaybeTextParam {
     postgres_types::to_sql_checked!();
 }
 
+#[derive(Debug, Clone)]
+struct PgEnumText(String);
+
+impl<'a> FromSql<'a> for PgEnumText {
+    fn from_sql(
+        ty: &PgType,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(<&str as FromSql>::from_sql(ty, raw)?.to_string()))
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        matches!(ty.kind(), postgres_types::Kind::Enum(_))
+            || matches!(
+                *ty,
+                PgType::VARCHAR | PgType::TEXT | PgType::BPCHAR | PgType::NAME | PgType::UNKNOWN
+            )
+    }
+}
+
 fn to_postgres_interval(duration: std::time::Duration) -> PgInterval {
     let micros_u128 = duration.as_micros();
     let micros = micros_u128.min(i64::MAX as u128) as i64;
@@ -217,6 +237,223 @@ fn pg_infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
     }
 }
 
+fn pg_value_from_row_cell(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    rust_type: &str,
+    is_nullable: bool,
+    enum_variants: Option<&[&str]>,
+) -> anyhow::Result<crate::model::Value> {
+    if enum_variants.is_some() {
+        let value: Option<PgEnumText> = row
+            .try_get(idx)
+            .trace_for("tokio_postgres::Row::try_get enum")?;
+        return Ok(match value {
+            Some(value) => crate::model::Value::Text(value.0),
+            None => {
+                if is_nullable {
+                    crate::model::Value::Null
+                } else {
+                    return Err(anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected enum type {})",
+                        idx, rust_type
+                    )));
+                }
+            }
+        });
+    }
+
+    if is_nullable {
+        match rust_type {
+            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                let value: Option<i32> = row.get(idx);
+                Ok(value
+                    .map(|value| crate::model::Value::Integer(value as i64))
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "i64" | "u64" => {
+                let value: Option<i64> = row.get(idx);
+                Ok(value
+                    .map(crate::model::Value::Integer)
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "Duration" | "std::time::Duration" => {
+                let value: Option<PgInterval> = row.get(idx);
+                Ok(value
+                    .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "String" => {
+                let value: Option<String> = row.get(idx);
+                Ok(value
+                    .map(crate::model::Value::Text)
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "f32" | "f64" => {
+                let value: Option<f64> = row.get(idx);
+                Ok(value
+                    .map(crate::model::Value::Real)
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "bool" => {
+                let value: Option<bool> = row.get(idx);
+                Ok(match value {
+                    Some(true) => crate::model::Value::Integer(1),
+                    Some(false) => crate::model::Value::Integer(0),
+                    None => crate::model::Value::Null,
+                })
+            }
+            "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                let value: Option<Vec<u8>> = row.get(idx);
+                Ok(value
+                    .map(crate::model::Value::Bytes)
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                let value: Option<chrono::NaiveDateTime> = row.get(idx);
+                Ok(match value {
+                    Some(value) => crate::model::Value::DateTime(
+                        chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc),
+                    ),
+                    None => crate::model::Value::Null,
+                })
+            }
+            "DateTime" | "chrono::DateTime" => {
+                let value: Option<chrono::DateTime<chrono::Utc>> = row.get(idx);
+                Ok(value
+                    .map(crate::model::Value::DateTime)
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            _ => Err(anyhow::anyhow!(
+                "Unsupported nullable column type: {rust_type}"
+            )),
+        }
+    } else {
+        match rust_type {
+            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
+                let value: Option<i32> = row.get(idx);
+                value
+                    .map(|value| crate::model::Value::Integer(value as i64))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(format!(
+                            "Failed to parse non-nullable column at index {} (expected integer type)",
+                            idx
+                        ))
+                    })
+            }
+            "i64" | "u64" => {
+                let value: Option<i64> = row.get(idx);
+                value.map(crate::model::Value::Integer).ok_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected i64 type)",
+                        idx
+                    ))
+                })
+            }
+            "Duration" | "std::time::Duration" => {
+                let value: Option<PgInterval> = row.get(idx);
+                value
+                    .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(format!(
+                            "Failed to parse non-nullable column at index {} (expected Duration type)",
+                            idx
+                        ))
+                    })
+            }
+            "String" => {
+                let value: Option<String> = row.get(idx);
+                value.map(crate::model::Value::Text).ok_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected String type)",
+                        idx
+                    ))
+                })
+            }
+            "f32" | "f64" => {
+                let value: Option<f64> = row.get(idx);
+                value.map(crate::model::Value::Real).ok_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected float type)",
+                        idx
+                    ))
+                })
+            }
+            "bool" => {
+                let value: Option<bool> = row.get(idx);
+                match value {
+                    Some(true) => Ok(crate::model::Value::Integer(1)),
+                    Some(false) => Ok(crate::model::Value::Integer(0)),
+                    None => Err(anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected bool type)",
+                        idx
+                    ))),
+                }
+            }
+            "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                let value: Option<Vec<u8>> = row.get(idx);
+                value.map(crate::model::Value::Bytes).ok_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected Vec<u8> type)",
+                        idx
+                    ))
+                })
+            }
+            "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                let value: Option<chrono::NaiveDateTime> = row.get(idx);
+                value
+                    .map(|value| {
+                        crate::model::Value::DateTime(
+                            chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(format!(
+                            "Failed to parse non-nullable column at index {} (expected NaiveDateTime type)",
+                            idx
+                        ))
+                    })
+            }
+            "DateTime" | "chrono::DateTime" => {
+                let value: Option<chrono::DateTime<chrono::Utc>> = row.get(idx);
+                value.map(crate::model::Value::DateTime).ok_or_else(|| {
+                    anyhow::anyhow!(format!(
+                        "Failed to parse non-nullable column at index {} (expected DateTime type)",
+                        idx
+                    ))
+                })
+            }
+            _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
+        }
+    }
+}
+
+fn pg_model_value_from_row<T: Model>(
+    row: &tokio_postgres::Row,
+    schema_idx: usize,
+    row_idx: usize,
+) -> anyhow::Result<crate::model::Value> {
+    let column = &T::COLUMN_SCHEMA[schema_idx];
+    let rust_type = column.data_type.unwrap_or(column.rust_type);
+    pg_value_from_row_cell(
+        row,
+        row_idx,
+        rust_type,
+        column.is_nullable,
+        column.enum_variants,
+    )
+}
+
+fn pg_outer_join_model_value_from_row<T: Model>(
+    row: &tokio_postgres::Row,
+    schema_idx: usize,
+    row_idx: usize,
+) -> anyhow::Result<crate::model::Value> {
+    let column = &T::COLUMN_SCHEMA[schema_idx];
+    let rust_type = column.data_type.unwrap_or(column.rust_type);
+    pg_value_from_row_cell(row, row_idx, rust_type, true, column.enum_variants)
+}
+
 fn pg_collect_filter_param_rust_types<T: Model>(
     filter: &FilterExpr,
     rust_types: &mut Vec<&'static str>,
@@ -231,9 +468,8 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
             let rust_type = pg_model_column_rust_type::<T>(column);
             for value in values {
-                rust_types.push(
-                    rust_type.unwrap_or_else(|| pg_infer_filter_value_rust_type(value)),
-                );
+                rust_types
+                    .push(rust_type.unwrap_or_else(|| pg_infer_filter_value_rust_type(value)));
             }
         }
         FilterExpr::InSubquery {
@@ -1492,7 +1728,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
                 convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&statement.sql, &param_refs).trace().await?;
+            self.client
+                .execute(&statement.sql, &param_refs)
+                .trace()
+                .await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }
     }
@@ -1568,7 +1807,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        self.client.execute(&statement.sql, &param_refs).trace().await?;
+        self.client
+            .execute(&statement.sql, &param_refs)
+            .trace()
+            .await?;
         Ok(())
     }
 }
@@ -1635,7 +1877,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        self.client.execute(&statement.sql, &param_refs).trace().await?;
+        self.client
+            .execute(&statement.sql, &param_refs)
+            .trace()
+            .await?;
         Ok(())
     }
 }
@@ -2455,264 +2700,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                // 根据列的类型获取值
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    // 处理可空类型 - 根据PostgreSQL的实际列类型读取
-                    use tokio_postgres::types::Type;
-                    let pg_type = row.columns()[i].type_();
-
-                    match *pg_type {
-                        Type::INT2 => {
-                            let v: Option<i16> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val as i64),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::INT4 => {
-                            let v: Option<i32> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val as i64),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::INT8 => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::TEXT | Type::VARCHAR => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::FLOAT4 => {
-                            let v: Option<f32> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val as f64),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::FLOAT8 => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::BOOL => {
-                            let v: Option<bool> = row.get(i);
-                            match v {
-                                Some(true) => crate::model::Value::Integer(1),
-                                Some(false) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::BYTEA => {
-                            let v: Option<Vec<u8>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Bytes(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::TIMESTAMP => {
-                            let v: Option<chrono::NaiveDateTime> = row.get(i);
-                            match v {
-                                Some(val) => {
-                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                        val,
-                                        chrono::Utc,
-                                    );
-                                    crate::model::Value::DateTime(utc)
-                                }
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        Type::TIMESTAMPTZ => {
-                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::DateTime(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            // 备用方案：使用rust_type
-                            match rust_type {
-                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                                    let v: Option<i64> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Integer(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "String" => {
-                                    let v: Option<String> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Text(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "f32" | "f64" => {
-                                    let v: Option<f64> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Real(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "bool" => {
-                                    let v: Option<bool> = row.get(i);
-                                    match v {
-                                        Some(true) => crate::model::Value::Integer(1),
-                                        Some(false) => crate::model::Value::Integer(0),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "Vec<u8>"
-                                | "std::vec::Vec<u8>"
-                                | "alloc::vec::Vec<u8>"
-                                | "&[u8]" => {
-                                    let v: Option<Vec<u8>> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Bytes(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                                    let v: Option<chrono::NaiveDateTime> = row.get(i);
-                                    match v {
-                                        Some(val) => {
-                                            let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                                val,
-                                                chrono::Utc,
-                                            );
-                                            crate::model::Value::DateTime(utc)
-                                        }
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "DateTime" | "chrono::DateTime" => {
-                                    let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::DateTime(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                _ => {
-                                    return Err(anyhow::anyhow!(format!(
-                                        "Unsupported nullable column type: {rust_type}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // 处理非空类型 - 根据PostgreSQL的实际列类型读取
-                    use tokio_postgres::types::Type;
-                    let pg_type = row.columns()[i].type_();
-
-                    match *pg_type {
-                        Type::INT2 => {
-                            let v: i16 = row.get(i);
-                            crate::model::Value::Integer(v as i64)
-                        }
-                        Type::INT4 => {
-                            let v: i32 = row.get(i);
-                            crate::model::Value::Integer(v as i64)
-                        }
-                        Type::INT8 => {
-                            let v: i64 = row.get(i);
-                            crate::model::Value::Integer(v)
-                        }
-                        Type::TEXT | Type::VARCHAR => {
-                            let v: String = row.get(i);
-                            crate::model::Value::Text(v)
-                        }
-                        Type::FLOAT4 => {
-                            let v: f32 = row.get(i);
-                            crate::model::Value::Real(v as f64)
-                        }
-                        Type::FLOAT8 => {
-                            let v: f64 = row.get(i);
-                            crate::model::Value::Real(v)
-                        }
-                        Type::BOOL => {
-                            let v: bool = row.get(i);
-                            if v {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
-                            }
-                        }
-                        Type::BYTEA => {
-                            let v: Vec<u8> = row.get(i);
-                            crate::model::Value::Bytes(v)
-                        }
-                        Type::TIMESTAMP => {
-                            let v: chrono::NaiveDateTime = row.get(i);
-                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                            crate::model::Value::DateTime(utc)
-                        }
-                        Type::TIMESTAMPTZ => {
-                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                            crate::model::Value::DateTime(v)
-                        }
-                        _ => {
-                            // 备用方案：使用rust_type
-                            match rust_type {
-                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                                    let v: i64 = row.get(i);
-                                    crate::model::Value::Integer(v)
-                                }
-                                "String" => {
-                                    let v: String = row.get(i);
-                                    crate::model::Value::Text(v)
-                                }
-                                "f32" | "f64" => {
-                                    let v: f64 = row.get(i);
-                                    crate::model::Value::Real(v)
-                                }
-                                "bool" => {
-                                    let v: bool = row.get(i);
-                                    if v {
-                                        crate::model::Value::Integer(1)
-                                    } else {
-                                        crate::model::Value::Integer(0)
-                                    }
-                                }
-                                "Vec<u8>"
-                                | "std::vec::Vec<u8>"
-                                | "alloc::vec::Vec<u8>"
-                                | "&[u8]" => {
-                                    let v: Vec<u8> = row.get(i);
-                                    crate::model::Value::Bytes(v)
-                                }
-                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                                    let v: chrono::NaiveDateTime = row.get(i);
-                                    let utc =
-                                        chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                                    crate::model::Value::DateTime(utc)
-                                }
-                                "DateTime" | "chrono::DateTime" => {
-                                    let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                                    crate::model::Value::DateTime(v)
-                                }
-                                _ => {
-                                    return Err(anyhow::anyhow!(format!(
-                                        "Unsupported column type: {rust_type}"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -2854,7 +2842,11 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let result = self.client.execute(&statement.sql, &param_refs).trace().await?;
+        let result = self
+            .client
+            .execute(&statement.sql, &param_refs)
+            .trace()
+            .await?;
         Ok(result)
     }
 }
@@ -2934,7 +2926,8 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         let statements = self.build_all_sql()?;
         let mut sql_statements = Vec::with_capacity(statements.len());
         for (sql, params, rust_types) in statements {
-            sql_statements.push(SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types));
+            sql_statements
+                .push(SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types));
         }
         Ok(SqlStatement::batch(DbType::PostgreSQL, sql_statements))
     }
@@ -3079,7 +3072,11 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
                 .iter()
                 .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
-            let result = self.client.execute(&statement.sql, &param_refs).trace().await?;
+            let result = self
+                .client
+                .execute(&statement.sql, &param_refs)
+                .trace()
+                .await?;
             total += result;
         }
         Ok(total)
@@ -3132,10 +3129,8 @@ fn values_to_params_with_types(
                     Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
-            crate::model::Value::Text(v) => {
-                Box::new(PgTextParam::from(v.clone()))
-                    as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
+            crate::model::Value::Text(v) => Box::new(PgTextParam::from(v.clone()))
+                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
             crate::model::Value::Real(v) => {
                 Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
@@ -3202,8 +3197,8 @@ fn values_to_params_with_types(
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     _ => {
-                        // 默认使用Option<i32>
-                        let null_val: Option<i32> = None;
+                        // 未知类型优先按文本 NULL 处理，覆盖 PostgreSQL enum 等自定义类型
+                        let null_val = PgMaybeTextParam(None);
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                 }
@@ -3349,243 +3344,10 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                 // 解析行数据为 Model
                 let mut data = HashMap::new();
                 for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let column_info = &T::COLUMN_SCHEMA[i];
-                    let rust_type = column_info.rust_type;
-                    let is_nullable = column_info.is_nullable;
-
-                    let ormer_value = if is_nullable {
-                        use tokio_postgres::types::Type;
-                        let pg_type = row.columns()[i].type_();
-
-                        match *pg_type {
-                            Type::INT2 => {
-                                let v: Option<i16> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Integer(val as i64),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::INT4 => {
-                                let v: Option<i32> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Integer(val as i64),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::INT8 => {
-                                let v: Option<i64> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Integer(val),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::TEXT | Type::VARCHAR => {
-                                let v: Option<String> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Text(val),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::FLOAT4 => {
-                                let v: Option<f32> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Real(val as f64),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::FLOAT8 => {
-                                let v: Option<f64> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Real(val),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            Type::BOOL => {
-                                let v: Option<bool> = row.get(i);
-                                match v {
-                                    Some(true) => crate::model::Value::Integer(1),
-                                    Some(false) => crate::model::Value::Integer(0),
-                                    None => crate::model::Value::Null,
-                                }
-                            }
-                            _ => match rust_type {
-                                "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                                    let v: Option<i64> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Integer(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "String" => {
-                                    let v: Option<String> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Text(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "f32" | "f64" => {
-                                    let v: Option<f64> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Real(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "bool" => {
-                                    let v: Option<bool> = row.get(i);
-                                    match v {
-                                        Some(true) => crate::model::Value::Integer(1),
-                                        Some(false) => crate::model::Value::Integer(0),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "Vec<u8>"
-                                | "std::vec::Vec<u8>"
-                                | "alloc::vec::Vec<u8>"
-                                | "&[u8]" => {
-                                    let v: Option<Vec<u8>> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::Bytes(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                                    let v: Option<chrono::NaiveDateTime> = row.get(i);
-                                    match v {
-                                        Some(val) => {
-                                            let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                                val,
-                                                chrono::Utc,
-                                            );
-                                            crate::model::Value::DateTime(utc)
-                                        }
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                "DateTime" | "chrono::DateTime" => {
-                                    let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                                    match v {
-                                        Some(val) => crate::model::Value::DateTime(val),
-                                        None => crate::model::Value::Null,
-                                    }
-                                }
-                                _ => {
-                                    return Some(Err(anyhow::anyhow!(format!(
-                                        "Unsupported nullable column type: {rust_type}"
-                                    ))));
-                                }
-                            },
-                        }
-                    } else {
-                        // 非空类型处理 - 解析失败时返回错误
-                        match rust_type {
-                            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                                let v: Option<i32> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Integer(val as i64),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected integer type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "i64" | "u64" => {
-                                let v: Option<i64> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Integer(val),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected i64 type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "String" => {
-                                let v: Option<String> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Text(val),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected String type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "f32" | "f64" => {
-                                let v: Option<f64> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Real(val),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected float type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "bool" => {
-                                let v: Option<bool> = row.get(i);
-                                match v {
-                                    Some(true) => crate::model::Value::Integer(1),
-                                    Some(false) => crate::model::Value::Integer(0),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected bool type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                                let v: Option<Vec<u8>> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::Bytes(val),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected Vec<u8> type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                                let v: Option<chrono::NaiveDateTime> = row.get(i);
-                                match v {
-                                    Some(val) => {
-                                        let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                            val,
-                                            chrono::Utc,
-                                        );
-                                        crate::model::Value::DateTime(utc)
-                                    }
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected NaiveDateTime type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            "DateTime" | "chrono::DateTime" => {
-                                let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                                match v {
-                                    Some(val) => crate::model::Value::DateTime(val),
-                                    None => {
-                                        return Some(Err(anyhow::anyhow!(format!(
-                                            "Failed to parse non-nullable column '{}' (expected DateTime type)",
-                                            col_name
-                                        ))));
-                                    }
-                                }
-                            }
-                            _ => {
-                                return Some(Err(anyhow::anyhow!(format!(
-                                    "Unsupported column type: {rust_type}"
-                                ))));
-                            }
+                    let ormer_value = match pg_model_value_from_row::<T>(&row, i, i) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            return Some(Err(err.context(format!("column '{}'", col_name))));
                         }
                     };
 
@@ -3649,116 +3411,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<bool> = row.get(i);
-                            match v {
-                                Some(true) => crate::model::Value::Integer(1),
-                                Some(false) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Option<Vec<u8>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Bytes(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: Option<chrono::NaiveDateTime> = row.get(i);
-                            match v {
-                                Some(val) => {
-                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                        val,
-                                        chrono::Utc,
-                                    );
-                                    crate::model::Value::DateTime(utc)
-                                }
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::DateTime(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i);
-                            crate::model::Value::Integer(v)
-                        }
-                        "String" => {
-                            let v: String = row.get(i);
-                            crate::model::Value::Text(v)
-                        }
-                        "f32" | "f64" => {
-                            let v: f64 = row.get(i);
-                            crate::model::Value::Real(v)
-                        }
-                        "bool" => {
-                            let v: bool = row.get(i);
-                            if v {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Vec<u8> = row.get(i);
-                            crate::model::Value::Bytes(v)
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: chrono::NaiveDateTime = row.get(i);
-                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                            crate::model::Value::DateTime(utc)
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                            crate::model::Value::DateTime(v)
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
             let ormer_row = Row::new(data);
@@ -3835,116 +3488,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<bool> = row.get(i);
-                            match v {
-                                Some(true) => crate::model::Value::Integer(1),
-                                Some(false) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Option<Vec<u8>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Bytes(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: Option<chrono::NaiveDateTime> = row.get(i);
-                            match v {
-                                Some(val) => {
-                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                        val,
-                                        chrono::Utc,
-                                    );
-                                    crate::model::Value::DateTime(utc)
-                                }
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::DateTime(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i);
-                            crate::model::Value::Integer(v)
-                        }
-                        "String" => {
-                            let v: String = row.get(i);
-                            crate::model::Value::Text(v)
-                        }
-                        "f32" | "f64" => {
-                            let v: f64 = row.get(i);
-                            crate::model::Value::Real(v)
-                        }
-                        "bool" => {
-                            let v: bool = row.get(i);
-                            if v {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Vec<u8> = row.get(i);
-                            crate::model::Value::Bytes(v)
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: chrono::NaiveDateTime = row.get(i);
-                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                            crate::model::Value::DateTime(utc)
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                            crate::model::Value::DateTime(v)
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
             let ormer_row = Row::new(data);
@@ -4022,116 +3566,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.data_type.unwrap_or(column_info.rust_type);
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<bool> = row.get(i);
-                            match v {
-                                Some(true) => crate::model::Value::Integer(1),
-                                Some(false) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Option<Vec<u8>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Bytes(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: Option<chrono::NaiveDateTime> = row.get(i);
-                            match v {
-                                Some(val) => {
-                                    let utc = chrono::DateTime::from_naive_utc_and_offset(
-                                        val,
-                                        chrono::Utc,
-                                    );
-                                    crate::model::Value::DateTime(utc)
-                                }
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: Option<chrono::DateTime<chrono::Utc>> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::DateTime(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: i64 = row.get(i);
-                            crate::model::Value::Integer(v)
-                        }
-                        "String" => {
-                            let v: String = row.get(i);
-                            crate::model::Value::Text(v)
-                        }
-                        "f32" | "f64" => {
-                            let v: f64 = row.get(i);
-                            crate::model::Value::Real(v)
-                        }
-                        "bool" => {
-                            let v: bool = row.get(i);
-                            if v {
-                                crate::model::Value::Integer(1)
-                            } else {
-                                crate::model::Value::Integer(0)
-                            }
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let v: Vec<u8> = row.get(i);
-                            crate::model::Value::Bytes(v)
-                        }
-                        "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                            let v: chrono::NaiveDateTime = row.get(i);
-                            let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                            crate::model::Value::DateTime(utc)
-                        }
-                        "DateTime" | "chrono::DateTime" => {
-                            let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                            crate::model::Value::DateTime(v)
-                        }
-                        _ => {
-                            return Err(anyhow::anyhow!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 data.insert(col_name.to_string(), ormer_value);
             }
             let ormer_row = Row::new(data);
@@ -4284,68 +3719,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
         for row in rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: Option<i32> = row.try_get(i).ok().flatten();
-                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
-                    }
-                    "i64" => {
-                        let v: Option<i64> = row.try_get(i).ok().flatten();
-                        crate::model::Value::Integer(v.unwrap_or(0))
-                    }
-                    "Duration" | "std::time::Duration" => {
-                        let v: Option<PgInterval> = row.try_get(i).ok().flatten();
-                        match v {
-                            Some(val) => crate::model::Value::Duration(from_postgres_interval(val)),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "String" => {
-                        let v: Option<String> = row.try_get(i).ok().flatten();
-                        crate::model::Value::Text(v.unwrap_or_default())
-                    }
-                    "f32" | "f64" => {
-                        let v: Option<f64> = row.try_get(i).ok().flatten();
-                        crate::model::Value::Real(v.unwrap_or(0.0))
-                    }
-                    "bool" => {
-                        let v: Option<bool> = row.try_get(i).ok().flatten();
-                        match v {
-                            Some(true) => crate::model::Value::Integer(1),
-                            Some(false) => crate::model::Value::Integer(0),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Option<Vec<u8>> = row.try_get(i).ok().flatten();
-                        crate::model::Value::Bytes(v.unwrap_or_default())
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: Option<chrono::NaiveDateTime> = row.try_get(i).ok().flatten();
-                        match v {
-                            Some(val) => {
-                                let utc =
-                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
-                                crate::model::Value::DateTime(utc)
-                            }
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get(i).ok().flatten();
-                        match v {
-                            Some(val) => crate::model::Value::DateTime(val),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 t_data.insert(col_name.to_string(), ormer_value);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -4355,95 +3729,10 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             let mut j_is_null = true;
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: Option<i32> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
-                    }
-                    "i64" => {
-                        let v: Option<i64> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        crate::model::Value::Integer(v.unwrap_or(0))
-                    }
-                    "Duration" | "std::time::Duration" => {
-                        let v: Option<PgInterval> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        match v {
-                            Some(val) => crate::model::Value::Duration(from_postgres_interval(val)),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "String" => {
-                        let v: Option<String> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        crate::model::Value::Text(v.unwrap_or_default())
-                    }
-                    "f32" | "f64" => {
-                        let v: Option<f64> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        crate::model::Value::Real(v.unwrap_or(0.0))
-                    }
-                    "bool" => {
-                        let v: Option<bool> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        match v {
-                            Some(true) => crate::model::Value::Integer(1),
-                            Some(false) => crate::model::Value::Integer(0),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Option<Vec<u8>> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        crate::model::Value::Bytes(v.unwrap_or_default())
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: Option<chrono::NaiveDateTime> = row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        match v {
-                            Some(val) => {
-                                let utc =
-                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
-                                crate::model::Value::DateTime(utc)
-                            }
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get(idx).ok().flatten();
-                        if v.is_some() {
-                            j_is_null = false;
-                        }
-                        match v {
-                            Some(val) => crate::model::Value::DateTime(val),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_outer_join_model_value_from_row::<J>(&row, i, idx)?;
+                if !matches!(ormer_value, crate::model::Value::Null) {
+                    j_is_null = false;
+                }
                 j_data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -4578,51 +3867,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         for row in rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: i32 = row.get(i);
-                        crate::model::Value::Integer(v as i64)
-                    }
-                    "i64" => {
-                        let v: i64 = row.get(i);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(i);
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(i);
-                        crate::model::Value::Real(v)
-                    }
-                    "bool" => {
-                        let v: bool = row.get(i);
-                        if v {
-                            crate::model::Value::Integer(1)
-                        } else {
-                            crate::model::Value::Integer(0)
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Vec<u8> = row.get(i);
-                        crate::model::Value::Bytes(v)
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: chrono::NaiveDateTime = row.get(i);
-                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                        crate::model::Value::DateTime(utc)
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: chrono::DateTime<chrono::Utc> = row.get(i);
-                        crate::model::Value::DateTime(v)
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
                 t_data.insert(col_name.to_string(), ormer_value);
             }
             let t_model = T::from_row(&Row::new(t_data))?;
@@ -4630,51 +3875,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: i32 = row.get(idx);
-                        crate::model::Value::Integer(v as i64)
-                    }
-                    "i64" => {
-                        let v: i64 = row.get(idx);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(idx);
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(idx);
-                        crate::model::Value::Real(v)
-                    }
-                    "bool" => {
-                        let v: bool = row.get(idx);
-                        if v {
-                            crate::model::Value::Integer(1)
-                        } else {
-                            crate::model::Value::Integer(0)
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Vec<u8> = row.get(idx);
-                        crate::model::Value::Bytes(v)
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: chrono::NaiveDateTime = row.get(idx);
-                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                        crate::model::Value::DateTime(utc)
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: chrono::DateTime<chrono::Utc> = row.get(idx);
-                        crate::model::Value::DateTime(v)
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<J>(&row, i, idx)?;
                 j_data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -4814,95 +4015,10 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             let mut t_data = HashMap::new();
             let mut t_is_null = true;
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: Option<i32> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Integer(v.unwrap_or(0) as i64)
-                    }
-                    "i64" => {
-                        let v: Option<i64> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Integer(v.unwrap_or(0))
-                    }
-                    "Duration" | "std::time::Duration" => {
-                        let v: Option<PgInterval> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        match v {
-                            Some(val) => crate::model::Value::Duration(from_postgres_interval(val)),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "String" => {
-                        let v: Option<String> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Text(v.unwrap_or_default())
-                    }
-                    "f32" | "f64" => {
-                        let v: Option<f64> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Real(v.unwrap_or(0.0))
-                    }
-                    "bool" => {
-                        let v: Option<bool> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        match v {
-                            Some(true) => crate::model::Value::Integer(1),
-                            Some(false) => crate::model::Value::Integer(0),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Option<Vec<u8>> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Bytes(v.unwrap_or_default())
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: Option<chrono::NaiveDateTime> = row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        match v {
-                            Some(val) => {
-                                let utc =
-                                    chrono::DateTime::from_naive_utc_and_offset(val, chrono::Utc);
-                                crate::model::Value::DateTime(utc)
-                            }
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: Option<chrono::DateTime<chrono::Utc>> =
-                            row.try_get(i).ok().flatten();
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        match v {
-                            Some(val) => crate::model::Value::DateTime(val),
-                            None => crate::model::Value::Null,
-                        }
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_outer_join_model_value_from_row::<T>(&row, i, i)?;
+                if !matches!(ormer_value, crate::model::Value::Null) {
+                    t_is_null = false;
+                }
                 t_data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -4915,55 +4031,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" => {
-                        let v: i32 = row.get(idx);
-                        crate::model::Value::Integer(v as i64)
-                    }
-                    "i64" => {
-                        let v: i64 = row.get(idx);
-                        crate::model::Value::Integer(v)
-                    }
-                    "Duration" | "std::time::Duration" => {
-                        let v: PgInterval = row.get(idx);
-                        crate::model::Value::Duration(from_postgres_interval(v))
-                    }
-                    "String" => {
-                        let v: String = row.get(idx);
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(idx);
-                        crate::model::Value::Real(v)
-                    }
-                    "bool" => {
-                        let v: bool = row.get(idx);
-                        if v {
-                            crate::model::Value::Integer(1)
-                        } else {
-                            crate::model::Value::Integer(0)
-                        }
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let v: Vec<u8> = row.get(idx);
-                        crate::model::Value::Bytes(v)
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let v: chrono::NaiveDateTime = row.get(idx);
-                        let utc = chrono::DateTime::from_naive_utc_and_offset(v, chrono::Utc);
-                        crate::model::Value::DateTime(utc)
-                    }
-                    "DateTime" | "chrono::DateTime" => {
-                        let v: chrono::DateTime<chrono::Utc> = row.get(idx);
-                        crate::model::Value::DateTime(v)
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
+                let ormer_value = pg_model_value_from_row::<J>(&row, i, idx)?;
                 j_data.insert(col_name.to_string(), ormer_value);
             }
 
@@ -4983,6 +4051,15 @@ fn convert_postgres_value(
     use tokio_postgres::types::Type;
 
     let col_type = row.columns()[index].type_();
+
+    if matches!(col_type.kind(), postgres_types::Kind::Enum(_)) {
+        if let Ok(v) = row.try_get::<_, Option<PgEnumText>>(index) {
+            return Ok(match v {
+                Some(val) => crate::model::Value::Text(val.0),
+                None => crate::model::Value::Null,
+            });
+        }
+    }
 
     // 根据PostgreSQL类型选择正确的Rust类型
     match *col_type {

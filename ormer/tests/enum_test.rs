@@ -1,6 +1,9 @@
 #[allow(unused_imports)]
 use ormer::{Model, ModelEnum};
 
+#[cfg(feature = "postgresql")]
+mod _test_common;
+
 #[derive(Debug, Clone, ModelEnum, PartialEq)]
 enum UserStatus {
     Active,
@@ -199,4 +202,62 @@ fn test_mysql_enum_create_sql() {
     let optional_sql =
         ormer::generate_create_table_sql::<TestEnumUserOptional>(ormer::DbType::MySQL).unwrap();
     assert!(optional_sql.contains("status ENUM('Active', 'Inactive', 'Banned')"));
+}
+
+#[cfg(feature = "postgresql")]
+#[tokio::test]
+async fn test_postgresql_enum_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let config = _test_common::postgresql_config();
+    let db = _test_common::create_db_connection(&config).await?;
+    let _ = db.drop_table::<TestEnumUserOptional>().execute().await;
+    let _ = db.drop_table::<TestEnumUser>().execute().await;
+
+    db.create_table::<TestEnumUser>().execute().await?;
+    db.create_table::<TestEnumUserOptional>().execute().await?;
+
+    db.insert(&TestEnumUser {
+        id: 1,
+        status: UserStatus::Active,
+        name: "Alice".to_string(),
+    })
+    .execute()
+    .await?;
+    db.insert(&TestEnumUserOptional {
+        id: 1,
+        status: Some(UserStatus::Banned),
+        name: "Bob".to_string(),
+    })
+    .execute()
+    .await?;
+    db.insert(&TestEnumUserOptional {
+        id: 2,
+        status: None,
+        name: "Carol".to_string(),
+    })
+    .execute()
+    .await?;
+
+    let users = db.select::<TestEnumUser>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].status, UserStatus::Active);
+
+    let optional_users = db.select::<TestEnumUserOptional>().collect::<Vec<_>>().await?;
+    assert_eq!(optional_users.len(), 2);
+    assert_eq!(optional_users[0].status, Some(UserStatus::Banned));
+    assert_eq!(optional_users[1].status, None);
+
+    let returned = db
+        .insert(&TestEnumUser {
+            id: 2,
+            status: UserStatus::Inactive,
+            name: "Dave".to_string(),
+        })
+        .returning()
+        .await?;
+    assert_eq!(returned.len(), 1);
+    assert_eq!(returned[0].status, UserStatus::Inactive);
+
+    db.drop_table::<TestEnumUserOptional>().execute().await?;
+    db.drop_table::<TestEnumUser>().execute().await?;
+    Ok(())
 }
