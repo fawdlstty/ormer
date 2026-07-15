@@ -175,14 +175,16 @@ fn test_enum_column_schema_metadata() {
         .find(|col| col.name == "status")
         .unwrap();
     assert_eq!(optional_status_col.rust_type, "UserStatus");
-    assert_eq!(optional_status_col.enum_variants, Some(UserStatus::VARIANTS));
+    assert_eq!(
+        optional_status_col.enum_variants,
+        Some(UserStatus::VARIANTS)
+    );
 }
 
 #[cfg(feature = "postgresql")]
 #[test]
 fn test_postgresql_enum_create_sql() {
-    let sql = ormer::generate_create_table_sql::<TestEnumUser>(ormer::DbType::PostgreSQL)
-        .unwrap();
+    let sql = ormer::generate_create_table_sql::<TestEnumUser>(ormer::DbType::PostgreSQL).unwrap();
     assert!(sql.contains("status user_status NOT NULL"));
     assert!(!sql.contains("status TEXT"));
 
@@ -241,7 +243,10 @@ async fn test_postgresql_enum_roundtrip() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(users.len(), 1);
     assert_eq!(users[0].status, UserStatus::Active);
 
-    let optional_users = db.select::<TestEnumUserOptional>().collect::<Vec<_>>().await?;
+    let optional_users = db
+        .select::<TestEnumUserOptional>()
+        .collect::<Vec<_>>()
+        .await?;
     assert_eq!(optional_users.len(), 2);
     assert_eq!(optional_users[0].status, Some(UserStatus::Banned));
     assert_eq!(optional_users[1].status, None);

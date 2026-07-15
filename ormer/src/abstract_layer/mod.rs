@@ -89,8 +89,7 @@ pub use common::{
     InsertOrUpdateExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
     MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
     SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
-    SqlStatement,
-    Transaction, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    SqlStatement, Transaction, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
     TransactionInsertOrUpdateExecutor, UpdateExecutor,
 };
 

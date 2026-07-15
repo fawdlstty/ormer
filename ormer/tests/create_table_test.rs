@@ -370,7 +370,7 @@ mod create_table_tests {
         let sql =
             generate_create_table_sql::<TestDateTimePrimaryKey>(ormer::DbType::PostgreSQL).unwrap();
 
-        assert!(sql.contains("update_time TIMESTAMP PRIMARY KEY"));
+        assert!(sql.contains("update_time TIMESTAMPTZ PRIMARY KEY"));
         assert!(!sql.contains("update_time INTEGER PRIMARY KEY"));
     }
 

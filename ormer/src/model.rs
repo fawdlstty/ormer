@@ -310,6 +310,7 @@ impl<T: ModelEnumProvider> ModelEnumProvider for Option<T> {
 impl<T: ModelEnum> From<Option<T>> for Value {
     fn from(v: Option<T>) -> Self {
         match v {
+            Some(enum_val) if T::is_numeric_enum() => Value::Integer(enum_val.as_i64()),
             Some(enum_val) => Value::Text(enum_val.name().to_string()),
             None => Value::Null,
         }
@@ -321,6 +322,7 @@ impl<T: ModelEnum> FromValue for Option<T> {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
+            Value::Integer(v) if T::is_numeric_enum() => T::from_i64(*v).map(Some),
             Value::Text(s) => {
                 // 使用 ModelEnum::from_name 构造枚举值
                 match T::from_name(s) {
@@ -364,6 +366,7 @@ impl_enum_provider_for_non_enum!(
     String,
     &str,
     Vec<u8>,
+    Vec<String>,
     std::time::Duration,
     chrono::DateTime<chrono::Utc>,
     chrono::NaiveDateTime,
@@ -847,6 +850,62 @@ impl FromRowValues for String {
     }
 }
 
+impl From<Vec<String>> for Value {
+    fn from(v: Vec<String>) -> Self {
+        Value::Text(serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()))
+    }
+}
+
+impl FromValue for Vec<String> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(Vec::new()),
+            Value::Text(v) => {
+                let raw = v.trim();
+                if raw.is_empty() {
+                    return Ok(Vec::new());
+                }
+                if let Ok(users) = serde_json::from_str::<Vec<String>>(raw) {
+                    return Ok(users
+                        .into_iter()
+                        .map(|user| user.trim().to_string())
+                        .filter(|user| !user.is_empty())
+                        .collect());
+                }
+                Ok(vec![raw.to_string()])
+            }
+            Value::Json(v) => {
+                if v.is_null() {
+                    return Ok(Vec::new());
+                }
+                if let Some(user) = v.as_str() {
+                    let user = user.trim();
+                    return Ok((!user.is_empty())
+                        .then(|| user.to_string())
+                        .into_iter()
+                        .collect());
+                }
+                let users = serde_json::from_value::<Vec<String>>(v.clone())?;
+                Ok(users
+                    .into_iter()
+                    .map(|user| user.trim().to_string())
+                    .filter(|user| !user.is_empty())
+                    .collect())
+            }
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<String>")),
+        }
+    }
+}
+
+impl FromRowValues for Vec<String> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Vec<String>"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
 // bool 特殊处理（从 Boolean 读取）
 impl FromValue for bool {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
@@ -1125,6 +1184,15 @@ impl FromValue for Vec<u8> {
             Value::Bytes(v) => Ok(v.clone()),
             _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>")),
         }
+    }
+}
+
+impl FromRowValues for Vec<u8> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>"));
+        }
+        Self::from_value(&values[0])
     }
 }
 

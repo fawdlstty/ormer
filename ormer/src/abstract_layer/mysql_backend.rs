@@ -437,7 +437,10 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
 
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT IGNORE INTO {} ({columns}) VALUES ",
+            I::Model::TABLE_NAME
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in refs.iter().enumerate() {
@@ -1065,10 +1068,9 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertExecutor<
             let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
             if has_auto_increment {
                 let last_id = conn.last_insert_id().unwrap_or(0);
-                let result =
-                    convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
-                        last_id,
-                    )?;
+                let result = convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
+                    last_id,
+                )?;
                 return Ok(result);
             }
         }

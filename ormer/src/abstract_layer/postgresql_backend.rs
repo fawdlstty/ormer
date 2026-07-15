@@ -154,6 +154,51 @@ impl ToSql for PgMaybeTextParam {
     postgres_types::to_sql_checked!();
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PgDateTimeParam(chrono::DateTime<chrono::Utc>);
+
+impl ToSql for PgDateTimeParam {
+    fn to_sql(
+        &self,
+        ty: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty == PgType::TIMESTAMP {
+            self.0.naive_utc().to_sql(ty, out)
+        } else {
+            self.0.to_sql(ty, out)
+        }
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        matches!(*ty, PgType::TIMESTAMP | PgType::TIMESTAMPTZ)
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PgMaybeDateTimeParam(Option<chrono::DateTime<chrono::Utc>>);
+
+impl ToSql for PgMaybeDateTimeParam {
+    fn to_sql(
+        &self,
+        ty: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self.0 {
+            Some(value) => PgDateTimeParam(value).to_sql(ty, out),
+            None => Ok(IsNull::Yes),
+        }
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        PgDateTimeParam::accepts(ty)
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
 #[derive(Debug, Clone)]
 struct PgEnumText(String);
 
@@ -195,6 +240,23 @@ fn from_postgres_interval(interval: PgInterval) -> std::time::Duration {
     } else {
         std::time::Duration::from_micros(total_micros.min(u64::MAX as i128) as u64)
     }
+}
+
+fn pg_datetime_value_from_row(
+    row: &tokio_postgres::Row,
+    idx: usize,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    if let Ok(value) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
+        return Ok(value);
+    }
+    if let Ok(value) = row.try_get::<_, Option<chrono::NaiveDateTime>>(idx) {
+        return Ok(
+            value.map(|value| chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc))
+        );
+    }
+    Err(anyhow::anyhow!(
+        "Failed to parse column at index {idx} (expected PostgreSQL timestamp type)"
+    ))
 }
 
 fn pg_model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
@@ -283,7 +345,7 @@ fn pg_value_from_row_cell(
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .unwrap_or(crate::model::Value::Null))
             }
-            "String" => {
+            "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
                 let value: Option<String> = row.get(idx);
                 Ok(value
                     .map(crate::model::Value::Text)
@@ -309,18 +371,8 @@ fn pg_value_from_row_cell(
                     .map(crate::model::Value::Bytes)
                     .unwrap_or(crate::model::Value::Null))
             }
-            "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                let value: Option<chrono::NaiveDateTime> = row.get(idx);
-                Ok(match value {
-                    Some(value) => crate::model::Value::DateTime(
-                        chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc),
-                    ),
-                    None => crate::model::Value::Null,
-                })
-            }
-            "DateTime" | "chrono::DateTime" => {
-                let value: Option<chrono::DateTime<chrono::Utc>> = row.get(idx);
-                Ok(value
+            "NaiveDateTime" | "chrono::NaiveDateTime" | "DateTime" | "chrono::DateTime" => {
+                Ok(pg_datetime_value_from_row(row, idx)?
                     .map(crate::model::Value::DateTime)
                     .unwrap_or(crate::model::Value::Null))
             }
@@ -361,7 +413,7 @@ fn pg_value_from_row_cell(
                         ))
                     })
             }
-            "String" => {
+            "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
                 let value: Option<String> = row.get(idx);
                 value.map(crate::model::Value::Text).ok_or_else(|| {
                     anyhow::anyhow!(format!(
@@ -399,29 +451,15 @@ fn pg_value_from_row_cell(
                     ))
                 })
             }
-            "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                let value: Option<chrono::NaiveDateTime> = row.get(idx);
-                value
-                    .map(|value| {
-                        crate::model::Value::DateTime(
-                            chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc),
-                        )
-                    })
+            "NaiveDateTime" | "chrono::NaiveDateTime" | "DateTime" | "chrono::DateTime" => {
+                pg_datetime_value_from_row(row, idx)?
+                    .map(crate::model::Value::DateTime)
                     .ok_or_else(|| {
                         anyhow::anyhow!(format!(
-                            "Failed to parse non-nullable column at index {} (expected NaiveDateTime type)",
+                            "Failed to parse non-nullable column at index {} (expected timestamp type)",
                             idx
                         ))
                     })
-            }
-            "DateTime" | "chrono::DateTime" => {
-                let value: Option<chrono::DateTime<chrono::Utc>> = row.get(idx);
-                value.map(crate::model::Value::DateTime).ok_or_else(|| {
-                    anyhow::anyhow!(format!(
-                        "Failed to parse non-nullable column at index {} (expected DateTime type)",
-                        idx
-                    ))
-                })
             }
             _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
         }
@@ -548,8 +586,9 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
             // 日期时间类型（如果使用 chrono crate）
-            "DateTime" | "chrono::DateTime" => "TIMESTAMPTZ",
-            "NaiveDateTime" | "chrono::NaiveDateTime" => "TIMESTAMP",
+            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                "TIMESTAMPTZ"
+            }
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
             // JSON 类型
@@ -1302,6 +1341,12 @@ impl Database {
         // 标准化类型名称 - 只提取基础类型，去除约束
         fn normalize(s: &str) -> String {
             let upper = s.to_uppercase();
+            if upper.starts_with("TIMESTAMP WITH TIME ZONE") || upper == "TIMESTAMPTZ" {
+                return "TIMESTAMPTZ".to_string();
+            }
+            if upper.starts_with("TIMESTAMP WITHOUT TIME ZONE") || upper == "TIMESTAMP" {
+                return "TIMESTAMP".to_string();
+            }
             // 提取第一个单词作为基础类型
             let base_type = upper.split_whitespace().next().unwrap_or(&upper);
 
@@ -1333,7 +1378,9 @@ impl Database {
             }
         }
 
-        normalize(actual) == normalize(expected)
+        let actual = normalize(actual);
+        let expected = normalize(expected);
+        actual == expected || (actual == "TIMESTAMP" && expected == "TIMESTAMPTZ")
     }
 
     /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
@@ -3143,14 +3190,7 @@ fn values_to_params_with_types(
             crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
                 as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
             crate::model::Value::DateTime(v) => {
-                // NaiveDateTime 对应 PostgreSQL TIMESTAMP，DateTime<Utc> 对应 TIMESTAMPTZ
-                // 根据列的 rust_type 决定传递哪种类型，避免类型不匹配导致序列化失败
-                if rust_type == "NaiveDateTime" || rust_type == "chrono::NaiveDateTime" {
-                    Box::new(v.naive_utc()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
-                    // DateTime<Utc> 需要传递 chrono::DateTime<chrono::Utc> 类型
-                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                }
+                Box::new(PgDateTimeParam(*v)) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Json(v) => {
                 Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
@@ -3188,13 +3228,9 @@ fn values_to_params_with_types(
                         let null_val: Option<Vec<u8>> = None;
                         Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
-                    "DateTime" | "chrono::DateTime" => {
-                        let null_val: Option<chrono::DateTime<chrono::Utc>> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        let null_val: Option<chrono::NaiveDateTime> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+                        Box::new(PgMaybeDateTimeParam(None))
+                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     _ => {
                         // 未知类型优先按文本 NULL 处理，覆盖 PostgreSQL enum 等自定义类型

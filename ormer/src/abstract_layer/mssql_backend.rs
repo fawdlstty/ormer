@@ -840,7 +840,10 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         let col_count = I::Model::COLUMNS.len();
         let pks = I::Model::primary_key_columns();
 
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "MERGE INTO {} AS target USING (VALUES ",
+            I::Model::TABLE_NAME
+        );
         let mut all_values = Vec::new();
         for (idx, model) in refs.iter().enumerate() {
             if idx > 0 {
@@ -992,7 +995,10 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         let col_count = I::Model::COLUMNS.len();
         let pks = I::Model::primary_key_columns();
 
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "MERGE INTO {} AS target USING (VALUES ",
+            I::Model::TABLE_NAME
+        );
         let mut all_values = Vec::new();
         for (idx, model) in refs.iter().enumerate() {
             if idx > 0 {
@@ -2029,7 +2035,9 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             DbType::MSSQL,
             statements
                 .into_iter()
-                .map(|(sql, params)| crate::abstract_layer::common::SingleSqlStatement::new(sql, params))
+                .map(|(sql, params)| {
+                    crate::abstract_layer::common::SingleSqlStatement::new(sql, params)
+                })
                 .collect(),
         ))
     }

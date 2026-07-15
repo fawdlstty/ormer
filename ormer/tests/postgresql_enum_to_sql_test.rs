@@ -1,7 +1,7 @@
 #![cfg(feature = "postgresql")]
 
-use ormer::{Model, ModelEnum};
 use ormer::model::DbBackendTypeMapper;
+use ormer::{Model, ModelEnum};
 use postgres_types::{Format, ToSql, Type};
 
 #[derive(Debug, Clone, ModelEnum, PartialEq)]
@@ -90,7 +90,9 @@ fn postgres_enum_text_param_accepts_enum_type() {
     );
     let mut out = bytes::BytesMut::new();
     let param = TestTextParam("Active".to_string());
-    let is_null = param.to_sql_checked(&ty, &mut out).expect("enum text param should encode");
+    let is_null = param
+        .to_sql_checked(&ty, &mut out)
+        .expect("enum text param should encode");
 
     assert!(matches!(is_null, postgres_types::IsNull::No));
     assert!(matches!(param.encode_format(&ty), Format::Text));

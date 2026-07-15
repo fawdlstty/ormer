@@ -2034,6 +2034,33 @@ impl ColumnValueType for std::time::Duration {
     }
 }
 
+impl<T: crate::model::ModelEnum> ColumnValueType for T {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        if T::is_numeric_enum() {
+            crate::query::filter::Value::Integer(value.as_i64())
+        } else {
+            crate::query::filter::Value::Text(value.name().to_string())
+        }
+    }
+
+    fn supports_comparison() -> bool {
+        false
+    }
+}
+
+impl<T: ColumnValueType> ColumnValueType for Option<T> {
+    fn to_filter_value(value: Self) -> crate::query::filter::Value {
+        match value {
+            Some(value) => T::to_filter_value(value),
+            None => crate::query::filter::Value::Null,
+        }
+    }
+
+    fn supports_comparison() -> bool {
+        T::supports_comparison()
+    }
+}
+
 // ==================== 统一的 IsInValue Trait ====================
 // 使用泛型支持所有类型的 IN 语句
 
@@ -2574,6 +2601,20 @@ impl TypedColumn<String> {
     /// ```
     pub fn ends_with(self, pattern: &str) -> WhereExpr {
         self.like(&format!("%{}", pattern))
+    }
+}
+
+impl TypedColumn<Vec<String>> {
+    /// PostgreSQL JSONB array membership, generated as `column::jsonb ? value`.
+    pub fn contains(self, value: impl Into<String>) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::Comparison {
+                column: format!("{}::jsonb", self.column_name),
+                operator: "?".to_string(),
+                value: crate::query::filter::Value::Text(value.into()),
+            },
+            ..WhereExpr::defaults()
+        }
     }
 }
 
