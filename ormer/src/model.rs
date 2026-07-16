@@ -1,3 +1,4 @@
+use crate::time::{naive_local_to_utc, utc_to_naive_local};
 use std::collections::HashMap;
 
 /// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
@@ -1264,14 +1265,14 @@ impl FromValue for Option<chrono::DateTime<chrono::Utc>> {
 // chrono::NaiveDateTime 特殊处理
 impl From<chrono::NaiveDateTime> for Value {
     fn from(v: chrono::NaiveDateTime) -> Self {
-        Value::DateTime(v.and_utc())
+        Value::DateTime(naive_local_to_utc(v))
     }
 }
 
 impl FromValue for chrono::NaiveDateTime {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
-            Value::DateTime(v) => Ok(v.naive_utc()),
+            Value::DateTime(v) => Ok(utc_to_naive_local(*v)),
             _ => Err(anyhow::anyhow!("Type mismatch: expected NaiveDateTime")),
         }
     }
@@ -1289,7 +1290,7 @@ impl FromRowValues for chrono::NaiveDateTime {
 impl From<Option<chrono::NaiveDateTime>> for Value {
     fn from(v: Option<chrono::NaiveDateTime>) -> Self {
         match v {
-            Some(dt) => Value::DateTime(dt.and_utc()),
+            Some(dt) => Value::DateTime(naive_local_to_utc(dt)),
             None => Value::Null,
         }
     }
@@ -1299,7 +1300,7 @@ impl FromValue for Option<chrono::NaiveDateTime> {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(None),
-            Value::DateTime(v) => Ok(Some(v.naive_utc())),
+            Value::DateTime(v) => Ok(Some(utc_to_naive_local(*v))),
             _ => Err(anyhow::anyhow!(
                 "Type mismatch: expected Option<NaiveDateTime>"
             )),

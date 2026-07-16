@@ -2016,7 +2016,7 @@ impl ColumnValueType for &str {
 // 为 chrono::NaiveDateTime 实现 ColumnValueType
 impl ColumnValueType for chrono::NaiveDateTime {
     fn to_filter_value(value: Self) -> crate::query::filter::Value {
-        crate::query::filter::Value::DateTime(value.and_utc())
+        crate::query::filter::Value::DateTime(crate::time::naive_local_to_utc(value))
     }
 
     fn supports_comparison() -> bool {

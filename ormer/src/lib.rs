@@ -2,6 +2,7 @@ pub mod abstract_layer;
 pub mod hooks;
 pub mod model;
 pub mod query;
+mod time;
 pub mod utils;
 
 #[cfg(not(any(
