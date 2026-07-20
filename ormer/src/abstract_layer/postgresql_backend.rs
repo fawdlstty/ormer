@@ -1180,7 +1180,8 @@ impl Database {
         }
 
         // 表已存在，验证表结构
-        self.validate_table_schema::<T>().await
+        self.validate_table_schema::<T>().await?;
+        self.validate_table_hypertable::<T>().await
     }
 
     /// 检查表是否存在
@@ -1196,6 +1197,55 @@ impl Database {
         let count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
 
         Ok(count > 0)
+    }
+
+    async fn check_table_is_hypertable<T: Model>(&self) -> anyhow::Result<bool> {
+        let sql = "SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL";
+        let row = self.client.query_one(sql, &[]).trace().await?;
+        let has_hypertables_view: bool =
+            row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+
+        if !has_hypertables_view {
+            return Ok(false);
+        }
+
+        let sql = r#"
+            SELECT COUNT(*)
+            FROM timescaledb_information.hypertables
+            WHERE hypertable_schema = 'public' AND hypertable_name = $1
+        "#;
+        let row = self
+            .client
+            .query_one(sql, &[&T::TABLE_NAME])
+            .trace()
+            .await?;
+        let count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+
+        Ok(count > 0)
+    }
+
+    async fn validate_table_hypertable<T: Model>(&self) -> anyhow::Result<()> {
+        let expected_hypertable = T::hypertable_info().is_some();
+        let actual_hypertable = self.check_table_is_hypertable::<T>().trace().await?;
+
+        if expected_hypertable != actual_hypertable {
+            return Err(anyhow::anyhow!(
+                "Schema mismatch: table {}, reason: Hypertable mismatch: expected {}, but actual is {}",
+                T::TABLE_NAME,
+                if expected_hypertable {
+                    "hypertable"
+                } else {
+                    "regular table"
+                },
+                if actual_hypertable {
+                    "hypertable"
+                } else {
+                    "regular table"
+                }
+            ));
+        }
+
+        Ok(())
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）

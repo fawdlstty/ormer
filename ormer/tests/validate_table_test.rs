@@ -13,6 +13,17 @@ define_test_user_simple!(
     "validate_table_novalidation_users_1"
 );
 
+#[cfg(feature = "postgresql")]
+#[derive(Debug, ormer::Model, Clone)]
+#[table = "validate_table_hypertable_mismatch_1"]
+struct ValidateTestHypertable {
+    #[primary]
+    id: i32,
+    #[hypertable(std::time::Duration::from_secs(3600))]
+    created_at: chrono::NaiveDateTime,
+    name: String,
+}
+
 #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 mod validate_table_tests {
     use super::*;
@@ -95,7 +106,49 @@ mod validate_table_tests {
         Ok(())
     }
 
+    #[cfg(feature = "postgresql")]
+    async fn test_validate_table_hypertable_mismatch_impl(
+        config: &DbConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = create_db_connection(config).await?;
+
+        db.drop_table::<ValidateTestHypertable>()
+            .execute()
+            .await
+            .ok();
+        db.exec_non_query(
+            r#"
+            CREATE TABLE validate_table_hypertable_mismatch_1 (
+                id INTEGER PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL,
+                name VARCHAR(255) NOT NULL
+            )
+            "#,
+        )
+        .await?;
+
+        let result = db.validate_table::<ValidateTestHypertable>().await;
+        db.drop_table::<ValidateTestHypertable>().execute().await?;
+
+        let error = result
+            .expect_err("validate_table should reject a regular table for a hypertable model");
+        assert!(
+            format!("{error:?}").contains("Hypertable mismatch"),
+            "unexpected error: {error:?}"
+        );
+
+        Ok(())
+    }
+
     test_on_all_dbs_result!(test_validate_table_success_impl);
     test_on_all_dbs_result!(test_validate_table_not_exists_impl);
     test_on_all_dbs_result!(test_create_table_without_validation_impl);
+
+    #[cfg(feature = "postgresql")]
+    #[tokio::test]
+    async fn test_postgresql_validate_table_hypertable_mismatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = _test_common::postgresql_config();
+        test_validate_table_hypertable_mismatch_impl(&config).await
+    }
 }
