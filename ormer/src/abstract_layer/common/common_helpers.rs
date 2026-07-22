@@ -472,6 +472,11 @@ pub fn value_to_filter_value(val: &Value) -> crate::query::filter::Value {
         Value::Real(v) => crate::query::filter::Value::Real(*v),
         Value::Boolean(v) => crate::query::filter::Value::Boolean(*v),
         Value::Bytes(v) => crate::query::filter::Value::Bytes(v.clone()),
+        Value::IntegerArray(v) => crate::query::filter::Value::IntegerArray(v.clone()),
+        Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v.clone()),
+        Value::NullableBigIntArray(v) => {
+            crate::query::filter::Value::NullableBigIntArray(v.clone())
+        }
         Value::DateTime(v) => crate::query::filter::Value::DateTime(*v),
         Value::Json(v) => crate::query::filter::Value::Json(v.clone()),
         Value::Uuid(v) => crate::query::filter::Value::Uuid(*v),

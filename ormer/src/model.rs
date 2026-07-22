@@ -367,6 +367,9 @@ impl_enum_provider_for_non_enum!(
     String,
     &str,
     Vec<u8>,
+    Vec<i32>,
+    Vec<i64>,
+    Vec<Option<i64>>,
     Vec<String>,
     std::time::Duration,
     chrono::DateTime<chrono::Utc>,
@@ -709,6 +712,9 @@ pub enum Value {
     Real(f64),
     Boolean(bool),
     Bytes(Vec<u8>),
+    IntegerArray(Vec<i32>),
+    BigIntArray(Vec<i64>),
+    NullableBigIntArray(Vec<Option<i64>>),
     DateTime(chrono::DateTime<chrono::Utc>),
     Json(serde_json::Value),
     Uuid(uuid::Uuid),
@@ -717,6 +723,71 @@ pub enum Value {
 
 pub trait FromValue: Sized {
     fn from_value(value: &Value) -> anyhow::Result<Self>;
+}
+
+#[doc(hidden)]
+pub struct I32DataTypeDecoder<T>(std::marker::PhantomData<T>);
+
+impl<T> I32DataTypeDecoder<T> {
+    pub const fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+#[doc(hidden)]
+pub trait I32DataTypeDecode<T> {
+    fn decode(
+        self,
+        value: i32,
+        column_name: &'static str,
+        target_type: &'static str,
+    ) -> anyhow::Result<T>;
+}
+
+impl<T> I32DataTypeDecode<T> for I32DataTypeDecoder<T>
+where
+    T: TryFrom<i32>,
+    <T as TryFrom<i32>>::Error: std::fmt::Display,
+{
+    fn decode(
+        self,
+        value: i32,
+        column_name: &'static str,
+        target_type: &'static str,
+    ) -> anyhow::Result<T> {
+        T::try_from(value).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to convert column '{}' to {}: {}",
+                column_name,
+                target_type,
+                err
+            )
+        })
+    }
+}
+
+impl<T> I32DataTypeDecode<T> for &I32DataTypeDecoder<T>
+where
+    T: Copy,
+{
+    fn decode(
+        self,
+        value: i32,
+        column_name: &'static str,
+        target_type: &'static str,
+    ) -> anyhow::Result<T> {
+        if std::mem::size_of::<T>() != std::mem::size_of::<i32>() {
+            return Err(anyhow::anyhow!(
+                "Failed to convert column '{}' to {}: target type must be i32-sized when it does not implement TryFrom<i32>",
+                column_name,
+                target_type
+            ));
+        }
+
+        // Fallback for #[data_type(i32)] C-like enums that intentionally do not
+        // implement TryFrom<i32>. Valid discriminants are the caller's contract.
+        Ok(unsafe { std::mem::transmute_copy::<i32, T>(&value) })
+    }
 }
 
 /// FromRowValues trait - 用于从一行中的多个值构建类型(如元组、Model)
@@ -1154,6 +1225,9 @@ impl From<crate::query::filter::Value> for Value {
             crate::query::filter::Value::Real(v) => Value::Real(v),
             crate::query::filter::Value::Boolean(v) => Value::Boolean(v),
             crate::query::filter::Value::Bytes(v) => Value::Bytes(v),
+            crate::query::filter::Value::IntegerArray(v) => Value::IntegerArray(v),
+            crate::query::filter::Value::BigIntArray(v) => Value::BigIntArray(v),
+            crate::query::filter::Value::NullableBigIntArray(v) => Value::NullableBigIntArray(v),
             crate::query::filter::Value::DateTime(v) => Value::DateTime(v),
             crate::query::filter::Value::Json(v) => Value::Json(v),
             crate::query::filter::Value::Uuid(v) => Value::Uuid(v),
@@ -1192,6 +1266,87 @@ impl FromRowValues for Vec<u8> {
     fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
         if values.is_empty() {
             return Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl From<Vec<i32>> for Value {
+    fn from(v: Vec<i32>) -> Self {
+        Value::IntegerArray(v)
+    }
+}
+
+impl FromValue for Vec<i32> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(Vec::new()),
+            Value::IntegerArray(v) => Ok(v.clone()),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<i32>")),
+        }
+    }
+}
+
+impl FromRowValues for Vec<i32> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Vec<i32>"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl From<Vec<i64>> for Value {
+    fn from(v: Vec<i64>) -> Self {
+        Value::BigIntArray(v)
+    }
+}
+
+impl FromValue for Vec<i64> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(Vec::new()),
+            Value::BigIntArray(v) => Ok(v.clone()),
+            Value::NullableBigIntArray(v) => v
+                .iter()
+                .copied()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow::anyhow!("Type mismatch: expected Vec<i64>")),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<i64>")),
+        }
+    }
+}
+
+impl FromRowValues for Vec<i64> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Vec<i64>"));
+        }
+        Self::from_value(&values[0])
+    }
+}
+
+impl From<Vec<Option<i64>>> for Value {
+    fn from(v: Vec<Option<i64>>) -> Self {
+        Value::NullableBigIntArray(v)
+    }
+}
+
+impl FromValue for Vec<Option<i64>> {
+    fn from_value(value: &Value) -> anyhow::Result<Self> {
+        match value {
+            Value::Null => Ok(Vec::new()),
+            Value::BigIntArray(v) => Ok(v.iter().copied().map(Some).collect()),
+            Value::NullableBigIntArray(v) => Ok(v.clone()),
+            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<Option<i64>>")),
+        }
+    }
+}
+
+impl FromRowValues for Vec<Option<i64>> {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        if values.is_empty() {
+            return Err(anyhow::anyhow!("Type mismatch: expected Vec<Option<i64>>"));
         }
         Self::from_value(&values[0])
     }

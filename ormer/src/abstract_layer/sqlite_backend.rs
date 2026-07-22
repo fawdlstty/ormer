@@ -1819,6 +1819,11 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1914,6 +1919,11 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -1996,6 +2006,11 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2091,6 +2106,11 @@ impl<
                     crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                     crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                     crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64),
+                    crate::model::Value::IntegerArray(_)
+                    | crate::model::Value::BigIntArray(_)
+                    | crate::model::Value::NullableBigIntArray(_) => {
+                        panic!("SQLite backend does not support PostgreSQL array values")
+                    }
                     crate::model::Value::Null => turso::Value::Null,
                 })
                 .collect();
@@ -2268,6 +2288,11 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2336,6 +2361,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2706,6 +2736,9 @@ fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
             Value::Json(v) => turso::Value::Text(v.to_string()),
             Value::Uuid(v) => turso::Value::Text(v.to_string()),
             Value::BigInt(v) => turso::Value::Integer(*v as i64),
+            Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
+                panic!("SQLite backend does not support PostgreSQL array values")
+            }
             Value::Null => turso::Value::Null,
         };
         params.push(param);
@@ -2843,6 +2876,11 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -2966,6 +3004,11 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();
@@ -3046,6 +3089,11 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
                 crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
                 crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
+                crate::model::Value::IntegerArray(_)
+                | crate::model::Value::BigIntArray(_)
+                | crate::model::Value::NullableBigIntArray(_) => {
+                    panic!("SQLite backend does not support PostgreSQL array values")
+                }
                 crate::model::Value::Null => turso::Value::Null,
             })
             .collect();

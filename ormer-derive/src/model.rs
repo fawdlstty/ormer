@@ -85,9 +85,21 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let primary_key_values: Vec<_> = primary_keys
         .iter()
         .map(|(field_name, _)| {
-            quote! { ::ormer::Value::from(self.#field_name.clone()) }
+            let field = fields
+                .iter()
+                .find(|f| f.ident.as_ref().unwrap() == field_name)
+                .expect("Primary key field not found");
+            field_to_value_expr(field)
         })
         .collect();
+
+    let primary_key_value_expr = {
+        let field = fields
+            .iter()
+            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
+            .expect("Primary key field not found");
+        field_to_value_expr(field)
+    };
 
     // 生成字段名列表
     let field_names: Vec<String> = fields
@@ -172,29 +184,57 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成 from_row 实现
     let from_row_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        quote! {
-            #field_name: row.get(stringify!(#field_name))?
+        if has_i32_data_type(f) {
+            field_from_i32_expr(
+                f,
+                quote! { row.get::<i32>(stringify!(#field_name))? },
+                quote! { row.get::<Option<i32>>(stringify!(#field_name))? },
+            )
+        } else if has_vec_i32_data_type(f) {
+            field_from_vec_i32_expr(f, quote! { row.get::<Vec<i32>>(stringify!(#field_name))? })
+        } else {
+            quote! {
+                #field_name: row.get(stringify!(#field_name))?
+            }
         }
     });
 
     // 生成 from_row_values 实现（按顺序从行值中读取）
     let from_row_values_fields = fields.iter().enumerate().map(|(i, f)| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_type = &f.ty;
-        quote! {
-            #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
-                &values[#i..#i+1]
-            )?
+        if has_i32_data_type(f) {
+            field_from_i32_expr(
+                f,
+                quote! {
+                    <i32 as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
+                },
+                quote! {
+                    <Option<i32> as ::ormer::FromRowValues>::from_row_values(
+                        &values[#i..#i+1]
+                    )?
+                },
+            )
+        } else if has_vec_i32_data_type(f) {
+            field_from_vec_i32_expr(
+                f,
+                quote! {
+                    <Vec<i32> as ::ormer::FromRowValues>::from_row_values(
+                        &values[#i..#i+1]
+                    )?
+                },
+            )
+        } else {
+            let field_type = &f.ty;
+            quote! {
+                #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
+                    &values[#i..#i+1]
+                )?
+            }
         }
     });
 
     // 生成 field_values 实现
-    let field_names_for_values = fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
-        quote! {
-            ::ormer::Value::from(self.#field_name.clone())
-        }
-    });
+    let field_names_for_values = fields.iter().map(|f| field_to_value_expr(f));
 
     // 生成 Where 结构体的字段
     // 为所有字段生成类型化列代理
@@ -283,7 +323,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
 
             fn primary_key_value(&self) -> ::ormer::Value {
-                ::ormer::Value::from(self.#primary_key_field.clone())
+                #primary_key_value_expr
             }
         }
 
@@ -492,6 +532,198 @@ fn has_data_type(field: &syn::Field) -> bool {
         .attrs
         .iter()
         .any(|attr| attr.path().is_ident("data_type"))
+}
+
+fn has_i32_data_type(field: &syn::Field) -> bool {
+    extract_data_type_type(field)
+        .as_ref()
+        .map(|ty| is_i32_type(ty))
+        .unwrap_or(false)
+}
+
+fn has_vec_i32_data_type(field: &syn::Field) -> bool {
+    extract_data_type_type(field)
+        .as_ref()
+        .map(|ty| is_vec_i32_type(ty))
+        .unwrap_or(false)
+}
+
+fn extract_data_type_type(field: &syn::Field) -> Option<syn::Type> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("data_type") {
+            if let Meta::List(list) = &attr.meta {
+                if let Ok(data_type) = syn::parse2::<syn::Type>(list.tokens.clone()) {
+                    return Some(data_type);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_i32_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident == "i32")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn is_vec_i32_type(ty: &syn::Type) -> bool {
+    vec_inner_type(ty).map(is_i32_type).unwrap_or(false)
+}
+
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let segment = type_path.path.segments.last()?;
+            if segment.ident != "Option" {
+                return None;
+            }
+
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.first().and_then(|arg| {
+                    if let syn::GenericArgument::Type(inner) = arg {
+                        Some(inner)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn vec_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let segment = type_path.path.segments.last()?;
+            if segment.ident != "Vec" {
+                return None;
+            }
+
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.first().and_then(|arg| {
+                    if let syn::GenericArgument::Type(inner) = arg {
+                        Some(inner)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn field_to_value_expr(field: &syn::Field) -> proc_macro2::TokenStream {
+    let field_name = field.ident.as_ref().unwrap();
+    let field_type = &field.ty;
+
+    if has_i32_data_type(field) {
+        if option_inner_type(field_type).is_some() {
+            quote! {
+                match self.#field_name.clone() {
+                    Some(value) => ::ormer::Value::from(value as i32),
+                    None => ::ormer::Value::Null,
+                }
+            }
+        } else {
+            quote! {
+                ::ormer::Value::from(self.#field_name.clone() as i32)
+            }
+        }
+    } else if has_vec_i32_data_type(field) {
+        let Some(_) = vec_inner_type(field_type) else {
+            panic!("#[data_type(Vec<i32>)] requires a Vec<T> field");
+        };
+        quote! {
+            ::ormer::Value::from(
+                self.#field_name
+                    .clone()
+                    .into_iter()
+                    .map(|value| value as i32)
+                    .collect::<Vec<i32>>()
+            )
+        }
+    } else {
+        quote! {
+            ::ormer::Value::from(self.#field_name.clone())
+        }
+    }
+}
+
+fn field_from_i32_expr(
+    field: &syn::Field,
+    value_expr: proc_macro2::TokenStream,
+    optional_value_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let field_name = field.ident.as_ref().unwrap();
+    let field_type = &field.ty;
+
+    if let Some(inner_type) = option_inner_type(field_type) {
+        let decode_expr = data_type_i32_decode_expr(inner_type, field_name, quote! { value });
+        quote! {
+            #field_name: {
+                let value = #optional_value_expr;
+                match value {
+                    Some(value) => Some(#decode_expr),
+                    None => None,
+                }
+            }
+        }
+    } else {
+        let decode_expr = data_type_i32_decode_expr(field_type, field_name, value_expr);
+        quote! {
+            #field_name: #decode_expr
+        }
+    }
+}
+
+fn field_from_vec_i32_expr(
+    field: &syn::Field,
+    value_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let field_name = field.ident.as_ref().unwrap();
+    let field_type = &field.ty;
+    let inner_type =
+        vec_inner_type(field_type).expect("#[data_type(Vec<i32>)] requires a Vec<T> field");
+
+    quote! {
+        #field_name: {
+            let values = #value_expr;
+            use ::ormer::model::I32DataTypeDecode as _;
+            values
+                .into_iter()
+                .map(|value| {
+                    ::ormer::model::I32DataTypeDecoder::<#inner_type>::new()
+                        .decode(value, stringify!(#field_name), stringify!(#inner_type))
+                })
+                .collect::<anyhow::Result<Vec<#inner_type>>>()?
+        }
+    }
+}
+
+fn data_type_i32_decode_expr(
+    target_type: &syn::Type,
+    field_name: &syn::Ident,
+    value_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    quote! {
+        {
+            let value = #value_expr;
+            use ::ormer::model::I32DataTypeDecode as _;
+            ::ormer::model::I32DataTypeDecoder::<#target_type>::new()
+                .decode(value, stringify!(#field_name), stringify!(#target_type))?
+        }
+    }
 }
 
 /// 提取 hypertable 属性的分片时长信息

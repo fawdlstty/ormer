@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.1.23"
+version = "0.1.24"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -24,7 +24,7 @@ async-trait = "0.1"
 byteorder = "1.5"
 bytes = "1"
 futures = "0.3"
-ormer-derive = { version = "0.1.19", path = "../ormer-derive" }
+ormer-derive = { version = "0.1.24", path = "../ormer-derive" }
 paste = "1.0"
 tokio = { version = "1.52.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -36,7 +36,7 @@ turso = { version = "0.1", optional = true }
 bb8 = { version = "0.8", optional = true }
 bb8-postgres = { version = "0.8", optional = true }
 postgres-types = { version = "0.2", optional = true }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres = { version = "0.7", features = ["array-impls", "with-chrono-0_4"], optional = true }
 # mysql
 mysql_async = { version = "0.34", optional = true }
 # mssql

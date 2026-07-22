@@ -276,6 +276,9 @@ fn pg_infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'sta
         crate::query::filter::Value::Real(_) => "f64",
         crate::query::filter::Value::Boolean(_) => "bool",
         crate::query::filter::Value::Bytes(_) => "Vec<u8>",
+        crate::query::filter::Value::IntegerArray(_) => "Vec<i32>",
+        crate::query::filter::Value::BigIntArray(_) => "Vec<i64>",
+        crate::query::filter::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
         crate::query::filter::Value::DateTime(_) => "NaiveDateTime",
         crate::query::filter::Value::Json(_) => "String",
         crate::query::filter::Value::Uuid(_) => "String",
@@ -292,11 +295,35 @@ fn pg_infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
         crate::model::Value::Real(_) => "f64",
         crate::model::Value::Boolean(_) => "bool",
         crate::model::Value::Bytes(_) => "Vec<u8>",
+        crate::model::Value::IntegerArray(_) => "Vec<i32>",
+        crate::model::Value::BigIntArray(_) => "Vec<i64>",
+        crate::model::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
         crate::model::Value::DateTime(_) => "NaiveDateTime",
         crate::model::Value::Json(_) => "String",
         crate::model::Value::Uuid(_) => "String",
         crate::model::Value::Null => "i32",
     }
+}
+
+fn is_vec_i32_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>"
+    )
+}
+
+fn is_vec_i64_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "Vec<i64>" | "std::vec::Vec<i64>" | "alloc::vec::Vec<i64>"
+    )
+}
+
+fn is_vec_option_i64_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "Vec<Option<i64>>" | "std::vec::Vec<Option<i64>>" | "alloc::vec::Vec<Option<i64>>"
+    )
 }
 
 fn pg_value_from_row_cell(
@@ -323,6 +350,42 @@ fn pg_value_from_row_cell(
                 }
             }
         });
+    }
+
+    if is_vec_i32_type(rust_type) {
+        let value: Option<Vec<i32>> = row.get(idx);
+        return match value {
+            Some(value) => Ok(crate::model::Value::IntegerArray(value)),
+            None if is_nullable => Ok(crate::model::Value::Null),
+            None => Err(anyhow::anyhow!(format!(
+                "Failed to parse non-nullable column at index {} (expected Vec<i32> type)",
+                idx
+            ))),
+        };
+    }
+
+    if is_vec_i64_type(rust_type) {
+        let value: Option<Vec<i64>> = row.get(idx);
+        return match value {
+            Some(value) => Ok(crate::model::Value::BigIntArray(value)),
+            None if is_nullable => Ok(crate::model::Value::Null),
+            None => Err(anyhow::anyhow!(format!(
+                "Failed to parse non-nullable column at index {} (expected Vec<i64> type)",
+                idx
+            ))),
+        };
+    }
+
+    if is_vec_option_i64_type(rust_type) {
+        let value: Option<Vec<Option<i64>>> = row.get(idx);
+        return match value {
+            Some(value) => Ok(crate::model::Value::NullableBigIntArray(value)),
+            None if is_nullable => Ok(crate::model::Value::Null),
+            None => Err(anyhow::anyhow!(format!(
+                "Failed to parse non-nullable column at index {} (expected Vec<Option<i64>> type)",
+                idx
+            ))),
+        };
     }
 
     if is_nullable {
@@ -583,6 +646,12 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             "Duration" | "std::time::Duration" => "INTERVAL",
             // 字节数组
             "Vec<u8>" | "&[u8]" => "BYTEA",
+            // PostgreSQL 原生数组
+            "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => "INTEGER[]",
+            "Vec<i64>" | "std::vec::Vec<i64>" | "alloc::vec::Vec<i64>" => "BIGINT[]",
+            "Vec<Option<i64>>" | "std::vec::Vec<Option<i64>>" | "alloc::vec::Vec<Option<i64>>" => {
+                "BIGINT[]"
+            }
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
             // 日期时间类型（如果使用 chrono crate）
@@ -1268,7 +1337,7 @@ impl Database {
             let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
             let is_nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
 
-            let actual_type = if col_type == "USER-DEFINED" {
+            let actual_type = if col_type == "USER-DEFINED" || col_type == "ARRAY" {
                 udt_name
             } else {
                 col_type
@@ -1391,6 +1460,11 @@ impl Database {
         // 标准化类型名称 - 只提取基础类型，去除约束
         fn normalize(s: &str) -> String {
             let upper = s.to_uppercase();
+            match upper.as_str() {
+                "_INT4" | "INT4[]" | "INTEGER[]" => return "INTEGER[]".to_string(),
+                "_INT8" | "INT8[]" | "BIGINT[]" => return "BIGINT[]".to_string(),
+                _ => {}
+            }
             if upper.starts_with("TIMESTAMP WITH TIME ZONE") || upper == "TIMESTAMPTZ" {
                 return "TIMESTAMPTZ".to_string();
             }
@@ -2658,6 +2732,15 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     crate::model::Value::Bytes(b) => {
                         Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::IntegerArray(v) => {
+                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::BigIntArray(v) => {
+                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::NullableBigIntArray(v) => {
+                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::DateTime(dt) => {
                         Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
@@ -3237,6 +3320,15 @@ fn values_to_params_with_types(
             crate::model::Value::Bytes(v) => {
                 Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
+            crate::model::Value::IntegerArray(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::BigIntArray(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::NullableBigIntArray(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
             crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
                 as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
             crate::model::Value::DateTime(v) => {
@@ -3253,39 +3345,58 @@ fn values_to_params_with_types(
             }
             crate::model::Value::Null => {
                 // 根据列类型选择NULL的类型
-                match rust_type {
-                    "i64" | "u64" => {
-                        let null_val: Option<i64> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "i32" | "i16" | "i8" | "u16" | "u32" | "u8" => {
-                        let null_val: Option<i32> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "String" | "&str" => {
-                        let null_val = PgMaybeTextParam(None);
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "f32" | "f64" => {
-                        let null_val: Option<f64> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "bool" => {
-                        let null_val: Option<bool> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                        let null_val: Option<Vec<u8>> = None;
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                        Box::new(PgMaybeDateTimeParam(None))
-                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    _ => {
-                        // 未知类型优先按文本 NULL 处理，覆盖 PostgreSQL enum 等自定义类型
-                        let null_val = PgMaybeTextParam(None);
-                        Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                if is_vec_i32_type(rust_type) {
+                    let null_val: Option<Vec<i32>> = None;
+                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else if is_vec_i64_type(rust_type) {
+                    let null_val: Option<Vec<i64>> = None;
+                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else if is_vec_option_i64_type(rust_type) {
+                    let null_val: Option<Vec<Option<i64>>> = None;
+                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else {
+                    match rust_type {
+                        "i64" | "u64" => {
+                            let null_val: Option<i64> = None;
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "i32" | "i16" | "i8" | "u16" | "u32" | "u8" => {
+                            let null_val: Option<i32> = None;
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "String" | "&str" => {
+                            let null_val = PgMaybeTextParam(None);
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "f32" | "f64" => {
+                            let null_val: Option<f64> = None;
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "bool" => {
+                            let null_val: Option<bool> = None;
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
+                            let null_val: Option<Vec<u8>> = None;
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
+                        "DateTime"
+                        | "chrono::DateTime"
+                        | "NaiveDateTime"
+                        | "chrono::NaiveDateTime" => Box::new(PgMaybeDateTimeParam(None))
+                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+                        _ => {
+                            // 未知类型优先按文本 NULL 处理，覆盖 PostgreSQL enum 等自定义类型
+                            let null_val = PgMaybeTextParam(None);
+                            Box::new(null_val)
+                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                        }
                     }
                 }
             }
@@ -3334,6 +3445,15 @@ fn values_to_params(
                 Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Bytes(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::IntegerArray(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::BigIntArray(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::NullableBigIntArray(v) => {
                 Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
@@ -3772,6 +3892,15 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Bytes(b) => {
                     Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
+                crate::model::Value::IntegerArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::BigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::NullableBigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
                 crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
                     as Box<dyn postgres_types::ToSql + Sync + Send>,
                 crate::model::Value::DateTime(dt) => {
@@ -3920,6 +4049,15 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Bytes(b) => {
                     Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
+                crate::model::Value::IntegerArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::BigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::NullableBigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
                 crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
                     as Box<dyn postgres_types::ToSql + Sync + Send>,
                 crate::model::Value::DateTime(dt) => {
@@ -4067,6 +4205,15 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                 crate::model::Value::Bytes(b) => {
                     Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                 }
+                crate::model::Value::IntegerArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::BigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
+                crate::model::Value::NullableBigIntArray(v) => {
+                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                }
                 crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
                     as Box<dyn postgres_types::ToSql + Sync + Send>,
                 crate::model::Value::DateTime(dt) => {
@@ -4145,6 +4292,26 @@ fn convert_postgres_value(
                 None => crate::model::Value::Null,
             });
         }
+    }
+
+    match col_type.name() {
+        "_int4" => {
+            if let Ok(v) = row.try_get::<_, Option<Vec<i32>>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::IntegerArray(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        "_int8" => {
+            if let Ok(v) = row.try_get::<_, Option<Vec<Option<i64>>>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::NullableBigIntArray(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        _ => {}
     }
 
     // 根据PostgreSQL类型选择正确的Rust类型
@@ -4345,6 +4512,15 @@ impl<
                     }
                     crate::model::Value::Bytes(b) => {
                         Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::IntegerArray(v) => {
+                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::BigIntArray(v) => {
+                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::NullableBigIntArray(v) => {
+                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
                         as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,

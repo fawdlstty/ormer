@@ -30,6 +30,18 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         }
     });
 
+    let is_i32_repr = input.attrs.iter().any(|attr| {
+        if attr.path().is_ident("repr") {
+            if let syn::Meta::List(list) = &attr.meta {
+                list.tokens.to_string().replace(' ', "") == "i32"
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+
     // 生成 From<EnumType> for Value 实现 (用于插入)
     let from_value_impl = if is_numeric_enum {
         // 数值枚举：转为 Integer
@@ -132,6 +144,31 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                 <#name as ::ormer::model::FromValue>::from_value(&values[0])
             }
         }
+    };
+
+    let try_from_i32_impl = if is_i32_repr {
+        let match_arms = variant_names.iter().map(|v| {
+            quote! {
+                val if val == #name::#v as i32 => Ok(#name::#v),
+            }
+        });
+
+        quote! {
+            impl ::core::convert::TryFrom<i32> for #name {
+                type Error = anyhow::Error;
+
+                fn try_from(value: i32) -> anyhow::Result<Self> {
+                    match value {
+                        #(#match_arms)*
+                        _ => Err(anyhow::anyhow!(
+                            "Unknown numeric value '{}' for {}", value, stringify!(#name)
+                        )),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
     };
 
     // 生成 inherent 方法和 trait 实现
@@ -238,6 +275,7 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
     // Option<EnumType> 的转换由通用的 Option<T> 实现处理
 
     quote! {
+        #try_from_i32_impl
         #from_impl
         #from_value_impl
         #from_row_values_impl

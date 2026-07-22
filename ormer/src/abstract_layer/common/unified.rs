@@ -399,6 +399,13 @@ impl Database {
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
                 crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
+                crate::model::Value::IntegerArray(v) => {
+                    crate::query::filter::Value::IntegerArray(v)
+                }
+                crate::model::Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
+                crate::model::Value::NullableBigIntArray(v) => {
+                    crate::query::filter::Value::NullableBigIntArray(v)
+                }
                 crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
                 crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
                 crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
@@ -1364,6 +1371,13 @@ impl<'a> Transaction<'a> {
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
                 crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
+                crate::model::Value::IntegerArray(v) => {
+                    crate::query::filter::Value::IntegerArray(v)
+                }
+                crate::model::Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
+                crate::model::Value::NullableBigIntArray(v) => {
+                    crate::query::filter::Value::NullableBigIntArray(v)
+                }
                 crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
                 crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
                 crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
