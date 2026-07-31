@@ -48,7 +48,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
             ConnectionWrapper::Sqlite(_) => {
                 let columns = I::Model::insert_columns();
                 let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::Sqlite),
                     &columns,
                     refs.len(),
                 );
@@ -70,7 +70,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
                     I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
                 let columns = I::Model::insert_columns();
                 let (sql, _) = common_helpers::build_batch_insert_sql_postgresql_with_columns(
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
                     &columns,
                     refs.len(),
                 );
@@ -104,7 +104,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
             ConnectionWrapper::MySQL(_) => {
                 let columns = I::Model::insert_columns();
                 let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::MySQL),
                     &columns,
                     refs.len(),
                 );
@@ -119,7 +119,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
                     I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
                 let columns = I::Model::insert_columns();
                 let (sql, _) = common_helpers::build_batch_insert_sql_mssql_with_columns(
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::MSSQL),
                     &columns,
                     refs.len(),
                 );
@@ -196,7 +196,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 let primary_key = primary_key_columns.join(", ");
                 let mut sql = format!(
                     "INSERT INTO {} ({}) VALUES ",
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::Sqlite),
                     columns.join(", ")
                 );
                 let mut all_values = Vec::new();
@@ -234,7 +234,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 let primary_key = primary_key_columns.join(", ");
                 let mut sql = format!(
                     "INSERT INTO {} ({}) VALUES ",
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
                     columns.join(", ")
                 );
                 let mut all_values = Vec::new();
@@ -279,7 +279,10 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
             ConnectionWrapper::MySQL(_) => {
                 let columns = I::Model::COLUMNS.join(", ");
                 let col_count = I::Model::COLUMNS.len();
-                let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+                let mut sql = format!(
+                    "INSERT INTO {} ({columns}) VALUES ",
+                    <I::Model as Model>::table_name_for_db(DbType::MySQL)
+                );
                 let mut all_values = Vec::new();
 
                 for (idx, model) in refs.iter().enumerate() {
@@ -311,7 +314,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 let pks = I::Model::primary_key_columns();
                 let mut sql = format!(
                     "MERGE INTO {} AS target USING (VALUES ",
-                    I::Model::TABLE_NAME
+                    <I::Model as Model>::table_name_for_db(DbType::MSSQL)
                 );
                 let mut all_values = Vec::new();
                 for (idx, model) in refs.iter().enumerate() {
@@ -410,7 +413,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 let primary_key = primary_key_columns.join(", ");
                 let mut sql = format!(
                     "INSERT INTO {} ({}) VALUES ",
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::Sqlite),
                     columns.join(", ")
                 );
                 let mut all_values = Vec::new();
@@ -436,7 +439,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 let primary_key = primary_key_columns.join(", ");
                 let mut sql = format!(
                     "INSERT INTO {} ({}) VALUES ",
-                    I::Model::TABLE_NAME,
+                    <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
                     columns.join(", ")
                 );
                 let mut all_values = Vec::new();
@@ -472,7 +475,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 let col_count = I::Model::COLUMNS.len();
                 let mut sql = format!(
                     "INSERT IGNORE INTO {} ({columns}) VALUES ",
-                    I::Model::TABLE_NAME
+                    <I::Model as Model>::table_name_for_db(DbType::MySQL)
                 );
                 let mut all_values = Vec::new();
 
@@ -495,7 +498,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 let pks = I::Model::primary_key_columns();
                 let mut sql = format!(
                     "MERGE INTO {} AS target USING (VALUES ",
-                    I::Model::TABLE_NAME
+                    <I::Model as Model>::table_name_for_db(DbType::MSSQL)
                 );
                 let mut all_values = Vec::new();
                 for (idx, model) in refs.iter().enumerate() {

@@ -4,7 +4,10 @@ pub(crate) fn naive_local_to_utc(v: chrono::NaiveDateTime) -> chrono::DateTime<c
     match chrono::Local.from_local_datetime(&v) {
         chrono::LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
         chrono::LocalResult::Ambiguous(dt, _) => dt.with_timezone(&chrono::Utc),
-        chrono::LocalResult::None => panic!("invalid local NaiveDateTime: {v}"),
+        chrono::LocalResult::None => {
+            eprintln!("[ormer] invalid local NaiveDateTime: {v}; treating it as UTC");
+            chrono::Utc.from_utc_datetime(&v)
+        }
     }
 }
 

@@ -54,6 +54,10 @@ fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Res
     }
 }
 
+fn table_name_for<T: Model>() -> &'static str {
+    T::table_name_for_db(DbType::Sqlite)
+}
+
 // 导入宏
 use crate::impl_backend_executor_methods;
 use crate::impl_backend_join_executor_methods;
@@ -189,7 +193,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::Sqlite,
-            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            format!("DROP TABLE IF EXISTS {}", table_name_for::<T>()),
             Vec::new(),
         ))
     }
@@ -230,7 +234,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             refs.len(),
         );
@@ -250,7 +254,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             refs.len(),
         );
@@ -283,7 +287,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             refs.len(),
         );
@@ -365,7 +369,10 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         let col_count = I::Model::COLUMNS.len();
         // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
         // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT INTO {} ({columns}) VALUES ",
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite)
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in refs.iter().enumerate() {
@@ -388,7 +395,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
-        let table_name = I::Model::TABLE_NAME;
+        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
         let columns_str = columns.join(", ");
@@ -466,7 +473,7 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         // 在执行阶段捕获约束冲突错误并忽略。
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES ",
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             columns.join(", ")
         );
         let mut all_values = Vec::new();
@@ -490,7 +497,7 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = I::Model::TABLE_NAME;
+        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
         let columns_str = columns.join(", ");
         let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
         let placeholders_str = placeholders.join(", ");
@@ -575,7 +582,11 @@ impl Database {
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
-        let mut rows = self.conn.query(sql, [T::TABLE_NAME]).trace().await?;
+        let mut rows = self
+            .conn
+            .query(sql, [table_name_for::<T>()])
+            .trace()
+            .await?;
 
         if let Some(row) = rows.next().trace().await? {
             let count = row.get_value(0).trace_for("turso::Row::get_value")?;
@@ -592,7 +603,7 @@ impl Database {
     /// 验证表结构是否与模型定义匹配（内部使用）
     async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
         // 查询表的列信息
-        let sql = format!("PRAGMA table_info({})", T::TABLE_NAME);
+        let sql = format!("PRAGMA table_info({})", table_name_for::<T>());
 
         let mut rows = self.conn.query(&sql, ()).trace().await?;
 
@@ -783,7 +794,7 @@ impl Database {
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
+            table_name_for::<T>(),
             &columns,
             models.len(),
         );
@@ -817,7 +828,7 @@ impl Database {
         let columns = T::insert_columns();
         let col_count = columns.len();
         let pk_columns = T::primary_key_columns();
-        let table_name = T::TABLE_NAME;
+        let table_name = table_name_for::<T>();
 
         let columns_str = columns.join(", ");
         let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
@@ -860,7 +871,7 @@ impl Database {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let table_name = T::TABLE_NAME;
+        let table_name = table_name_for::<T>();
 
         let columns_str = columns.join(", ");
         let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
@@ -1013,7 +1024,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             refs.len(),
         );
@@ -1033,7 +1044,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             refs.len(),
         );
@@ -1074,7 +1085,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
 
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT INTO {} ({columns}) VALUES ",
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite)
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in refs.iter().enumerate() {
@@ -1097,7 +1111,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
 
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
-        let table_name = I::Model::TABLE_NAME;
+        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
         let columns_str = columns.join(", ");
@@ -1154,7 +1168,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
 
         let mut sql = format!(
             "INSERT INTO {} ({}) VALUES ",
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             columns.join(", ")
         );
         let mut all_values = Vec::new();
@@ -1180,7 +1194,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = I::Model::TABLE_NAME;
+        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
 
         let columns_str = columns.join(", ");
         let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
@@ -1316,7 +1330,7 @@ impl Transaction {
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
+            table_name_for::<T>(),
             &columns,
             models.len(),
         );
@@ -1349,7 +1363,7 @@ impl Transaction {
         let columns = T::insert_columns();
         let col_count = columns.len();
         let pk_columns = T::primary_key_columns();
-        let table_name = T::TABLE_NAME;
+        let table_name = table_name_for::<T>();
 
         let columns_str = columns.join(", ");
         let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
@@ -1391,7 +1405,7 @@ impl Transaction {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let table_name = T::TABLE_NAME;
+        let table_name = table_name_for::<T>();
 
         let columns_str = columns.join(", ");
         let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
@@ -2455,7 +2469,7 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     fn build_ormer_sql(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut sql = format!("DELETE FROM {}", table_name_for::<T>());
         let mut ormer_params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -2621,7 +2635,7 @@ impl<T: Model> UpdateExecutor<T> {
         let mut statements = Vec::new();
 
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
             let mut ormer_params = Vec::new();
             let mut first = true;
             for (col_name, value) in &self.sets {
@@ -2652,7 +2666,7 @@ impl<T: Model> UpdateExecutor<T> {
         }
 
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
             let mut ormer_params = Vec::new();
             let mut first = true;
             for (col_name, value) in model_sets {

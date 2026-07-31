@@ -1,7 +1,9 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
-use crate::model::{DbBackendTypeMapper, DurationToInterval, Model, Row, Value};
+use crate::model::{
+    DbBackendTypeMapper, DurationToInterval, Model, Row, Value, split_schema_table_name,
+};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
@@ -9,7 +11,7 @@ use crate::query::builder::{
 use crate::query::filter::FilterExpr;
 use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use bytes::{BufMut, BytesMut};
-use postgres_types::{FromSql, IsNull, ToSql, Type as PgType};
+use postgres_types::{FromSql, FromSqlOwned, IsNull, ToSql, Type as PgType};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use tokio_postgres::NoTls;
@@ -259,6 +261,23 @@ fn pg_datetime_value_from_row(
     ))
 }
 
+fn pg_try_get<T: FromSqlOwned>(
+    row: &tokio_postgres::Row,
+    idx: usize,
+    expected_type: &str,
+) -> anyhow::Result<Option<T>> {
+    let actual_type = row
+        .columns()
+        .get(idx)
+        .map(|column| column.type_().name())
+        .unwrap_or("<out of range>");
+    row.try_get(idx).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to parse column at index {idx} (expected {expected_type}, actual PostgreSQL type {actual_type}): {err}"
+        )
+    })
+}
+
 fn pg_model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
     let column = column.rsplit('.').next().unwrap_or(column);
     T::COLUMN_SCHEMA
@@ -334,9 +353,7 @@ fn pg_value_from_row_cell(
     enum_variants: Option<&[&str]>,
 ) -> anyhow::Result<crate::model::Value> {
     if enum_variants.is_some() {
-        let value: Option<PgEnumText> = row
-            .try_get(idx)
-            .trace_for("tokio_postgres::Row::try_get enum")?;
+        let value: Option<PgEnumText> = pg_try_get(row, idx, rust_type)?;
         return Ok(match value {
             Some(value) => crate::model::Value::Text(value.0),
             None => {
@@ -353,7 +370,7 @@ fn pg_value_from_row_cell(
     }
 
     if is_vec_i32_type(rust_type) {
-        let value: Option<Vec<i32>> = row.get(idx);
+        let value: Option<Vec<i32>> = pg_try_get(row, idx, "Vec<i32>")?;
         return match value {
             Some(value) => Ok(crate::model::Value::IntegerArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
@@ -365,7 +382,7 @@ fn pg_value_from_row_cell(
     }
 
     if is_vec_i64_type(rust_type) {
-        let value: Option<Vec<i64>> = row.get(idx);
+        let value: Option<Vec<i64>> = pg_try_get(row, idx, "Vec<i64>")?;
         return match value {
             Some(value) => Ok(crate::model::Value::BigIntArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
@@ -377,7 +394,7 @@ fn pg_value_from_row_cell(
     }
 
     if is_vec_option_i64_type(rust_type) {
-        let value: Option<Vec<Option<i64>>> = row.get(idx);
+        let value: Option<Vec<Option<i64>>> = pg_try_get(row, idx, "Vec<Option<i64>>")?;
         return match value {
             Some(value) => Ok(crate::model::Value::NullableBigIntArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
@@ -391,37 +408,37 @@ fn pg_value_from_row_cell(
     if is_nullable {
         match rust_type {
             "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                let value: Option<i32> = row.get(idx);
+                let value: Option<i32> = pg_try_get(row, idx, "i32")?;
                 Ok(value
                     .map(|value| crate::model::Value::Integer(value as i64))
                     .unwrap_or(crate::model::Value::Null))
             }
             "i64" | "u64" => {
-                let value: Option<i64> = row.get(idx);
+                let value: Option<i64> = pg_try_get(row, idx, "i64")?;
                 Ok(value
                     .map(crate::model::Value::Integer)
                     .unwrap_or(crate::model::Value::Null))
             }
             "Duration" | "std::time::Duration" => {
-                let value: Option<PgInterval> = row.get(idx);
+                let value: Option<PgInterval> = pg_try_get(row, idx, "Duration")?;
                 Ok(value
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .unwrap_or(crate::model::Value::Null))
             }
             "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
-                let value: Option<String> = row.get(idx);
+                let value: Option<String> = pg_try_get(row, idx, "String")?;
                 Ok(value
                     .map(crate::model::Value::Text)
                     .unwrap_or(crate::model::Value::Null))
             }
             "f32" | "f64" => {
-                let value: Option<f64> = row.get(idx);
+                let value: Option<f64> = pg_try_get(row, idx, "f64")?;
                 Ok(value
                     .map(crate::model::Value::Real)
                     .unwrap_or(crate::model::Value::Null))
             }
             "bool" => {
-                let value: Option<bool> = row.get(idx);
+                let value: Option<bool> = pg_try_get(row, idx, "bool")?;
                 Ok(match value {
                     Some(true) => crate::model::Value::Integer(1),
                     Some(false) => crate::model::Value::Integer(0),
@@ -429,7 +446,7 @@ fn pg_value_from_row_cell(
                 })
             }
             "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                let value: Option<Vec<u8>> = row.get(idx);
+                let value: Option<Vec<u8>> = pg_try_get(row, idx, "Vec<u8>")?;
                 Ok(value
                     .map(crate::model::Value::Bytes)
                     .unwrap_or(crate::model::Value::Null))
@@ -446,7 +463,7 @@ fn pg_value_from_row_cell(
     } else {
         match rust_type {
             "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
-                let value: Option<i32> = row.get(idx);
+                let value: Option<i32> = pg_try_get(row, idx, "i32")?;
                 value
                     .map(|value| crate::model::Value::Integer(value as i64))
                     .ok_or_else(|| {
@@ -457,7 +474,7 @@ fn pg_value_from_row_cell(
                     })
             }
             "i64" | "u64" => {
-                let value: Option<i64> = row.get(idx);
+                let value: Option<i64> = pg_try_get(row, idx, "i64")?;
                 value.map(crate::model::Value::Integer).ok_or_else(|| {
                     anyhow::anyhow!(format!(
                         "Failed to parse non-nullable column at index {} (expected i64 type)",
@@ -466,7 +483,7 @@ fn pg_value_from_row_cell(
                 })
             }
             "Duration" | "std::time::Duration" => {
-                let value: Option<PgInterval> = row.get(idx);
+                let value: Option<PgInterval> = pg_try_get(row, idx, "Duration")?;
                 value
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .ok_or_else(|| {
@@ -477,7 +494,7 @@ fn pg_value_from_row_cell(
                     })
             }
             "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
-                let value: Option<String> = row.get(idx);
+                let value: Option<String> = pg_try_get(row, idx, "String")?;
                 value.map(crate::model::Value::Text).ok_or_else(|| {
                     anyhow::anyhow!(format!(
                         "Failed to parse non-nullable column at index {} (expected String type)",
@@ -486,7 +503,7 @@ fn pg_value_from_row_cell(
                 })
             }
             "f32" | "f64" => {
-                let value: Option<f64> = row.get(idx);
+                let value: Option<f64> = pg_try_get(row, idx, "f64")?;
                 value.map(crate::model::Value::Real).ok_or_else(|| {
                     anyhow::anyhow!(format!(
                         "Failed to parse non-nullable column at index {} (expected float type)",
@@ -495,7 +512,7 @@ fn pg_value_from_row_cell(
                 })
             }
             "bool" => {
-                let value: Option<bool> = row.get(idx);
+                let value: Option<bool> = pg_try_get(row, idx, "bool")?;
                 match value {
                     Some(true) => Ok(crate::model::Value::Integer(1)),
                     Some(false) => Ok(crate::model::Value::Integer(0)),
@@ -506,7 +523,7 @@ fn pg_value_from_row_cell(
                 }
             }
             "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                let value: Option<Vec<u8>> = row.get(idx);
+                let value: Option<Vec<u8>> = pg_try_get(row, idx, "Vec<u8>")?;
                 value.map(crate::model::Value::Bytes).ok_or_else(|| {
                     anyhow::anyhow!(format!(
                         "Failed to parse non-nullable column at index {} (expected Vec<u8> type)",
@@ -1255,11 +1272,12 @@ impl Database {
 
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
-        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema='public' AND table_name=$1";
+        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
+        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema=$1 AND table_name=$2";
 
         let row = self
             .client
-            .query_one(sql, &[&T::TABLE_NAME])
+            .query_one(sql, &[&schema_name, &table_name])
             .trace()
             .await?;
 
@@ -1278,14 +1296,15 @@ impl Database {
             return Ok(false);
         }
 
+        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let sql = r#"
             SELECT COUNT(*)
             FROM timescaledb_information.hypertables
-            WHERE hypertable_schema = 'public' AND hypertable_name = $1
+            WHERE hypertable_schema = $1 AND hypertable_name = $2
         "#;
         let row = self
             .client
-            .query_one(sql, &[&T::TABLE_NAME])
+            .query_one(sql, &[&schema_name, &table_name])
             .trace()
             .await?;
         let count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
@@ -1320,14 +1339,19 @@ impl Database {
     /// 验证表结构是否与模型定义匹配（内部使用）
     async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
         // 查询表的列信息
+        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let sql = r#"
             SELECT column_name, data_type, udt_name, is_nullable
             FROM information_schema.columns
-            WHERE table_schema='public' AND table_name = $1
+            WHERE table_schema = $1 AND table_name = $2
             ORDER BY ordinal_position
         "#;
 
-        let rows = self.client.query(sql, &[&T::TABLE_NAME]).trace().await?;
+        let rows = self
+            .client
+            .query(sql, &[&schema_name, &table_name])
+            .trace()
+            .await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();

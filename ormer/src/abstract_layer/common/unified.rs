@@ -419,14 +419,16 @@ impl Database {
         }
 
         // 组合所有条件为 AND
-        let filter = if filters.len() == 1 {
-            filters.into_iter().next().unwrap()
-        } else {
-            filters
-                .into_iter()
-                .reduce(|a, b| crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b)))
-                .unwrap()
+        let mut filters = filters.into_iter();
+        let Some(filter) = filters.next() else {
+            return Err(anyhow::anyhow!(
+                "Model {} does not have a primary key filter",
+                T::TABLE_NAME
+            ));
         };
+        let filter = filters.fold(filter, |a, b| {
+            crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
+        });
 
         let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
 
@@ -1391,14 +1393,16 @@ impl<'a> Transaction<'a> {
         }
 
         // 组合所有条件为 AND
-        let filter = if filters.len() == 1 {
-            filters.into_iter().next().unwrap()
-        } else {
-            filters
-                .into_iter()
-                .reduce(|a, b| crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b)))
-                .unwrap()
+        let mut filters = filters.into_iter();
+        let Some(filter) = filters.next() else {
+            return Err(anyhow::anyhow!(
+                "Model {} does not have a primary key filter",
+                T::TABLE_NAME
+            ));
         };
+        let filter = filters.fold(filter, |a, b| {
+            crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
+        });
 
         let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
 

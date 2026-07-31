@@ -1,9 +1,13 @@
 use crate::abstract_layer::DbType;
-use crate::model::Model;
+use crate::model::{Model, normalize_table_name_for_db};
 use crate::query::filter::{FilterExpr, OrderBy};
 use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
+
+fn table_name_for<T: Model>(db_type: DbType) -> &'static str {
+    T::table_name_for_db(db_type)
+}
 
 /// 范围边界类型,支持多种 range 语法
 pub struct RangeBounds {
@@ -301,7 +305,7 @@ impl<T: Model, R> AggregateSelect<T, R> {
             "SELECT {}({}) FROM {}",
             self.aggregate_func,
             self.column_name,
-            T::TABLE_NAME
+            table_name_for::<T>(db_type)
         )
         .expect("Failed to write aggregate SELECT clause");
 
@@ -363,7 +367,7 @@ impl<T: Model, V> MappedSelect<T, V> {
             "SELECT {}{} FROM {}",
             distinct_str,
             columns,
-            T::TABLE_NAME
+            table_name_for::<T>(db_type)
         )
         .expect("Failed to write SELECT clause");
 
@@ -571,8 +575,13 @@ impl<T: Model, V> GroupedSelect<T, V> {
             .collect::<Vec<_>>()
             .join(", ");
 
-        write!(&mut sql, "SELECT {} FROM {}", columns, T::TABLE_NAME)
-            .expect("Failed to write SELECT clause");
+        write!(
+            &mut sql,
+            "SELECT {} FROM {}",
+            columns,
+            table_name_for::<T>(db_type)
+        )
+        .expect("Failed to write SELECT clause");
 
         // WHERE 子句（分组前过滤）
         if !self.filters.is_empty() {
@@ -1032,7 +1041,7 @@ impl<T: Model> Select<T> {
         let mut sql = String::new();
         let mut params = Vec::new();
 
-        write!(&mut sql, "SELECT 1 FROM {}", T::TABLE_NAME)
+        write!(&mut sql, "SELECT 1 FROM {}", table_name_for::<T>(db_type))
             .unwrap_or_else(|e| panic!("Failed to write EXISTS subquery SQL: {}", e));
 
         // WHERE 子句
@@ -1089,7 +1098,7 @@ impl<T: Model> Select<T> {
             "SELECT {}{} FROM {}",
             distinct_str,
             T::COLUMNS.join(", "),
-            T::TABLE_NAME
+            table_name_for::<T>(db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -1336,8 +1345,8 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
                 .map(|c| format!("t0.{}", c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            R::TABLE_NAME
+            table_name_for::<T>(db_type),
+            table_name_for::<R>(db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -1447,9 +1456,9 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
                 .map(|c| format!("t0.{}", c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            R1::TABLE_NAME,
-            R2::TABLE_NAME
+            table_name_for::<T>(db_type),
+            table_name_for::<R1>(db_type),
+            table_name_for::<R2>(db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -1560,10 +1569,10 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
                 .map(|c| format!("t0.{}", c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            R1::TABLE_NAME,
-            R2::TABLE_NAME,
-            R3::TABLE_NAME
+            table_name_for::<T>(db_type),
+            table_name_for::<R1>(db_type),
+            table_name_for::<R2>(db_type),
+            table_name_for::<R3>(db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3048,8 +3057,8 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
@@ -3123,8 +3132,8 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3250,8 +3259,8 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
@@ -3325,8 +3334,8 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3452,8 +3461,8 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
@@ -3527,8 +3536,8 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 .map(|c| format!("t1.{} as j_{}", c, c))
                 .collect::<Vec<_>>()
                 .join(", "),
-            T::TABLE_NAME,
-            self.join_table,
+            table_name_for::<T>(db_type),
+            normalize_table_name_for_db(db_type, &self.join_table),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 

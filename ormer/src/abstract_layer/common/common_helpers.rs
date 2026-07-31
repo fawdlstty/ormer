@@ -454,7 +454,7 @@ pub fn convert_column_value(
             )),
             "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
                 Ok(Value::DateTime(get_datetime().unwrap_or_else(|| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap()
+                    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
                 })))
             }
             _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),

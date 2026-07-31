@@ -438,12 +438,15 @@ impl Database {
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
         let mut client = self.pool.lock().await;
+        let table_filter = if let Some((schema_name, table_name)) = T::TABLE_NAME.rsplit_once('.') {
+            format!("TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'")
+        } else {
+            format!("TABLE_NAME = '{}'", T::TABLE_NAME)
+        };
 
         // 检查表是否存在
-        let check_sql = format!(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{}'",
-            T::TABLE_NAME
-        );
+        let check_sql =
+            format!("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE {table_filter}");
         {
             let query = Query::new(&check_sql);
             let stream = query.query(&mut *client).trace().await?;
@@ -461,8 +464,7 @@ impl Database {
 
         // 查询表的列信息
         let col_sql = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{}' ORDER BY ORDINAL_POSITION",
-            T::TABLE_NAME
+            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE {table_filter} ORDER BY ORDINAL_POSITION"
         );
         let query = Query::new(&col_sql);
         let stream = query.query(&mut *client).trace().await?;

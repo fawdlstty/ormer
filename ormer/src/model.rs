@@ -154,6 +154,11 @@ pub trait Model: Sized {
     const COLUMNS: &'static [&'static str];
     const COLUMN_SCHEMA: &'static [ColumnSchema];
 
+    /// 获取指定数据库后端实际使用的表名。
+    fn table_name_for_db(db_type: crate::abstract_layer::DbType) -> &'static str {
+        normalize_table_name_for_db(db_type, Self::TABLE_NAME)
+    }
+
     /// 获取 hypertable 时间字段名和分片时长（如果有）
     fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
         for col in Self::COLUMN_SCHEMA {
@@ -263,6 +268,41 @@ pub trait ModelEnumProvider {
     fn enum_variants() -> Option<&'static [&'static str]> {
         Self::ENUM_VARIANTS
     }
+}
+
+/// 去掉 schema 前缀，返回最后一段表名。
+pub fn table_name_without_schema(table_name: &str) -> &str {
+    table_name
+        .rsplit_once('.')
+        .map(|(_, table)| table)
+        .unwrap_or(table_name)
+}
+
+/// 按数据库后端返回实际 SQL 中使用的表名。
+pub fn normalize_table_name_for_db(
+    db_type: crate::abstract_layer::DbType,
+    table_name: &str,
+) -> &str {
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        crate::abstract_layer::DbType::Sqlite => table_name_without_schema(table_name),
+        #[cfg(feature = "mysql")]
+        crate::abstract_layer::DbType::MySQL => table_name_without_schema(table_name),
+        #[cfg(feature = "postgresql")]
+        crate::abstract_layer::DbType::PostgreSQL => table_name,
+        #[cfg(feature = "mssql")]
+        crate::abstract_layer::DbType::MSSQL => table_name,
+    }
+}
+
+/// 拆分支持 schema 的数据库表名，未指定 schema 时使用默认 schema。
+pub fn split_schema_table_name<'a>(
+    table_name: &'a str,
+    default_schema: &'a str,
+) -> (&'a str, &'a str) {
+    table_name
+        .rsplit_once('.')
+        .unwrap_or((default_schema, table_name))
 }
 
 /// ModelEnum trait - 用于标记枚举类型 (由派生宏自动实现)
@@ -486,7 +526,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> anyhow::Result<String> {
-    let table_name = table_name.unwrap_or(T::TABLE_NAME);
+    let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
 
     for (i, column) in T::COLUMN_SCHEMA.iter().enumerate() {
@@ -556,7 +596,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     }
 
     // 添加外键约束
-    let foreign_key_constraints = generate_foreign_key_constraints::<T>();
+    let foreign_key_constraints = generate_foreign_key_constraints::<T>(db_type);
     if !foreign_key_constraints.is_empty() {
         sql.push_str(", ");
         sql.push_str(&foreign_key_constraints.join(", "));
@@ -628,7 +668,7 @@ fn generate_indexes_with_name<T: Model>(
 
     for column in T::COLUMN_SCHEMA.iter() {
         if column.is_indexed {
-            let index_name = format!("idx_{}_{}", table_name, column.name);
+            let index_name = format!("idx_{}_{}", table_name.replace('.', "_"), column.name);
             // MySQL 不支持 CREATE INDEX IF NOT EXISTS，需要特殊处理
             let sql = if is_mysql {
                 format!(
@@ -650,15 +690,18 @@ fn generate_indexes_with_name<T: Model>(
 }
 
 /// 生成外键约束 SQL
-fn generate_foreign_key_constraints<T: Model>() -> Vec<String> {
+fn generate_foreign_key_constraints<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+) -> Vec<String> {
     let mut constraints = Vec::new();
 
     for column in T::COLUMN_SCHEMA.iter() {
         if let Some(fk) = &column.foreign_key {
             let ref_column = fk.get_ref_column();
+            let ref_table = normalize_table_name_for_db(db_type, fk.ref_table);
             constraints.push(format!(
                 "FOREIGN KEY ({}) REFERENCES {} ({})",
-                column.name, fk.ref_table, ref_column
+                column.name, ref_table, ref_column
             ));
         }
     }

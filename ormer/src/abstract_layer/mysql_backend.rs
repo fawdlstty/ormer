@@ -46,6 +46,10 @@ fn convert_auto_increment_key<K: Default + 'static>(last_id: u64) -> anyhow::Res
     }
 }
 
+fn table_name_for<T: Model>() -> &'static str {
+    T::table_name_for_db(DbType::MySQL)
+}
+
 /// MySQL 类型映射器
 pub struct MySQLTypeMapper;
 
@@ -184,7 +188,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::MySQL,
-            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            format!("DROP TABLE IF EXISTS {}", table_name_for::<T>()),
             Vec::new(),
         ))
     }
@@ -226,7 +230,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
             &columns,
             refs.len(),
         );
@@ -258,7 +262,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
+            table_name_for::<T>(),
             &columns,
             models.len(),
         );
@@ -325,7 +329,10 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
 
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT INTO {} ({columns}) VALUES ",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in refs.iter().enumerate() {
@@ -368,7 +375,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -439,7 +446,7 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         let col_count = I::Model::COLUMNS.len();
         let mut sql = format!(
             "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            I::Model::TABLE_NAME
+            <I::Model as Model>::table_name_for_db(DbType::MySQL)
         );
         let mut all_values = Vec::new();
 
@@ -473,7 +480,10 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT IGNORE INTO {} ({columns}) VALUES ",
+            table_name_for::<T>()
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -568,7 +578,10 @@ impl Database {
     ) -> anyhow::Result<bool> {
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
 
-        let result: Option<u64> = conn.exec_first(sql, (T::TABLE_NAME,)).trace().await?;
+        let result: Option<u64> = conn
+            .exec_first(sql, (table_name_for::<T>(),))
+            .trace()
+            .await?;
 
         Ok(result.unwrap_or(0) > 0)
     }
@@ -586,7 +599,7 @@ impl Database {
             ORDER BY ORDINAL_POSITION
         "#;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(sql, (T::TABLE_NAME,)).trace().await?;
+        let rows: Vec<mysql_async::Row> = conn.exec(sql, (table_name_for::<T>(),)).trace().await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
@@ -786,7 +799,7 @@ impl Database {
 
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            T::TABLE_NAME,
+            table_name_for::<T>(),
             &columns,
             models.len(),
         );
@@ -821,7 +834,7 @@ impl Database {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -866,7 +879,10 @@ impl Database {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let mut sql = format!("INSERT IGNORE INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT IGNORE INTO {} ({columns}) VALUES ",
+            table_name_for::<T>()
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -1031,7 +1047,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
         }
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            I::Model::TABLE_NAME,
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
             &columns,
             refs.len(),
         );
@@ -1094,7 +1110,10 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         }
         let columns = I::Model::COLUMNS.join(", ");
         let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
+        let mut sql = format!(
+            "INSERT INTO {} ({columns}) VALUES ",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        );
         let mut all_values = Vec::new();
 
         for (idx, model) in refs.iter().enumerate() {
@@ -1260,7 +1279,7 @@ impl<'a> Transaction<'a> {
         let col_count = T::COLUMNS.len();
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
         let mut all_values = Vec::new();
 
         for (idx, model) in models.iter().enumerate() {
@@ -1313,7 +1332,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
         let col_count = I::Model::COLUMNS.len();
         let mut sql = format!(
             "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            I::Model::TABLE_NAME
+            <I::Model as Model>::table_name_for_db(DbType::MySQL)
         );
         let mut all_values = Vec::new();
 
@@ -1978,7 +1997,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut sql = format!("DELETE FROM {}", table_name_for::<T>());
         let mut params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -2118,7 +2137,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in &self.sets {
@@ -2150,7 +2169,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Model UPDATE statements
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in model_sets {
