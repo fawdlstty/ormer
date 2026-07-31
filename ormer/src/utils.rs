@@ -50,6 +50,7 @@ impl<T, E: Error, F: std::future::Future<Output = Result<T, E>>> FutureTraceExt<
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn trace_for(
         self,
         func_name: &'static str,
@@ -113,6 +114,7 @@ impl<T, F: std::future::Future<Output = anyhow::Result<T>>> AnyhowFutureTraceExt
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn trace_for(
         self,
         func_name: &'static str,

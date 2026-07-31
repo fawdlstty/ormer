@@ -5,6 +5,7 @@ use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
+use crate::query::filter::FilterExpr;
 use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -12,6 +13,9 @@ use tiberius::{Client, Config, Query};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
+type CollectMarker<'a, C> = PhantomData<(fn() -> C, &'a ())>;
 
 /// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
 /// 支持 i32, i64, u32, u64 等整数类型，以及 ()
@@ -526,7 +530,7 @@ impl Database {
             );
             // 提取基础类型（第一个单词，去除约束和大小）
             let base_expected = expected_sql_type
-                .split(|c: char| c == ' ' || c == '(')
+                .split([' ', '('])
                 .next()
                 .unwrap_or("")
                 .to_lowercase();
@@ -534,11 +538,11 @@ impl Database {
             // 检查列类型
             if &base_expected != actual_type {
                 // 处理特殊情况：MSSQL 的 INT/INTEGER
-                if !(base_expected == "int" && actual_type == "integer")
-                    && !(base_expected == "integer" && actual_type == "int")
-                    && !(base_expected == "nvarchar" && actual_type == "varchar")
-                    && !(base_expected == "nchar" && actual_type == "char")
-                {
+                let compatible_type = (base_expected == "int" && actual_type == "integer")
+                    || (base_expected == "integer" && actual_type == "int")
+                    || (base_expected == "nvarchar" && actual_type == "varchar")
+                    || (base_expected == "nchar" && actual_type == "char");
+                if !compatible_type {
                     return Err(anyhow::anyhow!(
                         "Schema mismatch: table {}, reason: Column type mismatch at column '{}': expected '{}', but actual is '{}'",
                         T::TABLE_NAME,
@@ -742,6 +746,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
         Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
     }
 
+    #[allow(dead_code)]
     async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
@@ -896,6 +901,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         <Self as SqlExecutor>::execute(self).await
     }
 
+    #[allow(dead_code)]
     async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
         if models.is_empty() {
             return Ok(0);
@@ -1184,8 +1190,8 @@ pub struct DeleteExecutor<'a, T: Model> {
 /// 更新执行器
 pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<(String, Value)>,
-    filters: Vec<crate::query::filter::FilterExpr>,
-    model_updates: Vec<(Vec<(String, Value)>, Vec<crate::query::filter::FilterExpr>)>,
+    filters: Vec<FilterExpr>,
+    model_updates: ModelUpdateBatch,
     pool: Pool,
     _marker: PhantomData<(T, &'a ())>,
 }
@@ -1535,7 +1541,7 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrIgnoreE
 /// 收集 Future
 pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     executor: SelectExecutor<'a, T>,
-    _marker: PhantomData<(fn() -> C, &'a ())>,
+    _marker: CollectMarker<'a, C>,
 }
 
 impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> CollectFuture<'a, T, C> {
@@ -1598,13 +1604,13 @@ impl<'a, T: Model + 'static, R: Model + 'static> RelatedCollectFuture<'a, T, R> 
 /// 映射收集 Future
 pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     executor: MappedSelectExecutor<'a, T, V>,
-    _marker: PhantomData<(fn() -> C, &'a ())>,
+    _marker: CollectMarker<'a, C>,
 }
 
 /// 分组收集 Future
 pub struct GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     executor: GroupedSelectExecutor<'a, T, V>,
-    _marker: PhantomData<(fn() -> C, &'a ())>,
+    _marker: CollectMarker<'a, C>,
 }
 
 /// 流式查询
@@ -1741,6 +1747,19 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     {
         MappedSelectExecutor {
             select: self.select.map_to(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 忽略指定字段，查询时用默认常量替代真实列值
+    pub fn ignore<F, M>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        Self {
+            select: self.select.ignore(f),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2018,7 +2037,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         let pk_columns = T::primary_key_columns();
         let pk_values = model.primary_key_values();
         let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val =
                 crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
             model_filters.push(crate::query::filter::FilterExpr::Comparison {
@@ -2834,5 +2853,8 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
         Value::DateTime(v) => query.bind(v.naive_utc()),
         Value::Json(v) => query.bind(v.to_string()),
         Value::Uuid(v) => query.bind(v.as_bytes().as_slice()),
+        Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
+            panic!("MSSQL backend does not support PostgreSQL array values")
+        }
     }
 }

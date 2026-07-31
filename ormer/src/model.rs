@@ -777,6 +777,12 @@ impl<T> I32DataTypeDecoder<T> {
     }
 }
 
+impl<T> Default for I32DataTypeDecoder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[doc(hidden)]
 pub trait I32DataTypeDecode<T> {
     fn decode(

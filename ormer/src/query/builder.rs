@@ -1,5 +1,5 @@
 use crate::abstract_layer::DbType;
-use crate::model::{Model, normalize_table_name_for_db};
+use crate::model::{ColumnSchema, Model, normalize_table_name_for_db};
 use crate::query::filter::{FilterExpr, OrderBy};
 use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
@@ -7,6 +7,252 @@ use std::marker::PhantomData;
 
 fn table_name_for<T: Model>(db_type: DbType) -> &'static str {
     T::table_name_for_db(db_type)
+}
+
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(feature = "postgresql")]
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if c.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(c.to_lowercase().next().unwrap_or(c));
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+#[cfg(feature = "postgresql")]
+fn postgres_null_expr(column: &ColumnSchema, rust_type: &str) -> String {
+    if column.enum_variants.is_some() {
+        return format!("NULL::{}", to_snake_case(column.rust_type));
+    }
+
+    match rust_type {
+        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "usize" => "NULL::INTEGER",
+        "i64" | "u64" => "NULL::BIGINT",
+        "f32" | "f64" => "NULL::DOUBLE PRECISION",
+        "bool" => "NULL::BOOLEAN",
+        "Duration" | "std::time::Duration" => "NULL::INTERVAL",
+        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => "NULL::BYTEA",
+        "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => "NULL::INTEGER[]",
+        "Vec<i64>"
+        | "std::vec::Vec<i64>"
+        | "alloc::vec::Vec<i64>"
+        | "Vec<Option<i64>>"
+        | "std::vec::Vec<Option<i64>>"
+        | "alloc::vec::Vec<Option<i64>>" => "NULL::BIGINT[]",
+        "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
+            "NULL::TIMESTAMPTZ"
+        }
+        "JsonValue" | "serde_json::Value" => "NULL::JSONB",
+        "Uuid" | "uuid::Uuid" => "NULL::UUID",
+        _ => "NULL::TEXT",
+    }
+    .to_string()
+}
+
+fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String {
+    let rust_type = column.data_type.unwrap_or(column.rust_type);
+
+    if column.is_nullable {
+        return match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => postgres_null_expr(column, rust_type),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "NULL".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "NULL".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "NULL".to_string(),
+        };
+    }
+
+    if let Some(variants) = column.enum_variants
+        && let Some(first_variant) = variants.first()
+    {
+        return quote_sql_string(first_variant);
+    }
+
+    match rust_type {
+        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "usize" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "0::INTEGER".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "0".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "0".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST(0 AS INT)".to_string(),
+        },
+        "i64" | "u64" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "0::BIGINT".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "0".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "0".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
+        },
+        "f32" | "f64" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "0::DOUBLE PRECISION".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "0.0".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "0.0".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST(0 AS FLOAT)".to_string(),
+        },
+        "bool" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "FALSE".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "0".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "FALSE".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST(0 AS BIT)".to_string(),
+        },
+        "Duration" | "std::time::Duration" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => quote_sql_string("0 seconds") + "::INTERVAL",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "0".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "0".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
+        },
+        "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
+            quote_sql_string("")
+        }
+        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => quote_sql_string("") + "::BYTEA",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "X''".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "X''".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST('' AS VARBINARY(MAX))".to_string(),
+        },
+        "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "ARRAY[]::INTEGER[]".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "NULL".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "NULL".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "NULL".to_string(),
+        },
+        "Vec<i64>"
+        | "std::vec::Vec<i64>"
+        | "alloc::vec::Vec<i64>"
+        | "Vec<Option<i64>>"
+        | "std::vec::Vec<Option<i64>>"
+        | "alloc::vec::Vec<Option<i64>>" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "ARRAY[]::BIGINT[]".to_string(),
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "NULL".to_string(),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "NULL".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "NULL".to_string(),
+        },
+        "DateTime" | "chrono::DateTime" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => quote_sql_string("1970-01-01 00:00:00+00") + "::TIMESTAMPTZ",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => quote_sql_string("1970-01-01T00:00:00+00:00"),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
+        },
+        "NaiveDateTime" | "chrono::NaiveDateTime" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => quote_sql_string("1970-01-01 00:00:00") + "::TIMESTAMP",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => quote_sql_string("1970-01-01T00:00:00+00:00"),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
+        },
+        "JsonValue" | "serde_json::Value" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => quote_sql_string("null") + "::JSONB",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => quote_sql_string("null"),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "CAST('null' AS JSON)".to_string(),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => quote_sql_string("null"),
+        },
+        "Uuid" | "uuid::Uuid" => match db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => {
+                quote_sql_string("00000000-0000-0000-0000-000000000000") + "::UUID"
+            }
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => quote_sql_string("00000000-0000-0000-0000-000000000000"),
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => quote_sql_string("00000000-0000-0000-0000-000000000000"),
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => {
+                "CAST(0x00000000000000000000000000000000 AS VARBINARY(16))".to_string()
+            }
+        },
+        _ => quote_sql_string(""),
+    }
+}
+
+fn select_expr_for_column<T: Model>(
+    column: &'static str,
+    db_type: DbType,
+    ignored_columns: &[String],
+    table_prefix: Option<&str>,
+) -> String {
+    if ignored_columns.iter().any(|ignored| ignored == column) {
+        let schema = T::COLUMN_SCHEMA
+            .iter()
+            .find(|schema| schema.name == column)
+            .unwrap_or_else(|| panic!("Column schema not found: {}", column));
+        return format!(
+            "{} AS {}",
+            ignored_column_default_expr(schema, db_type),
+            column
+        );
+    }
+
+    if let Some(prefix) = table_prefix {
+        format!("{}.{}", prefix, column)
+    } else {
+        column.to_string()
+    }
+}
+
+fn select_exprs_for_model<T: Model>(
+    db_type: DbType,
+    ignored_columns: &[String],
+    table_prefix: Option<&str>,
+) -> String {
+    T::COLUMNS
+        .iter()
+        .map(|column| select_expr_for_column::<T>(column, db_type, ignored_columns, table_prefix))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// 范围边界类型,支持多种 range 语法
@@ -170,6 +416,7 @@ pub struct Select<T: Model> {
     range_start: Option<usize>,
     range_end: Option<usize>,
     distinct: bool,
+    ignored_columns: Vec<String>,
     _marker: PhantomData<T>,
 }
 
@@ -181,6 +428,7 @@ impl<T: Model> Clone for Select<T> {
             range_start: self.range_start,
             range_end: self.range_end,
             distinct: self.distinct,
+            ignored_columns: self.ignored_columns.clone(),
             _marker: PhantomData,
         }
     }
@@ -192,6 +440,7 @@ pub struct RelatedSelect<T: Model, R: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     _marker: PhantomData<(T, R)>,
 }
 
@@ -201,6 +450,7 @@ pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     _marker: PhantomData<(T, R1, R2)>,
 }
 
@@ -210,6 +460,7 @@ pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
@@ -710,6 +961,7 @@ impl<T: Model> Select<T> {
             range_start: None,
             range_end: None,
             distinct: false,
+            ignored_columns: Vec::new(),
             _marker: PhantomData,
         }
     }
@@ -727,6 +979,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             _marker: PhantomData,
         }
     }
@@ -742,6 +995,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             _marker: PhantomData,
         }
     }
@@ -757,6 +1011,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             _marker: PhantomData,
         }
     }
@@ -857,6 +1112,26 @@ impl<T: Model> Select<T> {
             distinct: self.distinct,
             _marker: PhantomData,
         }
+    }
+
+    /// 忽略指定字段 - 查询时用默认常量替代真实列值，返回类型仍为完整 Model
+    pub fn ignore<F, M>(mut self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> M,
+        M: MapToResult,
+    {
+        let where_obj = <T as Model>::Where::default();
+        let result = f(where_obj);
+        for column in result.column_names() {
+            if !self
+                .ignored_columns
+                .iter()
+                .any(|ignored| ignored == &column)
+            {
+                self.ignored_columns.push(column);
+            }
+        }
+        self
     }
 
     /// 字段投影并映射到目标Model - 自动生成别名以匹配目标Model的列名
@@ -1097,7 +1372,7 @@ impl<T: Model> Select<T> {
             &mut sql,
             "SELECT {}{} FROM {}",
             distinct_str,
-            T::COLUMNS.join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, None),
             table_name_for::<T>(db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
@@ -1340,11 +1615,7 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         write!(
             &mut sql,
             "SELECT {} FROM {} AS t0, {} AS t1",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             table_name_for::<T>(db_type),
             table_name_for::<R>(db_type)
         )
@@ -1451,11 +1722,7 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         write!(
             &mut sql,
             "SELECT {} FROM {} AS t0, {} AS t1, {} AS t2",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             table_name_for::<T>(db_type),
             table_name_for::<R1>(db_type),
             table_name_for::<R2>(db_type)
@@ -1564,11 +1831,7 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         write!(
             &mut sql,
             "SELECT {} FROM {} AS t0, {} AS t1, {} AS t2, {} AS t3",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             table_name_for::<T>(db_type),
             table_name_for::<R1>(db_type),
             table_name_for::<R2>(db_type),
@@ -2806,6 +3069,7 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -2827,6 +3091,7 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns.clone(),
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
@@ -2846,6 +3111,7 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -2867,6 +3133,7 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns.clone(),
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
@@ -2886,6 +3153,7 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    ignored_columns: Vec<String>,
     join_table: String,
     join_alias: String,
     on_condition: FilterExpr,
@@ -2907,6 +3175,7 @@ impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns.clone(),
             join_table: self.join_table.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
@@ -2939,6 +3208,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -2969,6 +3239,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -2999,6 +3270,7 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
             join_table: J::TABLE_NAME.to_string(),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
@@ -3047,11 +3319,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 LEFT JOIN {} AS {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))
@@ -3122,11 +3390,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 LEFT JOIN LATERAL (SELECT * FROM {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))
@@ -3249,11 +3513,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 INNER JOIN {} AS {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))
@@ -3324,11 +3584,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 INNER JOIN LATERAL (SELECT * FROM {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))
@@ -3451,11 +3707,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 RIGHT JOIN {} AS {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))
@@ -3526,11 +3778,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         write!(
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 RIGHT JOIN LATERAL (SELECT * FROM {}",
-            T::COLUMNS
-                .iter()
-                .map(|c| format!("t0.{}", c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
             J::COLUMNS
                 .iter()
                 .map(|c| format!("t1.{} as j_{}", c, c))

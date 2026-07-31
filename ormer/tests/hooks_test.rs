@@ -7,8 +7,8 @@ use ormer::{
 use ormer::{
     AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, Model,
 };
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Mutex;
 
 // 全局计数器用于验证钩子是否被调用
 static BEFORE_INSERT_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -19,7 +19,7 @@ static BEFORE_DELETE_COUNT: AtomicUsize = AtomicUsize::new(0);
 static AFTER_DELETE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // 互斥锁确保使用全局计数器的测试串行执行，避免并行时 reset_counters 互相干扰
-static HOOKS_TEST_MUTEX: Mutex<()> = Mutex::new(());
+static HOOKS_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Model)]
 #[table = "hook_test_users"]
@@ -87,7 +87,7 @@ async fn test_hooks_trait_definition() {
     // 注意：由于 Rust 类型系统限制，自动触发机制需要更复杂的实现
     // 当前版本提供了钩子 traits 定义，用户可以手动调用
 
-    let _guard = HOOKS_TEST_MUTEX.lock().unwrap();
+    let _guard = HOOKS_TEST_MUTEX.lock().await;
     reset_counters();
 
     let mut user = HookTestUser {
@@ -120,7 +120,7 @@ async fn test_hooks_trait_definition() {
 #[tokio::test]
 async fn test_hooks_with_database_insert() {
     // 测试使用数据库时的钩子调用
-    let _guard = HOOKS_TEST_MUTEX.lock().unwrap();
+    let _guard = HOOKS_TEST_MUTEX.lock().await;
     reset_counters();
 
     #[cfg(feature = "sqlite")]
@@ -148,7 +148,7 @@ async fn test_hooks_with_database_insert() {
 #[tokio::test]
 async fn test_hooks_with_database_batch_insert() {
     // 测试批量插入时的钩子
-    let _guard = HOOKS_TEST_MUTEX.lock().unwrap();
+    let _guard = HOOKS_TEST_MUTEX.lock().await;
     reset_counters();
 
     #[cfg(feature = "sqlite")]

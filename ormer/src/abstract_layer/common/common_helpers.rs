@@ -453,7 +453,7 @@ pub fn convert_column_value(
                 std::time::Duration::from_micros(get_int().unwrap_or(0).max(0) as u64),
             )),
             "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                Ok(Value::DateTime(get_datetime().unwrap_or_else(|| {
+                Ok(Value::DateTime(get_datetime().unwrap_or({
                     chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
                 })))
             }

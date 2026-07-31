@@ -589,6 +589,7 @@ use super::super::mysql_backend;
 use super::super::mssql_backend;
 
 /// 连接包装器 - 包装各后端的 Database 实例
+#[allow(clippy::upper_case_acronyms)]
 enum ConnectionWrapper {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::Database),
@@ -810,9 +811,9 @@ impl PoolBuilder {
                     "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
                 )?;
                 let mut builder = bb8::Pool::builder();
-                builder = builder.max_size(self.config.max_size as u32);
+                builder = builder.max_size(self.config.max_size);
                 if self.config.min_size > 0 {
-                    builder = builder.min_idle(Some(self.config.min_size as u32));
+                    builder = builder.min_idle(Some(self.config.min_size));
                 }
                 let pool = crate::utils::FutureTraceExt::trace(builder.build(manager)).await?;
                 Ok(ConnectionPool::PostgreSQL(pool))
@@ -901,6 +902,7 @@ impl ConnectionPool {
 
 /// 连接池内部类型
 #[derive(Clone)]
+#[allow(clippy::upper_case_acronyms)]
 enum PooledConnectionInner {
     #[cfg(feature = "sqlite")]
     Sqlite(Arc<ManualPool>),

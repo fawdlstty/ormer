@@ -220,6 +220,23 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.distinct()),
                 }
             }
+
+            pub fn ignore<F, M>(self, f: F) -> Self
+            where
+                F: FnOnce(<T as $crate::Model>::Where) -> M,
+                M: $crate::query::builder::MapToResult,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.ignore(f)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.ignore(f)),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.ignore(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.ignore(f)),
+                }
+            }
         }
     };
 }

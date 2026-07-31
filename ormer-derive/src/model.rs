@@ -234,7 +234,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 field_values 实现
-    let field_names_for_values = fields.iter().map(|f| field_to_value_expr(f));
+    let field_names_for_values = fields.iter().map(field_to_value_expr);
 
     // 生成 Where 结构体的字段
     // 为所有字段生成类型化列代理
@@ -537,14 +537,14 @@ fn has_data_type(field: &syn::Field) -> bool {
 fn has_i32_data_type(field: &syn::Field) -> bool {
     extract_data_type_type(field)
         .as_ref()
-        .map(|ty| is_i32_type(ty))
+        .map(is_i32_type)
         .unwrap_or(false)
 }
 
 fn has_vec_i32_data_type(field: &syn::Field) -> bool {
     extract_data_type_type(field)
         .as_ref()
-        .map(|ty| is_vec_i32_type(ty))
+        .map(is_vec_i32_type)
         .unwrap_or(false)
 }
 

@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
+
 /// 判断错误是否为约束冲突错误（如主键/唯一键重复）
 /// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
 fn is_constraint_error(e: &anyhow::Error) -> bool {
@@ -1398,6 +1400,7 @@ impl Transaction {
     }
 
     /// 批量插入或忽略记录（遇到重复键时忽略）（内部使用）
+    #[allow(dead_code)]
     async fn insert_or_ignore_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -1604,6 +1607,19 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
             select: mapped_select,
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 忽略指定字段，查询时用默认常量替代真实列值
+    pub fn ignore<F, M>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        Self {
+            select: self.select.ignore(f),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2531,7 +2547,7 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for DeleteE
 pub struct UpdateExecutor<T: Model> {
     sets: Vec<(String, Value)>,
     filters: Vec<FilterExpr>,
-    model_updates: Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>,
+    model_updates: ModelUpdateBatch,
     conn: Arc<turso::Connection>,
     _marker: PhantomData<T>,
 }
@@ -2575,7 +2591,7 @@ impl<T: Model> UpdateExecutor<T> {
         let pk_columns = T::primary_key_columns();
         let pk_values = model.primary_key_values();
         let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val = common_helpers::value_to_filter_value(&val);
             model_filters.push(crate::query::filter::FilterExpr::Comparison {
                 column: col.to_string(),

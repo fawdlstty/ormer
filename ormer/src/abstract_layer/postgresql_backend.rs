@@ -17,6 +17,9 @@ use std::marker::PhantomData;
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 
+type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
+type UpdateSqlBatch = Vec<(String, Vec<Value>, Vec<&'static str>)>;
+
 /// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
 /// 支持 i32, i64, u32, u64 等整数类型，以及 ()
 fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
@@ -2552,6 +2555,19 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// 忽略指定字段，查询时用默认常量替代真实列值
+    pub fn ignore<F, M>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        Self {
+            select: self.select.ignore(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 选择列（支持聚合函数）- 转换为分组查询
     pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
     where
@@ -3069,7 +3085,7 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'
 pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<(String, Value)>,
     filters: Vec<FilterExpr>,
-    model_updates: Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>,
+    model_updates: ModelUpdateBatch,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<T>,
 }
@@ -3113,7 +3129,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         let pk_columns = T::primary_key_columns();
         let pk_values = model.primary_key_values();
         let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val =
                 crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
             model_filters.push(crate::query::filter::FilterExpr::Comparison {
@@ -3171,9 +3187,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         Ok(results)
     }
 
-    fn build_all_sql(
-        &self,
-    ) -> anyhow::Result<Vec<(String, Vec<crate::model::Value>, Vec<&'static str>)>> {
+    fn build_all_sql(&self) -> anyhow::Result<UpdateSqlBatch> {
         let mut statements = Vec::new();
 
         // Base UPDATE from sets/filters
@@ -3483,7 +3497,7 @@ fn values_to_params(
             crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
                 as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
             crate::model::Value::DateTime(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Json(v) => {
                 Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>

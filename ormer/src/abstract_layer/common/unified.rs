@@ -1,4 +1,6 @@
-﻿/// 统一的数据库抽象层
+﻿#![allow(clippy::upper_case_acronyms)]
+
+/// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::SqlStatement;
@@ -390,7 +392,7 @@ impl Database {
 
         // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
         let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val = match val {
                 crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
@@ -1364,7 +1366,7 @@ impl<'a> Transaction<'a> {
 
         // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
         let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val = match val {
                 crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),

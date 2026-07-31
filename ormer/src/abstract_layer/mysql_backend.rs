@@ -14,6 +14,8 @@ use mysql_async::prelude::*;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
+
 /// 将数据库返回的自增ID（u64）转换为模型指定的 AutoIncrementKeyType
 /// 支持 i32, i64, u32, u64 等整数类型，以及 ()
 fn convert_auto_increment_key<K: Default + 'static>(last_id: u64) -> anyhow::Result<K> {
@@ -48,6 +50,37 @@ fn convert_auto_increment_key<K: Default + 'static>(last_id: u64) -> anyhow::Res
 
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::MySQL)
+}
+
+fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Value {
+    match value {
+        crate::model::Value::Integer(v) => mysql_async::Value::Int(*v),
+        crate::model::Value::Text(v) => mysql_async::Value::Bytes(v.as_bytes().to_vec()),
+        crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
+        crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
+        crate::model::Value::Duration(v) => {
+            mysql_async::Value::Int(v.as_micros().min(i64::MAX as u128) as i64)
+        }
+        crate::model::Value::Bytes(v) => mysql_async::Value::Bytes(v.clone()),
+        crate::model::Value::DateTime(v) => mysql_async::Value::Date(
+            v.year() as u16,
+            v.month() as u8,
+            v.day() as u8,
+            v.hour() as u8,
+            v.minute() as u8,
+            v.second() as u8,
+            v.timestamp_subsec_micros(),
+        ),
+        crate::model::Value::Json(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
+        crate::model::Value::Uuid(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
+        crate::model::Value::BigInt(v) => mysql_async::Value::Int(*v as i64),
+        crate::model::Value::IntegerArray(_)
+        | crate::model::Value::BigIntArray(_)
+        | crate::model::Value::NullableBigIntArray(_) => {
+            panic!("MySQL backend does not support PostgreSQL array values")
+        }
+        crate::model::Value::Null => mysql_async::Value::NULL,
+    }
 }
 
 /// MySQL 类型映射器
@@ -250,6 +283,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
         Err(anyhow::anyhow!("MySQL does not support RETURNING clause"))
     }
 
+    #[allow(dead_code)]
     async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
@@ -364,6 +398,7 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         <Self as SqlExecutor>::execute(self).await
     }
 
+    #[allow(dead_code)]
     async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -469,6 +504,7 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         <Self as SqlExecutor>::execute(self).await
     }
 
+    #[allow(dead_code)]
     async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -1476,35 +1512,7 @@ impl<
             // 将ormer::Value转换为mysql_async::Params
             let mysql_params: Vec<mysql_async::Value> = params
                 .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
-                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
-                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
-                    crate::model::Value::Boolean(b) => {
-                        mysql_async::Value::Int(if b { 1 } else { 0 })
-                    }
-                    crate::model::Value::Duration(d) => {
-                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                    }
-                    crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                    crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                        dt.year() as u16,
-                        dt.month() as u8,
-                        dt.day() as u8,
-                        dt.hour() as u8,
-                        dt.minute() as u8,
-                        dt.second() as u8,
-                        dt.timestamp_subsec_micros(),
-                    ),
-                    crate::model::Value::Json(j) => {
-                        mysql_async::Value::Bytes(j.to_string().into_bytes())
-                    }
-                    crate::model::Value::Uuid(u) => {
-                        mysql_async::Value::Bytes(u.to_string().into_bytes())
-                    }
-                    crate::model::Value::BigInt(b) => mysql_async::Value::Int(b as i64),
-                    crate::model::Value::Null => mysql_async::Value::NULL,
-                })
+                .map(|v| mysql_value_from_ormer_value(&v))
                 .collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
@@ -1645,6 +1653,19 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mapped_select = self.select.map_to(f);
         MappedSelectExecutor {
             select: mapped_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 忽略指定字段，查询时用默认常量替代真实列值
+    pub fn ignore<F, M>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        Self {
+            select: self.select.ignore(f),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1823,35 +1844,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
             // 构建参数
             let mysql_params: Vec<mysql_async::Value> = params
                 .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
-                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
-                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
-                    crate::model::Value::Boolean(b) => {
-                        mysql_async::Value::Int(if b { 1 } else { 0 })
-                    }
-                    crate::model::Value::Duration(d) => {
-                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                    }
-                    crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                    crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                        dt.year() as u16,
-                        dt.month() as u8,
-                        dt.day() as u8,
-                        dt.hour() as u8,
-                        dt.minute() as u8,
-                        dt.second() as u8,
-                        dt.timestamp_subsec_micros(),
-                    ),
-                    crate::model::Value::Json(j) => {
-                        mysql_async::Value::Bytes(j.to_string().into_bytes())
-                    }
-                    crate::model::Value::Uuid(u) => {
-                        mysql_async::Value::Bytes(u.to_string().into_bytes())
-                    }
-                    crate::model::Value::BigInt(b) => mysql_async::Value::Int(b as i64),
-                    crate::model::Value::Null => mysql_async::Value::NULL,
-                })
+                .map(|v| mysql_value_from_ormer_value(&v))
                 .collect();
 
             let mut exec_result = conn.exec_iter(&sql, mysql_params).trace().await?;
@@ -2055,7 +2048,7 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'
 pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<(String, Value)>,
     filters: Vec<FilterExpr>,
-    model_updates: Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>,
+    model_updates: ModelUpdateBatch,
     pool: &'a Pool,
     _marker: PhantomData<T>,
 }
@@ -2099,7 +2092,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         let pk_columns = T::primary_key_columns();
         let pk_values = model.primary_key_values();
         let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values.into_iter()) {
+        for (col, val) in pk_columns.iter().zip(pk_values) {
             let filter_val =
                 crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
             model_filters.push(crate::query::filter::FilterExpr::Comparison {
@@ -2237,30 +2230,7 @@ fn values_to_params(values: &[crate::model::Value]) -> anyhow::Result<Vec<mysql_
     let mut params: Vec<mysql_async::Value> = Vec::new();
 
     for value in values {
-        let param = match value {
-            crate::model::Value::Integer(v) => mysql_async::Value::Int(*v),
-            crate::model::Value::Text(v) => mysql_async::Value::Bytes(v.as_bytes().to_vec()),
-            crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
-            crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
-            crate::model::Value::Duration(v) => {
-                mysql_async::Value::Int(v.as_micros().min(i64::MAX as u128) as i64)
-            }
-            crate::model::Value::Bytes(v) => mysql_async::Value::Bytes(v.clone()),
-            crate::model::Value::DateTime(v) => mysql_async::Value::Date(
-                v.year() as u16,
-                v.month() as u8,
-                v.day() as u8,
-                v.hour() as u8,
-                v.minute() as u8,
-                v.second() as u8,
-                v.timestamp_subsec_micros(),
-            ),
-            crate::model::Value::Json(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
-            crate::model::Value::Uuid(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
-            crate::model::Value::BigInt(v) => mysql_async::Value::Int(*v as i64),
-            crate::model::Value::Null => mysql_async::Value::NULL,
-        };
-        params.push(param);
+        params.push(mysql_value_from_ormer_value(value));
     }
 
     Ok(params)
@@ -2300,36 +2270,8 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         // 将参数转换为 mysql_async::Value
-        let mysql_params: Vec<mysql_async::Value> = params
-            .iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(n) => mysql_async::Value::Int(*n),
-                crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
-                crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
-                crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
-                crate::model::Value::Duration(d) => {
-                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                    dt.year() as u16,
-                    dt.month() as u8,
-                    dt.day() as u8,
-                    dt.hour() as u8,
-                    dt.minute() as u8,
-                    dt.second() as u8,
-                    dt.timestamp_subsec_micros(),
-                ),
-                crate::model::Value::Json(j) => {
-                    mysql_async::Value::Bytes(j.to_string().into_bytes())
-                }
-                crate::model::Value::Uuid(u) => {
-                    mysql_async::Value::Bytes(u.to_string().into_bytes())
-                }
-                crate::model::Value::BigInt(b) => mysql_async::Value::Int(*b as i64),
-                crate::model::Value::Null => mysql_async::Value::NULL,
-            })
-            .collect();
+        let mysql_params: Vec<mysql_async::Value> =
+            params.iter().map(mysql_value_from_ormer_value).collect();
 
         // 获取连接
         let conn = self.pool.get_conn().trace().await?;
@@ -2443,36 +2385,8 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-        let mysql_params: Vec<mysql_async::Value> = params
-            .iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(n) => mysql_async::Value::Int(*n),
-                crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
-                crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
-                crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
-                crate::model::Value::Duration(d) => {
-                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                    dt.year() as u16,
-                    dt.month() as u8,
-                    dt.day() as u8,
-                    dt.hour() as u8,
-                    dt.minute() as u8,
-                    dt.second() as u8,
-                    dt.timestamp_subsec_micros(),
-                ),
-                crate::model::Value::Json(j) => {
-                    mysql_async::Value::Bytes(j.to_string().into_bytes())
-                }
-                crate::model::Value::Uuid(u) => {
-                    mysql_async::Value::Bytes(u.to_string().into_bytes())
-                }
-                crate::model::Value::BigInt(b) => mysql_async::Value::Int(*b as i64),
-                crate::model::Value::Null => mysql_async::Value::NULL,
-            })
-            .collect();
+        let mysql_params: Vec<mysql_async::Value> =
+            params.iter().map(mysql_value_from_ormer_value).collect();
 
         let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2653,36 +2567,8 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-        let mysql_params: Vec<mysql_async::Value> = params
-            .iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(n) => mysql_async::Value::Int(*n),
-                crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
-                crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
-                crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
-                crate::model::Value::Duration(d) => {
-                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                    dt.year() as u16,
-                    dt.month() as u8,
-                    dt.day() as u8,
-                    dt.hour() as u8,
-                    dt.minute() as u8,
-                    dt.second() as u8,
-                    dt.timestamp_subsec_micros(),
-                ),
-                crate::model::Value::Json(j) => {
-                    mysql_async::Value::Bytes(j.to_string().into_bytes())
-                }
-                crate::model::Value::Uuid(u) => {
-                    mysql_async::Value::Bytes(u.to_string().into_bytes())
-                }
-                crate::model::Value::BigInt(b) => mysql_async::Value::Int(*b as i64),
-                crate::model::Value::Null => mysql_async::Value::NULL,
-            })
-            .collect();
+        let mysql_params: Vec<mysql_async::Value> =
+            params.iter().map(mysql_value_from_ormer_value).collect();
 
         let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2865,36 +2751,8 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let mysql_params: Vec<mysql_async::Value> = params
-            .iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(n) => mysql_async::Value::Int(*n),
-                crate::model::Value::Text(s) => mysql_async::Value::Bytes(s.as_bytes().to_vec()),
-                crate::model::Value::Real(f) => mysql_async::Value::Double(*f),
-                crate::model::Value::Boolean(b) => mysql_async::Value::Int(if *b { 1 } else { 0 }),
-                crate::model::Value::Duration(d) => {
-                    mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                    dt.year() as u16,
-                    dt.month() as u8,
-                    dt.day() as u8,
-                    dt.hour() as u8,
-                    dt.minute() as u8,
-                    dt.second() as u8,
-                    dt.timestamp_subsec_micros(),
-                ),
-                crate::model::Value::Json(j) => {
-                    mysql_async::Value::Bytes(j.to_string().into_bytes())
-                }
-                crate::model::Value::Uuid(u) => {
-                    mysql_async::Value::Bytes(u.to_string().into_bytes())
-                }
-                crate::model::Value::BigInt(b) => mysql_async::Value::Int(*b as i64),
-                crate::model::Value::Null => mysql_async::Value::NULL,
-            })
-            .collect();
+        let mysql_params: Vec<mysql_async::Value> =
+            params.iter().map(mysql_value_from_ormer_value).collect();
 
         let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
 
@@ -3638,35 +3496,7 @@ impl<
             // 将ormer::Value转换为mysql_async::Params
             let mysql_params: Vec<mysql_async::Value> = params
                 .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => mysql_async::Value::Int(i),
-                    crate::model::Value::Text(t) => mysql_async::Value::Bytes(t.into_bytes()),
-                    crate::model::Value::Real(r) => mysql_async::Value::Double(r),
-                    crate::model::Value::Boolean(b) => {
-                        mysql_async::Value::Int(if b { 1 } else { 0 })
-                    }
-                    crate::model::Value::Duration(d) => {
-                        mysql_async::Value::Int(d.as_micros().min(i64::MAX as u128) as i64)
-                    }
-                    crate::model::Value::Bytes(b) => mysql_async::Value::Bytes(b.clone()),
-                    crate::model::Value::DateTime(dt) => mysql_async::Value::Date(
-                        dt.year() as u16,
-                        dt.month() as u8,
-                        dt.day() as u8,
-                        dt.hour() as u8,
-                        dt.minute() as u8,
-                        dt.second() as u8,
-                        dt.timestamp_subsec_micros(),
-                    ),
-                    crate::model::Value::Json(j) => {
-                        mysql_async::Value::Bytes(j.to_string().into_bytes())
-                    }
-                    crate::model::Value::Uuid(u) => {
-                        mysql_async::Value::Bytes(u.to_string().into_bytes())
-                    }
-                    crate::model::Value::BigInt(b) => mysql_async::Value::Int(b as i64),
-                    crate::model::Value::Null => mysql_async::Value::NULL,
-                })
+                .map(|v| mysql_value_from_ormer_value(&v))
                 .collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
