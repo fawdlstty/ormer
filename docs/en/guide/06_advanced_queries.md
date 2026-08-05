@@ -257,6 +257,36 @@ Can be combined with outer conditions:
 ))
 ```
 
+## Loading Model Relations
+
+After declaring `#[has_many]` or `#[belongs_to]` on a model, related objects can be loaded on demand:
+
+```rust
+let user = db.find_by_id::<User>(1).await?.unwrap();
+let posts = db
+    .find_related(&user, UserWhere::default().posts)
+    .await?;
+```
+
+Use `preload` to load a relation for a batch of parent models without an N+1 query loop:
+
+```rust
+let mut users = db.select::<User>().collect::<Vec<_>>().await?;
+db.preload(&mut users, UserWhere::default().posts).await?;
+```
+
+Use `include` to load a `belongs_to` relation as part of the query result:
+
+```rust
+let posts: Vec<Post> = db
+    .select::<Post>()
+    .include(|post| post.user)
+    .collect()
+    .await?;
+```
+
+Relation fields are excluded from column mapping. A missing `has_many` relation is an empty `Vec`, while a missing `belongs_to` target is `None`.
+
 ## Set Operations
 
 ### UNION / UNION ALL

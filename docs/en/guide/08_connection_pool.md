@@ -6,9 +6,7 @@
 use ormer::{Database, DbType, ConnectionPool};
 
 let pool = Database::create_pool(DbType::PostgreSQL, "postgresql://user:pass@localhost/dbname")
-    .max_size(10)
-    .min_size(5)
-    .idle_timeout(300)
+    .range(5..10)
     .build()
     .await?;
 ```
@@ -31,6 +29,22 @@ async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error:
 }
 ```
 
+`PooledConnection` also supports `select_sql` and `execute_sql`, so you can run raw SQL directly from the pool:
+
+```rust
+let conn = pool.get().await?;
+let users: Vec<User> = conn
+    .select_sql::<User>(ormer::sql("SELECT * FROM users WHERE age >= {}").bind(18))
+    .collect()
+    .await?;
+conn.execute_sql(
+    ormer::sql("UPDATE users SET name = {} WHERE id = {}")
+        .bind("Bob")
+        .bind(1),
+)
+.await?;
+```
+
 ## SQLite Backend Considerations
 
 The SQLite (turso) backend, due to its embedded nature, does not officially support multi-threaded shared connections. Recommendations:
@@ -46,7 +60,7 @@ The SQLite (turso) backend, due to its embedded nature, does not officially supp
 2. **Concurrent Scenarios**: For high concurrency read/write, consider enabling MVCC mode
    ```rust
    let conn = pool.get().await?;
-   conn.exec_non_query("PRAGMA journal_mode = 'mvcc'").await?;
+   conn.execute_sql("PRAGMA journal_mode = 'mvcc'").await?;
    // Use BEGIN CONCURRENT for concurrent writes
    ```
 
@@ -82,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DbType::PostgreSQL,
         "postgresql://user:pass@localhost/mydb"
     )
-    .max_size(20)
+    .range(0..20)
     .build()
     .await?;
     

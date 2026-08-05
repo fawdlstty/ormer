@@ -6,7 +6,8 @@ use proc_macro::TokenStream;
 #[proc_macro_derive(
     Model,
     attributes(
-        table, primary, unique, index, foreign, data_type, hypertable, compress
+        table, primary, unique, index, foreign, data_type, hypertable, compress, has_many,
+        belongs_to
     )
 )]
 pub fn derive_model(input: TokenStream) -> TokenStream {

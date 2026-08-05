@@ -1,4 +1,4 @@
-﻿/// 宏定义 - 用于减少重复代码
+/// 宏定义 - 用于减少重复代码
 ///
 /// 本文件包含用于生成重复代码模式的宏
 /// 为 JOIN Executor 生成通用的 filter/range 方法
@@ -290,6 +290,46 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
+            /// Execute the configured delete and run hooks around it.
+            ///
+            /// `AfterDelete` runs only when the statement affects at least one
+            /// row. The supplied model is the hook subject; filters remain
+            /// fully controlled by the executor.
+            pub async fn execute_with_hooks(self, model: &T) -> anyhow::Result<u64>
+            where
+                T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
+            {
+                let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete);
+                $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                let affected = self.execute().await?;
+                if affected > 0 {
+                    $crate::AfterDelete::after_delete(model, &mut ctx).await?;
+                }
+                Ok(affected)
+            }
+
+            /// Execute the configured delete with per-model hooks.
+            pub async fn execute_models_with_hooks(self, models: &[T]) -> anyhow::Result<u64>
+            where
+                T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
+            {
+                for (index, model) in models.iter().enumerate() {
+                    let mut ctx =
+                        $crate::HookContext::new($crate::HookOperation::Delete).for_batch(index);
+                    $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                }
+
+                let affected = self.execute().await?;
+                if affected > 0 {
+                    for (index, model) in models.iter().enumerate() {
+                        let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete)
+                            .for_batch(index);
+                        $crate::AfterDelete::after_delete(model, &mut ctx).await?;
+                    }
+                }
+                Ok(affected)
+            }
+
             pub async fn returning(self) -> anyhow::Result<Vec<T>> {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -423,6 +463,46 @@ macro_rules! impl_unified_update_executor {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
                 }
+            }
+
+            /// Execute the configured update and run hooks around it.
+            ///
+            /// The model supplied here is also the model observed by hooks;
+            /// use `set_model(model)` when the update should be derived from
+            /// that model's values.
+            pub async fn execute_with_hooks(self, model: &mut T) -> anyhow::Result<u64>
+            where
+                T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
+            {
+                let mut ctx = $crate::HookContext::new($crate::HookOperation::Update);
+                $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                let affected = self.execute().await?;
+                if affected > 0 {
+                    $crate::AfterUpdate::after_update(model, &mut ctx).await?;
+                }
+                Ok(affected)
+            }
+
+            /// Execute the configured update with per-model hooks.
+            pub async fn execute_models_with_hooks(self, models: &mut [T]) -> anyhow::Result<u64>
+            where
+                T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
+            {
+                for (index, model) in models.iter_mut().enumerate() {
+                    let mut ctx =
+                        $crate::HookContext::new($crate::HookOperation::Update).for_batch(index);
+                    $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                }
+
+                let affected = self.execute().await?;
+                if affected > 0 {
+                    for (index, model) in models.iter().enumerate() {
+                        let mut ctx = $crate::HookContext::new($crate::HookOperation::Update)
+                            .for_batch(index);
+                        $crate::AfterUpdate::after_update(model, &mut ctx).await?;
+                    }
+                }
+                Ok(affected)
             }
 
             pub async fn returning(self) -> anyhow::Result<Vec<T>> {
@@ -632,33 +712,21 @@ macro_rules! impl_unified_related_select_executor {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, phantom) => {
-                        RelatedCollectFuture::Sqlite(exec.exec(), phantom)
+                        RelatedCollectFuture::Sqlite(exec.into_collect_future(), phantom)
                     }
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => {
-                        RelatedCollectFuture::PostgreSQL(exec.exec())
+                        RelatedCollectFuture::PostgreSQL(exec.into_collect_future())
                     }
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => RelatedCollectFuture::MySQL(exec.exec()),
+                    $executor_name::MySQL(exec) => {
+                        RelatedCollectFuture::MySQL(exec.into_collect_future())
+                    }
                     #[cfg(feature = "mssql")]
-                    $executor_name::MSSQL(exec) => RelatedCollectFuture::MSSQL(exec.exec()),
+                    $executor_name::MSSQL(exec) => {
+                        RelatedCollectFuture::MSSQL(exec.into_collect_future())
+                    }
                 }
-            }
-
-            pub fn exec(self) -> RelatedCollectFuture<'a, T, R>
-            where
-                T: 'static,
-                R: 'static,
-            {
-                self.collect::<Vec<T>>()
-            }
-
-            pub fn execute(self) -> RelatedCollectFuture<'a, T, R>
-            where
-                T: 'static,
-                R: 'static,
-            {
-                self.collect::<Vec<T>>()
             }
         }
     };

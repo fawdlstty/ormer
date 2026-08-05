@@ -1,4 +1,4 @@
-﻿/// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
+/// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
 pub mod connection_pool;
 
 pub mod common_helpers;
@@ -18,15 +18,17 @@ pub use stream_connection::StreamConnection;
 mod unified;
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, InsertExecutor,
-    InsertOrUpdateExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
-    MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
+    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
+    IncludedSelectExecutor, InsertExecutor, InsertOrUpdateExecutor, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
     SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, UpdateExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
-pub use connection_pool::{ConnectionPool, PooledConnection};
+pub use connection_pool::{ConnectionPool, PooledConnection, PooledRawSelectExecutor};
 
 #[derive(Debug, Clone)]
 pub struct SingleSqlStatement {

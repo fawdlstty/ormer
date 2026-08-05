@@ -14,7 +14,7 @@ async fn test_stream_basic_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -53,7 +53,7 @@ async fn test_stream_with_filter_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -95,7 +95,7 @@ async fn test_stream_with_order_and_range_impl(config: &_test_common::DbConfig) 
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -139,7 +139,7 @@ async fn test_stream_empty_result_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -166,7 +166,7 @@ async fn test_stream_in_transaction_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -227,7 +227,7 @@ async fn test_stream_large_dataset_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -271,7 +271,7 @@ async fn test_stream_error_handling_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 
@@ -326,7 +326,7 @@ async fn test_stream_with_connection_pool_impl(config: &_test_common::DbConfig) 
 
     // 删除表（如果存在）并重新创建
     let _ = pooled_conn
-        .exec_non_query("DROP TABLE IF EXISTS stream_pool_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_pool_users_test")
         .await;
     pooled_conn
         .create_table::<StreamPoolUser>()
@@ -369,7 +369,7 @@ async fn test_stream_with_limit_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_users_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_users_test")
         .await;
     db.create_table::<StreamUser>().execute().await.unwrap();
 

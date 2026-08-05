@@ -41,6 +41,20 @@ let user: Vec<User> = db
 .filter(|u| u.name.contains("li").and(u.age.gt(29)))
 ```
 
+### PostgreSQL 字符串数组包含
+
+对于 PostgreSQL 的 `Vec<String>` 字段，可使用 `contains` 判断数组是否包含元素：
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.tags.contains("admin"))
+    .collect()
+    .await?;
+```
+
+该条件生成 PostgreSQL 数组包含运算；其他后端不提供此数组专用条件。
+
 ### NULL 判断
 
 ```rust
@@ -112,6 +126,20 @@ let names: Vec<String> = db.select::<User>().distinct().map_to(|u| u.name).colle
 
 可与 `filter`、`order_by`、`range` 等组合使用。
 
+## 忽略字段
+
+使用 `ignore` 查询完整模型时，可以用常量替代指定字段的真实值。字段仍然存在于返回模型中，但不会从数据库读取：
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .ignore(|u| (u.id, u.email))
+    .collect()
+    .await?;
+```
+
+例如，整数主键会读为 `0`，可空字段会读为 `None`。该方法适合不需要读取敏感或大字段的查询。
+
 ## 单条查询
 
 ```rust
@@ -154,6 +182,16 @@ let user_ids: Vec<UserId> = db
     .select::<User>()
     .map_to(|u| u.id)
     .collect_with(|id| UserId { id })
+    .await?;
+```
+
+如果目标仍是另一个 `Model`，可以使用 `map_to_model`，框架会按目标模型的列名生成别名：
+
+```rust
+let archived: Vec<ArchiveUser> = db
+    .select::<User>()
+    .map_to_model::<_, ArchiveUser>(|u| u.id)
+    .collect()
     .await?;
 ```
 

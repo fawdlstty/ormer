@@ -56,6 +56,41 @@ let count = txn
 txn.commit().await?;
 ```
 
+### 原生 SQL
+
+事务对象也支持原生 SQL 和参数绑定：
+
+```rust
+let mut txn = db.begin().await?;
+
+let users: Vec<User> = txn
+    .select_sql::<User>(
+        ormer::sql("SELECT * FROM users WHERE age >= {}").bind(18),
+    )
+    .collect()
+    .await?;
+
+txn.execute_sql(
+    ormer::sql("UPDATE users SET name = {} WHERE id = {}")
+        .bind("Adult")
+        .bind(1),
+)
+.await?;
+
+txn.commit().await?;
+```
+
+### 插入或更新、插入或忽略
+
+事务对象也提供与数据库对象相同的 upsert 和 ignore 操作：
+
+```rust
+let mut txn = db.begin().await?;
+txn.insert_or_update(&user).execute().await?;
+txn.insert_or_ignore(&user).execute().await?;
+txn.commit().await?;
+```
+
 ## 错误处理
 
 ```rust

@@ -430,14 +430,15 @@ mod connection_pool_tests {
         conn.create_table::<PoolTestUser>().execute().await?;
 
         // 执行原生插入 SQL
-        conn.exec_non_query(
+        conn.execute_sql(
             "INSERT INTO pool_test_users_1 (id, name, age, email) VALUES (1, 'Alice', 25, 'alice@example.com')",
         )
         .await?;
 
         // 执行原生查询 SQL
         let users = conn
-            .execute::<PoolTestUser>("SELECT * FROM pool_test_users_1")
+            .select_sql::<PoolTestUser>("SELECT * FROM pool_test_users_1")
+            .collect::<Vec<PoolTestUser>>()
             .await?;
 
         assert_eq!(users.len(), 1);

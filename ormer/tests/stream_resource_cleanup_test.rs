@@ -14,7 +14,7 @@ async fn test_stream_pollution_on_error_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_pollution")
+        .execute_sql("DROP TABLE IF EXISTS stream_cleanup_pollution")
         .await;
     db.create_table::<StreamCleanupUserPollution>()
         .execute()
@@ -55,7 +55,7 @@ async fn test_stream_early_termination_cleanup_impl(config: &_test_common::DbCon
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_et")
+        .execute_sql("DROP TABLE IF EXISTS stream_cleanup_et")
         .await;
     db.create_table::<StreamCleanupUserEt>()
         .execute()
@@ -108,7 +108,7 @@ async fn test_multiple_consecutive_streams_impl(config: &_test_common::DbConfig)
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_mc")
+        .execute_sql("DROP TABLE IF EXISTS stream_cleanup_mc")
         .await;
     db.create_table::<StreamCleanupUserMc>()
         .execute()
@@ -171,7 +171,7 @@ async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = pooled_conn
-        .exec_non_query("DROP TABLE IF EXISTS stream_cleanup_pool")
+        .execute_sql("DROP TABLE IF EXISTS stream_cleanup_pool")
         .await;
     pooled_conn
         .create_table::<StreamCleanupUserPool>()

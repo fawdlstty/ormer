@@ -27,6 +27,8 @@ struct User {
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
 - `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
 
+PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite 和 MySQL 会使用最后一段表名。
+
 ## 字段属性
 
 ### 唯一约束
@@ -131,6 +133,62 @@ struct User {
 
 支持 `Option<EnumType>` 表示可空枚举字段。
 
+`ModelEnum` 枚举也可以用于 `IN`、比较和排序条件：
+
+```rust
+let active: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.status.is_in([UserStatus::Active, UserStatus::Banned]))
+    .collect()
+    .await?;
+```
+
+如果已有数值枚举或包装类型，不需要派生 `ModelEnum`，可以用 `#[data_type(i32)]` 指定数据库类型。可空字段必须同时使用 `#[data_type(Option<i32>)]`：
+
+```rust
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+enum Status {
+    Active = 1,
+    Disabled = 0,
+}
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i32,
+    #[data_type(i32)]
+    status: Status,
+    #[data_type(Option<i32>)]
+    old_status: Option<Status>,
+}
+```
+
+### PostgreSQL 数组
+
+PostgreSQL 支持 `Vec<i32>`、`Vec<i64>`、`Vec<Option<i64>>` 和 `Vec<String>`。这些字段映射到原生数组类型；`Vec<String>` 使用 `TEXT[]`，不是 JSON 字段：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i32,
+    tags: Vec<String>,
+    scores: Vec<i32>,
+}
+```
+
+对 `Vec<T>` 中的自定义数值枚举，可以使用 `#[data_type(Vec<i32>)]`：
+
+```rust
+#[data_type(Vec<i32>)]
+roles: Vec<Status>,
+```
+
+数组类型和上述写法目前用于 PostgreSQL 后端。
+
 ## 完整示例
 
 ```rust
@@ -172,6 +230,36 @@ struct Post {
     content: String,
 }
 ```
+
+## 模型关系
+
+外键字段只描述数据库约束；需要加载关联模型时，可使用 `#[has_many]` 和 `#[belongs_to]`：
+
+```rust
+#[derive(Debug, Clone, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    #[has_many(Post.user_id)]
+    posts: Vec<Post>,
+}
+
+#[derive(Debug, Clone, Model)]
+#[table = "posts"]
+struct Post {
+    #[primary(auto)]
+    id: i32,
+    #[foreign(User.id)]
+    user_id: i32,
+    #[belongs_to(user_id)]
+    user: Option<User>,
+    title: String,
+}
+```
+
+关系字段不会成为数据库列；`#[belongs_to]` 字段必须是 `Option<T>`，`#[has_many]` 字段必须是 `Vec<T>`。
 
 ## 复合主键
 
@@ -273,5 +361,4 @@ for au in &archived {
     println!("User: {}", au.inner().name);
 }
 ```
-
 

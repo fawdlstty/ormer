@@ -13,7 +13,7 @@ async fn test_stream_connection_release_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_leak_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_leak_test")
         .await;
     db.create_table::<StreamLeakUser>().execute().await.unwrap();
 
@@ -56,7 +56,7 @@ async fn test_stream_early_termination_impl(config: &_test_common::DbConfig) {
 
     // 删除表（如果存在）并重新创建
     let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_early_term_test")
+        .execute_sql("DROP TABLE IF EXISTS stream_early_term_test")
         .await;
     db.create_table::<StreamEarlyTermUser>()
         .execute()
@@ -106,9 +106,7 @@ async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig
     let db = _test_common::create_db_connection(config).await.unwrap();
 
     // 删除表（如果存在）并重新创建
-    let _ = db
-        .exec_non_query("DROP TABLE IF EXISTS stream_txn_test")
-        .await;
+    let _ = db.execute_sql("DROP TABLE IF EXISTS stream_txn_test").await;
     db.create_table::<StreamTxnUser>().execute().await.unwrap();
 
     // 插入测试数据

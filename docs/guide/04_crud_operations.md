@@ -153,11 +153,42 @@ db.drop_table::<User>().execute().await?;
 
 ```rust
 let users: Vec<User> = db
-    .execute::<User>("SELECT * FROM users WHERE age >= 18")
+    .select_sql::<User>("SELECT * FROM users WHERE age >= 18")
+    .collect::<Vec<User>>()
     .await?;
 
 let affected = db
-    .exec_non_query("UPDATE users SET name = 'Test' WHERE id = 1")
+    .execute_sql("UPDATE users SET name = 'Test' WHERE id = 1")
+    .await?;
+```
+
+需要参数时使用 `sql!`、`bind` 或 `bind_named`，不要拼接用户输入：
+
+```rust
+db.execute_sql(ormer::sql!(
+    "UPDATE users SET name = {name} WHERE id = {id}",
+    name = "Alice".to_string(),
+    id = 1,
+))
+.await?;
+
+let users: Vec<User> = db
+    .select_sql::<User>(
+        ormer::sql("SELECT * FROM users WHERE age >= :age")
+            .bind_named("age", 18),
+    )
+    .collect()
+    .await?;
+```
+
+`{}` 是位置参数，`{name}` 和 `:name` 是命名参数；渲染时会根据后端转换为 `?` 或 `$1` 等占位符，字符串和注释中的类似文本不会被替换。事务和连接池连接也提供相同的 `select_sql` 与 `execute_sql` 方法。
+
+如果 SQL 中包含方言语法或需要保留字面量中的冒号，可使用 `RawSql::plain()` 禁用占位符解析：
+
+```rust
+let users: Vec<User> = db
+    .select_sql::<User>(ormer::RawSql::plain("SELECT * FROM users WHERE note = ':literal'"))
+    .collect()
     .await?;
 ```
 
@@ -217,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 钩子系统 (Hooks)
 
-Ormer 提供了钩子系统，允许您在数据操作前后自动执行自定义逻辑。支持的钩子包括：
+Ormer 提供了钩子系统，允许您在写操作前后执行可失败的自定义逻辑。插入会自动触发已实现的 Hook；更新和删除需要使用 `execute_with_hooks` 或 `execute_models_with_hooks` 显式提供 Hook 对象。
 
 - `BeforeInsert` / `AfterInsert` - 插入前后
 - `BeforeUpdate` / `AfterUpdate` - 更新前后
@@ -226,7 +257,7 @@ Ormer 提供了钩子系统，允许您在数据操作前后自动执行自定�
 ### 使用示例
 
 ```rust
-use ormer::{Model, BeforeInsert, BeforeUpdate};
+use ormer::{AfterInsert, BeforeInsert, BeforeUpdate, HookContext, Model};
 
 #[derive(Debug, Model)]
 #[table = "users"]
@@ -240,17 +271,26 @@ struct User {
 
 #[async_trait::async_trait]
 impl BeforeInsert for User {
-    async fn before_insert(&mut self) {
+    async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         let now = chrono::Utc::now();
         self.created_at = now;
         self.updated_at = now;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AfterInsert for User {
+    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl BeforeUpdate for User {
-    async fn before_update(&mut self) {
+    async fn before_update(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         self.updated_at = chrono::Utc::now();
+        Ok(())
     }
 }
 ```

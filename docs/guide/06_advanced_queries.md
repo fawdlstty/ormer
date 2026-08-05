@@ -257,6 +257,36 @@ let users_with_roles: Vec<User> = db
 ))
 ```
 
+## 模型关系加载
+
+模型使用 `#[has_many]` 或 `#[belongs_to]` 声明关系后，可以按需加载关联对象：
+
+```rust
+let user = db.find_by_id::<User>(1).await?.unwrap();
+let posts = db
+    .find_related(&user, UserWhere::default().posts)
+    .await?;
+```
+
+使用 `preload` 为一批父模型一次性加载关系，避免逐条查询：
+
+```rust
+let mut users = db.select::<User>().collect::<Vec<_>>().await?;
+db.preload(&mut users, UserWhere::default().posts).await?;
+```
+
+`include` 用于在查询结果中加载 `belongs_to` 关系：
+
+```rust
+let posts: Vec<Post> = db
+    .select::<Post>()
+    .include(|post| post.user)
+    .collect()
+    .await?;
+```
+
+关系字段不会参与表列映射；`has_many` 结果为空时返回空 `Vec`，`belongs_to` 未找到目标时为 `None`。
+
 ## 集合操作
 
 ### UNION / UNION ALL

@@ -8,8 +8,8 @@ define_test_user!(ExecTestUser2, "exec_test_users_2");
 define_test_user!(ExecTestUser3, "exec_test_users_3");
 define_test_user!(ExecTestUser4, "exec_test_users_4");
 
-/// 测试 execute 方法 - 执行原生 SQL 查询并返回模型列表
-async fn test_execute_impl(
+/// 测试 select_sql 方法 - 执行原生 SQL 查询并返回模型列表
+async fn test_select_sql_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -49,9 +49,10 @@ async fn test_execute_impl(
     .execute()
     .await?;
 
-    // 测试 execute - 查询所有用户
+    // 测试 select_sql - 查询所有用户
     let users = db
-        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1;")
+        .select_sql::<ExecTestUser1>("SELECT * FROM exec_test_users_1;")
+        .collect::<Vec<ExecTestUser1>>()
         .await?;
 
     assert_eq!(users.len(), 3);
@@ -59,25 +60,28 @@ async fn test_execute_impl(
     assert_eq!(users[1].name, "Bob");
     assert_eq!(users[2].name, "Charlie");
 
-    // 测试 execute - 带 WHERE 条件的查询
+    // 测试 select_sql - 带 WHERE 条件的查询
     let young_users = db
-        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age < 30;")
+        .select_sql::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age < 30;")
+        .collect::<Vec<ExecTestUser1>>()
         .await?;
 
     assert_eq!(young_users.len(), 1);
     assert_eq!(young_users[0].name, "Alice");
     assert_eq!(young_users[0].age, 25);
 
-    // 测试 execute - 空结果
+    // 测试 select_sql - 空结果
     let old_users = db
-        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age > 100;")
+        .select_sql::<ExecTestUser1>("SELECT * FROM exec_test_users_1 WHERE age > 100;")
+        .collect::<Vec<ExecTestUser1>>()
         .await?;
 
     assert_eq!(old_users.len(), 0);
 
-    // 测试 execute - 排序查询
+    // 测试 select_sql - 排序查询
     let sorted_users = db
-        .execute::<ExecTestUser1>("SELECT * FROM exec_test_users_1 ORDER BY age DESC;")
+        .select_sql::<ExecTestUser1>("SELECT * FROM exec_test_users_1 ORDER BY age DESC;")
+        .collect::<Vec<ExecTestUser1>>()
         .await?;
 
     assert_eq!(sorted_users.len(), 3);
@@ -94,8 +98,8 @@ async fn test_execute_impl(
     Ok(())
 }
 
-/// 测试 exec_non_query 方法 - 执行原生非查询 SQL 并返回受影响行数
-async fn test_exec_non_query_impl(
+/// 测试 execute_sql 方法 - 执行原生非查询 SQL 并返回受影响行数
+async fn test_execute_sql_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -135,25 +139,26 @@ async fn test_exec_non_query_impl(
     .execute()
     .await?;
 
-    // 测试 exec_non_query - UPDATE 语句
+    // 测试 execute_sql - UPDATE 语句
     let updated_rows = db
-        .exec_non_query("UPDATE exec_test_users_2 SET age = 40 WHERE age >= 30;")
+        .execute_sql("UPDATE exec_test_users_2 SET age = 40 WHERE age >= 30;")
         .await?;
 
     assert_eq!(updated_rows, 2); // Bob 和 Charlie 的年龄被更新
 
     // 验证更新结果
     let users = db
-        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2 ORDER BY id;")
+        .select_sql::<ExecTestUser2>("SELECT * FROM exec_test_users_2 ORDER BY id;")
+        .collect::<Vec<ExecTestUser2>>()
         .await?;
 
     assert_eq!(users[0].age, 25); // Alice 未变
     assert_eq!(users[1].age, 40); // Bob 已更新
     assert_eq!(users[2].age, 40); // Charlie 已更新
 
-    // 测试 exec_non_query - DELETE 语句
+    // 测试 execute_sql - DELETE 语句
     let deleted_rows = db
-        .exec_non_query("DELETE FROM exec_test_users_2 WHERE age < 30;")
+        .execute_sql("DELETE FROM exec_test_users_2 WHERE age < 30;")
         .await?;
 
     println!("Deleted rows: {}", deleted_rows);
@@ -162,14 +167,15 @@ async fn test_exec_non_query_impl(
 
     // 验证删除结果
     let users = db
-        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .select_sql::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .collect::<Vec<ExecTestUser2>>()
         .await?;
 
     assert_eq!(users.len(), 2); // 只剩下 Bob 和 Charlie
 
-    // 测试 exec_non_query - INSERT 语句
+    // 测试 execute_sql - INSERT 语句
     let inserted_rows = db
-        .exec_non_query(
+        .execute_sql(
             "INSERT INTO exec_test_users_2 (id, name, age, email) VALUES (4, 'David', 28, 'david@example.com');",
         )
         .await?;
@@ -178,14 +184,15 @@ async fn test_exec_non_query_impl(
 
     // 验证插入结果
     let users = db
-        .execute::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .select_sql::<ExecTestUser2>("SELECT * FROM exec_test_users_2;")
+        .collect::<Vec<ExecTestUser2>>()
         .await?;
 
     assert_eq!(users.len(), 3); // 现在有 3 个用户
 
-    // 测试 exec_non_query - 不影响任何行的 UPDATE
+    // 测试 execute_sql - 不影响任何行的 UPDATE
     let updated_rows = db
-        .exec_non_query("UPDATE exec_test_users_2 SET age = 99 WHERE age > 200;")
+        .execute_sql("UPDATE exec_test_users_2 SET age = 99 WHERE age > 200;")
         .await?;
 
     assert_eq!(updated_rows, 0); // 没有符合条件的行
@@ -196,8 +203,8 @@ async fn test_exec_non_query_impl(
     Ok(())
 }
 
-/// 测试 execute 和 exec_non_query 的组合使用
-async fn test_execute_and_non_query_combined_impl(
+/// 测试 select_sql 和 execute_sql 的组合使用
+async fn test_select_sql_and_execute_sql_combined_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -209,8 +216,8 @@ async fn test_execute_and_non_query_combined_impl(
     // 创建表
     db.create_table::<ExecTestUser3>().execute().await?;
 
-    // 使用 exec_non_query 插入数据
-    db.exec_non_query(
+    // 使用 execute_sql 插入数据
+    db.execute_sql(
         "INSERT INTO exec_test_users_3 (id, name, age, email) VALUES 
          (1, 'Alice', 25, 'alice@example.com'),
          (2, 'Bob', 30, 'bob@example.com'),
@@ -218,9 +225,10 @@ async fn test_execute_and_non_query_combined_impl(
     )
     .await?;
 
-    // 使用 execute 查询数据
+    // 使用 select_sql 查询数据
     let users = db
-        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .select_sql::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .collect::<Vec<ExecTestUser3>>()
         .await?;
 
     assert_eq!(users.len(), 3);
@@ -231,21 +239,22 @@ async fn test_execute_and_non_query_combined_impl(
     assert_eq!(users[2].name, "Charlie");
     assert_eq!(users[2].age, 35);
 
-    // 使用 exec_non_query 批量更新
-    db.exec_non_query("UPDATE exec_test_users_3 SET age = age + 5;")
+    // 使用 execute_sql 批量更新
+    db.execute_sql("UPDATE exec_test_users_3 SET age = age + 5;")
         .await?;
 
     // 验证批量更新
     let users = db
-        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .select_sql::<ExecTestUser3>("SELECT * FROM exec_test_users_3 ORDER BY age;")
+        .collect::<Vec<ExecTestUser3>>()
         .await?;
 
     assert_eq!(users[0].age, 30);
     assert_eq!(users[1].age, 35);
     assert_eq!(users[2].age, 40);
 
-    // 使用 exec_non_query 删除所有数据
-    let deleted = db.exec_non_query("DELETE FROM exec_test_users_3;").await?;
+    // 使用 execute_sql 删除所有数据
+    let deleted = db.execute_sql("DELETE FROM exec_test_users_3;").await?;
 
     println!("Deleted all rows: {}", deleted);
     // 验证至少删除了3行（可能有残留数据）
@@ -253,7 +262,8 @@ async fn test_execute_and_non_query_combined_impl(
 
     // 验证表为空
     let users = db
-        .execute::<ExecTestUser3>("SELECT * FROM exec_test_users_3;")
+        .select_sql::<ExecTestUser3>("SELECT * FROM exec_test_users_3;")
+        .collect::<Vec<ExecTestUser3>>()
         .await?;
 
     assert_eq!(users.len(), 0);
@@ -264,8 +274,8 @@ async fn test_execute_and_non_query_combined_impl(
     Ok(())
 }
 
-/// 测试 execute 处理 NULL 值
-async fn test_execute_with_null_values_impl(
+/// 测试 select_sql 处理 NULL 值
+async fn test_select_sql_with_null_values_impl(
     config: &_test_common::DbConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 连接到数据库
@@ -278,7 +288,7 @@ async fn test_execute_with_null_values_impl(
     db.create_table::<ExecTestUser4>().execute().await?;
 
     // 插入包含 NULL 值的数据
-    db.exec_non_query(
+    db.execute_sql(
         "INSERT INTO exec_test_users_4 (id, name, age, email) VALUES 
          (1, 'Alice', 25, NULL),
          (2, 'Bob', 30, 'bob@example.com');",
@@ -287,7 +297,8 @@ async fn test_execute_with_null_values_impl(
 
     // 查询并验证 NULL 值处理
     let users = db
-        .execute::<ExecTestUser4>("SELECT * FROM exec_test_users_4 ORDER BY id;")
+        .select_sql::<ExecTestUser4>("SELECT * FROM exec_test_users_4 ORDER BY id;")
+        .collect::<Vec<ExecTestUser4>>()
         .await?;
 
     assert_eq!(users.len(), 2);
@@ -302,7 +313,7 @@ async fn test_execute_with_null_values_impl(
     Ok(())
 }
 
-test_on_all_dbs_result!(test_execute_impl);
-test_on_all_dbs_result!(test_exec_non_query_impl);
-test_on_all_dbs_result!(test_execute_and_non_query_combined_impl);
-test_on_all_dbs_result!(test_execute_with_null_values_impl);
+test_on_all_dbs_result!(test_select_sql_impl);
+test_on_all_dbs_result!(test_execute_sql_impl);
+test_on_all_dbs_result!(test_select_sql_and_execute_sql_combined_impl);
+test_on_all_dbs_result!(test_select_sql_with_null_values_impl);

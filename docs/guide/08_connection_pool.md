@@ -6,9 +6,7 @@
 use ormer::{Database, DbType, ConnectionPool};
 
 let pool = Database::create_pool(DbType::PostgreSQL, "postgresql://user:pass@localhost/dbname")
-    .max_size(10)
-    .min_size(5)
-    .idle_timeout(300)
+    .range(5..10)
     .build()
     .await?;
 ```
@@ -31,6 +29,22 @@ async fn handle_request(pool: &ConnectionPool) -> Result<(), Box<dyn std::error:
 }
 ```
 
+`PooledConnection` 也支持 `select_sql` 和 `execute_sql`，可以直接在池内执行原生 SQL：
+
+```rust
+let conn = pool.get().await?;
+let users: Vec<User> = conn
+    .select_sql::<User>(ormer::sql("SELECT * FROM users WHERE age >= {}").bind(18))
+    .collect()
+    .await?;
+conn.execute_sql(
+    ormer::sql("UPDATE users SET name = {} WHERE id = {}")
+        .bind("Bob")
+        .bind(1),
+)
+.await?;
+```
+
 ## SQLite 后端注意事项
 
 SQLite (turso) 后端由于其嵌入式特性，官方不支持多线程共享连接。建议：
@@ -46,7 +60,7 @@ SQLite (turso) 后端由于其嵌入式特性，官方不支持多线程共享�
 2. **并发场景**: 如需高并发读写，考虑启用 MVCC 模式
    ```rust
    let conn = pool.get().await?;
-   conn.exec_non_query("PRAGMA journal_mode = 'mvcc'").await?;
+   conn.execute_sql("PRAGMA journal_mode = 'mvcc'").await?;
    // 使用 BEGIN CONCURRENT 实现并发写入
    ```
 
@@ -82,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DbType::PostgreSQL,
         "postgresql://user:pass@localhost/mydb"
     )
-    .max_size(20)
+    .range(0..20)
     .build()
     .await?;
     

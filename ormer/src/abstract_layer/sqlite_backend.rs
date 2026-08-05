@@ -1,12 +1,15 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::hooks::{HookContext, HookOperation};
+use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect,
     MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::raw_sql::IntoRawSql;
 use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -19,6 +22,28 @@ type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 fn is_constraint_error(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
     msg.contains("UNIQUE constraint failed") || msg.contains("constraint")
+}
+
+fn turso_values_from_ormer_values(values: &[Value]) -> Vec<turso::Value> {
+    values
+        .iter()
+        .map(|v| match v {
+            Value::Integer(i) => turso::Value::Integer(*i),
+            Value::Text(t) => turso::Value::Text(t.clone()),
+            Value::Real(r) => turso::Value::Real(*r),
+            Value::Boolean(b) => turso::Value::Integer(if *b { 1 } else { 0 }),
+            Value::Bytes(b) => turso::Value::Blob(b.clone()),
+            Value::Duration(d) => turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64),
+            Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
+            Value::Json(j) => turso::Value::Text(j.to_string()),
+            Value::Uuid(u) => turso::Value::Text(u.to_string()),
+            Value::BigInt(b) => turso::Value::Integer(*b as i64),
+            Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
+                panic!("SQLite backend does not support PostgreSQL array values")
+            }
+            Value::Null => turso::Value::Null,
+        })
+        .collect()
 }
 
 /// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
@@ -227,7 +252,7 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -248,12 +273,15 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        if self.models.as_refs().is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
@@ -267,6 +295,7 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
         let all_params = values_to_params(&all_values)?;
 
         self.db.conn.execute(&sql, all_params).trace().await?;
+        self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -281,12 +310,15 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     }
 
     /// 执行插入并返回插入的行数据（SQLite RETURNING 支持）
-    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn returning(mut self) -> anyhow::Result<Vec<I::Model>> {
+        if self.models.as_refs().is_empty() {
             return Ok(Vec::new());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
@@ -320,11 +352,12 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
             results.push(model);
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(results)
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
@@ -360,7 +393,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -389,12 +422,15 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<()> {
+        if self.models.as_refs().is_empty() {
             return Ok(());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
         let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
@@ -433,11 +469,12 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
                 .await?;
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
@@ -462,7 +499,7 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -491,12 +528,15 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<()> {
+        if self.models.as_refs().is_empty() {
             return Ok(());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
         let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
@@ -517,11 +557,12 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
             }
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
@@ -962,39 +1003,126 @@ impl Database {
         }
     }
 
-    /// 执行原生 SQL 查询并返回模型列表
-    /// 执行原生 SQL 查询并返回模型列表
-    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let mut rows = self.conn.query(sql, ()).trace().await?;
+    /// 执行原生非查询 SQL 并返回影响的行数
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+        let sql = sql.into_raw_sql();
+        let (sql, params) = sql.render(DbType::Sqlite)?;
+        self.exec_raw(&sql, params).await
+    }
+
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    where
+        V: crate::model::FromRowValues,
+        C: FromIterator<V>,
+    {
+        let turso_params = turso_values_from_ormer_values(&params);
+        let mut rows = if turso_params.is_empty() {
+            self.conn.query(sql, ()).trace().await?
+        } else {
+            self.conn.query(sql, turso_params).trace().await?
+        };
 
         let mut results = Vec::new();
-
         while let Some(row) = rows.next().trace().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            let mut values = Vec::new();
+            for i in 0..row.column_count() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                let ormer_value = convert_turso_value(&value)?;
-                data.insert(col_name.to_string(), ormer_value);
+                values.push(convert_turso_value(&value)?);
             }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
-            results.push(model);
+            results.push(V::from_row_values(&values)?);
         }
 
-        Ok(results)
+        Ok(results.into_iter().collect())
     }
 
-    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
-    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        self.execute::<T>(sql).await
+    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
+        let turso_params = turso_values_from_ormer_values(&params);
+        if turso_params.is_empty() {
+            Ok(self.conn.execute(sql, ()).trace().await?)
+        } else {
+            Ok(self.conn.execute(sql, turso_params).trace().await?)
+        }
     }
 
-    /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
-        let result = self.conn.execute(sql, ()).trace().await?;
-        Ok(result)
+    pub(crate) async fn migration_history(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT version, name, checksum FROM __ormer_migrations ORDER BY version",
+                (),
+            )
+            .trace()
+            .await?;
+        let mut versions = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let version = match row.get_value(0).trace_for("turso::Row::get_value")? {
+                turso::Value::Integer(version) if version >= 0 => version as u64,
+                _ => continue,
+            };
+            let name = match row.get_value(1).trace_for("turso::Row::get_value")? {
+                turso::Value::Text(name) => name,
+                _ => String::new(),
+            };
+            let checksum = match row.get_value(2).trace_for("turso::Row::get_value")? {
+                turso::Value::Integer(checksum) if checksum >= 0 => checksum as u64,
+                turso::Value::Text(checksum) => checksum.parse::<u64>().unwrap_or(0),
+                _ => 0,
+            };
+            versions.push((version, name, checksum));
+        }
+        Ok(versions)
+    }
+
+    pub(crate) async fn schema_columns(
+        &self,
+        table_name: &str,
+    ) -> anyhow::Result<Option<Vec<SchemaColumn>>> {
+        let mut exists = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                [table_name],
+            )
+            .trace()
+            .await?;
+        let exists = match exists.next().trace().await? {
+            Some(row) => matches!(
+                row.get_value(0).trace_for("turso::Row::get_value")?,
+                turso::Value::Integer(count) if count > 0
+            ),
+            None => false,
+        };
+        if !exists {
+            return Ok(None);
+        }
+
+        let escaped = table_name.replace('\'', "''");
+        let mut rows = self
+            .conn
+            .query(&format!("PRAGMA table_info('{escaped}')"), ())
+            .trace()
+            .await?;
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let name = match row.get_value(1).trace_for("turso::Row::get_value")? {
+                turso::Value::Text(value) => value,
+                _ => continue,
+            };
+            let type_name = match row.get_value(2).trace_for("turso::Row::get_value")? {
+                turso::Value::Text(value) => value,
+                _ => String::new(),
+            };
+            let nullable = !matches!(
+                row.get_value(3).trace_for("turso::Row::get_value")?,
+                turso::Value::Integer(value) if value != 0
+            );
+            let primary_key = matches!(
+                row.get_value(5).trace_for("turso::Row::get_value")?,
+                turso::Value::Integer(value) if value != 0
+            );
+            columns.push(schema_column(name, type_name, nullable, primary_key));
+        }
+        Ok(Some(columns))
     }
 
     /// 检查连接是否有效
@@ -1017,7 +1145,7 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1038,12 +1166,15 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        if self.models.as_refs().is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
@@ -1057,6 +1188,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
         let all_params = values_to_params(&all_values)?;
 
         self.txn.conn.execute(&sql, all_params).trace().await?;
+        self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -1078,7 +1210,7 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1105,12 +1237,15 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<()> {
+        if self.models.as_refs().is_empty() {
             return Ok(());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
         let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
@@ -1147,6 +1282,7 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
                 .await?;
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -1158,7 +1294,7 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1188,12 +1324,15 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
+    pub async fn execute(mut self) -> anyhow::Result<()> {
+        if self.models.as_refs().is_empty() {
             return Ok(());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
         let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
@@ -1217,11 +1356,46 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
             }
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
 
 impl Transaction {
+    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
+        let turso_params = turso_values_from_ormer_values(&params);
+        if turso_params.is_empty() {
+            Ok(self.conn.execute(sql, ()).trace().await?)
+        } else {
+            Ok(self.conn.execute(sql, turso_params).trace().await?)
+        }
+    }
+
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    where
+        V: crate::model::FromRowValues,
+        C: FromIterator<V>,
+    {
+        let turso_params = turso_values_from_ormer_values(&params);
+        let mut rows = if turso_params.is_empty() {
+            self.conn.query(sql, ()).trace().await?
+        } else {
+            self.conn.query(sql, turso_params).trace().await?
+        };
+
+        let mut results = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let mut values = Vec::new();
+            for i in 0..row.column_count() {
+                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                values.push(convert_turso_value(&value)?);
+            }
+            results.push(V::from_row_values(&values)?);
+        }
+
+        Ok(results.into_iter().collect())
+    }
+
     /// 提交事务
     pub async fn commit(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
@@ -1559,6 +1733,14 @@ impl<'a, T: Model, V> Clone for GroupedSelectExecutor<'a, T, V> {
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
+    pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
+        SelectExecutor {
+            select: Select::new(),
+            conn: Arc::clone(&self.conn),
+            _marker: PhantomData,
+        }
+    }
+
     /// 添加 LEFT JOIN 查询
     pub fn left_join<J: Model>(
         self,
@@ -1645,22 +1827,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             executor: self,
             _marker: PhantomData,
         }
-    }
-
-    /// 执行查询并返回 Vec<T>
-    pub fn exec(self) -> CollectFuture<'a, T, Vec<T>>
-    where
-        T: 'static,
-    {
-        self.collect::<Vec<T>>()
-    }
-
-    /// 执行查询并返回 Vec<T> (exec 的别名)
-    pub fn execute(self) -> CollectFuture<'a, T, Vec<T>>
-    where
-        T: 'static,
-    {
-        self.collect::<Vec<T>>()
     }
 
     /// 执行查询并返回第一条记录
@@ -1815,23 +1981,6 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         }
     }
 
-    pub fn exec(self) -> LeftJoinCollectFuture<T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, Option<J>)>>()
-    }
-
-    /// 执行查询并返回 Vec<(T, Option<J>)> (exec 的别名)
-    pub fn execute(self) -> LeftJoinCollectFuture<T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, Option<J>)>>()
-    }
-
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params: Vec<turso::Value> = params
@@ -1914,14 +2063,6 @@ impl_backend_join_executor_methods!(
 );
 
 impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
-    pub fn exec(self) -> InnerJoinCollectFuture<T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        InnerJoinCollectFuture { executor: self }
-    }
-
     pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<T, J>
     where
         T: 'static,
@@ -2001,14 +2142,6 @@ impl_backend_join_executor_methods!(
 );
 
 impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
-    pub fn exec(self) -> RightJoinCollectFuture<T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        RightJoinCollectFuture { executor: self }
-    }
-
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(&self) -> RightJoinCollectFuture<T, J>
     where
         T: 'static,
@@ -2283,22 +2416,8 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         RelatedCollectFuture { executor: self }
     }
 
-    /// 执行查询并返回 Vec<T>
-    pub fn exec(self) -> RelatedCollectFuture<T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        self.collect::<Vec<T>>()
-    }
-
-    /// 执行查询并返回 Vec<T> (exec 的别名)
-    pub fn execute(self) -> RelatedCollectFuture<T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        self.collect::<Vec<T>>()
+    pub(crate) fn into_collect_future(self) -> RelatedCollectFuture<T, R> {
+        RelatedCollectFuture { executor: self }
     }
 
     async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {

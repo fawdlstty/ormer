@@ -41,6 +41,20 @@ Can be combined with other conditions:
 .filter(|u| u.name.contains("li").and(u.age.gt(29)))
 ```
 
+### PostgreSQL String-Array Membership
+
+For a PostgreSQL `Vec<String>` field, use `contains` to test whether an array contains an element:
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.tags.contains("admin"))
+    .collect()
+    .await?;
+```
+
+This uses PostgreSQL's array-containment operator; other backends do not provide this array-specific condition.
+
 ### NULL Checks
 
 ```rust
@@ -112,6 +126,20 @@ let names: Vec<String> = db.select::<User>().distinct().map_to(|u| u.name).colle
 
 Can be combined with `filter`, `order_by`, `range`, etc.
 
+## Ignoring Fields
+
+Use `ignore` to collect a complete model while replacing selected columns with constants. The fields remain in the returned model, but their database values are not read:
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .ignore(|u| (u.id, u.email))
+    .collect()
+    .await?;
+```
+
+For example, an integer primary key is read as `0` and a nullable field is read as `None`. This is useful when a query does not need sensitive or large fields.
+
 ## Single Record Query
 
 ```rust
@@ -154,6 +182,16 @@ let user_ids: Vec<UserId> = db
     .select::<User>()
     .map_to(|u| u.id)
     .collect_with(|id| UserId { id })
+    .await?;
+```
+
+When the target is another `Model`, use `map_to_model`; Ormer generates aliases from the target model's column names:
+
+```rust
+let archived: Vec<ArchiveUser> = db
+    .select::<User>()
+    .map_to_model::<_, ArchiveUser>(|u| u.id)
+    .collect()
     .await?;
 ```
 

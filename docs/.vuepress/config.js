@@ -35,7 +35,8 @@ export default defineUserConfig({
           '/guide/': [
             "00_introduction", "01_quick_start", "02_model_definition",
             "03_database_connection", "04_crud_operations", "05_query_builder",
-            "06_advanced_queries", "07_transactions", "08_connection_pool"
+            "06_advanced_queries", "07_transactions", "08_connection_pool",
+            "09_hooks", "10_migrations"
           ]
         }
       },
@@ -56,7 +57,8 @@ export default defineUserConfig({
           '/en/guide/': [
             "00_introduction", "01_quick_start", "02_model_definition",
             "03_database_connection", "04_crud_operations", "05_query_builder",
-            "06_advanced_queries", "07_transactions", "08_connection_pool"
+            "06_advanced_queries", "07_transactions", "08_connection_pool",
+            "09_hooks", "10_migrations"
           ]
         }
       }

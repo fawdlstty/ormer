@@ -152,11 +152,42 @@ db.drop_table::<User>().execute().await?;
 
 ```rust
 let users: Vec<User> = db
-    .execute::<User>("SELECT * FROM users WHERE age >= 18")
+    .select_sql::<User>("SELECT * FROM users WHERE age >= 18")
+    .collect::<Vec<User>>()
     .await?;
 
 let affected = db
-    .exec_non_query("UPDATE users SET name = 'Test' WHERE id = 1")
+    .execute_sql("UPDATE users SET name = 'Test' WHERE id = 1")
+    .await?;
+```
+
+Use `sql!`, `bind`, or `bind_named` for parameters instead of concatenating user input:
+
+```rust
+db.execute_sql(ormer::sql!(
+    "UPDATE users SET name = {name} WHERE id = {id}",
+    name = "Alice".to_string(),
+    id = 1,
+))
+.await?;
+
+let users: Vec<User> = db
+    .select_sql::<User>(
+        ormer::sql("SELECT * FROM users WHERE age >= :age")
+            .bind_named("age", 18),
+    )
+    .collect()
+    .await?;
+```
+
+`{}` is a positional parameter, while `{name}` and `:name` are named parameters. Rendering converts them to backend placeholders such as `?` or `$1`; similar text inside strings and comments is not replaced. Transactions and pooled connections expose the same `select_sql` and `execute_sql` methods.
+
+Use `RawSql::plain()` to disable placeholder parsing when SQL contains dialect syntax or literal colon text:
+
+```rust
+let users: Vec<User> = db
+    .select_sql::<User>(ormer::RawSql::plain("SELECT * FROM users WHERE note = ':literal'"))
+    .collect()
     .await?;
 ```
 
@@ -221,7 +252,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Hooks System
 
-Ormer provides a hooks system that allows you to automatically execute custom logic before and after data operations. Supported hooks include:
+Ormer provides fallible hooks around write operations. Inserts trigger implemented hooks automatically; updates and deletes require `execute_with_hooks` or `execute_models_with_hooks` to supply the hook subject.
 
 - `BeforeInsert` / `AfterInsert` - Before and after insert
 - `BeforeUpdate` / `AfterUpdate` - Before and after update
@@ -230,7 +261,7 @@ Ormer provides a hooks system that allows you to automatically execute custom lo
 ### Example
 
 ```rust
-use ormer::{Model, BeforeInsert, BeforeUpdate};
+use ormer::{AfterInsert, BeforeInsert, BeforeUpdate, HookContext, Model};
 
 #[derive(Debug, Model)]
 #[table = "users"]
@@ -244,17 +275,26 @@ struct User {
 
 #[async_trait::async_trait]
 impl BeforeInsert for User {
-    async fn before_insert(&mut self) {
+    async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         let now = chrono::Utc::now();
         self.created_at = now;
         self.updated_at = now;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AfterInsert for User {
+    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl BeforeUpdate for User {
-    async fn before_update(&mut self) {
+    async fn before_update(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         self.updated_at = chrono::Utc::now();
+        Ok(())
     }
 }
 ```

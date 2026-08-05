@@ -116,7 +116,7 @@ mod validate_table_tests {
             .execute()
             .await
             .ok();
-        db.exec_non_query(
+        db.execute_sql(
             r#"
             CREATE TABLE validate_table_hypertable_mismatch_1 (
                 id INTEGER PRIMARY KEY,

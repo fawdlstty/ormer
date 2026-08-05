@@ -1,7 +1,8 @@
 use super::super::DbType;
 use super::common_helpers;
 use super::{SqlExecutor, SqlStatement};
-use crate::model::Model;
+use crate::model::{FromRowValues, Model};
+use crate::raw_sql::{IntoRawSql, RawSql};
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::collections::VecDeque;
 use std::marker::PhantomData;
@@ -935,6 +936,44 @@ impl PooledConnectionInner {
     }
 }
 
+pub struct PooledRawSelectExecutor<'conn, 'pool, T> {
+    pooled_conn: &'conn PooledConnection<'pool>,
+    sql: RawSql,
+    _marker: PhantomData<T>,
+}
+
+impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
+    pub async fn collect<C>(self) -> anyhow::Result<C>
+    where
+        T: FromRowValues,
+        C: FromIterator<T>,
+    {
+        let raw_sql = self.sql;
+        match self.pooled_conn.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                let (sql, params) = raw_sql.render(DbType::Sqlite)?;
+                db.select_raw::<T, C>(&sql, params).await
+            }
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::PostgreSQL)?;
+                db.select_raw::<T, C>(&sql, params).await
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::MySQL)?;
+                db.select_raw::<T, C>(&sql, params).await
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::MSSQL)?;
+                db.select_raw::<T, C>(&sql, params).await
+            }
+        }
+    }
+}
+
 /// 统一的 PooledConnection
 /// 包装连接,实现 Database 的所有方法,Drop 时自动归还到池
 pub struct PooledConnection<'a> {
@@ -1164,37 +1203,38 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
-    /// 执行原生 SQL 查询并返回模型列表
-    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        match self.get_connection() {
-            #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => db.execute::<T>(sql).await,
+    pub fn select_sql<T>(&self, sql: impl IntoRawSql) -> PooledRawSelectExecutor<'_, 'a, T> {
+        PooledRawSelectExecutor {
+            pooled_conn: self,
+            sql: sql.into_raw_sql(),
+            _marker: PhantomData,
         }
     }
 
-    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
-    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        self.execute::<T>(sql).await
-    }
-
     /// 执行原生非查询 SQL
-    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+        let raw_sql = sql.into_raw_sql();
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => db.exec_non_query(sql).await,
+            ConnectionWrapper::Sqlite(db) => {
+                let (sql, params) = raw_sql.render(DbType::Sqlite)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.exec_non_query(sql).await,
+            ConnectionWrapper::PostgreSQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::PostgreSQL)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.exec_non_query(sql).await,
+            ConnectionWrapper::MySQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::MySQL)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => db.exec_non_query(sql).await,
+            ConnectionWrapper::MSSQL(db) => {
+                let (sql, params) = raw_sql.render(DbType::MSSQL)?;
+                db.exec_raw(&sql, params).await
+            }
         }
     }
 }

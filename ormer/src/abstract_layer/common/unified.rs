@@ -1,11 +1,13 @@
-﻿#![allow(clippy::upper_case_acronyms)]
+#![allow(clippy::upper_case_acronyms)]
 
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::SqlStatement;
-use crate::model::Model;
+use crate::model::normalize_table_name_for_db;
+use crate::model::{Model, Relation, RelationInfo, Value};
 use crate::query::builder::WhereExpr;
+use crate::raw_sql::{IntoRawSql, RawSql};
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
@@ -19,6 +21,103 @@ use super::super::mysql_backend;
 
 #[cfg(feature = "mssql")]
 use super::super::mssql_backend;
+
+fn model_value_key(value: &Value) -> String {
+    match value {
+        Value::Integer(v) => format!("i:{v}"),
+        Value::BigInt(v) => format!("b:{v}"),
+        Value::Duration(v) => format!("d:{:?}", v),
+        Value::Text(v) => format!("t:{v}"),
+        Value::Real(v) => format!("r:{v}"),
+        Value::Boolean(v) => format!("o:{v}"),
+        Value::Bytes(v) => format!("x:{v:?}"),
+        Value::IntegerArray(v) => format!("ia:{v:?}"),
+        Value::BigIntArray(v) => format!("ba:{v:?}"),
+        Value::NullableBigIntArray(v) => format!("na:{v:?}"),
+        Value::DateTime(v) => format!("dt:{v}"),
+        Value::Json(v) => format!("j:{v}"),
+        Value::Uuid(v) => format!("u:{v}"),
+        Value::Null => "n:".to_string(),
+    }
+}
+
+fn model_value_to_filter_value(value: Value) -> crate::query::filter::Value {
+    match value {
+        Value::Integer(v) => crate::query::filter::Value::Integer(v),
+        Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
+        Value::Duration(v) => crate::query::filter::Value::Duration(v),
+        Value::Text(v) => crate::query::filter::Value::Text(v),
+        Value::Real(v) => crate::query::filter::Value::Real(v),
+        Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
+        Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
+        Value::IntegerArray(v) => crate::query::filter::Value::IntegerArray(v),
+        Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
+        Value::NullableBigIntArray(v) => crate::query::filter::Value::NullableBigIntArray(v),
+        Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
+        Value::Json(v) => crate::query::filter::Value::Json(v),
+        Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
+        Value::Null => crate::query::filter::Value::Null,
+    }
+}
+
+fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
+    let mut seen = std::collections::HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| !matches!(value, Value::Null))
+        .filter(|value| seen.insert(model_value_key(value)))
+        .map(model_value_to_filter_value)
+        .collect()
+}
+
+fn quote_identifier(db_type: super::super::DbType, identifier: &str) -> String {
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        super::super::DbType::Sqlite => format!("\"{}\"", identifier.replace('"', "\"\"")),
+        #[cfg(feature = "postgresql")]
+        super::super::DbType::PostgreSQL => format!("\"{}\"", identifier.replace('"', "\"\"")),
+        #[cfg(feature = "mysql")]
+        super::super::DbType::MySQL => format!("`{}`", identifier.replace('`', "``")),
+        #[cfg(feature = "mssql")]
+        super::super::DbType::MSSQL => format!("[{}]", identifier.replace(']', "]]")),
+    }
+}
+
+fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
+    let normalized = normalize_table_name_for_db(db_type, table_name);
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        super::super::DbType::PostgreSQL => {
+            let (schema, table) = crate::model::split_schema_table_name(normalized, "public");
+            if schema == "public" {
+                quote_identifier(db_type, table)
+            } else {
+                format!(
+                    "{}.{}",
+                    quote_identifier(db_type, schema),
+                    quote_identifier(db_type, table)
+                )
+            }
+        }
+        #[cfg(feature = "mssql")]
+        super::super::DbType::MSSQL => {
+            let (schema, table) = crate::model::split_schema_table_name(normalized, "dbo");
+            if schema == "dbo" {
+                quote_identifier(db_type, table)
+            } else {
+                format!(
+                    "{}.{}",
+                    quote_identifier(db_type, schema),
+                    quote_identifier(db_type, table)
+                )
+            }
+        }
+        #[cfg(feature = "sqlite")]
+        super::super::DbType::Sqlite => quote_identifier(db_type, normalized),
+        #[cfg(feature = "mysql")]
+        super::super::DbType::MySQL => quote_identifier(db_type, normalized),
+    }
+}
 
 /// 统一的 Database 枚举
 pub enum Database {
@@ -124,7 +223,7 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -179,7 +278,7 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertOrUpdateExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -219,7 +318,7 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertOrIgnoreExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -439,10 +538,81 @@ impl Database {
             .select::<T>()
             .filter(|_| where_expr)
             .range(..1)
-            .execute()
+            .collect::<Vec<T>>()
             .await?;
 
         Ok(results.into_iter().next())
+    }
+
+    /// 查找单个模型的关联对象。
+    pub async fn find_related<
+        T: Model + 'static + std::marker::Send + std::marker::Sync,
+        R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+    >(
+        &self,
+        owner: &T,
+        relation: Relation<T, R>,
+    ) -> anyhow::Result<Vec<R>> {
+        let relation = relation.info()?;
+        let key = owner.relation_key_value(relation)?;
+        self.select_related::<R>(relation, vec![key]).await
+    }
+
+    /// 批量预加载关联对象，避免循环查询产生 N+1。
+    pub async fn preload<
+        T: Model + 'static + std::marker::Send + std::marker::Sync,
+        R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+    >(
+        &self,
+        owners: &mut [T],
+        relation: Relation<T, R>,
+    ) -> anyhow::Result<()> {
+        let relation = relation.info()?;
+        let owner_keys = owners
+            .iter()
+            .map(|owner| owner.relation_key_value(relation))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let related = self.select_related::<R>(relation, owner_keys).await?;
+
+        let mut grouped: std::collections::HashMap<String, Vec<R>> =
+            std::collections::HashMap::new();
+        for item in related {
+            if let Some(key) = item.column_value(relation.target_key) {
+                grouped.entry(model_value_key(&key)).or_default().push(item);
+            }
+        }
+
+        for owner in owners {
+            let key = owner.relation_key_value(relation)?;
+            let values = grouped
+                .get(&model_value_key(&key))
+                .cloned()
+                .unwrap_or_default();
+            owner.assign_relation(relation.name, values)?;
+        }
+
+        Ok(())
+    }
+
+    async fn select_related<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
+        &self,
+        relation: &RelationInfo,
+        keys: Vec<Value>,
+    ) -> anyhow::Result<Vec<R>> {
+        let values = relation_filter_values(keys);
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.select::<R>()
+            .filter(|_| {
+                WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
+                    column: relation.target_key.to_string(),
+                    values,
+                })
+            })
+            .collect::<Vec<R>>()
+            .await
     }
 
     /// 创建 Select 查询执行器
@@ -563,38 +733,49 @@ impl Database {
         }
     }
 
-    /// 执行原生 SQL 查询并返回模型列表
-    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            Database::Sqlite(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.execute::<T>(sql).await,
-            #[cfg(feature = "mssql")]
-            Database::MSSQL(db) => db.execute::<T>(sql).await,
+    pub fn select_sql<T>(&self, sql: impl IntoRawSql) -> RawSelectExecutor<'_, T> {
+        RawSelectExecutor {
+            db: self,
+            sql: sql.into_raw_sql(),
+            _marker: std::marker::PhantomData,
         }
-    }
-
-    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
-    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        self.execute::<T>(sql).await
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+        let sql = sql.into_raw_sql();
         match self {
             #[cfg(feature = "sqlite")]
-            Database::Sqlite(db) => db.exec_non_query(sql).await,
+            Database::Sqlite(db) => {
+                let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.exec_non_query(sql).await,
+            Database::PostgreSQL(db) => {
+                let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.exec_non_query(sql).await,
+            Database::MySQL(db) => {
+                let (sql, params) = sql.render(super::super::DbType::MySQL)?;
+                db.exec_raw(&sql, params).await
+            }
             #[cfg(feature = "mssql")]
-            Database::MSSQL(db) => db.exec_non_query(sql).await,
+            Database::MSSQL(db) => {
+                let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+                db.exec_raw(&sql, params).await
+            }
         }
+    }
+
+    /// Count rows in a table using backend-specific identifier quoting.
+    pub async fn table_row_count(&self, table_name: &str) -> anyhow::Result<u64> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {}",
+            quote_table_name(self.db_type(), table_name)
+        );
+        let rows = self.select_sql::<i64>(sql).collect::<Vec<i64>>().await?;
+        Ok(rows.into_iter().next().unwrap_or(0).max(0) as u64)
     }
 
     /// 创建连接池
@@ -609,6 +790,133 @@ impl Database {
         connection_string: &str,
     ) -> super::connection_pool::PoolBuilder {
         super::connection_pool::PoolBuilder::new(db_type, connection_string)
+    }
+}
+
+pub struct RawSelectExecutor<'a, T> {
+    db: &'a Database,
+    sql: RawSql,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T> RawSelectExecutor<'a, T> {
+    pub fn collect<C>(self) -> RawCollectFuture<'a, T, C>
+    where
+        T: crate::model::FromRowValues + 'static,
+        C: FromIterator<T> + 'static,
+    {
+        RawCollectFuture {
+            db: self.db,
+            sql: self.sql,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct RawCollectFuture<'a, T, C> {
+    db: &'a Database,
+    sql: RawSql,
+    _marker: std::marker::PhantomData<(T, C)>,
+}
+
+impl<'a, T, C> std::future::IntoFuture for RawCollectFuture<'a, T, C>
+where
+    T: crate::model::FromRowValues + 'static + std::marker::Send,
+    C: FromIterator<T> + 'static,
+{
+    type Output = anyhow::Result<C>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            match self.db {
+                #[cfg(feature = "sqlite")]
+                Database::Sqlite(db) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "postgresql")]
+                Database::PostgreSQL(db) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mysql")]
+                Database::MySQL(db) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mssql")]
+                Database::MSSQL(db) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+            }
+        })
+    }
+}
+
+pub struct TransactionRawSelectExecutor<'a, 'tx, T> {
+    txn: &'a mut Transaction<'tx>,
+    sql: RawSql,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, 'tx, T> TransactionRawSelectExecutor<'a, 'tx, T> {
+    pub fn collect<C>(self) -> TransactionRawCollectFuture<'a, 'tx, T, C>
+    where
+        T: crate::model::FromRowValues + 'static,
+        C: FromIterator<T> + 'static,
+    {
+        TransactionRawCollectFuture {
+            txn: self.txn,
+            sql: self.sql,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct TransactionRawCollectFuture<'a, 'tx, T, C> {
+    txn: &'a mut Transaction<'tx>,
+    sql: RawSql,
+    _marker: std::marker::PhantomData<(T, C)>,
+}
+
+impl<'a, 'tx, T, C> std::future::IntoFuture for TransactionRawCollectFuture<'a, 'tx, T, C>
+where
+    T: crate::model::FromRowValues + 'static + std::marker::Send,
+    C: FromIterator<T> + 'static,
+{
+    type Output = anyhow::Result<C>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            match self.txn {
+                #[cfg(feature = "sqlite")]
+                Transaction::Sqlite(txn) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "postgresql")]
+                Transaction::PostgreSQL(txn) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mysql")]
+                Transaction::MySQL(txn) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mssql")]
+                Transaction::MSSQL(txn) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                Transaction::_Phantom(_) => unreachable!(),
+            }
+        })
     }
 }
 
@@ -627,6 +935,112 @@ pub enum SelectExecutor<'a, T: Model> {
 crate::impl_unified_select_executor_methods!(SelectExecutor);
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
+    pub fn include<R: Model, F>(self, f: F) -> IncludedSelectExecutor<'a, T, R>
+    where
+        F: FnOnce(T::Where) -> Relation<T, R>,
+    {
+        let where_obj = T::Where::default();
+        IncludedSelectExecutor {
+            select: self,
+            relation: f(where_obj),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    async fn select_related<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
+        &self,
+        relation: &RelationInfo,
+        keys: Vec<Value>,
+    ) -> anyhow::Result<Vec<R>> {
+        let values = relation_filter_values(keys);
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => {
+                exec.select_model::<R>()
+                    .filter(|_| {
+                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
+                            column: relation.target_key.to_string(),
+                            values,
+                        })
+                    })
+                    .collect::<Vec<R>>()
+                    .await
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                exec.select_model::<R>()
+                    .filter(|_| {
+                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
+                            column: relation.target_key.to_string(),
+                            values,
+                        })
+                    })
+                    .collect::<Vec<R>>()
+                    .await
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => {
+                exec.select_model::<R>()
+                    .filter(|_| {
+                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
+                            column: relation.target_key.to_string(),
+                            values,
+                        })
+                    })
+                    .collect::<Vec<R>>()
+                    .await
+            }
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => {
+                exec.select_model::<R>()
+                    .filter(|_| {
+                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
+                            column: relation.target_key.to_string(),
+                            values,
+                        })
+                    })
+                    .collect::<Vec<R>>()
+                    .await
+            }
+        }
+    }
+
+    async fn preload_models<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
+        &self,
+        owners: &mut [T],
+        relation: Relation<T, R>,
+    ) -> anyhow::Result<()> {
+        let relation = relation.info()?;
+        let owner_keys = owners
+            .iter()
+            .map(|owner| owner.relation_key_value(relation))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let related = self.select_related::<R>(relation, owner_keys).await?;
+
+        let mut grouped: std::collections::HashMap<String, Vec<R>> =
+            std::collections::HashMap::new();
+        for item in related {
+            if let Some(key) = item.column_value(relation.target_key) {
+                grouped.entry(model_value_key(&key)).or_default().push(item);
+            }
+        }
+
+        for owner in owners {
+            let key = owner.relation_key_value(relation)?;
+            let values = grouped
+                .get(&model_value_key(&key))
+                .cloned()
+                .unwrap_or_default();
+            owner.assign_relation(relation.name, values)?;
+        }
+
+        Ok(())
+    }
+
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// select::<User>().from::<User, Role>()
     pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
@@ -796,14 +1210,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 CollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
         }
-    }
-
-    /// 执行查询并返回 Vec<T> (collect 的别名)
-    pub fn execute(self) -> CollectFuture<'a, T, Vec<T>>
-    where
-        T: 'static,
-    {
-        self.collect::<Vec<T>>()
     }
 
     /// 执行查询并返回第一条记录
@@ -1201,7 +1607,7 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1243,7 +1649,7 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1283,7 +1689,7 @@ pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1312,6 +1718,17 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
 }
 
 impl<'a> Transaction<'a> {
+    pub fn select_sql<T>(
+        &mut self,
+        sql: impl IntoRawSql,
+    ) -> TransactionRawSelectExecutor<'_, 'a, T> {
+        TransactionRawSelectExecutor {
+            txn: self,
+            sql: sql.into_raw_sql(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     /// 提交事务
     pub async fn commit(self) -> anyhow::Result<()> {
         match self {
@@ -1413,7 +1830,7 @@ impl<'a> Transaction<'a> {
             .select::<T>()
             .filter(|_| where_expr)
             .range(..1)
-            .execute()
+            .collect::<Vec<T>>()
             .await?;
 
         Ok(results.into_iter().next())
@@ -1587,15 +2004,6 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             }
         }
     }
-
-    /// 执行查询并返回 Vec<(T, Option<J>)>
-    pub fn execute(self) -> LeftJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, Option<J>)>>()
-    }
 }
 
 crate::impl_unified_join_executor!(InnerJoinedSelectExecutor);
@@ -1624,15 +2032,6 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                 InnerJoinCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
         }
-    }
-
-    /// 执行查询并返回 Vec<(T, J)>
-    pub fn execute(self) -> InnerJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, J)>>()
     }
 }
 
@@ -1664,15 +2063,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                 RightJoinCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
         }
-    }
-
-    /// 执行查询并返回 Vec<(Option<T>, J)>
-    pub fn execute(self) -> RightJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(Option<T>, J)>>()
     }
 }
 
@@ -1795,15 +2185,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
         }
-    }
-
-    /// 执行查询并返回 Vec<V>
-    pub fn exec(self) -> GroupedCollectFuture<'a, T, V, Vec<V>>
-    where
-        T: 'static,
-        V: crate::model::FromRowValues + 'static,
-    {
-        self.collect::<Vec<V>>()
     }
 }
 
@@ -1943,6 +2324,55 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.select_column(f)),
         }
+    }
+}
+
+pub struct IncludedSelectExecutor<'a, T: Model, R: Model> {
+    select: SelectExecutor<'a, T>,
+    relation: Relation<T, R>,
+    _marker: std::marker::PhantomData<R>,
+}
+
+impl<'a, T: Model, R: Model> IncludedSelectExecutor<'a, T, R> {
+    pub fn collect<C>(self) -> IncludedCollectFuture<'a, T, R, C>
+    where
+        T: 'static,
+        R: Clone + 'static,
+        C: FromIterator<T> + 'static,
+    {
+        IncludedCollectFuture {
+            select: self.select,
+            relation: self.relation,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct IncludedCollectFuture<'a, T: Model, R: Model, C> {
+    select: SelectExecutor<'a, T>,
+    relation: Relation<T, R>,
+    _marker: std::marker::PhantomData<C>,
+}
+
+impl<
+    'a,
+    T: Model + 'static + std::marker::Send + std::marker::Sync,
+    R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+    C: FromIterator<T> + 'static,
+> std::future::IntoFuture for IncludedCollectFuture<'a, T, R, C>
+{
+    type Output = anyhow::Result<C>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let mut owners = self.select.collect::<Vec<T>>().await?;
+            self.select
+                .preload_models::<R>(&mut owners, self.relation)
+                .await?;
+            Ok(owners.into_iter().collect())
+        })
     }
 }
 

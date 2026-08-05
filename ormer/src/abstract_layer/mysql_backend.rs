@@ -1,12 +1,15 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::hooks::{HookContext, HookOperation};
+use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::raw_sql::IntoRawSql;
 use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use chrono::{Datelike, Timelike};
 use mysql_async::Pool;
@@ -254,7 +257,7 @@ pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -320,17 +323,20 @@ impl<'a, I: crate::model::Insertable> InsertExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         InsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
+
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
 
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
@@ -338,12 +344,15 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for InsertExecutor<'a, I> {
         conn.exec_drop(&statement.sql, params).trace().await?;
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
+        let result = if has_auto_increment {
             let last_id = conn.last_insert_id().unwrap_or(0);
-            return convert_auto_increment_key::<Self::Output>(last_id);
-        }
+            convert_auto_increment_key::<Self::Output>(last_id)
+        } else {
+            Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+        }?;
 
-        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(result)
     }
 }
 
@@ -354,7 +363,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -444,21 +453,24 @@ impl<'a, I: crate::model::Insertable> InsertOrUpdateExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
         conn.exec_drop(&statement.sql, params).trace().await?;
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -470,7 +482,7 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -542,21 +554,24 @@ impl<'a, I: crate::model::Insertable> InsertOrIgnoreExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
         conn.exec_drop(&statement.sql, params).trace().await?;
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -1009,45 +1024,111 @@ impl Database {
         }
     }
 
-    /// 执行原生 SQL 查询并返回模型列表
-    /// 执行原生 SQL 查询并返回模型列表
-    pub async fn execute<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        let mut conn = self.pool.get_conn().trace().await?;
+    /// 执行原生非查询 SQL 并返回影响的行数
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+        let sql = sql.into_raw_sql();
+        let (sql, params) = sql.render(DbType::MySQL)?;
+        self.exec_raw(&sql, params).await
+    }
 
-        let rows: Vec<mysql_async::Row> = conn.query(sql).trace().await?;
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    where
+        V: crate::model::FromRowValues,
+        C: FromIterator<V>,
+    {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let mysql_params = values_to_params(&params)?;
+        let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
+            conn.query(sql).trace().await?
+        } else {
+            conn.exec(sql, mysql_async::Params::Positional(mysql_params))
+                .trace()
+                .await?
+        };
 
         let mut results = Vec::new();
-
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = convert_mysql_value(&row, i)?;
-                data.insert(col_name.to_string(), ormer_value);
+            let mut values = Vec::new();
+            for i in 0..row.columns_ref().len() {
+                values.push(convert_mysql_value(&row, i)?);
             }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
-            results.push(model);
+            results.push(V::from_row_values(&values)?);
         }
-
-        Ok(results)
+        Ok(results.into_iter().collect())
     }
 
-    /// 执行原生 SQL 查询并返回模型列表（向后兼容）
-    #[deprecated(since = "0.1.0", note = "请使用 execute 方法")]
-    pub async fn exec_table<T: Model>(&self, sql: &str) -> anyhow::Result<Vec<T>> {
-        self.execute::<T>(sql).await
-    }
-
-    /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn exec_non_query(&self, sql: &str) -> anyhow::Result<u64> {
+    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
         let mut conn = self.pool.get_conn().trace().await?;
+        let mysql_params = values_to_params(&params)?;
+        if mysql_params.is_empty() {
+            conn.query_drop(sql).trace().await?;
+        } else {
+            conn.exec_drop(sql, mysql_async::Params::Positional(mysql_params))
+                .trace()
+                .await?;
+        }
+        Ok(conn.affected_rows())
+    }
 
-        conn.query_drop(sql).trace().await?;
+    pub(crate) async fn migration_history(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let rows: Vec<mysql_async::Row> = conn
+            .query("SELECT version, name, checksum FROM __ormer_migrations ORDER BY version")
+            .trace()
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let version = row
+                    .get::<u64, _>(0)
+                    .ok_or_else(|| anyhow::anyhow!("Migration version is NULL"))?;
+                let name = row.get::<String, _>(1).unwrap_or_default();
+                let checksum = row
+                    .get::<String, _>(2)
+                    .ok_or_else(|| anyhow::anyhow!("Migration checksum is NULL"))?
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("Migration checksum is invalid"))?;
+                Ok((version, name, checksum))
+            })
+            .collect()
+    }
 
-        // 获取影响的行数
-        let affected_rows = conn.affected_rows();
-        Ok(affected_rows)
+    pub(crate) async fn schema_columns(
+        &self,
+        table_name: &str,
+    ) -> anyhow::Result<Option<Vec<SchemaColumn>>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let exists: Option<u64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_name = ?",
+                (table_name,),
+            )
+            .trace()
+            .await?;
+        if exists.unwrap_or(0) == 0 {
+            return Ok(None);
+        }
+        let rows: Vec<mysql_async::Row> = conn
+            .exec(
+                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY \
+                 FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+                 ORDER BY ORDINAL_POSITION",
+                (table_name,),
+            )
+            .trace()
+            .await?;
+        let columns = rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0).unwrap_or_default();
+                let type_name: String = row.get(1).unwrap_or_default();
+                let nullable: String = row.get(2).unwrap_or_default();
+                let key: String = row.get(3).unwrap_or_default();
+                schema_column(name, type_name, nullable == "YES", key == "PRI")
+            })
+            .collect();
+        Ok(Some(columns))
     }
 
     /// 检查连接是否有效
@@ -1075,7 +1156,7 @@ pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1100,34 +1181,40 @@ impl<'a, I: crate::model::Insertable> TransactionInsertExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
+    for TransactionInsertExecutor<'a, I>
+{
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         TransactionInsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
         }
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
 
-        if let Some(conn) = self.conn.as_mut() {
+        let result = if let Some(conn) = self.conn.as_mut() {
             conn.exec_drop(&statement.sql, params).trace().await?;
 
             let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
             if has_auto_increment {
                 let last_id = conn.last_insert_id().unwrap_or(0);
-                let result = convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
-                    last_id,
-                )?;
-                return Ok(result);
+                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)
+            } else {
+                Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
             }
-        }
+        } else {
+            Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
+        }?;
 
-        Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(result)
     }
 }
 
@@ -1138,7 +1225,7 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1180,17 +1267,21 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrUpdateExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrUpdateExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
+    for TransactionInsertOrUpdateExecutor<'a, I>
+{
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         TransactionInsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
 
@@ -1198,11 +1289,61 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrUpdateE
             conn.exec_drop(&statement.sql, params).trace().await?;
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
 
 impl<'a> Transaction<'a> {
+    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Transaction connection is unavailable"))?;
+        let mysql_params = values_to_params(&params)?;
+        if mysql_params.is_empty() {
+            conn.query_drop(sql).trace().await?;
+        } else {
+            conn.exec_drop(sql, mysql_async::Params::Positional(mysql_params))
+                .trace()
+                .await?;
+        }
+        Ok(conn.affected_rows())
+    }
+
+    pub(crate) async fn select_raw<V, C>(
+        &mut self,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> anyhow::Result<C>
+    where
+        V: crate::model::FromRowValues,
+        C: FromIterator<V>,
+    {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("Transaction connection is unavailable"))?;
+        let mysql_params = values_to_params(&params)?;
+        let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
+            conn.query(sql).trace().await?
+        } else {
+            conn.exec(sql, mysql_async::Params::Positional(mysql_params))
+                .trace()
+                .await?
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            let mut values = Vec::new();
+            for i in 0..row.columns_ref().len() {
+                values.push(convert_mysql_value(&row, i)?);
+            }
+            results.push(V::from_row_values(&values)?);
+        }
+        Ok(results.into_iter().collect())
+    }
+
     /// 提交事务
     pub async fn commit(mut self) -> anyhow::Result<()> {
         if self.committed || self.rolled_back {
@@ -1358,7 +1499,7 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     _marker: std::marker::PhantomData<I::Model>,
 }
 
-impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
@@ -1392,24 +1533,29 @@ impl<'a, I: crate::model::Insertable> TransactionInsertOrIgnoreExecutor<'a, I> {
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for TransactionInsertOrIgnoreExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
+    for TransactionInsertOrIgnoreExecutor<'a, I>
+{
     type Output = ();
 
     fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         TransactionInsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
 
-        if let Some(conn) = self.conn {
+        if let Some(conn) = self.conn.as_mut() {
             conn.exec_drop(&statement.sql, params).trace().await?;
         }
 
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -1543,6 +1689,14 @@ impl<
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
+    pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
+        SelectExecutor {
+            select: Select::new(),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     /// 克隆executor（保持相同的pool引用）
     pub fn clone_with_pool(&self) -> Self {
         Self {
@@ -2369,17 +2523,13 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         }
     }
 
-    pub fn exec(self) -> RelatedCollectFuture<'a, T, R>
-    where
-        T: 'static,
-        R: 'static,
-    {
-        RelatedCollectFuture { executor: self }
-    }
-
     pub async fn collect<C: FromIterator<T>>(self) -> anyhow::Result<C> {
         let results = self.collect_inner().trace().await?;
         Ok(results.into_iter().collect())
+    }
+
+    pub(crate) fn into_collect_future(self) -> RelatedCollectFuture<'a, T, R> {
+        RelatedCollectFuture { executor: self }
     }
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
@@ -2555,15 +2705,6 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
         }
     }
 
-    pub fn exec(self) -> MultiTableCollectFuture<'a, T, R1, R2>
-    where
-        T: 'static,
-        R1: 'static,
-        R2: 'static,
-    {
-        MultiTableCollectFuture { executor: self }
-    }
-
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
@@ -2735,16 +2876,6 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             pool: self.pool,
             _marker: PhantomData,
         }
-    }
-
-    pub fn exec(self) -> FourTableCollectFuture<'a, T, R1, R2, R3>
-    where
-        T: 'static,
-        R1: 'static,
-        R2: 'static,
-        R3: 'static,
-    {
-        FourTableCollectFuture { executor: self }
     }
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
@@ -2935,14 +3066,6 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             _marker: PhantomData,
         }
     }
-
-    pub fn execute(self) -> LeftJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, Option<J>)>>()
-    }
 }
 
 /// LEFT JOIN Collect future
@@ -3103,14 +3226,6 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             _marker: PhantomData,
         }
     }
-
-    pub fn execute(self) -> InnerJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(T, J)>>()
-    }
 }
 
 /// INNER JOIN Collect future
@@ -3242,14 +3357,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
-    }
-
-    pub fn execute(self) -> RightJoinCollectFuture<'a, T, J>
-    where
-        T: 'static,
-        J: 'static,
-    {
-        self.collect::<Vec<(Option<T>, J)>>()
     }
 }
 

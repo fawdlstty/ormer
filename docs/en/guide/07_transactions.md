@@ -56,6 +56,41 @@ let count = txn
 txn.commit().await?;
 ```
 
+### Raw SQL
+
+Transactions also support raw SQL with parameter binding:
+
+```rust
+let mut txn = db.begin().await?;
+
+let users: Vec<User> = txn
+    .select_sql::<User>(
+        ormer::sql("SELECT * FROM users WHERE age >= {}").bind(18),
+    )
+    .collect()
+    .await?;
+
+txn.execute_sql(
+    ormer::sql("UPDATE users SET name = {} WHERE id = {}")
+        .bind("Adult")
+        .bind(1),
+)
+.await?;
+
+txn.commit().await?;
+```
+
+### Insert or Update, Insert or Ignore
+
+Transactions expose the same upsert and ignore operations as `Database`:
+
+```rust
+let mut txn = db.begin().await?;
+txn.insert_or_update(&user).execute().await?;
+txn.insert_or_ignore(&user).execute().await?;
+txn.commit().await?;
+```
+
 ## Error Handling
 
 ```rust

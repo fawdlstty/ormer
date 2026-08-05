@@ -85,12 +85,14 @@ impl DbType {
 
 pub use common::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, InsertExecutor,
-    InsertOrUpdateExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture,
-    MappedSelectExecutor, ModelCollectWithFuture, RelatedCollectFuture, RelatedSelectExecutor,
-    SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
-    SqlStatement, Transaction, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, UpdateExecutor,
+    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
+    IncludedSelectExecutor, InsertExecutor, InsertOrUpdateExecutor, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    RelatedSelectExecutor, SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement,
+    SqlExecutor, SqlStatement, Transaction, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor,
 };
 
 pub use common::{ConnectionPool, PooledConnection};

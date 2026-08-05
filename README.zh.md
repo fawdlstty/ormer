@@ -7,6 +7,8 @@
 
 一款极简语法的ORM框架，支持Sqlite、PostgreSQL、MySQL、SqlServer。
 
+同时提供原生 SQL 参数绑定、关系加载、Hooks 和版本化迁移支持。
+
 [在线文档](https://ormer.fawdlstty.com/)
 
 ## 快速示例

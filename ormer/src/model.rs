@@ -1,5 +1,7 @@
 use crate::time::{naive_local_to_utc, utc_to_naive_local};
+use std::any::Any;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 /// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
 pub trait DurationToInterval {
@@ -86,6 +88,55 @@ impl ForeignKeyInfo {
     }
 }
 
+/// 关系方向
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    HasMany,
+    BelongsTo,
+}
+
+/// 关系元数据
+#[derive(Debug, Clone)]
+pub struct RelationInfo {
+    pub name: &'static str,
+    pub kind: RelationKind,
+    pub target_table: &'static str,
+    pub local_key: &'static str,
+    pub target_key: &'static str,
+}
+
+/// 类型化关系句柄，用于 include/preload/find_related。
+#[derive(Debug, Clone, Copy)]
+pub struct Relation<Owner: Model, Target: Model> {
+    name: &'static str,
+    _marker: PhantomData<(Owner, Target)>,
+}
+
+impl<Owner: Model, Target: Model> Relation<Owner, Target> {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn info(&self) -> anyhow::Result<&'static RelationInfo> {
+        Owner::RELATIONS
+            .iter()
+            .find(|relation| {
+                relation.name == self.name && relation.target_table == Target::TABLE_NAME
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Relation {} -> {} not found on {}",
+                    self.name,
+                    Target::TABLE_NAME,
+                    Owner::TABLE_NAME
+                )
+            })
+    }
+}
+
 /// 数据库后端 trait - 用于 SQL 类型映射
 pub trait DbBackendTypeMapper {
     /// 根据 Rust 类型获取 SQL 类型
@@ -153,6 +204,7 @@ pub trait Model: Sized {
     const TABLE_NAME: &'static str;
     const COLUMNS: &'static [&'static str];
     const COLUMN_SCHEMA: &'static [ColumnSchema];
+    const RELATIONS: &'static [RelationInfo] = &[];
 
     /// 获取指定数据库后端实际使用的表名。
     fn table_name_for_db(db_type: crate::abstract_layer::DbType) -> &'static str {
@@ -184,6 +236,37 @@ pub trait Model: Sized {
 
     /// 获取字段值 (用于 INSERT/UPDATE)
     fn field_values(&self) -> Vec<Value>;
+
+    /// 获取指定列的值。
+    fn column_value(&self, _column: &str) -> Option<Value> {
+        None
+    }
+
+    /// 获取关系本地键值。
+    fn relation_key_value(&self, relation: &RelationInfo) -> anyhow::Result<Value> {
+        self.column_value(relation.local_key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Column {} not found on {} for relation {}",
+                relation.local_key,
+                Self::TABLE_NAME,
+                relation.name
+            )
+        })
+    }
+
+    /// 写入预加载后的关系对象。
+    fn assign_relation<Target: Model + 'static>(
+        &mut self,
+        relation_name: &'static str,
+        values: Vec<Target>,
+    ) -> anyhow::Result<()> {
+        let _ = values;
+        Err(anyhow::anyhow!(
+            "Relation {} is not assignable on {}",
+            relation_name,
+            Self::TABLE_NAME
+        ))
+    }
 
     /// 获取主键字段名列表（支持单主键和复合主键）
     fn primary_key_columns() -> &'static [&'static str] {
@@ -419,10 +502,28 @@ impl_enum_provider_for_non_enum!(
 );
 
 /// 用于 insert/insert_or_update 的参数类型 trait
+#[async_trait::async_trait]
 pub trait Insertable {
     type Model: crate::model::Model;
     fn as_refs(&self) -> Vec<&Self::Model>;
     fn as_refs_mut(&mut self) -> Vec<&mut Self::Model>;
+
+    /// Run insert hooks for mutable hook-aware inputs.
+    ///
+    /// Immutable inputs intentionally keep the historical no-hook behavior.
+    async fn run_before_insert(
+        &mut self,
+        _ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_after_insert(
+        &self,
+        _ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl<T: crate::model::Model> Insertable for &T {
@@ -436,6 +537,39 @@ impl<T: crate::model::Model> Insertable for &T {
     }
 }
 
+/// A mutable single model opts into automatic insert hooks.
+#[async_trait::async_trait]
+impl<T> Insertable for &mut T
+where
+    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+{
+    type Model = T;
+
+    fn as_refs(&self) -> Vec<&T> {
+        vec![&**self]
+    }
+
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        vec![&mut **self]
+    }
+
+    async fn run_before_insert(
+        &mut self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        let mut ctx = ctx;
+        (**self).before_insert(&mut ctx).await
+    }
+
+    async fn run_after_insert(
+        &self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        let mut ctx = ctx;
+        (**self).after_insert(&mut ctx).await
+    }
+}
+
 impl<T: crate::model::Model> Insertable for Vec<T> {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
@@ -443,6 +577,45 @@ impl<T: crate::model::Model> Insertable for Vec<T> {
     }
     fn as_refs_mut(&mut self) -> Vec<&mut T> {
         self.iter_mut().collect()
+    }
+}
+
+/// A mutable batch opts into automatic per-row insert hooks.
+#[async_trait::async_trait]
+impl<T> Insertable for &mut Vec<T>
+where
+    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+{
+    type Model = T;
+
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        self.iter_mut().collect()
+    }
+
+    async fn run_before_insert(
+        &mut self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter_mut().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.before_insert(&mut row_ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_after_insert(
+        &self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.after_insert(&mut row_ctx).await?;
+        }
+        Ok(())
     }
 }
 
@@ -454,6 +627,44 @@ impl<T: crate::model::Model> Insertable for &Vec<T> {
     fn as_refs_mut(&mut self) -> Vec<&mut T> {
         // &Vec<T> 无法提供 &mut T，返回空向量
         vec![]
+    }
+}
+
+#[async_trait::async_trait]
+impl<T> Insertable for &mut [T]
+where
+    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+{
+    type Model = T;
+
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        self.iter_mut().collect()
+    }
+
+    async fn run_before_insert(
+        &mut self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter_mut().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.before_insert(&mut row_ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_after_insert(
+        &self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.after_insert(&mut row_ctx).await?;
+        }
+        Ok(())
     }
 }
 
@@ -479,6 +690,44 @@ impl<T: crate::model::Model, const N: usize> Insertable for &[T; N] {
     }
 }
 
+#[async_trait::async_trait]
+impl<T, const N: usize> Insertable for &mut [T; N]
+where
+    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+{
+    type Model = T;
+
+    fn as_refs(&self) -> Vec<&T> {
+        self.iter().collect()
+    }
+
+    fn as_refs_mut(&mut self) -> Vec<&mut T> {
+        self.iter_mut().collect()
+    }
+
+    async fn run_before_insert(
+        &mut self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter_mut().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.before_insert(&mut row_ctx).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_after_insert(
+        &self,
+        ctx: crate::hooks::HookContext<'static>,
+    ) -> anyhow::Result<()> {
+        for (index, model) in self.iter().enumerate() {
+            let mut row_ctx = ctx.for_batch(index);
+            model.after_insert(&mut row_ctx).await?;
+        }
+        Ok(())
+    }
+}
+
 /// 为具体的 Model 类型生成引用的集合类型的 Insertable 实现
 /// 这个宏用于解决 orphan rule 问题
 #[macro_export]
@@ -489,12 +738,18 @@ macro_rules! impl_insertable_for_ref_collections {
             fn as_refs(&self) -> Vec<&$model_type> {
                 self.as_slice().to_vec()
             }
+            fn as_refs_mut(&mut self) -> Vec<&mut $model_type> {
+                vec![]
+            }
         }
 
         impl Insertable for &Vec<&$model_type> {
             type Model = $model_type;
             fn as_refs(&self) -> Vec<&$model_type> {
                 self.as_slice().to_vec()
+            }
+            fn as_refs_mut(&mut self) -> Vec<&mut $model_type> {
+                vec![]
             }
         }
 
@@ -503,12 +758,18 @@ macro_rules! impl_insertable_for_ref_collections {
             fn as_refs(&self) -> Vec<&$model_type> {
                 self.to_vec()
             }
+            fn as_refs_mut(&mut self) -> Vec<&mut $model_type> {
+                vec![]
+            }
         }
 
         impl Insertable for &[&$model_type] {
             type Model = $model_type;
             fn as_refs(&self) -> Vec<&$model_type> {
                 self.to_vec()
+            }
+            fn as_refs_mut(&mut self) -> Vec<&mut $model_type> {
+                vec![]
             }
         }
     };
@@ -793,6 +1054,16 @@ pub trait FromValue: Sized {
     fn from_value(value: &Value) -> anyhow::Result<Self>;
 }
 
+pub fn downcast_relation_vec_as<Concrete: Model + 'static, Target: Model + 'static>(
+    values: Vec<Target>,
+) -> anyhow::Result<Vec<Concrete>> {
+    let boxed: Box<dyn Any> = Box::new(values);
+    boxed
+        .downcast::<Vec<Concrete>>()
+        .map(|values| *values)
+        .map_err(|_| anyhow::anyhow!("Relation target type mismatch"))
+}
+
 #[doc(hidden)]
 pub struct I32DataTypeEncoder<T>(std::marker::PhantomData<T>);
 
@@ -914,6 +1185,12 @@ where
 /// FromRowValues trait - 用于从一行中的多个值构建类型(如元组、Model)
 pub trait FromRowValues: Sized {
     fn from_row_values(values: &[Value]) -> anyhow::Result<Self>;
+}
+
+impl<T: Model> FromRowValues for T {
+    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+        T::from_row_values(values)
+    }
 }
 
 /// FromSingleValue trait - 用于从单个值构建Model(用于map_to后的转换)
@@ -1256,6 +1533,12 @@ impl From<std::time::Duration> for Value {
 impl From<String> for Value {
     fn from(v: String) -> Self {
         Value::Text(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::Text(v.to_string())
     }
 }
 

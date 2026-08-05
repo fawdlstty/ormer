@@ -4,7 +4,7 @@
 
 ```toml
 [dependencies]
-ormer = { version = "0.1", features = ["sqlite"] }
+ormer = { version = "0.2", features = ["sqlite"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

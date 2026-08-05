@@ -27,6 +27,8 @@ struct User {
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
 - `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
 
+PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite and MySQL use the final table-name component.
+
 ## Field Attributes
 
 ### Unique Constraint
@@ -131,6 +133,62 @@ struct User {
 
 Supports `Option<EnumType>` for nullable enum fields.
 
+`ModelEnum` values can also be used with `IN`, comparison, and ordering conditions:
+
+```rust
+let active: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.status.is_in([UserStatus::Active, UserStatus::Banned]))
+    .collect()
+    .await?;
+```
+
+For an existing numeric enum or wrapper type, use `#[data_type(i32)]` instead of deriving `ModelEnum`. A nullable field must use `#[data_type(Option<i32>)]`:
+
+```rust
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+enum Status {
+    Active = 1,
+    Disabled = 0,
+}
+
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i32,
+    #[data_type(i32)]
+    status: Status,
+    #[data_type(Option<i32>)]
+    old_status: Option<Status>,
+}
+```
+
+### PostgreSQL Arrays
+
+PostgreSQL supports `Vec<i32>`, `Vec<i64>`, `Vec<Option<i64>>`, and `Vec<String>`. These fields map to native array types; `Vec<String>` uses `TEXT[]`, not a JSON column:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i32,
+    tags: Vec<String>,
+    scores: Vec<i32>,
+}
+```
+
+For a custom numeric enum inside `Vec<T>`, use `#[data_type(Vec<i32>)]`:
+
+```rust
+#[data_type(Vec<i32>)]
+roles: Vec<Status>,
+```
+
+Array types and this syntax currently target the PostgreSQL backend.
+
 ## Complete Example
 
 ```rust
@@ -172,6 +230,36 @@ struct Post {
     content: String,
 }
 ```
+
+## Model Relations
+
+Foreign-key fields describe the database constraint. To load related models, use `#[has_many]` and `#[belongs_to]`:
+
+```rust
+#[derive(Debug, Clone, Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    #[has_many(Post.user_id)]
+    posts: Vec<Post>,
+}
+
+#[derive(Debug, Clone, Model)]
+#[table = "posts"]
+struct Post {
+    #[primary(auto)]
+    id: i32,
+    #[foreign(User.id)]
+    user_id: i32,
+    #[belongs_to(user_id)]
+    user: Option<User>,
+    title: String,
+}
+```
+
+Relation fields are not database columns. A `#[belongs_to]` field must be `Option<T>`, and a `#[has_many]` field must be `Vec<T>`.
 
 ## Composite Primary Keys
 
@@ -273,5 +361,4 @@ for au in &archived {
     println!("User: {}", au.inner().name);
 }
 ```
-
 

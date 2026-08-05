@@ -1,168 +1,92 @@
-﻿# 钩子系统 (Hooks)
+# 钩子系统 (Hooks)
 
-## 支持的钩子类型
+Hooks 为写操作提供可失败的生命周期回调。所有回调都接收 `HookContext` 并返回 `ormer::Result<()>`；业务校验应返回错误，而不是 panic。
 
-| 钩子 Trait | 触发时机 | 方法签名 |
-|-----------|---------|---------|
-| `BeforeInsert` | 插入数据前 | `async fn before_insert(&mut self)` |
-| `AfterInsert` | 插入数据后 | `async fn after_insert(&self)` |
-| `BeforeUpdate` | 更新数据前 | `async fn before_update(&mut self)` |
-| `AfterUpdate` | 更新数据后 | `async fn after_update(&self)` |
-| `BeforeDelete` | 删除数据前 | `async fn before_delete(&self)` |
-| `AfterDelete` | 删除数据后 | `async fn after_delete(&self)` |
+| Hook Trait | 时机 | 签名 |
+| --- | --- | --- |
+| `BeforeInsert` | SQL 插入前 | `async fn before_insert(&mut self, ctx: &mut HookContext<'_>) -> Result<()>` |
+| `AfterInsert` | SQL 插入成功后 | `async fn after_insert(&self, ctx: &mut HookContext<'_>) -> Result<()>` |
+| `BeforeUpdate` | SQL 更新前 | `async fn before_update(&mut self, ctx: &mut HookContext<'_>) -> Result<()>` |
+| `AfterUpdate` | SQL 更新影响至少一行后 | `async fn after_update(&self, ctx: &mut HookContext<'_>) -> Result<()>` |
+| `BeforeDelete` | SQL 删除前 | `async fn before_delete(&self, ctx: &mut HookContext<'_>) -> Result<()>` |
+| `AfterDelete` | SQL 删除影响至少一行后 | `async fn after_delete(&self, ctx: &mut HookContext<'_>) -> Result<()>` |
 
-## 使用示例
+## 插入
 
-### 基本用法
+插入 Hook 使用可变模型输入，以便 `BeforeInsert` 可以规范化或补充字段。实现 `BeforeInsert` 和 `AfterInsert` 后，`insert`、`insert_or_update`、`insert_or_ignore` 以及对应事务执行器都会按 `BeforeInsert -> SQL -> AfterInsert` 调用。
 
 ```rust
-use ormer::{Model, BeforeInsert, BeforeUpdate, AfterInsert};
+use ormer::{
+    AfterInsert, BeforeInsert, Database, DbType, HookContext, Model,
+};
 
 #[derive(Debug, Model)]
 #[table = "users"]
 struct User {
     #[primary(auto)]
     id: i32,
-    name: String,
     email: String,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[async_trait::async_trait]
 impl BeforeInsert for User {
-    async fn before_insert(&mut self) {
-        let now = chrono::Utc::now();
-        self.created_at = now;
-        self.updated_at = now;
-    }
-}
-
-#[async_trait::async_trait]
-impl BeforeUpdate for User {
-    async fn before_update(&mut self) {
-        self.updated_at = chrono::Utc::now();
+    async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
+        self.email = self.email.trim().to_lowercase();
+        if !self.email.contains('@') {
+            return Err(anyhow::anyhow!("invalid email"));
+        }
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl AfterInsert for User {
-    async fn after_insert(&self) {
-        println!("新用户已创建: {} ({})", self.name, self.email);
+    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
+        Ok(())
     }
 }
+
+let db = Database::connect(DbType::Sqlite, "app.db").await?;
+db.create_table::<User>().execute().await?;
+
+let mut user = User {
+    id: 0,
+    email: "  Alice@example.com ".into(),
+};
+user.id = db.insert(&mut user).execute().await?;
 ```
 
-### 使用钩子
+批量插入传入可变集合。框架会逐条调用 Hook，`ctx.batch_index()` 是当前记录在集合中的索引。
 
 ```rust
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::connect(DbType::Sqlite, "mydb.db").await?;
-    
-    db.create_table::<User>().execute().await?;
-    
-    let user = User {
-        id: 0,
-        name: "Alice".to_string(),
-        email: "alice@example.com".to_string(),
-        created_at: Default::default(),
-        updated_at: Default::default(),
-    };
-    
-    db.insert(&user).execute().await?;
-    
-    Ok(())
-}
+let mut users = vec![user_a, user_b];
+db.insert(&mut users).execute().await?;
 ```
 
-## 完整示例：用户管理
+`BeforeInsert` 返回错误时不会执行 SQL。`AfterInsert` 返回错误时 SQL 已执行；普通数据库操作已无法自动撤销，事务操作应由调用方随后执行 `rollback()`。
+
+## 更新和删除
+
+更新和删除没有模型输入时无法确定 Hook 的作用对象，因此使用 `execute_with_hooks` 显式提供模型。批量场景使用 `execute_models_with_hooks`，HookContext 会带上批量索引。
 
 ```rust
-use ormer::{Model, Database, DbType, BeforeInsert, BeforeUpdate, BeforeDelete, AfterDelete};
-use std::sync::atomic::{AtomicUsize, Ordering};
+db.update::<User>()
+    .set_model(&user)
+    .execute_with_hooks(&mut user)
+    .await?;
 
-static USER_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Debug, Model)]
-#[table = "users"]
-struct User {
-    #[primary(auto)]
-    id: i32,
-    username: String,
-    email: String,
-    status: String,
-}
-
-#[async_trait::async_trait]
-impl BeforeInsert for User {
-    async fn before_insert(&mut self) {
-        if !self.email.contains('@') {
-            panic!("Invalid email format");
-        }
-        
-        self.status = "active".to_string();
-        
-        println!("准备创建用户: {}", self.username);
-    }
-}
-
-#[async_trait::async_trait]
-impl BeforeUpdate for User {
-    async fn before_update(&mut self) {
-        if self.status == "disabled" {
-            panic!("Cannot update disabled user");
-        }
-        
-        println!("准备更新用户: {}", self.username);
-    }
-}
-
-#[async_trait::async_trait]
-impl BeforeDelete for User {
-    async fn before_delete(&self) {
-        println!("准备删除用户: {} (状态: {})", self.username, self.status);
-    }
-}
-
-#[async_trait::async_trait]
-impl AfterDelete for User {
-    async fn after_delete(&self) {
-        USER_COUNT.fetch_sub(1, Ordering::SeqCst);
-        println!("用户已删除: {}", self.username);
-    }
-}
+db.delete::<User>()
+    .filter(|fields| fields.id.eq(user.id))
+    .execute_with_hooks(&user)
+    .await?;
 ```
 
-## 注意事项
+在事务中执行插入时，`ctx.in_transaction()` 为 `true`。Hook 错误会作为 `Result` 返回，不会自动提交事务；调用方应根据业务语义选择 `commit()` 或 `rollback()`。
 
-### 1. 异步支持
+## HookContext
 
-所有钩子方法都是异步的（`async fn`），您可以在钩子中执行异步操作。
+`HookContext` 提供：
 
-### 2. 错误处理
-
-当前版本的钩子系统不会传播错误。如果钩子中发生 panic，会影响整个操作。
-
-### 3. 性能考虑
-
-- 钩子会增加额外的函数调用开销
-- 批量操作时，钩子会为每条记录调用一次
-- 避免在钩子中执行耗时操作
-
-### 4. 自动触发机制
-
-**当前状态**：钩子 traits 已定义并可正常实现，但自动触发机制（在执行器中自动调用钩子）由于 Rust 类型系统限制尚未完全实现。
-
-**当前用法**：您可以手动调用钩子方法：
-
-```rust
-let mut user = User { /* ... */ };
-
-user.before_insert().await;
-
-db.insert(&user).execute().await?;
-```
-
-**未来计划**：后续版本将通过更复杂的泛型特化机制实现完全自动触发。
-
+- `operation()`：当前操作类型，取值为 `Insert`、`Update` 或 `Delete`。
+- `batch_index()`：批量操作中的记录索引；单条操作为 `None`。
+- `in_transaction()`：当前操作是否由 `Transaction` 执行。
