@@ -745,6 +745,31 @@ impl Row {
     }
 }
 
+pub(crate) fn normalize_string_vec(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+pub(crate) fn parse_string_vec_text(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(raw) {
+        return normalize_string_vec(values);
+    }
+
+    vec![raw.to_string()]
+}
+
+pub(crate) fn stringify_string_vec(values: &[String]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// 值类型
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -766,6 +791,53 @@ pub enum Value {
 
 pub trait FromValue: Sized {
     fn from_value(value: &Value) -> anyhow::Result<Self>;
+}
+
+#[doc(hidden)]
+pub struct I32DataTypeEncoder<T>(std::marker::PhantomData<T>);
+
+impl<T> I32DataTypeEncoder<T> {
+    pub const fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+impl<T> Default for I32DataTypeEncoder<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[doc(hidden)]
+pub trait I32DataTypeEncode<T> {
+    fn encode(self, value: T, column_name: &'static str, target_type: &'static str) -> i32;
+}
+
+impl<T> I32DataTypeEncode<T> for I32DataTypeEncoder<T>
+where
+    T: Into<i32>,
+{
+    fn encode(self, value: T, _column_name: &'static str, _target_type: &'static str) -> i32 {
+        value.into()
+    }
+}
+
+impl<T> I32DataTypeEncode<T> for &I32DataTypeEncoder<T>
+where
+    T: Copy,
+{
+    fn encode(self, value: T, column_name: &'static str, target_type: &'static str) -> i32 {
+        if std::mem::size_of::<T>() != std::mem::size_of::<i32>() {
+            panic!(
+                "Failed to convert column '{}' from {}: target type must be i32-sized when it does not implement Into<i32>",
+                column_name, target_type
+            );
+        }
+
+        // Fallback for #[data_type(i32)] C-like enums that intentionally do not
+        // implement Into<i32>. Valid discriminants are the caller's contract.
+        unsafe { std::mem::transmute_copy::<T, i32>(&value) }
+    }
 }
 
 #[doc(hidden)]
@@ -973,7 +1045,7 @@ impl FromRowValues for String {
 
 impl From<Vec<String>> for Value {
     fn from(v: Vec<String>) -> Self {
-        Value::Text(serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()))
+        Value::Text(stringify_string_vec(&v))
     }
 }
 
@@ -981,20 +1053,7 @@ impl FromValue for Vec<String> {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
-            Value::Text(v) => {
-                let raw = v.trim();
-                if raw.is_empty() {
-                    return Ok(Vec::new());
-                }
-                if let Ok(users) = serde_json::from_str::<Vec<String>>(raw) {
-                    return Ok(users
-                        .into_iter()
-                        .map(|user| user.trim().to_string())
-                        .filter(|user| !user.is_empty())
-                        .collect());
-                }
-                Ok(vec![raw.to_string()])
-            }
+            Value::Text(v) => Ok(parse_string_vec_text(v)),
             Value::Json(v) => {
                 if v.is_null() {
                     return Ok(Vec::new());
@@ -1007,11 +1066,7 @@ impl FromValue for Vec<String> {
                         .collect());
                 }
                 let users = serde_json::from_value::<Vec<String>>(v.clone())?;
-                Ok(users
-                    .into_iter()
-                    .map(|user| user.trim().to_string())
-                    .filter(|user| !user.is_empty())
-                    .collect())
+                Ok(normalize_string_vec(users))
             }
             _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<String>")),
         }

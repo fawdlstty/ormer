@@ -348,6 +348,13 @@ fn is_vec_option_i64_type(rust_type: &str) -> bool {
     )
 }
 
+fn is_vec_string_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>"
+    )
+}
+
 fn pg_value_from_row_cell(
     row: &tokio_postgres::Row,
     idx: usize,
@@ -408,6 +415,20 @@ fn pg_value_from_row_cell(
         };
     }
 
+    if is_vec_string_type(rust_type) {
+        let value: Option<Vec<String>> = pg_try_get(row, idx, "Vec<String>")?;
+        return match value {
+            Some(value) => Ok(crate::model::Value::Text(
+                crate::model::stringify_string_vec(&value),
+            )),
+            None if is_nullable => Ok(crate::model::Value::Null),
+            None => Err(anyhow::anyhow!(format!(
+                "Failed to parse non-nullable column at index {} (expected Vec<String> type)",
+                idx
+            ))),
+        };
+    }
+
     if is_nullable {
         match rust_type {
             "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => {
@@ -428,7 +449,7 @@ fn pg_value_from_row_cell(
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .unwrap_or(crate::model::Value::Null))
             }
-            "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
+            "String" => {
                 let value: Option<String> = pg_try_get(row, idx, "String")?;
                 Ok(value
                     .map(crate::model::Value::Text)
@@ -496,7 +517,7 @@ fn pg_value_from_row_cell(
                         ))
                     })
             }
-            "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
+            "String" => {
                 let value: Option<String> = pg_try_get(row, idx, "String")?;
                 value.map(crate::model::Value::Text).ok_or_else(|| {
                     anyhow::anyhow!(format!(
@@ -580,10 +601,22 @@ fn pg_collect_filter_param_rust_types<T: Model>(
     rust_types: &mut Vec<&'static str>,
 ) {
     match filter {
-        FilterExpr::Comparison { column, value, .. } => {
+        FilterExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => {
+            let rust_type = pg_model_column_rust_type::<T>(column)
+                .unwrap_or_else(|| pg_infer_filter_value_rust_type(value));
             rust_types.push(
-                pg_model_column_rust_type::<T>(column)
-                    .unwrap_or_else(|| pg_infer_filter_value_rust_type(value)),
+                if operator == "@>"
+                    && is_vec_string_type(rust_type)
+                    && matches!(value, crate::query::filter::Value::Text(_))
+                {
+                    "String"
+                } else {
+                    rust_type
+                },
             );
         }
         FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
@@ -672,6 +705,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             "Vec<Option<i64>>" | "std::vec::Vec<Option<i64>>" | "alloc::vec::Vec<Option<i64>>" => {
                 "BIGINT[]"
             }
+            "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => "TEXT[]",
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
             // 日期时间类型（如果使用 chrono crate）
@@ -1490,6 +1524,13 @@ impl Database {
             match upper.as_str() {
                 "_INT4" | "INT4[]" | "INTEGER[]" => return "INTEGER[]".to_string(),
                 "_INT8" | "INT8[]" | "BIGINT[]" => return "BIGINT[]".to_string(),
+                "_TEXT"
+                | "TEXT[]"
+                | "_VARCHAR"
+                | "VARCHAR[]"
+                | "_BPCHAR"
+                | "CHAR[]"
+                | "CHARACTER VARYING[]" => return "TEXT[]".to_string(),
                 _ => {}
             }
             if upper.starts_with("TIMESTAMP WITH TIME ZONE") || upper == "TIMESTAMPTZ" {
@@ -3347,8 +3388,15 @@ fn values_to_params_with_types(
                     Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
-            crate::model::Value::Text(v) => Box::new(PgTextParam::from(v.clone()))
-                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+            crate::model::Value::Text(v) => {
+                if is_vec_string_type(rust_type) {
+                    let values = crate::model::parse_string_vec_text(v);
+                    Box::new(values) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else {
+                    Box::new(PgTextParam::from(v.clone()))
+                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                }
+            }
             crate::model::Value::Real(v) => {
                 Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
@@ -3391,6 +3439,9 @@ fn values_to_params_with_types(
                     Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 } else if is_vec_option_i64_type(rust_type) {
                     let null_val: Option<Vec<Option<i64>>> = None;
+                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else if is_vec_string_type(rust_type) {
+                    let null_val: Option<Vec<String>> = None;
                     Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 } else {
                     match rust_type {
@@ -3642,8 +3693,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     }
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params(&params)?;
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -3719,8 +3771,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
     }
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params(&params)?;
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -3797,8 +3850,9 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
     }
 
     async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params(&params)?;
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
             .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -3910,58 +3964,12 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::IntegerArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::NullableBigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
-                    as Box<dyn postgres_types::ToSql + Sync + Send>,
-                crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-            })
-            .collect();
-
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
+        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
-            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
         let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
@@ -4067,58 +4075,12 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::IntegerArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::NullableBigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
-                    as Box<dyn postgres_types::ToSql + Sync + Send>,
-                crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-            })
-            .collect();
-
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
+        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
-            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
         let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
@@ -4223,58 +4185,12 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
+        let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-
-        let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => {
-                    Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Text(t) => {
-                    Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Real(r) => {
-                    Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Boolean(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Bytes(b) => {
-                    Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::IntegerArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::NullableBigIntArray(v) => {
-                    Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
-                    as Box<dyn postgres_types::ToSql + Sync + Send>,
-                crate::model::Value::DateTime(dt) => {
-                    Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Json(j) => {
-                    Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Uuid(u) => {
-                    Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::BigInt(b) => {
-                    Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-                crate::model::Value::Null => {
-                    Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
-                }
-            })
-            .collect();
-
-        let pg_params_refs: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
+        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
+        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
             .iter()
-            .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
+            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
         let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
@@ -4350,6 +4266,13 @@ fn convert_postgres_value(
             }
         }
         _ => {}
+    }
+
+    if let Ok(v) = row.try_get::<_, Option<Vec<String>>>(index) {
+        return Ok(match v {
+            Some(val) => crate::model::Value::Text(crate::model::stringify_string_vec(&val)),
+            None => crate::model::Value::Null,
+        });
     }
 
     // 根据PostgreSQL类型选择正确的Rust类型

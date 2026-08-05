@@ -25,6 +25,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         _ => panic!("Model must be a struct"),
     };
 
+    for field in fields {
+        validate_data_type(field);
+    }
+
     // 提取主键字段列表（支持复合主键）
     let primary_keys: Vec<_> = fields
         .iter()
@@ -240,7 +244,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 为所有字段生成类型化列代理
     let where_fields = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_type = &f.ty;
+        let field_type = effective_data_type_type(f).unwrap_or_else(|| f.ty.clone());
         quote! {
             pub #field_name: ::ormer::query::builder::TypedColumn<#field_type>
         }
@@ -513,9 +517,16 @@ fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
     quote! { None }
 }
 
-/// 提取 data_type 属性的类型覆盖信息
-/// 支持语法：#[data_type(i32)]
+/// 提取 data_type 属性的类型覆盖信息。
+///
+/// `Option<T>` 字段允许使用 `#[data_type(Option<U>)]`，但数据库后端只需要
+/// 基础类型 `U`，所以这里去掉属性中的 `Option<>` 包装。
 fn extract_data_type(field: &syn::Field) -> proc_macro2::TokenStream {
+    if let Some(data_type) = effective_data_type_type(field) {
+        let type_str = normalize_type_string(quote! { #data_type }.to_string());
+        return quote! { Some(#type_str) };
+    }
+
     for attr in &field.attrs {
         if attr.path().is_ident("data_type") {
             if let Meta::List(list) = &attr.meta {
@@ -535,17 +546,56 @@ fn has_data_type(field: &syn::Field) -> bool {
 }
 
 fn has_i32_data_type(field: &syn::Field) -> bool {
-    extract_data_type_type(field)
+    effective_data_type_type(field)
         .as_ref()
         .map(is_i32_type)
         .unwrap_or(false)
 }
 
 fn has_vec_i32_data_type(field: &syn::Field) -> bool {
-    extract_data_type_type(field)
+    effective_data_type_type(field)
         .as_ref()
         .map(is_vec_i32_type)
         .unwrap_or(false)
+}
+
+fn validate_data_type(field: &syn::Field) {
+    let Some(data_type) = extract_data_type_type(field) else {
+        return;
+    };
+
+    let field_is_optional = option_inner_type(&field.ty).is_some();
+    let data_type_is_optional = option_inner_type(&data_type).is_some();
+    if field_is_optional == data_type_is_optional {
+        return;
+    }
+
+    let field_name = field
+        .ident
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unnamed>".to_string());
+
+    if field_is_optional {
+        panic!(
+            "field `{field_name}` is nullable, so its database type must use \
+             #[data_type(Option<...>)]"
+        );
+    }
+
+    panic!(
+        "field `{field_name}` is not nullable, so its database type must not use \
+         #[data_type(Option<...>)]"
+    );
+}
+
+fn effective_data_type_type(field: &syn::Field) -> Option<syn::Type> {
+    let data_type = extract_data_type_type(field)?;
+    if option_inner_type(&field.ty).is_some() {
+        option_inner_type(&data_type).cloned()
+    } else {
+        Some(data_type)
+    }
 }
 
 fn extract_data_type_type(field: &syn::Field) -> Option<syn::Type> {
@@ -626,18 +676,37 @@ fn vec_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
 fn field_to_value_expr(field: &syn::Field) -> proc_macro2::TokenStream {
     let field_name = field.ident.as_ref().unwrap();
     let field_type = &field.ty;
+    let value_type = option_inner_type(field_type).unwrap_or(field_type);
 
     if has_i32_data_type(field) {
         if option_inner_type(field_type).is_some() {
             quote! {
                 match self.#field_name.clone() {
-                    Some(value) => ::ormer::Value::from(value as i32),
+                    Some(value) => {
+                        use ::ormer::model::I32DataTypeEncode as _;
+                        ::ormer::Value::from(
+                            ::ormer::model::I32DataTypeEncoder::<#value_type>::new().encode(
+                                value,
+                                stringify!(#field_name),
+                                stringify!(#value_type),
+                            )
+                        )
+                    },
                     None => ::ormer::Value::Null,
                 }
             }
         } else {
             quote! {
-                ::ormer::Value::from(self.#field_name.clone() as i32)
+                {
+                    use ::ormer::model::I32DataTypeEncode as _;
+                    ::ormer::Value::from(
+                        ::ormer::model::I32DataTypeEncoder::<#value_type>::new().encode(
+                            self.#field_name.clone(),
+                            stringify!(#field_name),
+                            stringify!(#value_type),
+                        )
+                    )
+                }
             }
         }
     } else if has_vec_i32_data_type(field) {
@@ -795,4 +864,50 @@ fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
     }
     // 没有 foreign 属性
     quote! { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "field `optional_status` is nullable")]
+    fn rejects_non_nullable_data_type_for_option_field() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct InvalidModel {
+                #[primary]
+                id: i32,
+                #[data_type(i32)]
+                optional_status: Option<i32>,
+            }
+        };
+        derive_model(input);
+    }
+
+    #[test]
+    #[should_panic(expected = "field `status` is not nullable")]
+    fn rejects_nullable_data_type_for_non_option_field() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct InvalidModel {
+                #[primary]
+                id: i32,
+                #[data_type(Option<i32>)]
+                status: i32,
+            }
+        };
+        derive_model(input);
+    }
+
+    #[test]
+    fn unwraps_nullable_data_type_for_backend_mapping() {
+        let field: syn::Field =
+            syn::parse_quote! { #[data_type(Option<i32>)] optional_status: Option<i32> };
+        assert!(has_i32_data_type(&field));
+
+        let effective_type = effective_data_type_type(&field).expect("data type should exist");
+        assert_eq!(
+            normalize_type_string(quote! { #effective_type }.to_string()),
+            "i32"
+        );
+    }
 }

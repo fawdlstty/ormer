@@ -296,7 +296,11 @@ impl FilterFormatter {
                 } else {
                     "$".to_string() + &_param_idx.to_string()
                 };
-                format!("{} {} {}", full_col_name, operator, param_placeholder)
+                if operator == "@>" {
+                    format!("{} @> ARRAY[{}]", full_col_name, param_placeholder)
+                } else {
+                    format!("{} {} {}", full_col_name, operator, param_placeholder)
+                }
             }
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => format!("{} {} ?", full_col_name, operator),

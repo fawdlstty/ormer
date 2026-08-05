@@ -298,15 +298,51 @@ fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Ve
 }
 
 #[cfg(feature = "postgresql")]
+fn collect_join_filter_param_rust_types<T: Model>(
+    lateral: bool,
+    on_condition: &FilterExpr,
+    filters: &[FilterExpr],
+) -> Vec<&'static str> {
+    let mut rust_types = Vec::new();
+    if lateral {
+        collect_filter_param_rust_types::<T>(on_condition, &mut rust_types);
+    }
+    for filter in filters {
+        collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+    }
+    rust_types
+}
+
+#[cfg(feature = "postgresql")]
+fn is_vec_string_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>"
+    )
+}
+
+#[cfg(feature = "postgresql")]
 fn collect_filter_param_rust_types<T: Model>(
     filter: &FilterExpr,
     rust_types: &mut Vec<&'static str>,
 ) {
     match filter {
-        FilterExpr::Comparison { column, value, .. } => {
+        FilterExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => {
+            let rust_type = model_column_rust_type::<T>(column)
+                .unwrap_or_else(|| infer_filter_value_rust_type(value));
             rust_types.push(
-                model_column_rust_type::<T>(column)
-                    .unwrap_or_else(|| infer_filter_value_rust_type(value)),
+                if operator == "@>"
+                    && is_vec_string_type(rust_type)
+                    && matches!(value, crate::query::filter::Value::Text(_))
+                {
+                    "String"
+                } else {
+                    rust_type
+                },
             );
         }
         FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
@@ -1574,6 +1610,11 @@ impl<T: Model> Select<T> {
 }
 
 impl<T: Model, R: Model> RelatedSelect<T, R> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_model_filter_param_rust_types::<T>(&self.filters)
+    }
+
     /// 添加 WHERE 条件（支持两个表的字段比较）
     pub fn filter<F>(mut self, f: F) -> Self
     where
@@ -1680,6 +1721,11 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
 }
 
 impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_model_filter_param_rust_types::<T>(&self.filters)
+    }
+
     /// 添加 WHERE 条件（支持三个表的字段比较）
     pub fn filter<F>(mut self, f: F) -> Self
     where
@@ -1788,6 +1834,11 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
 }
 
 impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_model_filter_param_rust_types::<T>(&self.filters)
+    }
+
     /// 添加 WHERE 条件（支持四个表的字段比较）
     pub fn filter<F>(mut self, f: F) -> Self
     where
@@ -2375,6 +2426,33 @@ macro_rules! impl_is_in_value_for_numeric {
 // 为所有整数和浮点类型实现
 impl_is_in_value_for_numeric!(i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64,);
 
+impl<T> IsInValue<T> for T
+where
+    T: crate::model::ModelEnum,
+{
+    fn to_in_value(self) -> T {
+        self
+    }
+}
+
+impl<T> IsInValue<T> for &T
+where
+    T: crate::model::ModelEnum + Clone,
+{
+    fn to_in_value(self) -> T {
+        self.clone()
+    }
+}
+
+impl<T> IsInValue<T> for &&T
+where
+    T: crate::model::ModelEnum + Clone,
+{
+    fn to_in_value(self) -> T {
+        (*self).clone()
+    }
+}
+
 // 为字符串类型实现 IsInValue
 impl IsInValue<String> for String {
     fn to_in_value(self) -> String {
@@ -2883,12 +2961,12 @@ impl TypedColumn<String> {
 }
 
 impl TypedColumn<Vec<String>> {
-    /// PostgreSQL JSONB array membership, generated as `column::jsonb ? value`.
+    /// PostgreSQL array membership, generated as `column @> ARRAY[value]`.
     pub fn contains(self, value: impl Into<String>) -> WhereExpr {
         WhereExpr {
             inner: FilterExpr::Comparison {
-                column: format!("{}::jsonb", self.column_name),
-                operator: "?".to_string(),
+                column: self.column_name.to_string(),
+                operator: "@>".to_string(),
                 value: crate::query::filter::Value::Text(value.into()),
             },
             ..WhereExpr::defaults()
@@ -3284,6 +3362,11 @@ impl<T: Model> Select<T> {
 }
 
 impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+    }
+
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -3479,6 +3562,11 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
 }
 
 impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+    }
+
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -3673,6 +3761,11 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
 }
 
 impl<T: Model, J: Model> RightJoinedSelect<T, J> {
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+    }
+
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,

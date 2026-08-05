@@ -51,6 +51,12 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                     ::ormer::model::Value::Integer(v as i64)
                 }
             }
+
+            impl ::core::convert::From<#name> for i32 {
+                fn from(v: #name) -> Self {
+                    v as i32
+                }
+            }
         }
     } else {
         // 字符串枚举：转为 Text
