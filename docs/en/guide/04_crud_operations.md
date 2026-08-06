@@ -126,6 +126,12 @@ db.update::<User>()
     .set_model(&updated_user)
     .execute()
     .await?;
+
+// Update only selected model fields without overwriting other columns
+db.update::<User>()
+    .set_model_fields(&updated_user, |u| (u.name, u.age))
+    .execute()
+    .await?;
 ```
 
 ## Delete

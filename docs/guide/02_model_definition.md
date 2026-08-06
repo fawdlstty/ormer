@@ -18,11 +18,15 @@ struct User {
 ### 属性
 
 - `#[table = "表名"]` - 指定表名
+- `#[table(schema = "模式", name = "表名")]` - 独立指定 schema 和表名
+- `#[column(name = "列名")]` - 指定 SQL 列名
 - `#[primary]` - 主键（支持复合主键）
 - `#[primary(auto)]` - 自增主键（仅单主键或复合主键的第一个字段）
-- `#[unique]` - 唯一约束（支持 `group` 参数创建联合唯一）
-- `#[index]` - 索引
-- `#[foreign(Type)]` - 外键关系
+- `#[unique]` - 唯一约束（支持 `group`、`name` 参数）
+- `#[index]` - 索引（支持 `group`、`name`、`order`、`where` 参数）
+- `#[default(...)]` - 数据库默认值；SQL 表达式使用 `#[default(expr = "...")]`
+- `#[check(expr = "...")]` - CHECK 约束，可配置 `name`
+- `#[foreign(Type)]` - 外键关系；可配置 `name`、`on_delete`、`on_update`
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
 - `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
@@ -95,6 +99,25 @@ struct User {
     phone: Option<String>,
 }
 ```
+
+### 列名、默认值和约束
+
+```rust
+#[derive(Debug, Model)]
+#[table(schema = "auth", name = "users")]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    #[column(name = "display_name")]
+    #[default("")]
+    #[check(expr = "length(display_name) > 0")]
+    name: String,
+    #[default(expr = "CURRENT_TIMESTAMP")]
+    created_at: chrono::NaiveDateTime,
+}
+```
+
+`insert(&model)` 仍会显式写入模型的全部字段；数据库默认值只会在 INSERT 省略列时生效。
 
 ## 支持的类型
 
@@ -361,4 +384,3 @@ for au in &archived {
     println!("User: {}", au.inner().name);
 }
 ```
-

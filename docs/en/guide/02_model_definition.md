@@ -18,11 +18,15 @@ struct User {
 ### Attributes
 
 - `#[table = "table_name"]` - Specifies the table name
+- `#[table(schema = "schema", name = "table_name")]` - Specifies schema and table independently
+- `#[column(name = "column_name")]` - Specifies the SQL column name
 - `#[primary]` - Primary key (supports composite primary keys)
 - `#[primary(auto)]` - Auto-increment primary key (only for single primary key or the first field of composite primary key)
-- `#[unique]` - Unique constraint (supports `group` parameter for composite unique)
-- `#[index]` - Index
-- `#[foreign(Type)]` - Foreign key relationship
+- `#[unique]` - Unique constraint (supports `group` and `name`)
+- `#[index]` - Index (supports `group`, `name`, `order`, and `where`)
+- `#[default(...)]` - Database default; use `#[default(expr = "...")]` for SQL expressions
+- `#[check(expr = "...")]` - CHECK constraint, with optional `name`
+- `#[foreign(Type)]` - Foreign key relationship, with optional `name`, `on_delete`, and `on_update`
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
 - `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
@@ -95,6 +99,25 @@ struct User {
     phone: Option<String>,
 }
 ```
+
+### Column Names, Defaults, and Constraints
+
+```rust
+#[derive(Debug, Model)]
+#[table(schema = "auth", name = "users")]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    #[column(name = "display_name")]
+    #[default("")]
+    #[check(expr = "length(display_name) > 0")]
+    name: String,
+    #[default(expr = "CURRENT_TIMESTAMP")]
+    created_at: chrono::NaiveDateTime,
+}
+```
+
+`insert(&model)` still writes all model fields explicitly; a database default applies only when the column is omitted from the INSERT.
 
 ## Supported Types
 
@@ -361,4 +384,3 @@ for au in &archived {
     println!("User: {}", au.inner().name);
 }
 ```
-

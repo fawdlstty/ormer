@@ -1,12 +1,17 @@
 use crate::abstract_layer::DbType;
-use crate::model::{ColumnSchema, Model, normalize_table_name_for_db};
+use crate::model::{
+    ColumnSchema, Model, normalize_table_name_for_db, quote_column_reference,
+    quote_qualified_identifier,
+};
 use crate::query::filter::{FilterExpr, OrderBy};
+#[cfg(feature = "postgresql")]
+use crate::query::filter::{infer_filter_value_rust_type, infer_model_value_rust_type};
 use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
 
-fn table_name_for<T: Model>(db_type: DbType) -> &'static str {
-    T::table_name_for_db(db_type)
+fn table_name_for<T: Model>(db_type: DbType) -> String {
+    quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
 }
 
 fn quote_sql_string(value: &str) -> String {
@@ -232,14 +237,14 @@ fn select_expr_for_column<T: Model>(
         return format!(
             "{} AS {}",
             ignored_column_default_expr(schema, db_type),
-            column
+            quote_column_reference(db_type, column)
         );
     }
 
     if let Some(prefix) = table_prefix {
-        format!("{}.{}", prefix, column)
+        quote_column_reference(db_type, &format!("{}.{}", prefix, column))
     } else {
-        column.to_string()
+        quote_column_reference(db_type, column)
     }
 }
 
@@ -253,6 +258,143 @@ fn select_exprs_for_model<T: Model>(
         .map(|column| select_expr_for_column::<T>(column, db_type, ignored_columns, table_prefix))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn default_db_type() -> DbType {
+    #[cfg(feature = "sqlite")]
+    {
+        DbType::Sqlite
+    }
+    #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
+    {
+        DbType::PostgreSQL
+    }
+    #[cfg(all(
+        not(feature = "sqlite"),
+        not(feature = "postgresql"),
+        feature = "mysql"
+    ))]
+    {
+        DbType::MySQL
+    }
+    #[cfg(all(
+        not(feature = "sqlite"),
+        not(feature = "postgresql"),
+        not(feature = "mysql"),
+        feature = "mssql"
+    ))]
+    {
+        DbType::MSSQL
+    }
+}
+
+fn is_mssql_db(db_type: DbType) -> bool {
+    #[cfg(feature = "mssql")]
+    {
+        db_type == DbType::MSSQL
+    }
+    #[cfg(not(feature = "mssql"))]
+    {
+        let _ = db_type;
+        false
+    }
+}
+
+fn append_filter_clause(
+    sql: &mut String,
+    keyword: &str,
+    filters: &[FilterExpr],
+    formatter: FilterFormatter,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
+    if filters.is_empty() {
+        return;
+    }
+
+    sql.push_str(keyword);
+    for (i, filter) in filters.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" AND ");
+        }
+        let filter_sql = formatter.format(filter, param_idx, params);
+        sql.push_str(&filter_sql);
+    }
+}
+
+fn append_order_by_clause(sql: &mut String, order_by: &[OrderBy], db_type: DbType) {
+    if order_by.is_empty() {
+        return;
+    }
+
+    sql.push_str(" ORDER BY ");
+    let order_strs: Vec<String> = order_by.iter().map(|o| o.to_sql_for(db_type)).collect();
+    sql.push_str(&order_strs.join(", "));
+}
+
+fn range_limit(start: Option<usize>, end: usize) -> usize {
+    if let Some(start) = start {
+        end - start
+    } else {
+        end
+    }
+}
+
+fn append_limit_offset_clause(
+    sql: &mut String,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+) {
+    if let Some(end) = range_end {
+        write!(sql, " LIMIT {}", range_limit(range_start, end))
+            .expect("Failed to write LIMIT clause");
+    }
+    if let Some(start) = range_start {
+        write!(sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
+    }
+}
+
+fn append_range_clause(
+    sql: &mut String,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    has_order_by: bool,
+    db_type: DbType,
+) {
+    if is_mssql_db(db_type) {
+        if let Some(end) = range_end {
+            if !has_order_by {
+                sql.push_str(" ORDER BY (SELECT NULL)");
+            }
+            write!(
+                sql,
+                " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+                range_start.unwrap_or(0),
+                range_limit(range_start, end)
+            )
+            .expect("Failed to write OFFSET/FETCH clause");
+        }
+    } else {
+        append_limit_offset_clause(sql, range_start, range_end);
+    }
+}
+
+fn append_join_condition(db_type: DbType, filter: &FilterExpr, sql: &mut String) {
+    if let FilterExpr::ColumnComparison {
+        left_column,
+        operator,
+        right_column,
+    } = filter
+    {
+        write!(
+            sql,
+            "{} {} {}",
+            quote_column_reference(db_type, &format!("t0.{}", left_column)),
+            operator,
+            quote_column_reference(db_type, &format!("t1.{}", right_column))
+        )
+        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
+    }
 }
 
 /// 范围边界类型,支持多种 range 语法
@@ -403,46 +545,6 @@ fn normalize_filter_column_name(column: &str) -> &str {
     column
 }
 
-#[cfg(feature = "postgresql")]
-fn infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'static str {
-    match value {
-        crate::query::filter::Value::Integer(_) => "i32",
-        crate::query::filter::Value::BigInt(_) => "i64",
-        crate::query::filter::Value::Duration(_) => "Duration",
-        crate::query::filter::Value::Text(_) => "String",
-        crate::query::filter::Value::Real(_) => "f64",
-        crate::query::filter::Value::Boolean(_) => "bool",
-        crate::query::filter::Value::Bytes(_) => "Vec<u8>",
-        crate::query::filter::Value::IntegerArray(_) => "Vec<i32>",
-        crate::query::filter::Value::BigIntArray(_) => "Vec<i64>",
-        crate::query::filter::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
-        crate::query::filter::Value::DateTime(_) => "NaiveDateTime",
-        crate::query::filter::Value::Json(_) => "String",
-        crate::query::filter::Value::Uuid(_) => "String",
-        crate::query::filter::Value::Null => "i32",
-    }
-}
-
-#[cfg(feature = "postgresql")]
-fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
-    match value {
-        crate::model::Value::Integer(_) => "i32",
-        crate::model::Value::BigInt(_) => "i64",
-        crate::model::Value::Duration(_) => "Duration",
-        crate::model::Value::Text(_) => "String",
-        crate::model::Value::Real(_) => "f64",
-        crate::model::Value::Boolean(_) => "bool",
-        crate::model::Value::Bytes(_) => "Vec<u8>",
-        crate::model::Value::IntegerArray(_) => "Vec<i32>",
-        crate::model::Value::BigIntArray(_) => "Vec<i64>",
-        crate::model::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
-        crate::model::Value::DateTime(_) => "NaiveDateTime",
-        crate::model::Value::Json(_) => "String",
-        crate::model::Value::Uuid(_) => "String",
-        crate::model::Value::Null => "i32",
-    }
-}
-
 /// Select 查询结构体
 ///
 /// 使用方式:`Select::<User>`().filter(|p| p.age > 12).to_sql()
@@ -591,24 +693,20 @@ impl<T: Model, R> AggregateSelect<T, R> {
             &mut sql,
             "SELECT {}({}) FROM {}",
             self.aggregate_func,
-            self.column_name,
+            quote_column_reference(db_type, &self.column_name),
             table_name_for::<T>(db_type)
         )
         .expect("Failed to write aggregate SELECT clause");
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx = 1;
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
+        let mut param_idx = 1;
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type),
+            &mut param_idx,
+            &mut params,
+        );
 
         (sql, params)
     }
@@ -642,11 +740,21 @@ impl<T: Model, V> MappedSelect<T, V> {
             self.column_names
                 .iter()
                 .zip(aliases.iter())
-                .map(|(col, alias)| format!("{} AS {}", col, alias))
+                .map(|(col, alias)| {
+                    format!(
+                        "{} AS {}",
+                        quote_column_reference(db_type, col),
+                        quote_column_reference(db_type, alias)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
-            self.column_names.join(", ")
+            self.column_names
+                .iter()
+                .map(|col| quote_column_reference(db_type, col))
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         let distinct_str = if self.distinct { "DISTINCT " } else { "" };
         write!(
@@ -658,84 +766,30 @@ impl<T: Model, V> MappedSelect<T, V> {
         )
         .expect("Failed to write SELECT clause");
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx = 1;
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+        let mut param_idx = 1;
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type),
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         (sql, params)
     }
 
     /// 生成 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, _) = self.to_sql_with_params(db_type);
+        let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
     }
 }
@@ -856,8 +910,8 @@ impl<T: Model, V> GroupedSelect<T, V> {
             .iter()
             .zip(self.aggregate_funcs.iter())
             .map(|(col, agg)| match agg {
-                Some(func) => format!("{}({})", func, col),
-                None => col.clone(),
+                Some(func) => format!("{}({})", func, quote_column_reference(db_type, col)),
+                None => quote_column_reference(db_type, col),
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -870,111 +924,59 @@ impl<T: Model, V> GroupedSelect<T, V> {
         )
         .expect("Failed to write SELECT clause");
 
-        // WHERE 子句（分组前过滤）
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type),
+            &mut param_idx,
+            &mut params,
+        );
 
         // GROUP BY 子句
         if !self.group_by_columns.is_empty() {
             sql.push_str(" GROUP BY ");
-            sql.push_str(&self.group_by_columns.join(", "));
+            sql.push_str(
+                &self
+                    .group_by_columns
+                    .iter()
+                    .map(|col| quote_column_reference(db_type, col))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         }
 
-        // HAVING 子句（分组后过滤）
-        if !self.having_filters.is_empty() {
-            sql.push_str(" HAVING ");
-            // PostgreSQL需要为HAVING子句中的参数添加::bigint类型转换
-            // 因为COUNT等聚合函数返回BIGINT
-            #[cfg(feature = "postgresql")]
-            let formatter = if matches!(db_type, crate::DbType::PostgreSQL) {
-                FilterFormatter::new(db_type).with_postgresql_having_cast(true)
-            } else {
-                FilterFormatter::new(db_type)
-            };
-            #[cfg(not(feature = "postgresql"))]
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.having_filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+        #[cfg(feature = "postgresql")]
+        let having_formatter = if matches!(db_type, crate::DbType::PostgreSQL) {
+            FilterFormatter::new(db_type).with_postgresql_having_cast(true)
+        } else {
+            FilterFormatter::new(db_type)
+        };
+        #[cfg(not(feature = "postgresql"))]
+        let having_formatter = FilterFormatter::new(db_type);
+        append_filter_clause(
+            &mut sql,
+            " HAVING ",
+            &self.having_filters,
+            having_formatter,
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         (sql, params)
     }
 
     /// 生成 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, _) = self.to_sql_with_params(db_type);
+        let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
     }
 
@@ -1231,14 +1233,11 @@ impl<T: Model> Select<T> {
 
     /// 添加 WHERE 条件 (使用宏支持 >= 和 > 运算符语法)
     #[doc(hidden)]
-    pub fn filter_cmp<F>(mut self, f: F) -> Self
+    pub fn filter_cmp<F>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
     {
-        let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
-        self
+        self.filter(f)
     }
 
     /// 添加排序
@@ -1330,24 +1329,7 @@ impl<T: Model> Select<T> {
 
     /// 生成 EXISTS 子查询专用 SQL（SELECT 1 FROM ...）
     fn to_exists_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
-        // 使用第一个可用的数据库类型
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
+        let db_type = default_db_type();
 
         let mut sql = String::new();
         let mut params = Vec::new();
@@ -1355,45 +1337,22 @@ impl<T: Model> Select<T> {
         write!(&mut sql, "SELECT 1 FROM {}", table_name_for::<T>(db_type))
             .unwrap_or_else(|e| panic!("Failed to write EXISTS subquery SQL: {}", e));
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx = 1;
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
+        let mut param_idx = 1;
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type),
+            &mut param_idx,
+            &mut params,
+        );
 
         (sql, params)
     }
 
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
-        // 使用第一个可用的数据库类型用于调试
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, _) = self.to_sql_with_params(db_type);
+        let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
     }
 
@@ -1413,58 +1372,23 @@ impl<T: Model> Select<T> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx = 1;
-            let formatter = FilterFormatter::new(db_type);
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+        let mut param_idx = 1;
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type),
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         // 返回参数
         (sql, params)
@@ -1538,25 +1462,7 @@ impl<T: Model> Clone for UnionSelect<T> {
 impl<T: Model> UnionSelect<T> {
     /// 生成 SQL
     pub fn to_sql(&self) -> String {
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, _) = self.to_sql_with_params(db_type);
+        let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
     }
 
@@ -1662,59 +1568,24 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         (sql, params)
     }
@@ -1775,59 +1646,24 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         (sql, params)
     }
@@ -1890,59 +1726,24 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        // WHERE 子句
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // ORDER BY 子句
-        if !self.order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_strs: Vec<String> = self.order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_strs.join(", "));
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                if self.order_by.is_empty() {
-                    sql.push_str(" ORDER BY (SELECT NULL)");
-                }
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
 
         (sql, params)
     }
@@ -2569,26 +2370,7 @@ impl<T: ColumnValueType> IsNotInValues<T> for SubqueryParam {
 // 为 MappedSelect 实现 IsInValues（子查询）
 impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
     fn to_in_expr(self, column: String) -> WhereExpr {
-        // 使用第一个可用的数据库类型
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, params) = self.to_sql_with_params(db_type);
+        let (sql, params) = self.to_sql_with_params(default_db_type());
         WhereExpr {
             inner: FilterExpr::InSubquery {
                 column,
@@ -2603,26 +2385,7 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
 // 为 MappedSelect 实现 IsNotInValues（子查询）
 impl<T: Model, V: ColumnValueType> IsNotInValues<V> for MappedSelect<T, V> {
     fn to_not_in_expr(self, column: String) -> WhereExpr {
-        // 使用第一个可用的数据库类型
-        #[cfg(feature = "sqlite")]
-        let db_type = DbType::Sqlite;
-        #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
-        let db_type = DbType::PostgreSQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            feature = "mysql"
-        ))]
-        let db_type = DbType::MySQL;
-        #[cfg(all(
-            not(feature = "sqlite"),
-            not(feature = "postgresql"),
-            not(feature = "mysql"),
-            feature = "mssql"
-        ))]
-        let db_type = DbType::MSSQL;
-
-        let (sql, params) = self.to_sql_with_params(db_type);
+        let (sql, params) = self.to_sql_with_params(default_db_type());
         WhereExpr {
             inner: FilterExpr::NotInSubquery {
                 column,
@@ -3403,63 +3166,30 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 LEFT JOIN {} AS {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
-        self.format_join_condition(&self.on_condition, &mut sql);
+        append_join_condition(db_type, &self.on_condition, &mut sql);
 
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                sql.push_str(" ORDER BY (SELECT NULL)");
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_range_clause(&mut sql, self.range_start, self.range_end, false, db_type);
 
         (sql, params)
     }
@@ -3474,13 +3204,12 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 LEFT JOIN LATERAL (SELECT * FROM {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3491,73 +3220,26 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         write!(&mut sql, " WHERE {}", condition_sql)
             .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
 
-        // ORDER BY
-        if !self.join_order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_clauses: Vec<String> =
-                self.join_order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_clauses.join(", "));
-        }
-
-        // LIMIT / OFFSET
-        if let Some(end) = self.join_range_end {
-            let limit = if let Some(start) = self.join_range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.join_range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+        append_order_by_clause(&mut sql, &self.join_order_by, db_type);
+        append_limit_offset_clause(&mut sql, self.join_range_start, self.join_range_end);
 
         // 关闭子查询并写 ON true
         write!(&mut sql, ") AS {} ON true", self.join_alias)
             .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
 
-        // 主查询的 WHERE 条件
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let outer_formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // 主查询的 RANGE
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_limit_offset_clause(&mut sql, self.range_start, self.range_end);
 
         (sql, params)
-    }
-
-    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        if let FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } = filter
-        {
-            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
-                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
-        }
     }
 }
 
@@ -3602,63 +3284,30 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 INNER JOIN {} AS {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
-        self.format_join_condition(&self.on_condition, &mut sql);
+        append_join_condition(db_type, &self.on_condition, &mut sql);
 
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                sql.push_str(" ORDER BY (SELECT NULL)");
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_range_clause(&mut sql, self.range_start, self.range_end, false, db_type);
 
         (sql, params)
     }
@@ -3673,13 +3322,12 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 INNER JOIN LATERAL (SELECT * FROM {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3690,73 +3338,26 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         write!(&mut sql, " WHERE {}", condition_sql)
             .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
 
-        // ORDER BY
-        if !self.join_order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_clauses: Vec<String> =
-                self.join_order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_clauses.join(", "));
-        }
-
-        // LIMIT / OFFSET
-        if let Some(end) = self.join_range_end {
-            let limit = if let Some(start) = self.join_range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.join_range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+        append_order_by_clause(&mut sql, &self.join_order_by, db_type);
+        append_limit_offset_clause(&mut sql, self.join_range_start, self.join_range_end);
 
         // 关闭子查询并写 ON true
         write!(&mut sql, ") AS {} ON true", self.join_alias)
             .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
 
-        // 主查询的 WHERE 条件
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let outer_formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // 主查询的 RANGE
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_limit_offset_clause(&mut sql, self.range_start, self.range_end);
 
         (sql, params)
-    }
-
-    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        if let FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } = filter
-        {
-            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
-                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
-        }
     }
 }
 
@@ -3801,63 +3402,30 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 RIGHT JOIN {} AS {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
             self.join_alias
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
         sql.push_str(" ON ");
-        self.format_join_condition(&self.on_condition, &mut sql);
+        append_join_condition(db_type, &self.on_condition, &mut sql);
 
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // RANGE 子句 (LIMIT + OFFSET 或 MSSQL OFFSET/FETCH)
-        #[cfg(feature = "mssql")]
-        let is_mssql = db_type == crate::abstract_layer::DbType::MSSQL;
-        #[cfg(not(feature = "mssql"))]
-        let is_mssql = false;
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            if is_mssql {
-                let start_offset = self.range_start.unwrap_or(0);
-                sql.push_str(" ORDER BY (SELECT NULL)");
-                write!(
-                    &mut sql,
-                    " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                    start_offset, limit
-                )
-                .expect("Failed to write OFFSET/FETCH clause");
-            } else {
-                write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-            }
-        }
-        if !is_mssql {
-            if let Some(start) = self.range_start {
-                write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-            }
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_range_clause(&mut sql, self.range_start, self.range_end, false, db_type);
 
         (sql, params)
     }
@@ -3872,13 +3440,12 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
             &mut sql,
             "SELECT {}, {} FROM {} AS t0 RIGHT JOIN LATERAL (SELECT * FROM {}",
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            J::COLUMNS
-                .iter()
-                .map(|c| format!("t1.{} as j_{}", c, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            select_exprs_for_model::<J>(db_type, &[], Some("t1")),
             table_name_for::<T>(db_type),
-            normalize_table_name_for_db(db_type, &self.join_table),
+            quote_qualified_identifier(
+                db_type,
+                normalize_table_name_for_db(db_type, &self.join_table),
+            ),
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3889,72 +3456,25 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         write!(&mut sql, " WHERE {}", condition_sql)
             .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
 
-        // ORDER BY
-        if !self.join_order_by.is_empty() {
-            sql.push_str(" ORDER BY ");
-            let order_clauses: Vec<String> =
-                self.join_order_by.iter().map(|o| o.to_sql()).collect();
-            sql.push_str(&order_clauses.join(", "));
-        }
-
-        // LIMIT / OFFSET
-        if let Some(end) = self.join_range_end {
-            let limit = if let Some(start) = self.join_range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.join_range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+        append_order_by_clause(&mut sql, &self.join_order_by, db_type);
+        append_limit_offset_clause(&mut sql, self.join_range_start, self.join_range_end);
 
         // 关闭子查询并写 ON true
         write!(&mut sql, ") AS {} ON true", self.join_alias)
             .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
 
-        // 主查询的 WHERE 条件
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let outer_formatter = FilterFormatter::new(db_type)
+        append_filter_clause(
+            &mut sql,
+            " WHERE ",
+            &self.filters,
+            FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
-                .with_right_table_prefix("t1");
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let filter_sql = outer_formatter.format(filter, &mut param_idx, &mut params);
-                sql.push_str(&filter_sql);
-            }
-        }
-
-        // 主查询的 RANGE
-        if let Some(end) = self.range_end {
-            let limit = if let Some(start) = self.range_start {
-                end - start
-            } else {
-                end
-            };
-            write!(&mut sql, " LIMIT {}", limit).expect("Failed to write LIMIT clause");
-        }
-        if let Some(start) = self.range_start {
-            write!(&mut sql, " OFFSET {}", start).expect("Failed to write OFFSET clause");
-        }
+                .with_right_table_prefix("t1"),
+            &mut param_idx,
+            &mut params,
+        );
+        append_limit_offset_clause(&mut sql, self.range_start, self.range_end);
 
         (sql, params)
-    }
-
-    fn format_join_condition(&self, filter: &FilterExpr, sql: &mut String) {
-        if let FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } = filter
-        {
-            // 左列加 t0. 前缀(主表),右列加 t1. 前缀(JOIN表)
-            write!(sql, "t0.{} {} t1.{}", left_column, operator, right_column)
-                .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
-        }
     }
 }

@@ -19,38 +19,6 @@ use std::marker::PhantomData;
 
 type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 
-/// 将数据库返回的自增ID（u64）转换为模型指定的 AutoIncrementKeyType
-/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
-fn convert_auto_increment_key<K: Default + 'static>(last_id: u64) -> anyhow::Result<K> {
-    let result = std::any::TypeId::of::<K>();
-    if result == std::any::TypeId::of::<()>() {
-        let val: () = ();
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i32>() {
-        let val: i32 = last_id as i32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i64>() {
-        let val: i64 = last_id as i64;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u32>() {
-        let val: u32 = last_id as u32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u64>() {
-        let val: u64 = last_id;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<usize>() {
-        let val: usize = last_id as usize;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<Option<i64>>() {
-        let val: Option<i64> = Some(last_id as i64);
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else {
-        Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
-        ))
-    }
-}
-
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::MySQL)
 }
@@ -59,6 +27,9 @@ fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Val
     match value {
         crate::model::Value::Integer(v) => mysql_async::Value::Int(*v),
         crate::model::Value::Text(v) => mysql_async::Value::Bytes(v.as_bytes().to_vec()),
+        crate::model::Value::TextArray(v) => {
+            mysql_async::Value::Bytes(crate::model::stringify_string_vec(v).into_bytes())
+        }
         crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
         crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
         crate::model::Value::Duration(v) => {
@@ -104,11 +75,10 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
                 .map(|v| format!("'{}'", v))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut sql_type = format!("ENUM({})", variants_str);
-            if !is_nullable {
-                sql_type.push_str(" NOT NULL");
-            }
-            return sql_type;
+            return common_helpers::sql_type_with_nullability(
+                &format!("ENUM({})", variants_str),
+                is_nullable,
+            );
         }
 
         // 首先处理主键类型
@@ -161,14 +131,7 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
             _ => "TEXT",
         };
 
-        let mut sql_type = base_type.to_string();
-
-        // 非主键字段根据 is_nullable 决定是否添加 NOT NULL
-        if !is_nullable {
-            sql_type.push_str(" NOT NULL");
-        }
-
-        sql_type
+        common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
 }
 
@@ -224,7 +187,10 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::MySQL,
-            format!("DROP TABLE IF EXISTS {}", table_name_for::<T>()),
+            format!(
+                "DROP TABLE IF EXISTS {}",
+                common_helpers::quote_table_name::<T>(DbType::MySQL)
+            ),
             Vec::new(),
         ))
     }
@@ -264,16 +230,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
 
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::MySQL),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::MySQL, &refs);
 
         Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
     }
@@ -297,16 +255,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            table_name_for::<T>(),
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MySQL, models);
         let params = values_to_params(&all_values)?;
 
         conn.exec_drop(&sql, params).trace().await?;
@@ -315,7 +264,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = conn.last_insert_id().unwrap_or(0);
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            let result =
+                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
             return Ok(result);
         }
 
@@ -346,7 +296,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let result = if has_auto_increment {
             let last_id = conn.last_insert_id().unwrap_or(0);
-            convert_auto_increment_key::<Self::Output>(last_id)
+            common_helpers::convert_auto_increment_key::<Self::Output>(last_id)
         } else {
             Ok(<I::Model as Model>::AutoIncrementKeyType::default())
         }?;
@@ -370,25 +320,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
 
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!(
-            "INSERT INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::MySQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
         let mut first = true;
@@ -396,7 +335,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            sql.push_str(&common_helpers::quote_mysql_values_assignment(
+                DbType::MySQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -415,24 +357,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::MySQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::MySQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
         // 添加 ON DUPLICATE KEY UPDATE 子句
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
@@ -441,7 +374,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            sql.push_str(&common_helpers::quote_mysql_values_assignment(
+                DbType::MySQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -489,25 +425,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
 
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!(
-            "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::MySQL,
+            "INSERT IGNORE INTO",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
     }
@@ -524,27 +449,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let mut sql = format!(
-            "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            table_name_for::<T>()
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::MySQL,
+            "INSERT IGNORE INTO",
+            T::table_name_for_db(DbType::MySQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         let params = values_to_params(&all_values)?;
 
@@ -848,16 +761,7 @@ impl Database {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            table_name_for::<T>(),
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MySQL, models);
         let params = values_to_params(&all_values)?;
 
         conn.exec_drop(&sql, params).trace().await?;
@@ -866,7 +770,8 @@ impl Database {
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = conn.last_insert_id().unwrap_or(0);
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            let result =
+                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
             Ok(result)
         } else {
             Ok(T::AutoIncrementKeyType::default())
@@ -881,24 +786,15 @@ impl Database {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::MySQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::MySQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
         // 添加 ON DUPLICATE KEY UPDATE 子句
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
@@ -907,7 +803,10 @@ impl Database {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            sql.push_str(&common_helpers::quote_mysql_values_assignment(
+                DbType::MySQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -926,27 +825,15 @@ impl Database {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let mut sql = format!(
-            "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            table_name_for::<T>()
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::MySQL,
+            "INSERT IGNORE INTO",
+            T::table_name_for_db(DbType::MySQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         let params = values_to_params(&all_values)?;
 
@@ -1048,11 +935,10 @@ impl Database {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns_ref().len() {
-                values.push(convert_mysql_value(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns_ref().len(),
+                |i| convert_mysql_value(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -1162,16 +1048,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::MySQL),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::MySQL, &refs);
 
         Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
     }
@@ -1205,7 +1083,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
             let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
             if has_auto_increment {
                 let last_id = conn.last_insert_id().unwrap_or(0);
-                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)
+                common_helpers::convert_auto_increment_key::<
+                    <I::Model as Model>::AutoIncrementKeyType,
+                >(last_id)
             } else {
                 Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
             }
@@ -1231,23 +1111,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!(
-            "INSERT INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::MySQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
         let mut first = true;
@@ -1255,7 +1126,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            sql.push_str(&common_helpers::quote_mysql_values_assignment(
+                DbType::MySQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -1335,11 +1209,10 @@ impl<'a> Transaction<'a> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns_ref().len() {
-                values.push(convert_mysql_value(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns_ref().len(),
+                |i| convert_mysql_value(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -1452,24 +1325,15 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", table_name_for::<T>());
-        let mut all_values = Vec::new();
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::MySQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::MySQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
         // 添加 ON DUPLICATE KEY UPDATE 子句
         sql.push_str(" ON DUPLICATE KEY UPDATE ");
@@ -1478,7 +1342,10 @@ impl<'a> Transaction<'a> {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = VALUES({col_name})"));
+            sql.push_str(&common_helpers::quote_mysql_values_assignment(
+                DbType::MySQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -1505,25 +1372,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!(
-            "INSERT IGNORE INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL)
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::MySQL,
+            "INSERT IGNORE INTO",
+            <I::Model as Model>::table_name_for_db(DbType::MySQL),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
 
         Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
     }
@@ -1671,15 +1527,10 @@ impl<
 
             let mut results = Vec::new();
             for row in rows {
-                // 将行数据转换为Vec<Value>
-                let mut values = Vec::new();
-                for i in 0..row.columns_ref().len() {
-                    let value = convert_mysql_value(&row, i)?;
-                    values.push(value);
-                }
-
-                // 使用FromRowValues转换为V
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(
+                    row.columns_ref().len(),
+                    |i| convert_mysql_value(&row, i),
+                )?;
                 results.push(v);
             }
 
@@ -2095,14 +1946,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mut results = Vec::new();
 
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = convert_mysql_value(&row, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                convert_mysql_value(&row, i)
+            })?;
             results.push(model);
         }
 
@@ -2144,7 +1990,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", table_name_for::<T>());
+        let mut sql = format!(
+            "DELETE FROM {}",
+            common_helpers::quote_table_name::<T>(DbType::MySQL)
+        );
         let mut params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -2259,6 +2108,30 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
+    pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
+        let model_sets = model
+            .non_pk_field_values_for_columns(fields)
+            .into_iter()
+            .map(|(col_name, value)| (col_name.to_string(), value))
+            .collect::<Vec<_>>();
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let model_filters = pk_columns
+            .iter()
+            .zip(pk_values)
+            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: crate::abstract_layer::common::common_helpers::value_to_filter_value(&val),
+            })
+            .collect();
+
+        if !model_sets.is_empty() {
+            self.model_updates.push((model_sets, model_filters));
+        }
+        self
+    }
+
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         Ok(SqlStatement::batch(
@@ -2284,14 +2157,21 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::MySQL)
+            );
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{} = ?", col_name));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::MySQL,
+                    col_name,
+                    "?",
+                ));
                 params.push(value.clone());
                 first = false;
             }
@@ -2316,14 +2196,21 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Model UPDATE statements
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::MySQL)
+            );
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in model_sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{} = ?", col_name));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::MySQL,
+                    col_name,
+                    "?",
+                ));
                 params.push(value.clone());
                 first = false;
             }
@@ -2448,14 +2335,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
 /// 将 MySQL Row 解析为 Model
 fn parse_mysql_row<T: Model>(row: &mysql_async::Row) -> anyhow::Result<T> {
-    let mut data = HashMap::new();
-    for (i, col_name) in T::COLUMNS.iter().enumerate() {
-        let ormer_value = convert_mysql_value(row, i)?;
-        data.insert(col_name.to_string(), ormer_value);
-    }
-
-    let ormer_row = crate::model::Row::new(data);
-    T::from_row(&ormer_row)
+    common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| convert_mysql_value(row, i))
 }
 
 /// SelectStreamIterator - 真正的流式查询迭代器 (MySQL)
@@ -3398,74 +3278,14 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         let t_col_count = T::COLUMNS.len();
 
         for row in rows {
-            let mut t_data = HashMap::new();
-            let mut t_is_null = true;
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" => {
-                        let v: Option<i64> = row.get(i);
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Integer(v.unwrap_or(0))
-                    }
-                    "String" => {
-                        let v: Option<String> = row.get(i);
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Text(v.unwrap_or_default())
-                    }
-                    "f32" | "f64" => {
-                        let v: Option<f64> = row.get(i);
-                        if v.is_some() {
-                            t_is_null = false;
-                        }
-                        crate::model::Value::Real(v.unwrap_or(0.0))
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                t_data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let t_model = if t_is_null {
-                None
-            } else {
-                Some(T::from_row(&Row::new(t_data))?)
-            };
-
-            let mut j_data = HashMap::new();
-            for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" => {
-                        let v: i64 = row.get(idx).unwrap_or(0);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(idx).unwrap_or(String::new());
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(idx).unwrap_or(0.0);
-                        crate::model::Value::Real(v)
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                j_data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let j_model = J::from_row(&Row::new(j_data))?;
+            let t_model =
+                common_helpers::decode_optional_model_from_indexed_values::<T, _>(0, |i| {
+                    convert_mysql_value(&row, i)
+                })?;
+            let j_model =
+                common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
+                    convert_mysql_value(&row, i)
+                })?;
             results.push((t_model, j_model));
         }
 
@@ -3617,13 +3437,9 @@ impl<
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();
             for row in rows {
-                let mut values = Vec::with_capacity(column_count);
-                for i in 0..column_count {
-                    let value = convert_mysql_value(&row, i)?;
-                    values.push(value);
-                }
-
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
+                    convert_mysql_value(&row, i)
+                })?;
                 results.push(v);
             }
 

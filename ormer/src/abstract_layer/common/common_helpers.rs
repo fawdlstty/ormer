@@ -1,8 +1,70 @@
-﻿use super::super::DbType;
-use crate::model::{Model, Row, Value};
+use super::super::DbType;
+use crate::model::{
+    FromRowValues, Model, Row, Value, quote_identifier, quote_qualified_identifier,
+};
 use crate::query::filter::FilterExpr;
+use crate::query::filter_formatter::FilterFormatter;
 use std::collections::HashMap;
-use std::fmt::Write;
+
+pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => format!("${_param_idx}"),
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => format!("@P{_param_idx}"),
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => "?".to_string(),
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => "?".to_string(),
+    }
+}
+
+pub fn placeholder_list(db_type: DbType, start_idx: usize, count: usize) -> String {
+    (0..count)
+        .map(|offset| placeholder(db_type, start_idx + offset))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn quote_table_name<T: Model>(db_type: DbType) -> String {
+    quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
+}
+
+pub fn quote_column_list(db_type: DbType, columns: &[&str]) -> String {
+    columns
+        .iter()
+        .map(|column| quote_identifier(db_type, column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn quote_column_with_prefix(db_type: DbType, prefix: &str, column: &str) -> String {
+    format!("{}.{}", prefix, quote_identifier(db_type, column))
+}
+
+pub fn quote_assignment(db_type: DbType, column: &str, value_sql: &str) -> String {
+    format!("{} = {}", quote_identifier(db_type, column), value_sql)
+}
+
+pub fn quote_postgres_excluded_assignment(db_type: DbType, column: &str) -> String {
+    quote_assignment(
+        db_type,
+        column,
+        &quote_column_with_prefix(db_type, "EXCLUDED", column),
+    )
+}
+
+pub fn quote_mysql_values_assignment(db_type: DbType, column: &str) -> String {
+    quote_assignment(
+        db_type,
+        column,
+        &format!("VALUES({})", quote_identifier(db_type, column)),
+    )
+}
+
+pub fn sql_type_with_nullability(base_type: &str, is_nullable: bool) -> String {
+    format!("{base_type}{}", if is_nullable { "" } else { " NOT NULL" })
+}
 
 /// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
 pub fn format_filter(
@@ -11,187 +73,8 @@ pub fn format_filter(
     param_idx: &mut i32,
     db_type: DbType,
 ) -> anyhow::Result<()> {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value: _,
-        } => {
-            match db_type {
-                #[cfg(feature = "postgresql")]
-                DbType::PostgreSQL => {
-                    write!(sql, "{column} {operator} ${param_idx}")?;
-                }
-                #[cfg(feature = "sqlite")]
-                DbType::Sqlite => {
-                    write!(sql, "{column} {operator} ?")?;
-                }
-                #[cfg(feature = "mysql")]
-                DbType::MySQL => {
-                    write!(sql, "{column} {operator} ?")?;
-                }
-                #[cfg(feature = "mssql")]
-                DbType::MSSQL => {
-                    write!(sql, "{column} {operator} @P")?;
-                }
-            }
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            write!(sql, "{left_column} {operator} {right_column}")?;
-        }
-        FilterExpr::In { column, values } => {
-            // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column)?;
-            for (i, _) in values.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                match db_type {
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => {
-                        write!(sql, "${param_idx}")?;
-                    }
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        sql.push_str("@P");
-                    }
-                }
-                *param_idx += 1;
-            }
-            sql.push(')');
-        }
-        FilterExpr::NotIn { column, values } => {
-            // 生成 NOT IN 语句: column NOT IN (?, ?, ...)
-            write!(sql, "{} NOT IN (", column)?;
-            for (i, _) in values.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                match db_type {
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => {
-                        write!(sql, "${param_idx}")?;
-                    }
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        sql.push_str("@P");
-                    }
-                }
-                *param_idx += 1;
-            }
-            sql.push(')');
-        }
-        FilterExpr::InSubquery {
-            column,
-            subquery_sql,
-            subquery_params: _,
-        } => {
-            // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{column} IN ({subquery_sql})")?;
-            // 注意：子查询的参数数量需要累加到 param_idx
-            // 但在这个函数中我们不处理参数值，只处理占位符
-            // 子查询的 SQL 中已经包含了占位符，我们需要计算占位符数量
-            let placeholder_count = subquery_sql.matches('?').count()
-                + subquery_sql.matches('$').count()
-                + subquery_sql.matches("@P").count();
-            *param_idx += placeholder_count as i32;
-        }
-        FilterExpr::NotInSubquery {
-            column,
-            subquery_sql,
-            subquery_params: _,
-        } => {
-            // 生成子查询 NOT IN 语句: column NOT IN (SELECT ...)
-            write!(sql, "{column} NOT IN ({subquery_sql})")?;
-            // 注意：子查询的参数数量需要累加到 param_idx
-            let placeholder_count = subquery_sql.matches('?').count()
-                + subquery_sql.matches('$').count()
-                + subquery_sql.matches("@P").count();
-            *param_idx += placeholder_count as i32;
-        }
-        FilterExpr::And(left, right) => {
-            format_filter(left, sql, param_idx, db_type)?;
-            sql.push_str(" AND ");
-            format_filter(right, sql, param_idx, db_type)?;
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter(left, sql, param_idx, db_type)?;
-            sql.push_str(" OR ");
-            format_filter(right, sql, param_idx, db_type)?;
-        }
-        FilterExpr::IsNull { column } => {
-            write!(sql, "{column} IS NULL")?;
-        }
-        FilterExpr::IsNotNull { column } => {
-            write!(sql, "{column} IS NOT NULL")?;
-        }
-        FilterExpr::Between {
-            column,
-            min: _,
-            max: _,
-        } => {
-            match db_type {
-                #[cfg(feature = "postgresql")]
-                DbType::PostgreSQL => {
-                    write!(sql, "{column} BETWEEN ${param_idx} AND ${}", *param_idx + 1)?;
-                }
-                #[cfg(feature = "sqlite")]
-                DbType::Sqlite => {
-                    write!(sql, "{column} BETWEEN ? AND ?")?;
-                }
-                #[cfg(feature = "mysql")]
-                DbType::MySQL => {
-                    write!(sql, "{column} BETWEEN ? AND ?")?;
-                }
-                #[cfg(feature = "mssql")]
-                DbType::MSSQL => {
-                    write!(sql, "{column} BETWEEN @P AND @P")?;
-                }
-            }
-            *param_idx += 2;
-        }
-        FilterExpr::Exists {
-            subquery_sql,
-            subquery_params: _,
-        } => {
-            write!(sql, "EXISTS ({subquery_sql})")?;
-            let placeholder_count = subquery_sql.matches('?').count()
-                + subquery_sql.matches('$').count()
-                + subquery_sql.matches("@P").count();
-            *param_idx += placeholder_count as i32;
-        }
-        FilterExpr::NotExists {
-            subquery_sql,
-            subquery_params: _,
-        } => {
-            write!(sql, "NOT EXISTS ({subquery_sql})")?;
-            let placeholder_count = subquery_sql.matches('?').count()
-                + subquery_sql.matches('$').count()
-                + subquery_sql.matches("@P").count();
-            *param_idx += placeholder_count as i32;
-        }
-    }
+    let mut params = Vec::new();
+    sql.push_str(&FilterFormatter::new(db_type).format(filter, param_idx, &mut params));
     Ok(())
 }
 
@@ -203,186 +86,9 @@ pub fn format_filter_with_params(
     params: &mut Vec<Value>,
     db_type: DbType,
 ) -> anyhow::Result<()> {
-    match filter {
-        FilterExpr::Comparison {
-            column,
-            operator,
-            value,
-        } => {
-            match db_type {
-                #[cfg(feature = "postgresql")]
-                DbType::PostgreSQL => {
-                    write!(sql, "{column} {operator} ${param_idx}")?;
-                }
-                #[cfg(feature = "sqlite")]
-                DbType::Sqlite => {
-                    write!(sql, "{column} {operator} ?")?;
-                }
-                #[cfg(feature = "mysql")]
-                DbType::MySQL => {
-                    write!(sql, "{column} {operator} ?")?;
-                }
-                #[cfg(feature = "mssql")]
-                DbType::MSSQL => {
-                    write!(sql, "{column} {operator} @P")?;
-                }
-            }
-            params.push(value.clone().into());
-            *param_idx += 1;
-        }
-        FilterExpr::ColumnComparison {
-            left_column,
-            operator,
-            right_column,
-        } => {
-            write!(sql, "{} {} {}", left_column, operator, right_column)?;
-        }
-        FilterExpr::In { column, values } => {
-            // 生成 IN 语句: column IN (?, ?, ...)
-            write!(sql, "{} IN (", column)?;
-            for (i, value) in values.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                match db_type {
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx)?;
-                    }
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        sql.push_str("@P");
-                    }
-                }
-                params.push(value.clone().into());
-                *param_idx += 1;
-            }
-            sql.push(')');
-        }
-        FilterExpr::NotIn { column, values } => {
-            // 生成 NOT IN 语句: column NOT IN (?, ?, ...)
-            write!(sql, "{} NOT IN (", column)?;
-            for (i, value) in values.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
-                }
-                match db_type {
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => {
-                        write!(sql, "${}", param_idx)?;
-                    }
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => {
-                        sql.push('?');
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        sql.push_str("@P");
-                    }
-                }
-                params.push(value.clone().into());
-                *param_idx += 1;
-            }
-            sql.push(')');
-        }
-        FilterExpr::InSubquery {
-            column,
-            subquery_sql,
-            subquery_params,
-        } => {
-            // 生成子查询 IN 语句: column IN (SELECT ...)
-            write!(sql, "{} IN ({})", column, subquery_sql)?;
-            // 添加子查询的参数
-            for param in subquery_params {
-                params.push(param.clone());
-                *param_idx += 1;
-            }
-        }
-        FilterExpr::NotInSubquery {
-            column,
-            subquery_sql,
-            subquery_params,
-        } => {
-            // 生成子查询 NOT IN 语句: column NOT IN (SELECT ...)
-            write!(sql, "{} NOT IN ({})", column, subquery_sql)?;
-            // 添加子查询的参数
-            for param in subquery_params {
-                params.push(param.clone());
-                *param_idx += 1;
-            }
-        }
-        FilterExpr::And(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params, db_type)?;
-            sql.push_str(" AND ");
-            format_filter_with_params(right, sql, param_idx, params, db_type)?;
-        }
-        FilterExpr::Or(left, right) => {
-            format_filter_with_params(left, sql, param_idx, params, db_type)?;
-            sql.push_str(" OR ");
-            format_filter_with_params(right, sql, param_idx, params, db_type)?;
-        }
-        FilterExpr::IsNull { column } => {
-            write!(sql, "{column} IS NULL")?;
-        }
-        FilterExpr::IsNotNull { column } => {
-            write!(sql, "{column} IS NOT NULL")?;
-        }
-        FilterExpr::Between { column, min, max } => {
-            match db_type {
-                #[cfg(feature = "postgresql")]
-                DbType::PostgreSQL => {
-                    write!(sql, "{column} BETWEEN ${param_idx} AND ${}", *param_idx + 1)?;
-                }
-                #[cfg(feature = "sqlite")]
-                DbType::Sqlite => {
-                    write!(sql, "{column} BETWEEN ? AND ?")?;
-                }
-                #[cfg(feature = "mysql")]
-                DbType::MySQL => {
-                    write!(sql, "{column} BETWEEN ? AND ?")?;
-                }
-                #[cfg(feature = "mssql")]
-                DbType::MSSQL => {
-                    write!(sql, "{column} BETWEEN @P AND @P")?;
-                }
-            }
-            params.push(min.clone().into());
-            params.push(max.clone().into());
-            *param_idx += 2;
-        }
-        FilterExpr::Exists {
-            subquery_sql,
-            subquery_params,
-        } => {
-            write!(sql, "EXISTS ({})", subquery_sql)?;
-            for param in subquery_params {
-                params.push(param.clone());
-                *param_idx += 1;
-            }
-        }
-        FilterExpr::NotExists {
-            subquery_sql,
-            subquery_params,
-        } => {
-            write!(sql, "NOT EXISTS ({})", subquery_sql)?;
-            for param in subquery_params {
-                params.push(param.clone());
-                *param_idx += 1;
-            }
-        }
-    }
+    let mut next_param_idx = *param_idx as i32;
+    sql.push_str(&FilterFormatter::new(db_type).format(filter, &mut next_param_idx, params));
+    *param_idx = next_param_idx as usize;
     Ok(())
 }
 
@@ -390,6 +96,60 @@ pub fn format_filter_with_params(
 pub fn extract_model_from_row<T: Model>(row_data: &HashMap<String, Value>) -> anyhow::Result<T> {
     let row = Row::new(row_data.clone());
     T::from_row(&row)
+}
+
+pub fn decode_model_from_indexed_values<T, F>(offset: usize, mut value_at: F) -> anyhow::Result<T>
+where
+    T: Model,
+    F: FnMut(usize) -> anyhow::Result<Value>,
+{
+    let mut data = HashMap::new();
+    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+        data.insert(col_name.to_string(), value_at(offset + i)?);
+    }
+
+    T::from_row(&Row::new(data))
+}
+
+pub fn decode_optional_model_from_indexed_values<T, F>(
+    offset: usize,
+    mut value_at: F,
+) -> anyhow::Result<Option<T>>
+where
+    T: Model,
+    F: FnMut(usize) -> anyhow::Result<Value>,
+{
+    let mut data = HashMap::new();
+    let mut is_null = true;
+    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+        let value = value_at(offset + i)?;
+        if !matches!(value, Value::Null) {
+            is_null = false;
+        }
+        data.insert(col_name.to_string(), value);
+    }
+
+    if is_null {
+        Ok(None)
+    } else {
+        Ok(Some(T::from_row(&Row::new(data))?))
+    }
+}
+
+pub fn decode_row_values_from_indexed_values<V, F>(
+    column_count: usize,
+    mut value_at: F,
+) -> anyhow::Result<V>
+where
+    V: FromRowValues,
+    F: FnMut(usize) -> anyhow::Result<Value>,
+{
+    let mut values = Vec::with_capacity(column_count);
+    for i in 0..column_count {
+        values.push(value_at(i)?);
+    }
+
+    V::from_row_values(&values)
 }
 
 /// 通用列值转换助手 - 根据 rust_type 转换数据库值到 ormer Value
@@ -464,23 +224,41 @@ pub fn convert_column_value(
 
 /// 将 model::Value 转换为 filter::Value
 pub fn value_to_filter_value(val: &Value) -> crate::query::filter::Value {
-    match val {
-        Value::Integer(v) => crate::query::filter::Value::Integer(*v),
-        Value::BigInt(v) => crate::query::filter::Value::BigInt(*v),
-        Value::Duration(v) => crate::query::filter::Value::Duration(*v),
-        Value::Text(v) => crate::query::filter::Value::Text(v.clone()),
-        Value::Real(v) => crate::query::filter::Value::Real(*v),
-        Value::Boolean(v) => crate::query::filter::Value::Boolean(*v),
-        Value::Bytes(v) => crate::query::filter::Value::Bytes(v.clone()),
-        Value::IntegerArray(v) => crate::query::filter::Value::IntegerArray(v.clone()),
-        Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v.clone()),
-        Value::NullableBigIntArray(v) => {
-            crate::query::filter::Value::NullableBigIntArray(v.clone())
-        }
-        Value::DateTime(v) => crate::query::filter::Value::DateTime(*v),
-        Value::Json(v) => crate::query::filter::Value::Json(v.clone()),
-        Value::Uuid(v) => crate::query::filter::Value::Uuid(*v),
-        Value::Null => crate::query::filter::Value::Null,
+    val.clone().into()
+}
+
+fn downcast_auto_increment_key<K: 'static, T: 'static>(value: T) -> K {
+    let boxed: Box<dyn std::any::Any> = Box::new(value);
+    match boxed.downcast::<K>() {
+        Ok(value) => *value,
+        Err(_) => unreachable!("auto-increment key type checked before downcast"),
+    }
+}
+
+/// 将数据库返回的自增 ID 转换为模型指定的 AutoIncrementKeyType。
+pub fn convert_auto_increment_key<K: Default + 'static>(
+    last_id: impl Into<i128>,
+) -> anyhow::Result<K> {
+    let last_id = last_id.into();
+    let key_type = std::any::TypeId::of::<K>();
+    if key_type == std::any::TypeId::of::<()>() {
+        Ok(downcast_auto_increment_key(()))
+    } else if key_type == std::any::TypeId::of::<i32>() {
+        Ok(downcast_auto_increment_key(last_id as i32))
+    } else if key_type == std::any::TypeId::of::<i64>() {
+        Ok(downcast_auto_increment_key(last_id as i64))
+    } else if key_type == std::any::TypeId::of::<u32>() {
+        Ok(downcast_auto_increment_key(last_id as u32))
+    } else if key_type == std::any::TypeId::of::<u64>() {
+        Ok(downcast_auto_increment_key(last_id as u64))
+    } else if key_type == std::any::TypeId::of::<usize>() {
+        Ok(downcast_auto_increment_key(last_id as usize))
+    } else if key_type == std::any::TypeId::of::<Option<i64>>() {
+        Ok(downcast_auto_increment_key(Some(last_id as i64)))
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
+        ))
     }
 }
 
@@ -503,106 +281,227 @@ pub fn build_batch_insert_sql<T: Model>(models_count: usize) -> (String, usize) 
     (sql, col_count)
 }
 
-/// 构建批量插入 SQL 的公共函数（使用自定义列名列表，排除自增主键）
-pub fn build_batch_insert_sql_with_columns(
+fn build_batch_insert_sql_with_prefix(
+    db_type: DbType,
+    insert_prefix: &str,
     table_name: &str,
     columns: &[&str],
     models_count: usize,
 ) -> (String, usize) {
-    let columns_str = columns.join(", ");
+    let table_name = quote_qualified_identifier(db_type, table_name);
+    let columns_str = quote_column_list(db_type, columns);
     let col_count = columns.len();
 
-    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
+    let mut sql = format!("{insert_prefix} {table_name} ({columns_str}) VALUES ");
 
     for idx in 0..models_count {
         if idx > 0 {
             sql.push_str(", ");
         }
 
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        sql.push_str(&format!("({})", placeholders.join(", ")));
+        let start_idx = idx * col_count + 1;
+        sql.push_str(&format!(
+            "({})",
+            placeholder_list(db_type, start_idx, col_count)
+        ));
     }
 
     (sql, col_count)
 }
 
-/// 构建批量插入 SQL（MSSQL 使用 @P 占位符）
-pub fn build_batch_insert_sql_mssql_with_columns(
+/// 构建批量插入 SQL 的公共函数（使用自定义列名列表，排除自增主键）
+pub fn build_batch_insert_sql_with_columns(
+    db_type: DbType,
     table_name: &str,
     columns: &[&str],
     models_count: usize,
 ) -> (String, usize) {
-    let columns_str = columns.join(", ");
-    let col_count = columns.len();
+    build_batch_insert_sql_with_prefix(db_type, "INSERT INTO", table_name, columns, models_count)
+}
 
-    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
+#[derive(Debug, Clone, Copy)]
+pub enum BatchInsertValuesMode {
+    All,
+    WithoutAutoIncrement,
+}
 
-    for idx in 0..models_count {
+/// 构建批量 INSERT 主体并收集对应参数，冲突子句由各后端追加。
+pub fn build_batch_insert_statement<T: Model>(
+    db_type: DbType,
+    insert_prefix: &str,
+    table_name: &str,
+    columns: &[&str],
+    models: &[&T],
+    values_mode: BatchInsertValuesMode,
+) -> (String, Vec<Value>) {
+    let (sql, _) = build_batch_insert_sql_with_prefix(
+        db_type,
+        insert_prefix,
+        table_name,
+        columns,
+        models.len(),
+    );
+    let values = match values_mode {
+        BatchInsertValuesMode::All => collect_batch_insert_values(models),
+        BatchInsertValuesMode::WithoutAutoIncrement => {
+            collect_batch_insert_values_with_auto_increment(models)
+        }
+    };
+    (sql, values)
+}
+
+pub fn auto_increment_column<T: Model>() -> Option<&'static str> {
+    T::COLUMN_SCHEMA
+        .iter()
+        .find(|column| column.is_auto_increment)
+        .map(|column| column.name)
+}
+
+pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -> String {
+    let Some(_pk_col) = auto_increment_column::<T>() else {
+        return sql;
+    };
+
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => format!("{sql} RETURNING rowid"),
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => {
+            let pk_col = quote_column_list(DbType::PostgreSQL, &[_pk_col]);
+            format!("{sql} RETURNING {pk_col}")
+        }
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => sql,
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => {
+            format!(
+                "{} OUTPUT {}",
+                sql,
+                quote_column_with_prefix(DbType::MSSQL, "inserted", _pk_col)
+            )
+        }
+    }
+}
+
+pub fn build_insert_statement<T: Model>(db_type: DbType, models: &[&T]) -> (String, Vec<Value>) {
+    let columns = T::insert_columns();
+    build_batch_insert_statement::<T>(
+        db_type,
+        "INSERT INTO",
+        T::table_name_for_db(db_type),
+        &columns,
+        models,
+        BatchInsertValuesMode::WithoutAutoIncrement,
+    )
+}
+
+pub fn build_insert_statement_with_auto_increment_returning<T: Model>(
+    db_type: DbType,
+    models: &[&T],
+) -> (String, Vec<Value>) {
+    let (sql, values) = build_insert_statement::<T>(db_type, models);
+    (append_auto_increment_returning::<T>(db_type, sql), values)
+}
+
+#[cfg(feature = "mssql")]
+pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>) {
+    let columns = quote_column_list(DbType::MSSQL, T::COLUMNS);
+    let col_count = T::COLUMNS.len();
+    let mut sql = format!(
+        "MERGE INTO {} AS target USING (VALUES ",
+        quote_table_name::<T>(DbType::MSSQL)
+    );
+    let mut all_values = Vec::new();
+
+    for (idx, model) in models.iter().enumerate() {
         if idx > 0 {
             sql.push_str(", ");
         }
-
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-        sql.push_str(&format!("({})", placeholders.join(", ")));
+        let placeholders = placeholder_list(DbType::MSSQL, all_values.len() + 1, col_count);
+        sql.push_str(&format!("({placeholders})"));
+        all_values.extend(model.field_values());
     }
 
-    (sql, col_count)
+    sql.push_str(&format!(") AS source ({columns}) ON "));
+    for (i, pk) in T::primary_key_columns().iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str(&format!(
+            "{} = {}",
+            quote_column_with_prefix(DbType::MSSQL, "target", pk),
+            quote_column_with_prefix(DbType::MSSQL, "source", pk)
+        ));
+    }
+
+    (sql, all_values)
+}
+
+#[cfg(feature = "mssql")]
+pub fn append_mssql_merge_update_clause<T: Model>(sql: &mut String) {
+    sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+    let pks = T::primary_key_columns();
+    let mut first = true;
+    for col_name in T::COLUMNS.iter() {
+        if pks.contains(col_name) {
+            continue;
+        }
+        if !first {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_assignment(
+            DbType::MSSQL,
+            col_name,
+            &quote_column_with_prefix(DbType::MSSQL, "source", col_name),
+        ));
+        first = false;
+    }
+}
+
+#[cfg(feature = "mssql")]
+pub fn append_mssql_merge_insert_clause<T: Model>(sql: &mut String) {
+    let columns = quote_column_list(DbType::MSSQL, T::COLUMNS);
+    sql.push_str(&format!(
+        " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+    ));
+    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_column_with_prefix(DbType::MSSQL, "source", col_name));
+    }
+    sql.push_str(");");
+}
+
+/// 构建批量插入 SQL（MSSQL 使用 @P1, @P2 占位符）
+pub fn build_batch_insert_sql_mssql_with_columns(
+    db_type: DbType,
+    table_name: &str,
+    columns: &[&str],
+    models_count: usize,
+) -> (String, usize) {
+    build_batch_insert_sql_with_columns(db_type, table_name, columns, models_count)
 }
 
 /// 构建批量插入 SQL（PostgreSQL 使用 $1, $2 占位符）
+#[cfg(feature = "postgresql")]
 pub fn build_batch_insert_sql_postgresql<T: Model>(models_count: usize) -> (String, usize) {
-    let columns = T::COLUMNS.join(", ");
-    let col_count = T::COLUMNS.len();
-
-    let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
-    let mut param_idx = 1;
-
-    for idx in 0..models_count {
-        if idx > 0 {
-            sql.push_str(", ");
-        }
-
-        let placeholders: Vec<String> = (1..=col_count)
-            .map(|i| {
-                let idx = param_idx + i - 1;
-                format!("${}", idx)
-            })
-            .collect();
-        sql.push_str(&format!("({})", placeholders.join(", ")));
-        param_idx += col_count;
-    }
-
-    (sql, col_count)
+    build_batch_insert_sql_with_columns(
+        DbType::PostgreSQL,
+        T::table_name_for_db(DbType::PostgreSQL),
+        T::COLUMNS,
+        models_count,
+    )
 }
 
 /// 构建批量插入 SQL（PostgreSQL 使用 $1, $2 占位符，使用自定义列名列表）
 pub fn build_batch_insert_sql_postgresql_with_columns(
+    db_type: DbType,
     table_name: &str,
     columns: &[&str],
     models_count: usize,
 ) -> (String, usize) {
-    let columns_str = columns.join(", ");
-    let col_count = columns.len();
-
-    let mut sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ");
-    let mut param_idx = 1;
-
-    for idx in 0..models_count {
-        if idx > 0 {
-            sql.push_str(", ");
-        }
-
-        let placeholders: Vec<String> = (1..=col_count)
-            .map(|i| {
-                let idx = param_idx + i - 1;
-                format!("${}", idx)
-            })
-            .collect();
-        sql.push_str(&format!("({})", placeholders.join(", ")));
-        param_idx += col_count;
-    }
-
-    (sql, col_count)
+    build_batch_insert_sql_with_columns(db_type, table_name, columns, models_count)
 }
 
 /// 收集批量插入的所有模型值
@@ -722,6 +621,64 @@ pub fn parse_column_value_strict(
                 }
             }
             _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_insert_builder_uses_backend_placeholder_rules() {
+        let columns = &["id", "name", "age"];
+
+        #[cfg(feature = "sqlite")]
+        {
+            let (sql, col_count) =
+                build_batch_insert_sql_with_columns(DbType::Sqlite, "users", columns, 2);
+
+            assert_eq!(col_count, 3);
+            assert_eq!(
+                sql,
+                "INSERT INTO users (id, name, age) VALUES (?, ?, ?), (?, ?, ?)"
+            );
+        }
+
+        #[cfg(feature = "mysql")]
+        {
+            let (sql, col_count) =
+                build_batch_insert_sql_with_columns(DbType::MySQL, "users", columns, 2);
+
+            assert_eq!(col_count, 3);
+            assert_eq!(
+                sql,
+                "INSERT INTO users (id, name, age) VALUES (?, ?, ?), (?, ?, ?)"
+            );
+        }
+
+        #[cfg(feature = "postgresql")]
+        {
+            let (sql, col_count) =
+                build_batch_insert_sql_with_columns(DbType::PostgreSQL, "users", columns, 2);
+
+            assert_eq!(col_count, 3);
+            assert_eq!(
+                sql,
+                "INSERT INTO users (id, name, age) VALUES ($1, $2, $3), ($4, $5, $6)"
+            );
+        }
+
+        #[cfg(feature = "mssql")]
+        {
+            let (sql, col_count) =
+                build_batch_insert_sql_with_columns(DbType::MSSQL, "users", columns, 2);
+
+            assert_eq!(col_count, 3);
+            assert_eq!(
+                sql,
+                "INSERT INTO users (id, name, age) VALUES (@P1, @P2, @P3), (@P4, @P5, @P6)"
+            );
         }
     }
 }

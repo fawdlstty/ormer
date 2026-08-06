@@ -83,6 +83,28 @@ async fn test_set_model_impl(
     assert_eq!(users1.len(), 1);
     assert_eq!(users1[0].name, "Bob");
 
+    // 字段白名单更新只修改指定列
+    let partial_user = SetModelUser {
+        id: 1,
+        name: "Carol".to_string(),
+        age: 99,
+        email: Some("carol@test.com".to_string()),
+    };
+    db.update::<SetModelUser>()
+        .set_model_fields(&partial_user, |p| (p.name, p.email))
+        .execute()
+        .await?;
+
+    let partial_users: Vec<SetModelUser> = db
+        .select::<SetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(partial_users.len(), 1);
+    assert_eq!(partial_users[0].name, "Carol");
+    assert_eq!(partial_users[0].age, 25);
+    assert_eq!(partial_users[0].email, Some("carol@test.com".to_string()));
+
     // 清理
     db.drop_table::<SetModelUser>().execute().await?;
 

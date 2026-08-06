@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, Expr, ExprLit, Lit, Meta};
+use syn::{DeriveInput, Lit, Meta};
 
 pub fn derive_model(input: DeriveInput) -> TokenStream {
     let name = &input.ident;
@@ -85,9 +85,21 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let primary_key_field_names: Vec<_> = primary_keys
         .iter()
         .map(|(field_name, _)| {
-            quote! { stringify!(#field_name) }
+            let field = normal_fields
+                .iter()
+                .find(|f| f.ident.as_ref().unwrap() == field_name)
+                .expect("Primary key field not found");
+            let column_name = extract_column_name(field);
+            quote! { #column_name }
         })
         .collect();
+    let primary_key_column_name = {
+        let field = normal_fields
+            .iter()
+            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
+            .expect("Primary key field not found");
+        extract_column_name(field)
+    };
 
     // 生成主键值获取（支持复合主键）
     let primary_key_values: Vec<_> = primary_keys
@@ -112,7 +124,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成字段名列表
     let field_names: Vec<String> = normal_fields
         .iter()
-        .map(|f| f.ident.as_ref().unwrap().to_string())
+        .map(|f| extract_column_name(f))
         .collect();
 
     let field_names_lit = field_names.iter().map(|name| {
@@ -122,6 +134,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成字段元数据 (COLUMN_SCHEMA)
     let column_schema_entries = normal_fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
+        let rust_field_name = field_name.to_string();
+        let column_name = extract_column_name(f);
         let field_type = &f.ty;
         let type_str = normalize_type_string(quote! { #field_type }.to_string());
 
@@ -147,10 +161,23 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         };
 
         // 检查 unique 属性
-        let unique_group = extract_unique_group(f);
+        let unique_attr = extract_unique_attr(f);
+        let unique_group = option_i32_tokens(unique_attr.group);
+        let unique_name = option_string_tokens(unique_attr.name.as_deref());
 
         // 检查 index 属性
-        let is_indexed = f.attrs.iter().any(|attr| attr.path().is_ident("index"));
+        let index_attr = extract_index_attr(f);
+        let is_indexed = index_attr.is_some();
+        let index_group = option_i32_tokens(index_attr.as_ref().and_then(|attr| attr.group));
+        let index_name =
+            option_string_tokens(index_attr.as_ref().and_then(|attr| attr.name.as_deref()));
+        let index_order =
+            option_string_tokens(index_attr.as_ref().and_then(|attr| attr.order.as_deref()));
+        let index_where = option_string_tokens(
+            index_attr
+                .as_ref()
+                .and_then(|attr| attr.where_clause.as_deref()),
+        );
 
         // 检查 foreign 属性
         let foreign_key = extract_foreign_key(f);
@@ -158,6 +185,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         // 检查 data_type 属性
         let data_type = extract_data_type(f);
         let has_data_type = has_data_type(f);
+
+        // 检查 default/check 属性
+        let default = extract_default(f);
+        let check = extract_check(f);
 
         // 检查 hypertable 属性
         let hypertable = extract_hypertable(f);
@@ -173,16 +204,24 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
         quote! {
             ::ormer::model::ColumnSchema {
-                name: stringify!(#field_name),
+                rust_name: #rust_field_name,
+                name: #column_name,
                 rust_type: #rust_type,
                 is_primary: #is_primary,
                 is_auto_increment: #field_is_auto_increment,
                 is_nullable: #is_nullable,
                 unique_group: #unique_group,
+                unique_name: #unique_name,
                 is_indexed: #is_indexed,
+                index_group: #index_group,
+                index_name: #index_name,
+                index_order: #index_order,
+                index_where: #index_where,
                 foreign_key: #foreign_key,
                 enum_variants: #enum_variants,
                 data_type: #data_type,
+                default: #default,
+                check: #check,
                 hypertable: #hypertable,
                 compress: #compress,
             }
@@ -197,16 +236,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 #field_name: #default_expr
             }
         } else if has_i32_data_type(f) {
+            let column_name = extract_column_name(f);
             field_from_i32_expr(
                 f,
-                quote! { row.get::<i32>(stringify!(#field_name))? },
-                quote! { row.get::<Option<i32>>(stringify!(#field_name))? },
+                quote! { row.get::<i32>(#column_name)? },
+                quote! { row.get::<Option<i32>>(#column_name)? },
             )
         } else if has_vec_i32_data_type(f) {
-            field_from_vec_i32_expr(f, quote! { row.get::<Vec<i32>>(stringify!(#field_name))? })
+            let column_name = extract_column_name(f);
+            field_from_vec_i32_expr(f, quote! { row.get::<Vec<i32>>(#column_name)? })
         } else {
+            let column_name = extract_column_name(f);
             quote! {
-                #field_name: row.get(stringify!(#field_name))?
+                #field_name: row.get(#column_name)?
             }
         }
     });
@@ -286,8 +328,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 #field_name: ::ormer::model::Relation::new(stringify!(#field_name))
             }
         } else {
+            let column_name = extract_column_name(f);
             quote! {
-                #field_name: ::ormer::query::builder::TypedColumn::new(stringify!(#field_name))
+                #field_name: ::ormer::query::builder::TypedColumn::new(#column_name)
             }
         }
     });
@@ -324,9 +367,17 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
     let column_value_arms = normal_fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
+        let rust_field_name = field_name.to_string();
+        let column_name = extract_column_name(f);
         let value_expr = field_to_value_expr(f);
-        quote! {
-            stringify!(#field_name) => Some(#value_expr)
+        if rust_field_name == column_name {
+            quote! {
+                #column_name => Some(#value_expr)
+            }
+        } else {
+            quote! {
+                #column_name | #rust_field_name => Some(#value_expr)
+            }
         }
     });
 
@@ -443,7 +494,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             // 保持向后兼容的旧方法（已废弃）
             fn primary_key_column() -> &'static str {
-                stringify!(#primary_key_field)
+                #primary_key_column_name
             }
 
             fn primary_key_value(&self) -> ::ormer::Value {
@@ -668,7 +719,7 @@ fn derive_model_tuple_wrapper(
 }
 
 fn extract_table_name(input: &DeriveInput) -> String {
-    // 查找 #[table = "name"] 属性
+    // 查找 #[table = "name"] 或 #[table(schema = "...", name = "...")] 属性
     for attr in &input.attrs {
         if attr.path().is_ident("table") {
             if let Meta::NameValue(meta) = &attr.meta {
@@ -678,11 +729,80 @@ fn extract_table_name(input: &DeriveInput) -> String {
                     }
                 }
             }
+            if matches!(&attr.meta, Meta::List(_)) {
+                let mut schema = None;
+                let mut name = None;
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("schema") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        schema = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("name") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        name = Some(lit.value());
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported #[table] argument"))
+                    }
+                })
+                .expect("Failed to parse #[table] attribute");
+
+                if let Some(name) = name {
+                    return if let Some(schema) = schema {
+                        format!("{schema}.{name}")
+                    } else {
+                        name
+                    };
+                }
+            }
         }
     }
 
     // 默认使用结构体名的蛇形形式
     to_snake_case(&input.ident.to_string())
+}
+
+fn extract_column_name(field: &syn::Field) -> String {
+    let default_name = field.ident.as_ref().unwrap().to_string();
+
+    for attr in &field.attrs {
+        if attr.path().is_ident("column") {
+            if let Meta::NameValue(meta) = &attr.meta {
+                if let syn::Expr::Lit(expr) = &meta.value
+                    && let Lit::Str(lit) = &expr.lit
+                {
+                    return lit.value();
+                }
+            }
+
+            if let Meta::List(list) = &attr.meta {
+                if let Ok(lit) = syn::parse2::<syn::LitStr>(list.tokens.clone()) {
+                    return lit.value();
+                }
+
+                let mut name = None;
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("name") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        name = Some(lit.value());
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported #[column] argument"))
+                    }
+                })
+                .expect("Failed to parse #[column] attribute");
+
+                if let Some(name) = name {
+                    return name;
+                }
+            }
+        }
+    }
+
+    default_name
 }
 
 fn to_snake_case(s: &str) -> String {
@@ -700,34 +820,105 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
-/// 提取 unique 属性的 group 值
-fn extract_unique_group(field: &syn::Field) -> proc_macro2::TokenStream {
+#[derive(Default)]
+struct UniqueAttr {
+    group: Option<i32>,
+    name: Option<String>,
+}
+
+/// 提取 unique 属性。
+fn extract_unique_attr(field: &syn::Field) -> UniqueAttr {
     for attr in &field.attrs {
         if attr.path().is_ident("unique") {
-            // 检查是否有 group 参数
+            let mut unique = UniqueAttr {
+                group: Some(0),
+                name: None,
+            };
             if let Meta::List(list) = &attr.meta {
-                // 解析 tokens 查找 group = N
-                let tokens_str = list.tokens.to_string();
-                if tokens_str.contains("group") {
-                    // 尝试提取 group 值
-                    if let Ok(Meta::NameValue(meta)) = syn::parse2(list.tokens.clone()) {
-                        if let Expr::Lit(ExprLit {
-                            lit: Lit::Int(lit_int),
-                            ..
-                        }) = &meta.value
-                        {
-                            let group_value: i32 = lit_int.base10_parse().unwrap_or(0);
-                            return quote! { Some(#group_value) };
-                        }
+                let _ = list;
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("group") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        unique.group = Some(lit.base10_parse::<i32>()?);
+                        Ok(())
+                    } else if meta.path.is_ident("name") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        unique.name = Some(lit.value());
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported #[unique] argument"))
                     }
-                }
+                })
+                .expect("Failed to parse #[unique] attribute");
             }
-            // 没有 group 参数，使用 0 作为默认组
-            return quote! { Some(0) };
+            return unique;
         }
     }
-    // 没有 unique 属性
-    quote! { None }
+    UniqueAttr::default()
+}
+
+#[derive(Default)]
+struct IndexAttr {
+    group: Option<i32>,
+    name: Option<String>,
+    order: Option<String>,
+    where_clause: Option<String>,
+}
+
+fn extract_index_attr(field: &syn::Field) -> Option<IndexAttr> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("index") {
+            let mut index = IndexAttr::default();
+            if let Meta::List(_) = &attr.meta {
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("group") {
+                        let value = meta.value()?;
+                        let lit: syn::LitInt = value.parse()?;
+                        index.group = Some(lit.base10_parse::<i32>()?);
+                        Ok(())
+                    } else if meta.path.is_ident("name") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.name = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("order") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.order = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("where") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.where_clause = Some(lit.value());
+                        Ok(())
+                    } else {
+                        Err(meta.error("unsupported #[index] argument"))
+                    }
+                })
+                .expect("Failed to parse #[index] attribute");
+            }
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn option_i32_tokens(value: Option<i32>) -> proc_macro2::TokenStream {
+    if let Some(value) = value {
+        quote! { Some(#value) }
+    } else {
+        quote! { None }
+    }
+}
+
+fn option_string_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
+    if let Some(value) = value {
+        quote! { Some(#value) }
+    } else {
+        quote! { None }
+    }
 }
 
 /// 提取 data_type 属性的类型覆盖信息。
@@ -1026,52 +1217,212 @@ fn extract_hypertable(field: &syn::Field) -> proc_macro2::TokenStream {
 /// 支持两种语法：
 /// - #[foreign(Type)] - 新语法，自动关联到目标 model 的主键
 /// - #[foreign(Type.field)] - 旧语法，显式指定字段
+fn extract_default(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("default") {
+            continue;
+        }
+
+        let Meta::List(list) = &attr.meta else {
+            panic!("#[default] must use #[default(...)]");
+        };
+
+        let mut expression = None;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("expr") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                expression = Some(lit.value());
+                Ok(())
+            } else {
+                Err(meta.error("unsupported #[default] argument"))
+            }
+        });
+
+        if let Some(expression) = expression {
+            return quote! {
+                Some(::ormer::model::ColumnDefault::Expression(#expression))
+            };
+        }
+
+        match syn::parse2::<Lit>(list.tokens.clone()) {
+            Ok(Lit::Str(value)) => {
+                let value = value.value();
+                return quote! {
+                    Some(::ormer::model::ColumnDefault::String(#value))
+                };
+            }
+            Ok(Lit::Int(value)) => {
+                let value = value.to_string();
+                return quote! {
+                    Some(::ormer::model::ColumnDefault::Number(#value))
+                };
+            }
+            Ok(Lit::Float(value)) => {
+                let value = value.to_string();
+                return quote! {
+                    Some(::ormer::model::ColumnDefault::Number(#value))
+                };
+            }
+            Ok(Lit::Bool(value)) => {
+                return quote! {
+                    Some(::ormer::model::ColumnDefault::Boolean(#value))
+                };
+            }
+            _ => panic!("#[default] supports string, number, bool, or expr = \"...\""),
+        }
+    }
+    quote! { None }
+}
+
+fn extract_check(field: &syn::Field) -> proc_macro2::TokenStream {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("check") {
+            continue;
+        }
+
+        if !matches!(&attr.meta, Meta::List(_)) {
+            panic!("#[check] must use #[check(expr = \"...\")]");
+        }
+
+        let mut expr = None;
+        let mut name = None;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("expr") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                expr = Some(lit.value());
+                Ok(())
+            } else if meta.path.is_ident("name") {
+                let value = meta.value()?;
+                let lit: syn::LitStr = value.parse()?;
+                name = Some(lit.value());
+                Ok(())
+            } else {
+                Err(meta.error("unsupported #[check] argument"))
+            }
+        })
+        .expect("Failed to parse #[check] attribute");
+
+        let expr = expr.expect("#[check] requires expr = \"...\"");
+        let name = option_string_tokens(name.as_deref());
+        return quote! {
+            Some(::ormer::model::CheckConstraint {
+                name: #name,
+                expr: #expr,
+            })
+        };
+    }
+    quote! { None }
+}
+
+fn normalize_type_path(value: &str) -> String {
+    value.split_whitespace().collect::<String>()
+}
+
+fn foreign_action_tokens(value: &str) -> proc_macro2::TokenStream {
+    let normalized = value
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('_', "");
+    match normalized.as_str() {
+        "noaction" => quote! { ::ormer::model::ForeignKeyAction::NoAction },
+        "restrict" => quote! { ::ormer::model::ForeignKeyAction::Restrict },
+        "cascade" => quote! { ::ormer::model::ForeignKeyAction::Cascade },
+        "setnull" => quote! { ::ormer::model::ForeignKeyAction::SetNull },
+        "setdefault" => quote! { ::ormer::model::ForeignKeyAction::SetDefault },
+        _ => panic!("unsupported foreign-key action: {value}"),
+    }
+}
+
 fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
     for attr in &field.attrs {
         if attr.path().is_ident("foreign") {
             if let Meta::List(list) = &attr.meta {
-                let tokens_str = list.tokens.to_string();
-
-                // 尝试解析为 Type.field 格式（旧语法）
-                let parts: Vec<&str> = tokens_str.split('.').collect();
-                if parts.len() == 2 {
-                    let ref_type = parts[0].trim();
-                    let ref_field = parts[1].trim();
-                    let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
-
-                    // 使用目标模型的实际表名，而不是简单转换
-                    return quote! {
-                        Some(::ormer::model::ForeignKeyInfo {
-                            ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
-                            ref_column: #ref_field,
-                            ref_column_fn: None,
-                        })
+                let tokens = list.tokens.to_string();
+                let parts: Vec<&str> = tokens.split(',').collect();
+                let target = parts
+                    .first()
+                    .map(|part| part.trim())
+                    .filter(|part| !part.is_empty())
+                    .expect("#[foreign] requires a target model");
+                let target = normalize_type_path(target);
+                let (ref_type, ref_field) =
+                    if let Some((ref_type, ref_field)) = target.split_once('.') {
+                        (ref_type.to_string(), Some(ref_field.to_string()))
+                    } else {
+                        (target, None)
                     };
-                } else if parts.len() == 1 {
-                    // 新语法：只传递类型，自动关联到目标 model 的主键
-                    let ref_type = parts[0].trim();
-                    let ref_type_ident = syn::Ident::new(ref_type, proc_macro2::Span::call_site());
+                let ref_type: syn::Type =
+                    syn::parse_str(&ref_type).expect("#[foreign] target model is invalid");
 
-                    // 使用函数指针在运行时获取目标模型的主键字段名（避免在常量上下文中调用非 const 函数）
-                    // 创建一个辅助函数来返回主键列名
-                    let pk_fn_name = syn::Ident::new(
-                        &format!("__{}_primary_key_column", ref_type),
-                        proc_macro2::Span::call_site(),
-                    );
+                let mut constraint_name = None;
+                let mut on_delete = None;
+                let mut on_update = None;
+                for part in parts.into_iter().skip(1) {
+                    let Some((key, value)) = part.split_once('=') else {
+                        panic!("#[foreign] options must use key = value");
+                    };
+                    match key.trim() {
+                        "name" => {
+                            constraint_name = Some(value.trim().trim_matches('"').to_string());
+                        }
+                        "on_delete" => on_delete = Some(foreign_action_tokens(value)),
+                        "on_update" => on_update = Some(foreign_action_tokens(value)),
+                        other => panic!("unsupported #[foreign] option: {other}"),
+                    }
+                }
 
+                let constraint_name = option_string_tokens(constraint_name.as_deref());
+                let on_delete = on_delete
+                    .map(|action| quote! { Some(#action) })
+                    .unwrap_or_else(|| quote! { None });
+                let on_update = on_update
+                    .map(|action| quote! { Some(#action) })
+                    .unwrap_or_else(|| quote! { None });
+                let field_name = field.ident.as_ref().unwrap().to_string();
+                let ref_type_name = normalize_type_path(&quote! { #ref_type }.to_string())
+                    .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+                let ref_fn_name = syn::Ident::new(
+                    &format!("__ormer_fk_{field_name}_{ref_type_name}"),
+                    proc_macro2::Span::call_site(),
+                );
+
+                if let Some(ref_field) = ref_field {
                     return quote! {
                         {
-                            fn #pk_fn_name() -> &'static str {
-                                <#ref_type_ident as ::ormer::Model>::primary_key_columns()[0]
+                            fn #ref_fn_name() -> &'static str {
+                                <#ref_type as ::ormer::Model>::column_name_for_field(#ref_field)
+                                    .unwrap_or(#ref_field)
                             }
                             Some(::ormer::model::ForeignKeyInfo {
-                                ref_table: <#ref_type_ident as ::ormer::Model>::TABLE_NAME,
-                                ref_column: "",
-                                ref_column_fn: Some(#pk_fn_name),
+                                name: #constraint_name,
+                                ref_table: <#ref_type as ::ormer::Model>::TABLE_NAME,
+                                ref_column: #ref_field,
+                                ref_column_fn: Some(#ref_fn_name),
+                                on_delete: #on_delete,
+                                on_update: #on_update,
                             })
                         }
                     };
                 }
+
+                return quote! {
+                    {
+                        fn #ref_fn_name() -> &'static str {
+                            <#ref_type as ::ormer::Model>::primary_key_columns()[0]
+                        }
+                        Some(::ormer::model::ForeignKeyInfo {
+                            name: #constraint_name,
+                            ref_table: <#ref_type as ::ormer::Model>::TABLE_NAME,
+                            ref_column: "",
+                            ref_column_fn: Some(#ref_fn_name),
+                            on_delete: #on_delete,
+                            on_update: #on_update,
+                        })
+                    }
+                };
             }
         }
     }

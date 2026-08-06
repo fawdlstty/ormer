@@ -5,6 +5,15 @@ mod _test_common;
 // 定义测试模型（包含 email: Option<String> 字段）
 define_test_user!(TestUser, "test_like_users");
 
+fn assert_like_placeholder(sql: &str) {
+    assert!(
+        sql.contains("name LIKE ?")
+            || sql.contains("name LIKE $1")
+            || sql.contains("name LIKE @P1"),
+        "SQL: {sql}"
+    );
+}
+
 // ==================== SQL 生成测试 ====================
 
 async fn test_like_sql_impl(config: &_test_common::DbConfig) {
@@ -14,7 +23,7 @@ async fn test_like_sql_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name LIKE ?"));
+    assert_like_placeholder(&sql);
     assert!(sql.contains("WHERE"));
 }
 
@@ -25,7 +34,7 @@ async fn test_contains_sql_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name LIKE ?"));
+    assert_like_placeholder(&sql);
 }
 
 async fn test_starts_with_sql_impl(config: &_test_common::DbConfig) {
@@ -35,7 +44,7 @@ async fn test_starts_with_sql_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name LIKE ?"));
+    assert_like_placeholder(&sql);
 }
 
 async fn test_ends_with_sql_impl(config: &_test_common::DbConfig) {
@@ -45,7 +54,7 @@ async fn test_ends_with_sql_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name LIKE ?"));
+    assert_like_placeholder(&sql);
 }
 
 test_on_all_dbs!(test_like_sql_impl);

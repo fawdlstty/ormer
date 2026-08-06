@@ -127,6 +127,12 @@ db.update::<User>()
     .set_model(&updated_user)
     .execute()
     .await?;
+
+// 只更新模型中的指定字段，避免覆盖其他列
+db.update::<User>()
+    .set_model_fields(&updated_user, |u| (u.name, u.age))
+    .execute()
+    .await?;
 ```
 
 ## 删除 (Delete)

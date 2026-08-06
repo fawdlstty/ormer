@@ -5,6 +5,40 @@ mod _test_common;
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_direct!(TestUser, "test_in_stmt_users_1");
 
+fn assert_in_clause(sql: &str, column: &str, expected_count: usize) {
+    let needle = format!("{column} IN (");
+    let start = sql.find(&needle).unwrap_or_else(|| panic!("SQL: {sql}")) + needle.len();
+    let end = sql[start..]
+        .find(')')
+        .unwrap_or_else(|| panic!("SQL: {sql}"));
+    let placeholders: Vec<&str> = sql[start..start + end].split(',').map(str::trim).collect();
+
+    assert_eq!(placeholders.len(), expected_count, "SQL: {sql}");
+    assert!(placeholders.into_iter().all(is_placeholder), "SQL: {sql}");
+}
+
+fn assert_comparison_placeholder(sql: &str, expr: &str) {
+    let value = sql
+        .split_once(expr)
+        .unwrap_or_else(|| panic!("SQL: {sql}"))
+        .1
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    assert!(is_placeholder(value), "SQL: {sql}");
+}
+
+fn is_placeholder(value: &str) -> bool {
+    value == "?"
+        || value
+            .strip_prefix('$')
+            .is_some_and(|digits| digits.chars().all(|ch| ch.is_ascii_digit()))
+        || value
+            .strip_prefix("@P")
+            .is_some_and(|digits| digits.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 async fn test_in_statement_i32_impl(config: &_test_common::DbConfig) {
     let _config = config; // 仅用于获取数据库类型
     // 测试 &[i32] 类型
@@ -14,7 +48,7 @@ async fn test_in_statement_i32_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?, ?, ?)"));
+    assert_in_clause(&sql, "age", 5);
     assert!(sql.contains("WHERE"));
 }
 
@@ -30,7 +64,7 @@ async fn test_in_statement_i32_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?)"));
+    assert_in_clause(&sql, "age", 3);
 }
 
 async fn test_in_statement_string_impl(config: &_test_common::DbConfig) {
@@ -46,7 +80,7 @@ async fn test_in_statement_string_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?, ?)"));
+    assert_in_clause(&sql, "name", 3);
 }
 
 async fn test_in_statement_string_ref_impl(config: &_test_common::DbConfig) {
@@ -60,7 +94,7 @@ async fn test_in_statement_string_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 async fn test_in_statement_str_impl(config: &_test_common::DbConfig) {
@@ -72,7 +106,7 @@ async fn test_in_statement_str_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?, ?)"));
+    assert_in_clause(&sql, "name", 3);
 }
 
 async fn test_in_with_other_filters_impl(config: &_test_common::DbConfig) {
@@ -86,8 +120,8 @@ async fn test_in_with_other_filters_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age >= ?"));
-    assert!(sql.contains("age IN (?, ?, ?)"));
+    assert_comparison_placeholder(&sql, "age >=");
+    assert_in_clause(&sql, "age", 3);
     assert!(sql.contains("LIMIT 10"));
 }
 
@@ -114,7 +148,7 @@ async fn test_in_vec_i32_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?, ?, ?)"));
+    assert_in_clause(&sql, "age", 5);
 }
 
 async fn test_in_vec_i32_ref_impl(config: &_test_common::DbConfig) {
@@ -129,7 +163,7 @@ async fn test_in_vec_i32_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?)"));
+    assert_in_clause(&sql, "age", 3);
 }
 
 async fn test_in_vec_string_impl(config: &_test_common::DbConfig) {
@@ -141,7 +175,7 @@ async fn test_in_vec_string_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 async fn test_in_vec_string_ref_impl(config: &_test_common::DbConfig) {
@@ -155,7 +189,7 @@ async fn test_in_vec_string_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 async fn test_in_vec_str_impl(config: &_test_common::DbConfig) {
@@ -167,7 +201,7 @@ async fn test_in_vec_str_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?, ?)"));
+    assert_in_clause(&sql, "name", 3);
 }
 
 // ==================== 数组类型测试 ====================
@@ -181,7 +215,7 @@ async fn test_in_array_i32_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?, ?)"));
+    assert_in_clause(&sql, "age", 4);
 }
 
 async fn test_in_array_i32_ref_impl(config: &_test_common::DbConfig) {
@@ -196,7 +230,7 @@ async fn test_in_array_i32_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?)"));
+    assert_in_clause(&sql, "age", 3);
 }
 
 async fn test_in_array_string_impl(config: &_test_common::DbConfig) {
@@ -208,7 +242,7 @@ async fn test_in_array_string_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 async fn test_in_array_string_ref_impl(config: &_test_common::DbConfig) {
@@ -222,7 +256,7 @@ async fn test_in_array_string_ref_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 async fn test_in_array_str_impl(config: &_test_common::DbConfig) {
@@ -234,7 +268,7 @@ async fn test_in_array_str_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?, ?)"));
+    assert_in_clause(&sql, "name", 3);
 }
 
 // ==================== 直接字面量测试 ====================
@@ -250,7 +284,7 @@ async fn test_in_literal_array_i32_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("age IN (?, ?, ?, ?, ?)"));
+    assert_in_clause(&sql, "age", 5);
 }
 
 async fn test_in_literal_array_str_impl(config: &_test_common::DbConfig) {
@@ -264,7 +298,7 @@ async fn test_in_literal_array_str_impl(config: &_test_common::DbConfig) {
         .to_sql();
 
     println!("SQL: {}", sql);
-    assert!(sql.contains("name IN (?, ?)"));
+    assert_in_clause(&sql, "name", 2);
 }
 
 test_on_all_dbs!(test_in_statement_i32_impl);

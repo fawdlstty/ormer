@@ -10,7 +10,7 @@ use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
-use crate::query::filter::FilterExpr;
+use crate::query::filter::{FilterExpr, infer_filter_value_rust_type, infer_model_value_rust_type};
 use crate::raw_sql::IntoRawSql;
 use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
 use bytes::{BufMut, BytesMut};
@@ -22,38 +22,6 @@ use tokio_postgres::types::Type;
 
 type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 type UpdateSqlBatch = Vec<(String, Vec<Value>, Vec<&'static str>)>;
-
-/// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
-/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
-fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
-    let result = std::any::TypeId::of::<K>();
-    if result == std::any::TypeId::of::<()>() {
-        let val: () = ();
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i32>() {
-        let val: i32 = last_id as i32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i64>() {
-        let val: i64 = last_id;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u32>() {
-        let val: u32 = last_id as u32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u64>() {
-        let val: u64 = last_id as u64;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<usize>() {
-        let val: usize = last_id as usize;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<Option<i64>>() {
-        let val: Option<i64> = Some(last_id);
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else {
-        Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize and () are supported."
-        ))
-    }
-}
 
 // 导入宏
 // use crate::impl_backend_executor_methods_with_lifetime;
@@ -292,44 +260,6 @@ fn pg_model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
         .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
 }
 
-fn pg_infer_filter_value_rust_type(value: &crate::query::filter::Value) -> &'static str {
-    match value {
-        crate::query::filter::Value::Integer(_) => "i32",
-        crate::query::filter::Value::BigInt(_) => "i64",
-        crate::query::filter::Value::Duration(_) => "Duration",
-        crate::query::filter::Value::Text(_) => "String",
-        crate::query::filter::Value::Real(_) => "f64",
-        crate::query::filter::Value::Boolean(_) => "bool",
-        crate::query::filter::Value::Bytes(_) => "Vec<u8>",
-        crate::query::filter::Value::IntegerArray(_) => "Vec<i32>",
-        crate::query::filter::Value::BigIntArray(_) => "Vec<i64>",
-        crate::query::filter::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
-        crate::query::filter::Value::DateTime(_) => "NaiveDateTime",
-        crate::query::filter::Value::Json(_) => "String",
-        crate::query::filter::Value::Uuid(_) => "String",
-        crate::query::filter::Value::Null => "i32",
-    }
-}
-
-fn pg_infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
-    match value {
-        crate::model::Value::Integer(_) => "i32",
-        crate::model::Value::BigInt(_) => "i64",
-        crate::model::Value::Duration(_) => "Duration",
-        crate::model::Value::Text(_) => "String",
-        crate::model::Value::Real(_) => "f64",
-        crate::model::Value::Boolean(_) => "bool",
-        crate::model::Value::Bytes(_) => "Vec<u8>",
-        crate::model::Value::IntegerArray(_) => "Vec<i32>",
-        crate::model::Value::BigIntArray(_) => "Vec<i64>",
-        crate::model::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
-        crate::model::Value::DateTime(_) => "NaiveDateTime",
-        crate::model::Value::Json(_) => "String",
-        crate::model::Value::Uuid(_) => "String",
-        crate::model::Value::Null => "i32",
-    }
-}
-
 fn is_vec_i32_type(rust_type: &str) -> bool {
     matches!(
         rust_type,
@@ -421,9 +351,7 @@ fn pg_value_from_row_cell(
     if is_vec_string_type(rust_type) {
         let value: Option<Vec<String>> = pg_try_get(row, idx, "Vec<String>")?;
         return match value {
-            Some(value) => Ok(crate::model::Value::Text(
-                crate::model::stringify_string_vec(&value),
-            )),
+            Some(value) => Ok(crate::model::Value::TextArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
             None => Err(anyhow::anyhow!(format!(
                 "Failed to parse non-nullable column at index {} (expected Vec<String> type)",
@@ -610,7 +538,7 @@ fn pg_collect_filter_param_rust_types<T: Model>(
             value,
         } => {
             let rust_type = pg_model_column_rust_type::<T>(column)
-                .unwrap_or_else(|| pg_infer_filter_value_rust_type(value));
+                .unwrap_or_else(|| infer_filter_value_rust_type(value));
             rust_types.push(
                 if operator == "@>"
                     && is_vec_string_type(rust_type)
@@ -625,8 +553,7 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
             let rust_type = pg_model_column_rust_type::<T>(column);
             for value in values {
-                rust_types
-                    .push(rust_type.unwrap_or_else(|| pg_infer_filter_value_rust_type(value)));
+                rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(value)));
             }
         }
         FilterExpr::InSubquery {
@@ -635,7 +562,7 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         | FilterExpr::NotInSubquery {
             subquery_params, ..
         } => {
-            rust_types.extend(subquery_params.iter().map(pg_infer_model_value_rust_type));
+            rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
         }
         FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
             pg_collect_filter_param_rust_types::<T>(left, rust_types);
@@ -643,8 +570,8 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         }
         FilterExpr::Between { column, min, max } => {
             let rust_type = pg_model_column_rust_type::<T>(column);
-            rust_types.push(rust_type.unwrap_or_else(|| pg_infer_filter_value_rust_type(min)));
-            rust_types.push(rust_type.unwrap_or_else(|| pg_infer_filter_value_rust_type(max)));
+            rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(min)));
+            rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(max)));
         }
         FilterExpr::Exists {
             subquery_params, ..
@@ -652,7 +579,7 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         | FilterExpr::NotExists {
             subquery_params, ..
         } => {
-            rust_types.extend(subquery_params.iter().map(pg_infer_model_value_rust_type));
+            rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
         }
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
@@ -672,11 +599,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
         if enum_variants.is_some() {
             // 使用 rust_type 作为 ENUM 类型名（需要小蛇形命名）
             let enum_name = to_snake_case(rust_type);
-            return format!(
-                "{}{}",
-                enum_name,
-                if !is_nullable { " NOT NULL" } else { "" }
-            );
+            return common_helpers::sql_type_with_nullability(&enum_name, is_nullable);
         }
 
         // 基础类型映射
@@ -738,14 +661,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             }
         }
 
-        let mut sql_type = base_type.to_string();
-
-        // 非主键字段根据 is_nullable 决定是否添加 NOT NULL
-        if !is_nullable {
-            sql_type.push_str(" NOT NULL");
-        }
-
-        sql_type
+        common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
 }
 
@@ -859,7 +775,10 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::PostgreSQL,
-            format!("DROP TABLE IF EXISTS {} CASCADE", T::TABLE_NAME),
+            format!(
+                "DROP TABLE IF EXISTS {} CASCADE",
+                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
+            ),
             Vec::new(),
         ))
     }
@@ -898,18 +817,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = I::Model::insert_columns();
-        let (sql, _) =
-            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
-                I::Model::TABLE_NAME,
-                &columns,
-                refs.len(),
-            );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::PostgreSQL, &refs);
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
@@ -960,13 +870,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
-                let ormer_value = convert_postgres_value(&row, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = I::Model::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
+                convert_postgres_value(&row, i)
+            })?;
             results.push(model);
         }
 
@@ -1027,7 +933,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
                     ));
                 }
             };
-            convert_auto_increment_key::<Self::Output>(id)
+            common_helpers::convert_auto_increment_key::<Self::Output>(id)
         } else {
             self.db
                 .client
@@ -1056,29 +962,21 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
         let primary_key = I::Model::primary_key_columns()[0];
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", I::Model::TABLE_NAME);
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
+        let quoted_primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
+        sql.push_str(&format!(
+            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
+        ));
         let mut first = true;
         for col_name in I::Model::COLUMNS.iter() {
             if col_name == &primary_key {
@@ -1087,7 +985,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
+                DbType::PostgreSQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -1150,31 +1051,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         }
 
         let columns = I::Model::insert_columns();
-        let col_count = columns.len();
         let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            I::Model::TABLE_NAME,
-            columns.join(", ")
+        let primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+            &columns,
+            &refs,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.insert_values();
-            all_values.extend(values);
-        }
 
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
 
@@ -1605,17 +1492,8 @@ impl Database {
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
 
-        let columns = T::insert_columns();
-        let (sql, _) =
-            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
-                T::TABLE_NAME,
-                &columns,
-                models.len(),
-            );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<T>(DbType::PostgreSQL, models);
 
         // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
@@ -1662,7 +1540,7 @@ impl Database {
                     ));
                 }
             };
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
             self.client.execute(&sql, &param_refs).trace().await?;
@@ -1676,32 +1554,24 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_columns()[0];
+        let quoted_primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::PostgreSQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
         // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
+        sql.push_str(&format!(
+            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
+        ));
         let mut first = true;
         for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
@@ -1710,7 +1580,10 @@ impl Database {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
+                DbType::PostgreSQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -1736,33 +1609,19 @@ impl Database {
         }
 
         let columns = T::insert_columns();
-        let col_count = columns.len();
         let primary_key_columns = T::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
+        let primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
 
         // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            T::TABLE_NAME,
-            columns.join(", ")
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::PostgreSQL),
+            &columns,
+            models,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.insert_values();
-            all_values.extend(values);
-        }
 
         // 添加 ON CONFLICT DO NOTHING 子句
         sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
@@ -1868,11 +1727,10 @@ impl Database {
         let rows = self.client.query(sql, &param_refs).trace().await?;
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns().len() {
-                values.push(convert_postgres_value(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns().len(),
+                |i| convert_postgres_value(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -1999,18 +1857,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = I::Model::insert_columns();
-        let (sql, _) =
-            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
-                I::Model::TABLE_NAME,
-                &columns,
-                refs.len(),
-            );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::PostgreSQL, &refs);
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
@@ -2073,7 +1922,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
                     ));
                 }
             };
-            convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)
+            common_helpers::convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
+                id,
+            )
         } else {
             self.client
                 .execute(&statement.sql, &param_refs)
@@ -2101,27 +1952,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
         let columns = I::Model::insert_columns();
-        let col_count = columns.len();
         let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            I::Model::TABLE_NAME,
-            columns.join(", ")
+        let primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+            &columns,
+            &refs,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-            all_values.extend(model.insert_values());
-        }
         sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
         let mut first = true;
         for col_name in columns.iter() {
@@ -2131,7 +1972,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
+                DbType::PostgreSQL,
+                col_name,
+            ));
             first = false;
         }
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
@@ -2182,27 +2026,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
         let columns = I::Model::insert_columns();
-        let col_count = columns.len();
         let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key = primary_key_columns.join(", ");
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
-            I::Model::TABLE_NAME,
-            columns.join(", ")
+        let primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+            &columns,
+            &refs,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-            all_values.extend(model.insert_values());
-        }
         sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
 
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
@@ -2264,11 +2098,10 @@ impl<'a> Transaction<'a> {
         let rows = self.client.query(sql, &param_refs).trace().await?;
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns().len() {
-                values.push(convert_postgres_value(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns().len(),
+                |i| convert_postgres_value(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -2382,17 +2215,8 @@ impl<'a> Transaction<'a> {
         }
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = T::insert_columns();
-        let (sql, _) =
-            super::common::common_helpers::build_batch_insert_sql_postgresql_with_columns(
-                T::TABLE_NAME,
-                &columns,
-                models.len(),
-            );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<T>(DbType::PostgreSQL, models);
 
         // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
@@ -2439,7 +2263,7 @@ impl<'a> Transaction<'a> {
                     ));
                 }
             };
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
             self.client.execute(&sql, &param_refs).trace().await?;
@@ -2453,32 +2277,24 @@ impl<'a> Transaction<'a> {
             return Ok(());
         }
 
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
         let primary_key = T::primary_key_columns()[0];
+        let quoted_primary_key =
+            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
-        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        let mut param_idx = 1;
-
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count)
-                .map(|i| format!("${}", param_idx + i - 1))
-                .collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            param_idx += col_count;
-
-            let values = model.field_values();
-            all_values.extend(values);
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::PostgreSQL),
+            T::COLUMNS,
+            models,
+            common_helpers::BatchInsertValuesMode::All,
+        );
 
         // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO UPDATE SET "));
+        sql.push_str(&format!(
+            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
+        ));
         let mut first = true;
         for col_name in T::COLUMNS.iter() {
             if col_name == &primary_key {
@@ -2487,7 +2303,10 @@ impl<'a> Transaction<'a> {
             if !first {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
+            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
+                DbType::PostgreSQL,
+                col_name,
+            ));
             first = false;
         }
 
@@ -2611,15 +2430,10 @@ impl<
 
             let mut results = Vec::new();
             for row in rows {
-                // 将行数据转换为Vec<Value>
-                let mut values = Vec::new();
-                for i in 0..row.columns().len() {
-                    let value = convert_postgres_value(&row, i)?;
-                    values.push(value);
-                }
-
-                // 使用FromRowValues转换为V
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(
+                    row.columns().len(),
+                    |i| convert_postgres_value(&row, i),
+                )?;
                 results.push(v);
             }
 
@@ -2960,6 +2774,9 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     crate::model::Value::Text(t) => {
                         Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::TextArray(v) => {
+                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
@@ -3115,14 +2932,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mut results = Vec::new();
 
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                pg_model_value_from_row::<T>(&row, i, i)
+            })?;
             results.push(model);
         }
 
@@ -3187,13 +2999,9 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = convert_postgres_value(&row, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                convert_postgres_value(&row, i)
+            })?;
             results.push(model);
         }
 
@@ -3207,7 +3015,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut sql = format!(
+            "DELETE FROM {}",
+            common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
+        );
         let mut params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -3339,6 +3150,30 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
+    pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
+        let model_sets = model
+            .non_pk_field_values_for_columns(fields)
+            .into_iter()
+            .map(|(col_name, value)| (col_name.to_string(), value))
+            .collect::<Vec<_>>();
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let model_filters = pk_columns
+            .iter()
+            .zip(pk_values)
+            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: crate::abstract_layer::common::common_helpers::value_to_filter_value(&val),
+            })
+            .collect();
+
+        if !model_sets.is_empty() {
+            self.model_updates.push((model_sets, model_filters));
+        }
+        self
+    }
+
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         let mut sql_statements = Vec::with_capacity(statements.len());
@@ -3371,13 +3206,9 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 .trace()
                 .await?;
             for row in rows {
-                let mut data = HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = convert_postgres_value(&row, i)?;
-                    data.insert(col_name.to_string(), ormer_value);
-                }
-                let ormer_row = Row::new(data);
-                let model = T::from_row(&ormer_row)?;
+                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    convert_postgres_value(&row, i)
+                })?;
                 results.push(model);
             }
         }
@@ -3389,7 +3220,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
+            );
             let mut params = Vec::new();
             let mut rust_types = Vec::new();
             let mut first = true;
@@ -3397,11 +3231,15 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{col_name} = ${}", params.len() + 1));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::PostgreSQL,
+                    col_name,
+                    &common_helpers::placeholder(DbType::PostgreSQL, params.len() + 1),
+                ));
                 params.push(value.clone());
                 rust_types.push(
                     pg_model_column_rust_type::<T>(col_name)
-                        .unwrap_or_else(|| pg_infer_model_value_rust_type(value)),
+                        .unwrap_or_else(|| infer_model_value_rust_type(value)),
                 );
                 first = false;
             }
@@ -3429,7 +3267,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Model UPDATE statements
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
+            );
             let mut params = Vec::new();
             let mut rust_types = Vec::new();
             let mut first = true;
@@ -3437,11 +3278,15 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{col_name} = ${}", params.len() + 1));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::PostgreSQL,
+                    col_name,
+                    &common_helpers::placeholder(DbType::PostgreSQL, params.len() + 1),
+                ));
                 params.push(value.clone());
                 rust_types.push(
                     pg_model_column_rust_type::<T>(col_name)
-                        .unwrap_or_else(|| pg_infer_model_value_rust_type(value)),
+                        .unwrap_or_else(|| infer_model_value_rust_type(value)),
                 );
                 first = false;
             }
@@ -3551,6 +3396,14 @@ fn values_to_params_with_types(
                 } else {
                     Box::new(PgTextParam::from(v.clone()))
                         as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                }
+            }
+            crate::model::Value::TextArray(v) => {
+                if is_vec_string_type(rust_type) {
+                    Box::new(crate::model::normalize_string_vec(v.clone()))
+                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                } else {
+                    Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                 }
             }
             crate::model::Value::Real(v) => {
@@ -3681,6 +3534,9 @@ fn values_to_params(
                 Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Text(v) => {
+                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            }
+            crate::model::Value::TextArray(v) => {
                 Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
             }
             crate::model::Value::Real(v) => {
@@ -3857,13 +3713,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                pg_model_value_from_row::<T>(&row, i, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -3926,13 +3778,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                pg_model_value_from_row::<T>(&row, i, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -3995,13 +3843,9 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = pg_model_value_from_row::<T>(&row, i, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                pg_model_value_from_row::<T>(&row, i, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -4379,7 +4223,7 @@ fn convert_postgres_value(
 
     if let Ok(v) = row.try_get::<_, Option<Vec<String>>>(index) {
         return Ok(match v {
-            Some(val) => crate::model::Value::Text(crate::model::stringify_string_vec(&val)),
+            Some(val) => crate::model::Value::TextArray(val),
             None => crate::model::Value::Null,
         });
     }
@@ -4574,6 +4418,9 @@ impl<
                     crate::model::Value::Text(t) => {
                         Box::new(t) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::TextArray(v) => {
+                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
@@ -4633,13 +4480,9 @@ impl<
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();
             for row in rows {
-                let mut values = Vec::with_capacity(column_count);
-                for i in 0..column_count {
-                    let value = convert_postgres_value(&row, i)?;
-                    values.push(value);
-                }
-
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
+                    convert_postgres_value(&row, i)
+                })?;
                 results.push(v);
             }
 

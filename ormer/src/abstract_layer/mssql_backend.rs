@@ -1,4 +1,5 @@
 use crate::abstract_layer::DbType;
+use crate::abstract_layer::common::common_helpers;
 use crate::abstract_layer::common::{SqlExecutor, SqlStatement};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
@@ -19,38 +20,7 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 type CollectMarker<'a, C> = PhantomData<(fn() -> C, &'a ())>;
-
-/// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
-/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
-fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
-    let result = std::any::TypeId::of::<K>();
-    if result == std::any::TypeId::of::<()>() {
-        let val: () = ();
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i32>() {
-        let val: i32 = last_id as i32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i64>() {
-        let val: i64 = last_id;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u32>() {
-        let val: u32 = last_id as u32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u64>() {
-        let val: u64 = last_id as u64;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<usize>() {
-        let val: usize = last_id as usize;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<Option<i64>>() {
-        let val: Option<i64> = Some(last_id);
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else {
-        Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
-        ))
-    }
-}
+type MssqlBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// MSSQL 类型映射器
 pub struct MSSQLTypeMapper;
@@ -64,11 +34,7 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
         enum_variants: Option<&[&str]>,
     ) -> String {
         if enum_variants.is_some() {
-            let mut sql_type = "VARCHAR(255)".to_string();
-            if !is_nullable {
-                sql_type.push_str(" NOT NULL");
-            }
-            return sql_type;
+            return common_helpers::sql_type_with_nullability("VARCHAR(255)", is_nullable);
         }
 
         if is_primary {
@@ -109,11 +75,7 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             _ => "NVARCHAR(255)",
         };
 
-        let mut sql_type = base_type.to_string();
-        if !is_nullable {
-            sql_type.push_str(" NOT NULL");
-        }
-        sql_type
+        common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
 }
 
@@ -208,6 +170,7 @@ impl Database {
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let columns = T::insert_columns();
         let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
+            DbType::MSSQL,
             T::TABLE_NAME,
             &columns,
             models.len(),
@@ -227,7 +190,11 @@ impl Database {
                 .map(|c| c.name)
                 .unwrap_or("id");
             // 使用 OUTPUT 子句获取插入的ID
-            let sql_with_output = format!("{} OUTPUT inserted.{}", sql, pk_col);
+            let sql_with_output = format!(
+                "{} OUTPUT {}",
+                sql,
+                common_helpers::quote_column_with_prefix(DbType::MSSQL, "inserted", pk_col)
+            );
             let mut query = Query::new(&sql_with_output);
             for param in &all_values {
                 bind_value(&mut query, param);
@@ -235,7 +202,7 @@ impl Database {
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
             let mut query = Query::new(&sql);
@@ -251,54 +218,9 @@ impl Database {
         if models.is_empty() {
             return Ok(());
         }
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-        let pks = T::primary_key_columns();
-
-        // 构建 MERGE SQL（MSSQL 的 INSERT OR UPDATE 语法）
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON ",));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
-        let mut first = true;
-        for col_name in T::COLUMNS.iter() {
-            if pks.contains(col_name) {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{} = source.{}", col_name, col_name));
-            first = false;
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in T::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
+        common_helpers::append_mssql_merge_update_clause::<T>(&mut sql);
+        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
 
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
@@ -313,41 +235,8 @@ impl Database {
         if models.is_empty() {
             return Ok(0);
         }
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-        let pks = T::primary_key_columns();
-
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        // 只插入不匹配的记录，不更新已存在的记录
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in T::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
+        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
 
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
@@ -610,11 +499,10 @@ impl Database {
         let rows = stream.into_first_result().trace().await?;
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns().len() {
-                values.push(extract_value_from_row(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns().len(),
+                |i| extract_value_from_row(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -775,7 +663,10 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::MSSQL,
-            format!("DROP TABLE IF EXISTS {}", T::TABLE_NAME),
+            format!(
+                "DROP TABLE IF EXISTS {}",
+                common_helpers::quote_table_name::<T>(DbType::MSSQL)
+            ),
             Vec::new(),
         ))
     }
@@ -818,27 +709,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
 
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
-            I::Model::TABLE_NAME,
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
-        let sql = if has_auto_increment {
-            let pk_col = I::Model::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            format!("{} OUTPUT inserted.{}", sql, pk_col)
-        } else {
-            sql
-        };
+        let (sql, all_values) =
+            common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                DbType::MSSQL,
+                &refs,
+            );
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -860,17 +735,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let has_auto_increment = common_helpers::auto_increment_column::<T>().is_some();
+        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MSSQL, models);
 
         let mut client = self.pool.lock().await;
 
@@ -882,7 +748,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 .map(|c| c.name)
                 .unwrap_or("id");
             // 使用 OUTPUT 子句获取插入的ID
-            let sql_with_output = format!("{} OUTPUT inserted.{}", sql, pk_col);
+            let sql_with_output = format!(
+                "{} OUTPUT {}",
+                sql,
+                common_helpers::quote_column_with_prefix(DbType::MSSQL, "inserted", pk_col)
+            );
             let mut query = Query::new(&sql_with_output);
             for param in &all_values {
                 bind_value(&mut query, param);
@@ -890,7 +760,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
+            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
             let mut query = Query::new(&sql);
@@ -930,7 +800,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            convert_auto_increment_key::<Self::Output>(id)
+            common_helpers::convert_auto_increment_key::<Self::Output>(id)
         } else {
             query.execute(&mut *client).trace().await?;
             Ok(<I::Model as Model>::AutoIncrementKeyType::default())
@@ -954,56 +824,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let pks = I::Model::primary_key_columns();
-
-        let mut sql = format!(
-            "MERGE INTO {} AS target USING (VALUES ",
-            I::Model::TABLE_NAME
-        );
-        let mut all_values = Vec::new();
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
-        let mut first = true;
-        for col_name in I::Model::COLUMNS.iter() {
-            if pks.contains(col_name) {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{} = source.{}", col_name, col_name));
-            first = false;
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
+        common_helpers::append_mssql_merge_update_clause::<I::Model>(&mut sql);
+        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1017,53 +840,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         if models.is_empty() {
             return Ok(0);
         }
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-        let pks = T::primary_key_columns();
-
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
-        let mut first = true;
-        for col_name in T::COLUMNS.iter() {
-            if pks.contains(col_name) {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{} = source.{}", col_name, col_name));
-            first = false;
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in T::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
+        common_helpers::append_mssql_merge_update_clause::<T>(&mut sql);
+        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
 
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
@@ -1113,43 +892,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let pks = I::Model::primary_key_columns();
-
-        let mut sql = format!(
-            "MERGE INTO {} AS target USING (VALUES ",
-            I::Model::TABLE_NAME
-        );
-        let mut all_values = Vec::new();
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
+        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1162,42 +906,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         if models.is_empty() {
             return Ok(0);
         }
-        let columns = T::COLUMNS.join(", ");
-        let col_count = T::COLUMNS.len();
-        let pks = T::primary_key_columns();
-
-        // MSSQL: 使用 MERGE + WHEN NOT MATCHED BY SOURCE 来模拟 INSERT OR IGNORE
-        let mut sql = format!("MERGE INTO {} AS target USING (VALUES ", T::TABLE_NAME);
-        let mut all_values = Vec::new();
-        for (idx, model) in models.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        // 只插入不匹配的记录，不更新已存在的记录
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in T::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
+        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
 
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
@@ -1344,11 +1054,10 @@ impl<'a> Transaction<'a> {
         let rows = stream.into_first_result().trace().await?;
         let mut results = Vec::new();
         for row in rows {
-            let mut values = Vec::new();
-            for i in 0..row.columns().len() {
-                values.push(extract_value_from_row(&row, i)?);
-            }
-            results.push(V::from_row_values(&values)?);
+            results.push(common_helpers::decode_row_values_from_indexed_values(
+                row.columns().len(),
+                |i| extract_value_from_row(&row, i),
+            )?);
         }
         Ok(results.into_iter().collect())
     }
@@ -1449,27 +1158,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
 
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
-            I::Model::TABLE_NAME,
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
-        let sql = if has_auto_increment {
-            let pk_col = I::Model::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            format!("{} OUTPUT inserted.{}", sql, pk_col)
-        } else {
-            sql
-        };
+        let (sql, all_values) =
+            common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                DbType::MSSQL,
+                &refs,
+            );
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1508,7 +1201,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(id)
+            common_helpers::convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
+                id,
+            )
         } else {
             query.execute(&mut *client).trace().await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
@@ -1532,56 +1227,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let pks = I::Model::primary_key_columns();
-
-        let mut sql = format!(
-            "MERGE INTO {} AS target USING (VALUES ",
-            I::Model::TABLE_NAME
-        );
-        let mut all_values = Vec::new();
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
-        let mut first = true;
-        for col_name in I::Model::COLUMNS.iter() {
-            if pks.contains(col_name) {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("{} = source.{}", col_name, col_name));
-            first = false;
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
+        common_helpers::append_mssql_merge_update_clause::<I::Model>(&mut sql);
+        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1631,43 +1279,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let pks = I::Model::primary_key_columns();
-
-        let mut sql = format!(
-            "MERGE INTO {} AS target USING (VALUES ",
-            I::Model::TABLE_NAME
-        );
-        let mut all_values = Vec::new();
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "@P".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            let values = model.field_values();
-            all_values.extend(values);
-        }
-
-        sql.push_str(&format!(") AS source ({columns}) ON "));
-        for (i, pk) in pks.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" AND ");
-            }
-            sql.push_str(&format!("target.{} = source.{}", pk, pk));
-        }
-
-        sql.push_str(&format!(
-            " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
-        ));
-        for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(&format!("source.{}", col_name));
-        }
-        sql.push_str(");");
+        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
+        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1710,23 +1323,9 @@ pub struct CollectFuture<'a, T: Model, C: FromIterator<T>> {
     _marker: CollectMarker<'a, C>,
 }
 
-impl<'a, T: Model + 'static, C: FromIterator<T> + 'static> CollectFuture<'a, T, C> {
-    pub async fn into_future(self) -> anyhow::Result<C> {
-        // TODO: 实现实际的查询执行
-        Ok(Vec::new().into_iter().collect())
-    }
-}
-
 /// 单条记录查询 Future
 pub struct FirstFuture<'a, T: Model> {
     executor: SelectExecutor<'a, T>,
-}
-
-impl<'a, T: Model + 'static> FirstFuture<'a, T> {
-    pub async fn into_future(self) -> anyhow::Result<Option<T>> {
-        let results: Vec<T> = self.executor.collect::<Vec<T>>().into_future().await?;
-        Ok(results.into_iter().next())
-    }
 }
 
 /// 聚合 Future
@@ -1758,13 +1357,6 @@ pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
 pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
     executor: RelatedSelectExecutor<'a, T, R>,
     _marker: PhantomData<&'a ()>,
-}
-
-impl<'a, T: Model + 'static, R: Model + 'static> RelatedCollectFuture<'a, T, R> {
-    pub async fn into_future(self) -> anyhow::Result<Vec<T>> {
-        // TODO: 实现实际的关联查询执行
-        Ok(Vec::new())
-    }
 }
 
 /// 映射收集 Future
@@ -2123,7 +1715,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", T::TABLE_NAME);
+        let mut sql = format!(
+            "DELETE FROM {}",
+            common_helpers::quote_table_name::<T>(DbType::MSSQL)
+        );
         let mut params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -2220,6 +1815,30 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
+    pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
+        let model_sets = model
+            .non_pk_field_values_for_columns(fields)
+            .into_iter()
+            .map(|(col_name, value)| (col_name.to_string(), value))
+            .collect::<Vec<_>>();
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let model_filters = pk_columns
+            .iter()
+            .zip(pk_values)
+            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: crate::abstract_layer::common::common_helpers::value_to_filter_value(&val),
+            })
+            .collect();
+
+        if !model_sets.is_empty() {
+            self.model_updates.push((model_sets, model_filters));
+        }
+        self
+    }
+
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         Ok(SqlStatement::batch(
@@ -2246,20 +1865,27 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters (manual .set()/.filter() calls)
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::MSSQL)
+            );
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{} = @P", col_name));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::MSSQL,
+                    col_name,
+                    &common_helpers::placeholder(DbType::MSSQL, params.len() + 1),
+                ));
                 params.push(value.clone());
                 first = false;
             }
             if !self.filters.is_empty() {
                 sql.push_str(" WHERE ");
-                let mut param_idx: usize = 1;
+                let mut param_idx: usize = params.len() + 1;
                 for (i, filter) in self.filters.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(" AND ");
@@ -2279,14 +1905,21 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Model UPDATE statements
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", T::TABLE_NAME);
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::MSSQL)
+            );
             let mut params = Vec::new();
             let mut first = true;
             for (col_name, value) in model_sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{} = @P", col_name));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::MSSQL,
+                    col_name,
+                    &common_helpers::placeholder(DbType::MSSQL, params.len() + 1),
+                ));
                 params.push(value.clone());
                 first = false;
             }
@@ -2553,7 +2186,7 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
     std::future::IntoFuture for CollectFuture<'a, T, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         let SelectExecutor {
@@ -2573,13 +2206,9 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
 
             let mut results = Vec::new();
             for row in rows {
-                let mut data = std::collections::HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    data.insert(col_name.to_string(), ormer_value);
-                }
-                let ormer_row = crate::model::Row::new(data);
-                let model = T::from_row(&ormer_row)?;
+                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    extract_value_from_row(&row, i)
+                })?;
                 results.push(model);
             }
             Ok(results.into_iter().collect())
@@ -2594,7 +2223,7 @@ impl<
 > std::future::IntoFuture for AggregateFuture<'a, T, R>
 {
     type Output = anyhow::Result<R>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2617,11 +2246,25 @@ impl<
     }
 }
 
+impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
+    for FirstFuture<'a, T>
+{
+    type Output = anyhow::Result<Option<T>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let results: Vec<T> = self.executor.collect::<Vec<T>>().into_future().await?;
+            Ok(results.into_iter().next())
+        })
+    }
+}
+
 impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for LeftJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, Option<J>)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2640,29 +2283,13 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
             for row in rows {
-                let mut t_data = std::collections::HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    t_data.insert(col_name.to_string(), ormer_value);
-                }
-                let t_model = T::from_row(&crate::model::Row::new(t_data))?;
-
-                let mut j_data = std::collections::HashMap::new();
-                let mut j_is_null = true;
-                for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                    let idx = t_col_count + i;
-                    let ormer_value = extract_value_from_row(&row, idx)?;
-                    if !matches!(ormer_value, crate::model::Value::Null) {
-                        j_is_null = false;
-                    }
-                    j_data.insert(col_name.to_string(), ormer_value);
-                }
-
-                let j_model = if j_is_null {
-                    None
-                } else {
-                    Some(J::from_row(&crate::model::Row::new(j_data))?)
-                };
+                let t_model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    extract_value_from_row(&row, i)
+                })?;
+                let j_model = common_helpers::decode_optional_model_from_indexed_values::<J, _>(
+                    t_col_count,
+                    |i| extract_value_from_row(&row, i),
+                )?;
                 results.push((t_model, j_model));
             }
             Ok(results)
@@ -2674,7 +2301,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
     std::future::IntoFuture for InnerJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(T, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2693,20 +2320,13 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
             for row in rows {
-                let mut t_data = std::collections::HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    t_data.insert(col_name.to_string(), ormer_value);
-                }
-                let t_model = T::from_row(&crate::model::Row::new(t_data))?;
-
-                let mut j_data = std::collections::HashMap::new();
-                for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                    let idx = t_col_count + i;
-                    let ormer_value = extract_value_from_row(&row, idx)?;
-                    j_data.insert(col_name.to_string(), ormer_value);
-                }
-                let j_model = J::from_row(&crate::model::Row::new(j_data))?;
+                let t_model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    extract_value_from_row(&row, i)
+                })?;
+                let j_model =
+                    common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
+                        extract_value_from_row(&row, i)
+                    })?;
                 results.push((t_model, j_model));
             }
             Ok(results)
@@ -2718,7 +2338,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
     std::future::IntoFuture for RightJoinCollectFuture<'a, T, J>
 {
     type Output = anyhow::Result<Vec<(Option<T>, J)>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2737,28 +2357,14 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
             for row in rows {
-                let mut t_data = std::collections::HashMap::new();
-                let mut t_is_null = true;
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    if !matches!(ormer_value, crate::model::Value::Null) {
-                        t_is_null = false;
-                    }
-                    t_data.insert(col_name.to_string(), ormer_value);
-                }
-                let t_model = if t_is_null {
-                    None
-                } else {
-                    Some(T::from_row(&crate::model::Row::new(t_data))?)
-                };
-
-                let mut j_data = std::collections::HashMap::new();
-                for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                    let idx = t_col_count + i;
-                    let ormer_value = extract_value_from_row(&row, idx)?;
-                    j_data.insert(col_name.to_string(), ormer_value);
-                }
-                let j_model = J::from_row(&crate::model::Row::new(j_data))?;
+                let t_model =
+                    common_helpers::decode_optional_model_from_indexed_values::<T, _>(0, |i| {
+                        extract_value_from_row(&row, i)
+                    })?;
+                let j_model =
+                    common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
+                        extract_value_from_row(&row, i)
+                    })?;
                 results.push((t_model, j_model));
             }
             Ok(results)
@@ -2772,10 +2378,10 @@ impl<
     R: Model + 'static + std::marker::Send + std::marker::Sync,
 > std::future::IntoFuture for RelatedCollectFuture<'a, T, R>
 where
-    Self: 'static,
+    Self: 'a,
 {
     type Output = anyhow::Result<Vec<T>>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2793,13 +2399,9 @@ where
 
             let mut results = Vec::new();
             for row in rows {
-                let mut data = std::collections::HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    data.insert(col_name.to_string(), ormer_value);
-                }
-                let ormer_row = crate::model::Row::new(data);
-                let model = T::from_row(&ormer_row)?;
+                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    extract_value_from_row(&row, i)
+                })?;
                 results.push(model);
             }
             Ok(results)
@@ -2815,7 +2417,7 @@ impl<
 > std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2833,12 +2435,10 @@ impl<
 
             let mut results = Vec::new();
             for row in rows {
-                let mut values = Vec::new();
-                for i in 0..row.columns().len() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    values.push(ormer_value);
-                }
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(
+                    row.columns().len(),
+                    |i| extract_value_from_row(&row, i),
+                )?;
                 results.push(v);
             }
             Ok(results.into_iter().collect())
@@ -2854,7 +2454,7 @@ impl<
 > std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
     type Output = anyhow::Result<C>;
-    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
@@ -2872,12 +2472,10 @@ impl<
 
             let mut results = Vec::new();
             for row in rows {
-                let mut values = Vec::new();
-                for i in 0..row.columns().len() {
-                    let ormer_value = extract_value_from_row(&row, i)?;
-                    values.push(ormer_value);
-                }
-                let v = V::from_row_values(&values)?;
+                let v = common_helpers::decode_row_values_from_indexed_values(
+                    row.columns().len(),
+                    |i| extract_value_from_row(&row, i),
+                )?;
                 results.push(v);
             }
             Ok(results.into_iter().collect())
@@ -2901,13 +2499,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = std::collections::HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let ormer_value = extract_value_from_row(&row, i)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = crate::model::Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                extract_value_from_row(&row, i)
+            })?;
             results.push(model);
         }
         Ok(SelectStreamIterator {
@@ -3022,6 +2616,7 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
             query.bind(micros)
         }
         Value::Text(v) => query.bind(v.as_str()),
+        Value::TextArray(v) => query.bind(crate::model::stringify_string_vec(v)),
         Value::Bytes(v) => query.bind(v.as_slice()),
         Value::DateTime(v) => query.bind(v.naive_utc()),
         Value::Json(v) => query.bind(v.to_string()),

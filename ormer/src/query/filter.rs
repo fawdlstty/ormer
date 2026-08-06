@@ -62,6 +62,7 @@ pub enum Value {
     BigInt(i128),
     Duration(std::time::Duration),
     Text(String),
+    TextArray(Vec<String>),
     Real(f64),
     Boolean(bool),
     Bytes(Vec<u8>),
@@ -72,6 +73,70 @@ pub enum Value {
     Json(serde_json::Value),
     Uuid(uuid::Uuid),
     Null,
+}
+
+impl From<crate::model::Value> for Value {
+    fn from(value: crate::model::Value) -> Self {
+        match value {
+            crate::model::Value::Integer(v) => Value::Integer(v),
+            crate::model::Value::BigInt(v) => Value::BigInt(v),
+            crate::model::Value::Duration(v) => Value::Duration(v),
+            crate::model::Value::Text(v) => Value::Text(v),
+            crate::model::Value::TextArray(v) => Value::TextArray(v),
+            crate::model::Value::Real(v) => Value::Real(v),
+            crate::model::Value::Boolean(v) => Value::Boolean(v),
+            crate::model::Value::Bytes(v) => Value::Bytes(v),
+            crate::model::Value::IntegerArray(v) => Value::IntegerArray(v),
+            crate::model::Value::BigIntArray(v) => Value::BigIntArray(v),
+            crate::model::Value::NullableBigIntArray(v) => Value::NullableBigIntArray(v),
+            crate::model::Value::DateTime(v) => Value::DateTime(v),
+            crate::model::Value::Json(v) => Value::Json(v),
+            crate::model::Value::Uuid(v) => Value::Uuid(v),
+            crate::model::Value::Null => Value::Null,
+        }
+    }
+}
+
+#[cfg(feature = "postgresql")]
+pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
+    match value {
+        Value::Integer(_) => "i32",
+        Value::BigInt(_) => "i64",
+        Value::Duration(_) => "Duration",
+        Value::Text(_) => "String",
+        Value::TextArray(_) => "Vec<String>",
+        Value::Real(_) => "f64",
+        Value::Boolean(_) => "bool",
+        Value::Bytes(_) => "Vec<u8>",
+        Value::IntegerArray(_) => "Vec<i32>",
+        Value::BigIntArray(_) => "Vec<i64>",
+        Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
+        Value::DateTime(_) => "NaiveDateTime",
+        Value::Json(_) => "String",
+        Value::Uuid(_) => "String",
+        Value::Null => "i32",
+    }
+}
+
+#[cfg(feature = "postgresql")]
+pub(crate) fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
+    match value {
+        crate::model::Value::Integer(_) => "i32",
+        crate::model::Value::BigInt(_) => "i64",
+        crate::model::Value::Duration(_) => "Duration",
+        crate::model::Value::Text(_) => "String",
+        crate::model::Value::TextArray(_) => "Vec<String>",
+        crate::model::Value::Real(_) => "f64",
+        crate::model::Value::Boolean(_) => "bool",
+        crate::model::Value::Bytes(_) => "Vec<u8>",
+        crate::model::Value::IntegerArray(_) => "Vec<i32>",
+        crate::model::Value::BigIntArray(_) => "Vec<i64>",
+        crate::model::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
+        crate::model::Value::DateTime(_) => "NaiveDateTime",
+        crate::model::Value::Json(_) => "String",
+        crate::model::Value::Uuid(_) => "String",
+        crate::model::Value::Null => "i32",
+    }
 }
 
 /// 子查询 trait - 用于 is_in 方法
@@ -126,5 +191,18 @@ impl OrderBy {
             OrderDirection::Desc => "DESC",
         };
         format!("{} {}", self.column, dir)
+    }
+
+    /// 将 OrderBy 转换为指定后端的 SQL 字符串
+    pub fn to_sql_for(&self, db_type: crate::abstract_layer::DbType) -> String {
+        let dir = match self.direction {
+            OrderDirection::Asc => "ASC",
+            OrderDirection::Desc => "DESC",
+        };
+        format!(
+            "{} {}",
+            crate::model::quote_column_reference(db_type, &self.column),
+            dir
+        )
     }
 }

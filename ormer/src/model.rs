@@ -55,26 +55,77 @@ impl DurationToInterval for std::time::Duration {
 /// 字段元数据
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
+    pub rust_name: &'static str,
     pub name: &'static str,
     pub rust_type: &'static str,
     pub is_primary: bool,
     pub is_auto_increment: bool,
     pub is_nullable: bool,
     pub unique_group: Option<i32>, // None表示不唯一，Some(group_id)表示属于哪个唯一键组
+    pub unique_name: Option<&'static str>,
     pub is_indexed: bool,
+    pub index_group: Option<i32>,
+    pub index_name: Option<&'static str>,
+    pub index_order: Option<&'static str>,
+    pub index_where: Option<&'static str>,
     pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
     pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
     pub data_type: Option<&'static str>,     // 数据库类型覆盖
+    pub default: Option<ColumnDefault>,      // 数据库端默认值
+    pub check: Option<CheckConstraint>,      // CHECK 约束
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
     pub compress: bool,                      // 是否启用数据库级压缩（PostgreSQL: COMPRESSION pglz）
+}
+
+/// 字段默认值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnDefault {
+    String(&'static str),
+    Number(&'static str),
+    Boolean(bool),
+    Expression(&'static str),
+}
+
+impl ColumnDefault {
+    pub fn to_sql(self, db_type: crate::abstract_layer::DbType) -> String {
+        match self {
+            Self::String(value) => quote_sql_literal(value),
+            Self::Number(value) => value.to_string(),
+            Self::Boolean(value) => match db_type {
+                #[cfg(feature = "sqlite")]
+                crate::abstract_layer::DbType::Sqlite => if value { "1" } else { "0" }.to_string(),
+                #[cfg(feature = "postgresql")]
+                crate::abstract_layer::DbType::PostgreSQL => {
+                    if value { "TRUE" } else { "FALSE" }.to_string()
+                }
+                #[cfg(feature = "mysql")]
+                crate::abstract_layer::DbType::MySQL => {
+                    if value { "TRUE" } else { "FALSE" }.to_string()
+                }
+                #[cfg(feature = "mssql")]
+                crate::abstract_layer::DbType::MSSQL => if value { "1" } else { "0" }.to_string(),
+            },
+            Self::Expression(expr) => expr.to_string(),
+        }
+    }
+}
+
+/// 字段 CHECK 约束。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckConstraint {
+    pub name: Option<&'static str>,
+    pub expr: &'static str,
 }
 
 /// 外键信息
 #[derive(Debug, Clone)]
 pub struct ForeignKeyInfo {
+    pub name: Option<&'static str>,                  // 外键约束名
     pub ref_table: &'static str,                     // 引用的表名
     pub ref_column: &'static str,                    // 引用的列名（对于静态指定的情况）
     pub ref_column_fn: Option<fn() -> &'static str>, // 运行时获取列名的函数（对于自动关联主键的情况）
+    pub on_delete: Option<ForeignKeyAction>,         // ON DELETE 动作
+    pub on_update: Option<ForeignKeyAction>,         // ON UPDATE 动作
 }
 
 impl ForeignKeyInfo {
@@ -84,6 +135,28 @@ impl ForeignKeyInfo {
             fn_get()
         } else {
             self.ref_column
+        }
+    }
+}
+
+/// 外键动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+impl ForeignKeyAction {
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Restrict => "RESTRICT",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
         }
     }
 }
@@ -242,6 +315,14 @@ pub trait Model: Sized {
         None
     }
 
+    /// 通过 Rust 字段名查找实际 SQL 列名。
+    fn column_name_for_field(field: &str) -> Option<&'static str> {
+        Self::COLUMN_SCHEMA
+            .iter()
+            .find(|column| column.rust_name == field || column.name == field)
+            .map(|column| column.name)
+    }
+
     /// 获取关系本地键值。
     fn relation_key_value(&self, relation: &RelationInfo) -> anyhow::Result<Value> {
         self.column_value(relation.local_key).ok_or_else(|| {
@@ -307,6 +388,14 @@ pub trait Model: Sized {
                         }
                     })
             })
+            .collect()
+    }
+
+    /// 获取指定非主键字段的 (列名, 值) 对，用于 set_model_fields。
+    fn non_pk_field_values_for_columns(&self, columns: &[String]) -> Vec<(&'static str, Value)> {
+        self.non_pk_field_values()
+            .into_iter()
+            .filter(|(col, _)| columns.iter().any(|selected| selected == col))
             .collect()
     }
 
@@ -775,6 +864,98 @@ macro_rules! impl_insertable_for_ref_collections {
     };
 }
 
+pub fn quote_sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn needs_identifier_quote(identifier: &str) -> bool {
+    if identifier.is_empty() {
+        return true;
+    }
+
+    let mut chars = identifier.chars();
+    let Some(first) = chars.next() else {
+        return true;
+    };
+    if !(first == '_' || first.is_ascii_lowercase()) {
+        return true;
+    }
+    if chars.any(|ch| !(ch == '_' || ch.is_ascii_lowercase() || ch.is_ascii_digit())) {
+        return true;
+    }
+
+    matches!(
+        identifier,
+        "all"
+            | "and"
+            | "as"
+            | "by"
+            | "check"
+            | "column"
+            | "constraint"
+            | "create"
+            | "default"
+            | "delete"
+            | "desc"
+            | "from"
+            | "group"
+            | "index"
+            | "insert"
+            | "into"
+            | "key"
+            | "not"
+            | "null"
+            | "order"
+            | "primary"
+            | "references"
+            | "select"
+            | "table"
+            | "unique"
+            | "update"
+            | "user"
+            | "where"
+    )
+}
+
+pub fn quote_identifier(db_type: crate::abstract_layer::DbType, identifier: &str) -> String {
+    if !needs_identifier_quote(identifier) {
+        return identifier.to_string();
+    }
+
+    match db_type {
+        #[cfg(feature = "mysql")]
+        crate::abstract_layer::DbType::MySQL => {
+            format!("`{}`", identifier.replace('`', "``"))
+        }
+        #[cfg(feature = "mssql")]
+        crate::abstract_layer::DbType::MSSQL => {
+            format!("[{}]", identifier.replace(']', "]]"))
+        }
+        #[cfg(feature = "sqlite")]
+        crate::abstract_layer::DbType::Sqlite => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+        #[cfg(feature = "postgresql")]
+        crate::abstract_layer::DbType::PostgreSQL => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+    }
+}
+
+pub fn quote_qualified_identifier(db_type: crate::abstract_layer::DbType, name: &str) -> String {
+    name.split('.')
+        .map(|part| quote_identifier(db_type, part))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+pub fn quote_column_reference(db_type: crate::abstract_layer::DbType, column: &str) -> String {
+    if column.contains('(') || column.contains(' ') {
+        return column.to_string();
+    }
+    quote_qualified_identifier(db_type, column)
+}
+
 /// 运行时动态生成 CREATE TABLE SQL
 pub fn generate_create_table_sql<T: Model>(
     db_type: crate::abstract_layer::DbType,
@@ -788,7 +969,8 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     table_name: Option<&str>,
 ) -> anyhow::Result<String> {
     let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
-    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", table_name);
+    let quoted_table_name = quote_qualified_identifier(db_type, table_name);
+    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", quoted_table_name);
 
     for (i, column) in T::COLUMN_SCHEMA.iter().enumerate() {
         if i > 0 {
@@ -833,12 +1015,26 @@ pub fn generate_create_table_sql_with_name<T: Model>(
         if column.compress && is_postgresql {
             if sql_type.ends_with(" NOT NULL") {
                 let base = &sql_type[..sql_type.len() - " NOT NULL".len()];
-                sql.push_str(&format!("{} {base} COMPRESSION pglz NOT NULL", column.name));
+                sql.push_str(&format!(
+                    "{} {base} COMPRESSION pglz NOT NULL",
+                    quote_identifier(db_type, column.name)
+                ));
             } else {
-                sql.push_str(&format!("{} {sql_type} COMPRESSION pglz", column.name));
+                sql.push_str(&format!(
+                    "{} {sql_type} COMPRESSION pglz",
+                    quote_identifier(db_type, column.name)
+                ));
             }
         } else {
-            sql.push_str(&format!("{} {sql_type}", column.name));
+            sql.push_str(&format!(
+                "{} {sql_type}",
+                quote_identifier(db_type, column.name)
+            ));
+        }
+
+        if let Some(default) = column.default {
+            sql.push_str(" DEFAULT ");
+            sql.push_str(&default.to_sql(db_type));
         }
 
         // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
@@ -851,8 +1047,18 @@ pub fn generate_create_table_sql_with_name<T: Model>(
 
             if group_count == 1 {
                 // 单列唯一约束
-                sql.push_str(" UNIQUE");
+                if column.unique_name.is_none() {
+                    sql.push_str(" UNIQUE");
+                }
             }
+        }
+
+        if let Some(check) = column.check {
+            sql.push(' ');
+            if let Some(name) = check.name {
+                sql.push_str(&format!("CONSTRAINT {} ", quote_identifier(db_type, name)));
+            }
+            sql.push_str(&format!("CHECK ({})", check.expr));
         }
     }
 
@@ -864,14 +1070,14 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     }
 
     // 添加复合主键约束（如果有多个主键字段）
-    let composite_primary_constraint = generate_composite_primary_key_constraint::<T>();
+    let composite_primary_constraint = generate_composite_primary_key_constraint::<T>(db_type);
     if !composite_primary_constraint.is_empty() {
         sql.push_str(", ");
         sql.push_str(&composite_primary_constraint);
     }
 
     // 添加联合 UNIQUE 约束
-    let unique_constraints = generate_unique_constraints::<T>();
+    let unique_constraints = generate_unique_constraints::<T>(db_type);
     if !unique_constraints.is_empty() {
         sql.push_str(", ");
         sql.push_str(&unique_constraints.join(", "));
@@ -880,7 +1086,7 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     sql.push(')');
 
     // 添加索引
-    let index_sql = generate_indexes_with_name::<T>(db_type, table_name);
+    let index_sql = generate_indexes_with_name::<T>(db_type, table_name)?;
     if !index_sql.is_empty() {
         sql.push(';');
         sql.push_str(&index_sql);
@@ -890,27 +1096,35 @@ pub fn generate_create_table_sql_with_name<T: Model>(
 }
 
 /// 生成 UNIQUE 约束
-fn generate_unique_constraints<T: Model>() -> Vec<String> {
+fn generate_unique_constraints<T: Model>(db_type: crate::abstract_layer::DbType) -> Vec<String> {
     let mut constraints = Vec::new();
 
     // 收集所有 unique_group
-    let mut group_map: std::collections::BTreeMap<i32, Vec<&str>> =
+    let mut group_map: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
         std::collections::BTreeMap::new();
 
     for column in T::COLUMN_SCHEMA.iter() {
         if let Some(group_id) = column.unique_group {
-            group_map.entry(group_id).or_default().push(column.name);
+            group_map.entry(group_id).or_default().push(column);
         }
     }
 
     // 生成约束
     for (_group_id, columns) in group_map {
-        if columns.len() == 1 {
+        let unique_name = columns.iter().find_map(|column| column.unique_name);
+        if columns.len() == 1 && unique_name.is_none() {
             // 单列唯一约束已经在列定义中处理
         } else {
             // 联合唯一约束
-            let cols = columns.join(", ");
-            constraints.push(format!("UNIQUE ({cols})"));
+            let cols = columns
+                .iter()
+                .map(|column| quote_identifier(db_type, column.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let prefix = unique_name
+                .map(|name| format!("CONSTRAINT {} ", quote_identifier(db_type, name)))
+                .unwrap_or_default();
+            constraints.push(format!("{prefix}UNIQUE ({cols})"));
         }
     }
 
@@ -921,33 +1135,107 @@ fn generate_unique_constraints<T: Model>() -> Vec<String> {
 fn generate_indexes_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: &str,
-) -> String {
+) -> anyhow::Result<String> {
     let mut sqls = Vec::new();
 
     // 检查是否为 MySQL 数据库（通过调试字符串）
     let is_mysql = format!("{:?}", db_type).contains("MySQL");
 
+    let mut grouped_indexes: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
+        std::collections::BTreeMap::new();
+
     for column in T::COLUMN_SCHEMA.iter() {
-        if column.is_indexed {
-            let index_name = format!("idx_{}_{}", table_name.replace('.', "_"), column.name);
-            // MySQL 不支持 CREATE INDEX IF NOT EXISTS，需要特殊处理
-            let sql = if is_mysql {
-                format!(
-                    "CREATE INDEX {} ON {} ({})",
-                    index_name, table_name, column.name
-                )
-            } else {
-                // PostgreSQL 和 Sqlite (SQLite) 支持 IF NOT EXISTS
-                format!(
-                    "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
-                    index_name, table_name, column.name
-                )
-            };
-            sqls.push(sql);
+        if !column.is_indexed {
+            continue;
         }
+
+        if let Some(group_id) = column.index_group {
+            grouped_indexes.entry(group_id).or_default().push(column);
+            continue;
+        }
+
+        let index_name = column
+            .index_name
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("idx_{}_{}", table_name.replace('.', "_"), column.name));
+        sqls.push(render_index_sql(
+            db_type,
+            is_mysql,
+            table_name,
+            &index_name,
+            &[column],
+        )?);
     }
 
-    sqls.join(";")
+    for (group_id, columns) in grouped_indexes {
+        if columns.is_empty() {
+            continue;
+        }
+
+        let index_name = columns
+            .iter()
+            .find_map(|column| column.index_name)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("idx_{}_{}", table_name.replace('.', "_"), group_id));
+        sqls.push(render_index_sql(
+            db_type,
+            is_mysql,
+            table_name,
+            &index_name,
+            &columns,
+        )?);
+    }
+
+    Ok(sqls.join(";"))
+}
+
+fn render_index_sql(
+    db_type: crate::abstract_layer::DbType,
+    is_mysql: bool,
+    table_name: &str,
+    index_name: &str,
+    columns: &[&ColumnSchema],
+) -> anyhow::Result<String> {
+    let where_clause = columns.iter().find_map(|column| column.index_where);
+    if where_clause.is_some() && is_mysql {
+        return Err(anyhow::anyhow!(
+            "MySQL does not support partial index WHERE clauses"
+        ));
+    }
+
+    let columns_sql = columns
+        .iter()
+        .map(|column| {
+            let mut col = quote_identifier(db_type, column.name);
+            if let Some(order) = column.index_order {
+                col.push(' ');
+                col.push_str(order);
+            }
+            col
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = if is_mysql {
+        format!(
+            "CREATE INDEX {} ON {} ({})",
+            quote_identifier(db_type, index_name),
+            quote_qualified_identifier(db_type, table_name),
+            columns_sql
+        )
+    } else {
+        format!(
+            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            quote_identifier(db_type, index_name),
+            quote_qualified_identifier(db_type, table_name),
+            columns_sql
+        )
+    };
+
+    Ok(if let Some(where_clause) = where_clause {
+        format!("{sql} WHERE {where_clause}")
+    } else {
+        sql
+    })
 }
 
 /// 生成外键约束 SQL
@@ -960,10 +1248,23 @@ fn generate_foreign_key_constraints<T: Model>(
         if let Some(fk) = &column.foreign_key {
             let ref_column = fk.get_ref_column();
             let ref_table = normalize_table_name_for_db(db_type, fk.ref_table);
-            constraints.push(format!(
+            let mut constraint = String::new();
+            if let Some(name) = fk.name {
+                constraint.push_str(&format!("CONSTRAINT {} ", quote_identifier(db_type, name)));
+            }
+            constraint.push_str(&format!(
                 "FOREIGN KEY ({}) REFERENCES {} ({})",
-                column.name, ref_table, ref_column
+                quote_identifier(db_type, column.name),
+                quote_qualified_identifier(db_type, ref_table),
+                quote_identifier(db_type, ref_column)
             ));
+            if let Some(action) = fk.on_delete {
+                constraint.push_str(&format!(" ON DELETE {}", action.as_sql()));
+            }
+            if let Some(action) = fk.on_update {
+                constraint.push_str(&format!(" ON UPDATE {}", action.as_sql()));
+            }
+            constraints.push(constraint);
         }
     }
 
@@ -971,7 +1272,9 @@ fn generate_foreign_key_constraints<T: Model>(
 }
 
 /// 生成复合主键约束 SQL
-fn generate_composite_primary_key_constraint<T: Model>() -> String {
+fn generate_composite_primary_key_constraint<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+) -> String {
     let primary_keys: Vec<&str> = T::COLUMN_SCHEMA
         .iter()
         .filter(|c| c.is_primary)
@@ -980,7 +1283,14 @@ fn generate_composite_primary_key_constraint<T: Model>() -> String {
 
     if primary_keys.len() > 1 {
         // 复合主键：PRIMARY KEY (col1, col2, ...)
-        format!("PRIMARY KEY ({})", primary_keys.join(", "))
+        format!(
+            "PRIMARY KEY ({})",
+            primary_keys
+                .into_iter()
+                .map(|column| quote_identifier(db_type, column))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     } else {
         // 单主键或无主键：不需要表级约束
         String::new()
@@ -1027,6 +1337,7 @@ pub(crate) fn parse_string_vec_text(raw: &str) -> Vec<String> {
     vec![raw.to_string()]
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
 pub(crate) fn stringify_string_vec(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
@@ -1038,6 +1349,7 @@ pub enum Value {
     BigInt(i128),
     Duration(std::time::Duration),
     Text(String),
+    TextArray(Vec<String>),
     Real(f64),
     Boolean(bool),
     Bytes(Vec<u8>),
@@ -1322,7 +1634,7 @@ impl FromRowValues for String {
 
 impl From<Vec<String>> for Value {
     fn from(v: Vec<String>) -> Self {
-        Value::Text(stringify_string_vec(&v))
+        Value::TextArray(v)
     }
 }
 
@@ -1330,6 +1642,7 @@ impl FromValue for Vec<String> {
     fn from_value(value: &Value) -> anyhow::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
+            Value::TextArray(v) => Ok(normalize_string_vec(v.clone())),
             Value::Text(v) => Ok(parse_string_vec_text(v)),
             Value::Json(v) => {
                 if v.is_null() {
@@ -1346,6 +1659,15 @@ impl FromValue for Vec<String> {
                 Ok(normalize_string_vec(users))
             }
             _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<String>")),
+        }
+    }
+}
+
+impl From<Option<Vec<String>>> for Value {
+    fn from(v: Option<Vec<String>>) -> Self {
+        match v {
+            Some(values) => Value::TextArray(values),
+            None => Value::Null,
         }
     }
 }
@@ -1609,6 +1931,7 @@ impl From<crate::query::filter::Value> for Value {
             crate::query::filter::Value::BigInt(v) => Value::BigInt(v),
             crate::query::filter::Value::Duration(v) => Value::Duration(v),
             crate::query::filter::Value::Text(v) => Value::Text(v),
+            crate::query::filter::Value::TextArray(v) => Value::TextArray(v),
             crate::query::filter::Value::Real(v) => Value::Real(v),
             crate::query::filter::Value::Boolean(v) => Value::Boolean(v),
             crate::query::filter::Value::Bytes(v) => Value::Bytes(v),

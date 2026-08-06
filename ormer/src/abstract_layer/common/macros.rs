@@ -439,6 +439,46 @@ macro_rules! impl_unified_update_executor {
                 result
             }
 
+            /// 从模型实例设置指定字段，并自动添加主键作为 WHERE 条件。
+            pub fn set_model_fields<I, F, M>(self, models: I, fields_fn: F) -> Self
+            where
+                I: $crate::model::Insertable<Model = T>,
+                F: FnOnce(T::Where) -> M,
+                M: $crate::query::builder::MapToResult,
+            {
+                let fields = fields_fn(T::Where::default()).column_names();
+                let refs = models.as_refs();
+                let mut result = self;
+                for model_ref in refs {
+                    match result {
+                        #[cfg(feature = "sqlite")]
+                        $executor_name::Sqlite(exec, phantom) => {
+                            result = $executor_name::Sqlite(
+                                exec.set_model_fields(model_ref, &fields),
+                                phantom,
+                            );
+                        }
+                        #[cfg(feature = "postgresql")]
+                        $executor_name::PostgreSQL(exec) => {
+                            result = $executor_name::PostgreSQL(
+                                exec.set_model_fields(model_ref, &fields),
+                            );
+                        }
+                        #[cfg(feature = "mysql")]
+                        $executor_name::MySQL(exec) => {
+                            result =
+                                $executor_name::MySQL(exec.set_model_fields(model_ref, &fields));
+                        }
+                        #[cfg(feature = "mssql")]
+                        $executor_name::MSSQL(exec) => {
+                            result =
+                                $executor_name::MSSQL(exec.set_model_fields(model_ref, &fields));
+                        }
+                    }
+                }
+                result
+            }
+
             pub fn to_sql(&self) -> anyhow::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]

@@ -4,8 +4,7 @@
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::SqlStatement;
-use crate::model::normalize_table_name_for_db;
-use crate::model::{Model, Relation, RelationInfo, Value};
+use crate::model::{Model, Relation, RelationInfo, Value, normalize_table_name_for_db};
 use crate::query::builder::WhereExpr;
 use crate::raw_sql::{IntoRawSql, RawSql};
 
@@ -28,6 +27,7 @@ fn model_value_key(value: &Value) -> String {
         Value::BigInt(v) => format!("b:{v}"),
         Value::Duration(v) => format!("d:{:?}", v),
         Value::Text(v) => format!("t:{v}"),
+        Value::TextArray(v) => format!("ta:{v:?}"),
         Value::Real(v) => format!("r:{v}"),
         Value::Boolean(v) => format!("o:{v}"),
         Value::Bytes(v) => format!("x:{v:?}"),
@@ -41,46 +41,14 @@ fn model_value_key(value: &Value) -> String {
     }
 }
 
-fn model_value_to_filter_value(value: Value) -> crate::query::filter::Value {
-    match value {
-        Value::Integer(v) => crate::query::filter::Value::Integer(v),
-        Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
-        Value::Duration(v) => crate::query::filter::Value::Duration(v),
-        Value::Text(v) => crate::query::filter::Value::Text(v),
-        Value::Real(v) => crate::query::filter::Value::Real(v),
-        Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
-        Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
-        Value::IntegerArray(v) => crate::query::filter::Value::IntegerArray(v),
-        Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
-        Value::NullableBigIntArray(v) => crate::query::filter::Value::NullableBigIntArray(v),
-        Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
-        Value::Json(v) => crate::query::filter::Value::Json(v),
-        Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
-        Value::Null => crate::query::filter::Value::Null,
-    }
-}
-
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
     values
         .into_iter()
         .filter(|value| !matches!(value, Value::Null))
         .filter(|value| seen.insert(model_value_key(value)))
-        .map(model_value_to_filter_value)
+        .map(Into::into)
         .collect()
-}
-
-fn quote_identifier(db_type: super::super::DbType, identifier: &str) -> String {
-    match db_type {
-        #[cfg(feature = "sqlite")]
-        super::super::DbType::Sqlite => format!("\"{}\"", identifier.replace('"', "\"\"")),
-        #[cfg(feature = "postgresql")]
-        super::super::DbType::PostgreSQL => format!("\"{}\"", identifier.replace('"', "\"\"")),
-        #[cfg(feature = "mysql")]
-        super::super::DbType::MySQL => format!("`{}`", identifier.replace('`', "``")),
-        #[cfg(feature = "mssql")]
-        super::super::DbType::MSSQL => format!("[{}]", identifier.replace(']', "]]")),
-    }
 }
 
 fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
@@ -90,12 +58,12 @@ fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
         super::super::DbType::PostgreSQL => {
             let (schema, table) = crate::model::split_schema_table_name(normalized, "public");
             if schema == "public" {
-                quote_identifier(db_type, table)
+                crate::model::quote_identifier(db_type, table)
             } else {
                 format!(
                     "{}.{}",
-                    quote_identifier(db_type, schema),
-                    quote_identifier(db_type, table)
+                    crate::model::quote_identifier(db_type, schema),
+                    crate::model::quote_identifier(db_type, table)
                 )
             }
         }
@@ -103,19 +71,19 @@ fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
         super::super::DbType::MSSQL => {
             let (schema, table) = crate::model::split_schema_table_name(normalized, "dbo");
             if schema == "dbo" {
-                quote_identifier(db_type, table)
+                crate::model::quote_identifier(db_type, table)
             } else {
                 format!(
                     "{}.{}",
-                    quote_identifier(db_type, schema),
-                    quote_identifier(db_type, table)
+                    crate::model::quote_identifier(db_type, schema),
+                    crate::model::quote_identifier(db_type, table)
                 )
             }
         }
         #[cfg(feature = "sqlite")]
-        super::super::DbType::Sqlite => quote_identifier(db_type, normalized),
+        super::super::DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
         #[cfg(feature = "mysql")]
-        super::super::DbType::MySQL => quote_identifier(db_type, normalized),
+        super::super::DbType::MySQL => crate::model::quote_identifier(db_type, normalized),
     }
 }
 
@@ -497,6 +465,7 @@ impl Database {
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
                 crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
                 crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
+                crate::model::Value::TextArray(v) => crate::query::filter::Value::TextArray(v),
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
                 crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
@@ -1789,6 +1758,7 @@ impl<'a> Transaction<'a> {
                 crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
                 crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
                 crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
+                crate::model::Value::TextArray(v) => crate::query::filter::Value::TextArray(v),
                 crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
                 crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
                 crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),

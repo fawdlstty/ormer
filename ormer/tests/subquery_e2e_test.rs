@@ -83,14 +83,25 @@ fn test_subquery_with_params() {
         .filter(|u| u.age.gt(25))
         .map_to(|u| u.age);
 
+    #[cfg(feature = "sqlite")]
+    let db_type = DbType::Sqlite;
+    #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
+    let db_type = DbType::PostgreSQL;
+    #[cfg(all(
+        not(feature = "sqlite"),
+        not(feature = "postgresql"),
+        feature = "mysql"
+    ))]
+    let db_type = DbType::MySQL;
+
     let (sql, params) = Select::<TestSubqueryPost>::new()
         .filter(|p| p.age.is_in(subquery))
-        .to_sql_with_params(DbType::Sqlite);
+        .to_sql_with_params(db_type);
 
     println!("SUBQUERY WITH PARAMS SQL: {}", sql);
     println!("Params: {:?}", params);
 
     assert!(sql.contains("WHERE age >"));
-    assert!(sql.contains("?")); // Sqlite uses ? for parameters
+    assert!(sql.contains("?") || sql.contains("$1"));
     assert!(!params.is_empty(), "Should have parameters");
 }

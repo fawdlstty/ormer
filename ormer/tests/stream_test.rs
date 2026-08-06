@@ -1,4 +1,4 @@
-#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#![cfg(feature = "sqlite")]
 
 mod _test_common;
 

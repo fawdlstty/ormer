@@ -103,7 +103,10 @@ fn data_type_i32_where_uses_database_type_for_in_filter() -> anyhow::Result<()> 
         .filter(|w| w.status.is_in(&[1, 2, 3]))
         .to_sql();
     assert!(sql.contains("status IN"), "SQL: {sql}");
-    assert!(sql.contains("$1") || sql.contains("?"), "SQL: {sql}");
+    assert!(
+        sql.contains("$1") || sql.contains("?") || sql.contains("@P1"),
+        "SQL: {sql}"
+    );
 
     let model = DataTypeWrappedModel {
         id: 1,

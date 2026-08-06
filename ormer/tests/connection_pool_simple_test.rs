@@ -16,6 +16,7 @@ async fn test_pool_basic_impl(
     // 创建连接池（不设置 min_idle，避免初始连接）
     // Sqlite 后端限制最大连接数为 1，其他数据库可以使用更大的连接池
     let pool = match config.0 {
+        #[cfg(feature = "sqlite")]
         ormer::DbType::Sqlite => {
             Database::create_pool(config.0, config.1)
                 .range(0..1) // Sqlite: max=1

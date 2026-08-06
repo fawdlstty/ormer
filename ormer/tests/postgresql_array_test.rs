@@ -40,6 +40,14 @@ struct PgEnumArrayModel {
     roles: Vec<PgArrayRole>,
 }
 
+#[derive(Debug, Clone, PartialEq, ormer::Model)]
+#[table = "test_postgresql_arrays_3"]
+struct PgStringArrayModel {
+    #[primary]
+    id: i32,
+    tags: Vec<String>,
+}
+
 #[tokio::test]
 async fn test_postgresql_array_sql_and_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let config = _test_common::postgresql_config();
@@ -96,5 +104,42 @@ async fn test_postgresql_enum_array_data_type_roundtrip() -> Result<(), Box<dyn 
     assert_eq!(items, vec![model]);
 
     db.drop_table::<PgEnumArrayModel>().execute().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_postgresql_string_array_uses_text_array_value()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = _test_common::postgresql_config();
+
+    let sql = ormer::generate_create_table_sql::<PgStringArrayModel>(config.0)?;
+    assert!(sql.contains("tags TEXT[] NOT NULL"), "{sql}");
+
+    let model = PgStringArrayModel {
+        id: 1,
+        tags: vec!["alpha".to_string(), "beta".to_string()],
+    };
+
+    let values = <PgStringArrayModel as ormer::Model>::field_values(&model);
+    match &values[1] {
+        ormer::Value::TextArray(tags) => assert_eq!(tags, &model.tags),
+        other => panic!("expected TextArray value, got {:?}", other),
+    }
+
+    let db = _test_common::create_db_connection(&config).await?;
+    let _ = db.drop_table::<PgStringArrayModel>().execute().await;
+
+    db.create_table::<PgStringArrayModel>().execute().await?;
+    db.validate_table::<PgStringArrayModel>().await?;
+
+    db.insert(&model).execute().await?;
+
+    let items = db
+        .select::<PgStringArrayModel>()
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(items, vec![model]);
+
+    db.drop_table::<PgStringArrayModel>().execute().await?;
     Ok(())
 }

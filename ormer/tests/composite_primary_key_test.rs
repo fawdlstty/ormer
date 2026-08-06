@@ -31,6 +31,7 @@ struct OrderItem {
 mod composite_primary_key_tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_composite_pk_sql_generation() {
         // 测试 Sqlite (SQLite) 的 SQL 生成
@@ -45,6 +46,7 @@ mod composite_primary_key_tests {
         assert!(sql.contains("PRIMARY KEY (user_id, role_id)"));
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn test_composite_pk_with_auto_sql_generation() {
         // 测试带 auto 的复合主键
@@ -88,8 +90,11 @@ mod composite_primary_key_tests {
     #[test]
     fn test_composite_pk_multiple_databases() {
         // 测试不同数据库的 SQL 生成
-        let sql_turso = generate_create_table_sql::<UserRole>(ormer::DbType::Sqlite).unwrap();
-        assert!(sql_turso.contains("PRIMARY KEY (user_id, role_id)"));
+        #[cfg(feature = "sqlite")]
+        {
+            let sql_turso = generate_create_table_sql::<UserRole>(ormer::DbType::Sqlite).unwrap();
+            assert!(sql_turso.contains("PRIMARY KEY (user_id, role_id)"));
+        }
 
         #[cfg(feature = "postgresql")]
         {

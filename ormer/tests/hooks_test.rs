@@ -5,7 +5,8 @@ use ormer::{
 };
 #[cfg(not(feature = "sqlite"))]
 use ormer::{
-    AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, Model,
+    AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate, HookContext,
+    HookOperation, Model,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;

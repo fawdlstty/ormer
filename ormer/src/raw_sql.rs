@@ -1,6 +1,7 @@
 use crate::SingleSqlStatement;
 use crate::SqlStatement;
 use crate::abstract_layer::DbType;
+use crate::abstract_layer::common::common_helpers::placeholder;
 use crate::model::Value;
 use std::collections::HashSet;
 
@@ -331,19 +332,6 @@ fn is_ident_continue(byte: u8) -> bool {
     is_ident_start(byte) || byte.is_ascii_digit()
 }
 
-fn placeholder(db_type: DbType, _index: usize) -> String {
-    match db_type {
-        #[cfg(feature = "sqlite")]
-        DbType::Sqlite => "?".to_string(),
-        #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => format!("${_index}"),
-        #[cfg(feature = "mysql")]
-        DbType::MySQL => "?".to_string(),
-        #[cfg(feature = "mssql")]
-        DbType::MSSQL => format!("@P{_index}"),
-    }
-}
-
 #[macro_export]
 macro_rules! sql {
     ($sql:expr $(,)?) => {
@@ -362,6 +350,7 @@ macro_rules! sql {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn renders_named_params_and_skips_sql_literals() {
         let raw = RawSql::new(
@@ -390,6 +379,18 @@ mod tests {
 
         let (sql, params) = raw.render(DbType::PostgreSQL).unwrap();
         assert_eq!(sql, "SELECT * FROM users WHERE id = $1 AND name = $2");
+        assert_eq!(params.len(), 2);
+    }
+
+    #[cfg(feature = "mssql")]
+    #[test]
+    fn renders_mssql_placeholders() {
+        let raw = RawSql::new("SELECT * FROM users WHERE id = {} AND name = {name}")
+            .bind(1)
+            .bind_named("name", "Alice".to_string());
+
+        let (sql, params) = raw.render(DbType::MSSQL).unwrap();
+        assert_eq!(sql, "SELECT * FROM users WHERE id = @P1 AND name = @P2");
         assert_eq!(params.len(), 2);
     }
 

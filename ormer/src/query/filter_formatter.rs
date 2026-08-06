@@ -1,6 +1,7 @@
 use crate::abstract_layer::DbType;
-use crate::model::Value;
-use crate::query::filter::{FilterExpr, Value as FilterValue};
+use crate::abstract_layer::common::common_helpers::placeholder;
+use crate::model::{Value, quote_column_reference};
+use crate::query::filter::FilterExpr;
 
 /// 通用的 WHERE 条件格式化器
 ///
@@ -85,13 +86,15 @@ impl FilterFormatter {
                 write!(
                     sql,
                     "{}",
-                    self.comparison_sql(&full_col_name, operator, param_idx)
+                    self.comparison_sql(
+                        &quote_column_reference(self.db_type, &full_col_name),
+                        operator,
+                        param_idx
+                    )
                 )
                 .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
 
-                // 转换 filter Value 到 ormer Value
-                let ormer_value = Self::convert_filter_value(value);
-                params.push(ormer_value);
+                params.push(value.clone().into());
                 *param_idx += 1;
             }
             FilterExpr::ColumnComparison {
@@ -112,8 +115,14 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} {} {}", left_col, operator, right_col)
-                    .unwrap_or_else(|e| panic!("Failed to write column comparison SQL: {}", e));
+                write!(
+                    sql,
+                    "{} {} {}",
+                    quote_column_reference(self.db_type, &left_col),
+                    operator,
+                    quote_column_reference(self.db_type, &right_col)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write column comparison SQL: {}", e));
             }
             FilterExpr::In { column, values } => {
                 // 生成 IN 语句: column IN (?, ?, ...)
@@ -124,17 +133,19 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} IN (", col_name)
-                    .unwrap_or_else(|e| panic!("Failed to write IN clause: {}", e));
+                write!(
+                    sql,
+                    "{} IN (",
+                    quote_column_reference(self.db_type, &col_name)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write IN clause: {}", e));
                 for (i, value) in values.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    write!(sql, "{}", self.in_placeholder(param_idx))
+                    write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
                         .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
-                    // 转换 filter Value 到 ormer Value
-                    let ormer_value = Self::convert_filter_value(value);
-                    params.push(ormer_value);
+                    params.push(value.clone().into());
                     *param_idx += 1;
                 }
                 sql.push(')');
@@ -148,17 +159,19 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} NOT IN (", col_name)
-                    .unwrap_or_else(|e| panic!("Failed to write NOT IN clause: {}", e));
+                write!(
+                    sql,
+                    "{} NOT IN (",
+                    quote_column_reference(self.db_type, &col_name)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write NOT IN clause: {}", e));
                 for (i, value) in values.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    write!(sql, "{}", self.in_placeholder(param_idx))
+                    write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
                         .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
-                    // 转换 filter Value 到 ormer Value
-                    let ormer_value = Self::convert_filter_value(value);
-                    params.push(ormer_value);
+                    params.push(value.clone().into());
                     *param_idx += 1;
                 }
                 sql.push(')');
@@ -176,8 +189,13 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} IN ({})", col_name, subquery_sql)
-                    .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
+                write!(
+                    sql,
+                    "{} IN ({})",
+                    quote_column_reference(self.db_type, &col_name),
+                    subquery_sql
+                )
+                .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
 
                 // 添加子查询的参数
                 for param in subquery_params {
@@ -198,8 +216,13 @@ impl FilterFormatter {
                 };
 
                 use std::fmt::Write;
-                write!(sql, "{} NOT IN ({})", col_name, subquery_sql)
-                    .unwrap_or_else(|e| panic!("Failed to write subquery NOT IN clause: {}", e));
+                write!(
+                    sql,
+                    "{} NOT IN ({})",
+                    quote_column_reference(self.db_type, &col_name),
+                    subquery_sql
+                )
+                .unwrap_or_else(|e| panic!("Failed to write subquery NOT IN clause: {}", e));
 
                 // 添加子查询的参数
                 for param in subquery_params {
@@ -224,8 +247,12 @@ impl FilterFormatter {
                     column.clone()
                 };
                 use std::fmt::Write;
-                write!(sql, "{} IS NULL", col_name)
-                    .unwrap_or_else(|e| panic!("Failed to write IS NULL clause: {}", e));
+                write!(
+                    sql,
+                    "{} IS NULL",
+                    quote_column_reference(self.db_type, &col_name)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write IS NULL clause: {}", e));
             }
             FilterExpr::IsNotNull { column } => {
                 let col_name = if let Some(ref prefix) = self.table_prefix {
@@ -234,8 +261,12 @@ impl FilterFormatter {
                     column.clone()
                 };
                 use std::fmt::Write;
-                write!(sql, "{} IS NOT NULL", col_name)
-                    .unwrap_or_else(|e| panic!("Failed to write IS NOT NULL clause: {}", e));
+                write!(
+                    sql,
+                    "{} IS NOT NULL",
+                    quote_column_reference(self.db_type, &col_name)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write IS NOT NULL clause: {}", e));
             }
             FilterExpr::Between { column, min, max } => {
                 let col_name = if let Some(ref prefix) = self.table_prefix {
@@ -244,20 +275,20 @@ impl FilterFormatter {
                     column.clone()
                 };
                 use std::fmt::Write;
-                let min_placeholder = self.between_placeholder(param_idx);
+                let min_placeholder = placeholder(self.db_type, *param_idx as usize);
                 *param_idx += 1;
-                let max_placeholder = self.between_placeholder(param_idx);
+                let max_placeholder = placeholder(self.db_type, *param_idx as usize);
                 *param_idx += 1;
                 write!(
                     sql,
                     "{} BETWEEN {} AND {}",
-                    col_name, min_placeholder, max_placeholder
+                    quote_column_reference(self.db_type, &col_name),
+                    min_placeholder,
+                    max_placeholder
                 )
                 .unwrap_or_else(|e| panic!("Failed to write BETWEEN clause: {}", e));
-                let ormer_min = Self::convert_filter_value(min);
-                let ormer_max = Self::convert_filter_value(max);
-                params.push(ormer_min);
-                params.push(ormer_max);
+                params.push(min.clone().into());
+                params.push(max.clone().into());
             }
             FilterExpr::Exists {
                 subquery_sql,
@@ -287,75 +318,21 @@ impl FilterFormatter {
     }
 
     /// 格式化单个比较表达式的 SQL 片段
-    fn comparison_sql(&self, full_col_name: &str, operator: &str, _param_idx: &i32) -> String {
-        match self.db_type {
-            #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => {
-                let param_placeholder = if self.postgresql_having_cast {
-                    "$".to_string() + &_param_idx.to_string() + "::bigint"
-                } else {
-                    "$".to_string() + &_param_idx.to_string()
-                };
-                if operator == "@>" {
-                    format!("{} @> ARRAY[{}]", full_col_name, param_placeholder)
-                } else {
-                    format!("{} {} {}", full_col_name, operator, param_placeholder)
-                }
-            }
-            #[cfg(feature = "sqlite")]
-            DbType::Sqlite => format!("{} {} ?", full_col_name, operator),
-            #[cfg(feature = "mysql")]
-            DbType::MySQL => format!("{} {} ?", full_col_name, operator),
-            #[cfg(feature = "mssql")]
-            DbType::MSSQL => format!("{} {} @P", full_col_name, operator),
-        }
-    }
+    fn comparison_sql(&self, full_col_name: &str, operator: &str, param_idx: &i32) -> String {
+        let param_placeholder = placeholder(self.db_type, *param_idx as usize);
+        #[cfg(feature = "postgresql")]
+        let param_placeholder =
+            if matches!(self.db_type, DbType::PostgreSQL) && self.postgresql_having_cast {
+                format!("{param_placeholder}::bigint")
+            } else {
+                param_placeholder
+            };
 
-    /// 格式化 IN 子句的单个占位符
-    fn in_placeholder(&self, _param_idx: &i32) -> String {
-        match self.db_type {
-            #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => "$".to_string() + &_param_idx.to_string(),
-            #[cfg(feature = "sqlite")]
-            DbType::Sqlite => "?".to_string(),
-            #[cfg(feature = "mysql")]
-            DbType::MySQL => "?".to_string(),
-            #[cfg(feature = "mssql")]
-            DbType::MSSQL => "@P".to_string(),
+        #[cfg(feature = "postgresql")]
+        if matches!(self.db_type, DbType::PostgreSQL) && operator == "@>" {
+            return format!("{} @> ARRAY[{}]", full_col_name, param_placeholder);
         }
-    }
 
-    /// 格式化 BETWEEN 子句的占位符
-    fn between_placeholder(&self, _param_idx: &i32) -> String {
-        match self.db_type {
-            #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => "$".to_string() + &_param_idx.to_string(),
-            #[cfg(feature = "sqlite")]
-            DbType::Sqlite => "?".to_string(),
-            #[cfg(feature = "mysql")]
-            DbType::MySQL => "?".to_string(),
-            #[cfg(feature = "mssql")]
-            DbType::MSSQL => "@P".to_string(),
-        }
-    }
-
-    /// 转换 filter::Value 到 model::Value
-    fn convert_filter_value(value: &FilterValue) -> Value {
-        match value {
-            FilterValue::Integer(v) => Value::Integer(*v),
-            FilterValue::BigInt(v) => Value::BigInt(*v),
-            FilterValue::Duration(v) => Value::Duration(*v),
-            FilterValue::Text(v) => Value::Text(v.clone()),
-            FilterValue::Real(v) => Value::Real(*v),
-            FilterValue::Boolean(v) => Value::Boolean(*v),
-            FilterValue::Bytes(v) => Value::Bytes(v.clone()),
-            FilterValue::IntegerArray(v) => Value::IntegerArray(v.clone()),
-            FilterValue::BigIntArray(v) => Value::BigIntArray(v.clone()),
-            FilterValue::NullableBigIntArray(v) => Value::NullableBigIntArray(v.clone()),
-            FilterValue::DateTime(v) => Value::DateTime(*v),
-            FilterValue::Json(v) => Value::Json(v.clone()),
-            FilterValue::Uuid(v) => Value::Uuid(*v),
-            FilterValue::Null => Value::Null,
-        }
+        format!("{} {} {}", full_col_name, operator, param_placeholder)
     }
 }

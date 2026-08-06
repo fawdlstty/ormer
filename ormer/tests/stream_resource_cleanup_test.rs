@@ -152,6 +152,7 @@ async fn test_multiple_consecutive_streams_impl(config: &_test_common::DbConfig)
 /// 测试在连接池中使用流式查询
 async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
     // Turso后端连接池最大连接数必须为1
+    #[cfg(feature = "sqlite")]
     let pool = if config.0 == ormer::DbType::Sqlite {
         ormer::Database::create_pool(config.0, config.1)
             .range(1..1)
@@ -165,6 +166,12 @@ async fn test_stream_with_pool_cleanup_impl(config: &_test_common::DbConfig) {
             .await
             .unwrap()
     };
+    #[cfg(not(feature = "sqlite"))]
+    let pool = ormer::Database::create_pool(config.0, config.1)
+        .range(1..3)
+        .build()
+        .await
+        .unwrap();
 
     // 从连接池获取连接
     let pooled_conn = pool.get().await.unwrap();

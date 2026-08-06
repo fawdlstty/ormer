@@ -1,4 +1,4 @@
-#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+#![cfg(feature = "sqlite")]
 
 use ormer::Model;
 use ormer::generate_create_table_sql;

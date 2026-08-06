@@ -507,13 +507,26 @@ impl<'a, T: Model> TableMigration<'a, T> {
 }
 
 fn column_definition(db_type: DbType, column: &ColumnSchema) -> String {
-    db_type.sql_type(
+    let mut definition = db_type.sql_type(
         column.data_type.unwrap_or(column.rust_type),
         false,
         column.is_auto_increment,
         column.is_nullable,
         column.enum_variants,
-    )
+    );
+
+    if let Some(default) = column.default {
+        definition.push_str(" DEFAULT ");
+        definition.push_str(&default.to_sql(db_type));
+    }
+
+    if let Some(check) = column.check {
+        definition.push_str(" CHECK (");
+        definition.push_str(check.expr);
+        definition.push(')');
+    }
+
+    definition
 }
 
 fn column_type_definition(db_type: DbType, column: &ColumnSchema) -> String {

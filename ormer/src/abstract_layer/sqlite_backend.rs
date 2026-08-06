@@ -30,6 +30,7 @@ fn turso_values_from_ormer_values(values: &[Value]) -> Vec<turso::Value> {
         .map(|v| match v {
             Value::Integer(i) => turso::Value::Integer(*i),
             Value::Text(t) => turso::Value::Text(t.clone()),
+            Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
             Value::Real(r) => turso::Value::Real(*r),
             Value::Boolean(b) => turso::Value::Integer(if *b { 1 } else { 0 }),
             Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -44,41 +45,6 @@ fn turso_values_from_ormer_values(values: &[Value]) -> Vec<turso::Value> {
             Value::Null => turso::Value::Null,
         })
         .collect()
-}
-
-/// 将数据库返回的自增ID（i64）转换为模型指定的 AutoIncrementKeyType
-/// 支持 i32, i64, u32, u64 等整数类型，以及 ()
-fn convert_auto_increment_key<K: Default + 'static>(last_id: i64) -> anyhow::Result<K> {
-    // 使用 any downcast 模式进行类型转换
-    // 这是一个类型擦除的转换，基于 K 的实际类型
-    let result = std::any::TypeId::of::<K>();
-    if result == std::any::TypeId::of::<()>() {
-        let val: () = ();
-        // SAFETY: 我们已经验证了类型匹配
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i32>() {
-        let val: i32 = last_id as i32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<i64>() {
-        let val: i64 = last_id;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u32>() {
-        let val: u32 = last_id as u32;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<u64>() {
-        let val: u64 = last_id as u64;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<usize>() {
-        let val: usize = last_id as usize;
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else if result == std::any::TypeId::of::<Option<i64>>() {
-        let val: Option<i64> = Some(last_id);
-        Ok(unsafe { std::mem::transmute_copy(&val) })
-    } else {
-        Err(anyhow::anyhow!(
-            "Unsupported auto-increment key type. Only i32, i64, u32, u64, usize, Option<i64> and () are supported."
-        ))
-    }
 }
 
 fn table_name_for<T: Model>() -> &'static str {
@@ -103,12 +69,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
     ) -> String {
         // SQLite 不支持原生 ENUM,降级为 TEXT
         if enum_variants.is_some() {
-            let base_type = "TEXT";
-            let mut sql_type = base_type.to_string();
-            if !is_nullable && !is_primary {
-                sql_type.push_str(" NOT NULL");
-            }
-            return sql_type;
+            return common_helpers::sql_type_with_nullability("TEXT", is_nullable || is_primary);
         }
 
         // 首先处理主键类型
@@ -144,14 +105,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             _ => "TEXT",
         };
 
-        let mut sql_type = base_type.to_string();
-
-        // 非主键字段根据 is_nullable 决定是否添加 NOT NULL
-        if !is_nullable {
-            sql_type.push_str(" NOT NULL");
-        }
-
-        sql_type
+        common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
 }
 
@@ -220,7 +174,10 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::Sqlite,
-            format!("DROP TABLE IF EXISTS {}", table_name_for::<T>()),
+            format!(
+                "DROP TABLE IF EXISTS {}",
+                common_helpers::quote_table_name::<T>(DbType::Sqlite)
+            ),
             Vec::new(),
         ))
     }
@@ -259,16 +216,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -282,16 +231,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
         let all_params = values_to_params(&all_values)?;
 
         self.db.conn.execute(&sql, all_params).trace().await?;
@@ -301,8 +242,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.db.conn.last_insert_rowid();
-            let result =
-                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)?;
+            let result = common_helpers::convert_auto_increment_key::<
+                <I::Model as Model>::AutoIncrementKeyType,
+            >(last_id)?;
             Ok(result)
         } else {
             Ok(<I::Model as Model>::AutoIncrementKeyType::default())
@@ -319,16 +261,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
         let all_params = values_to_params(&all_values)?;
 
         let sql_with_returning = format!("{} RETURNING *", sql);
@@ -341,14 +275,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in I::Model::COLUMNS.iter().enumerate() {
+            let model = common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
                 let value = row.get_value(i)?;
-                let ormer_value = convert_turso_value(&value)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = I::Model::from_row(&ormer_row)?;
+                convert_turso_value(&value)
+            })?;
             results.push(model);
         }
 
@@ -378,7 +308,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.db.conn.last_insert_rowid();
-            let result = convert_auto_increment_key::<Self::Output>(last_id)?;
+            let result = common_helpers::convert_auto_increment_key::<Self::Output>(last_id)?;
             return Ok(result);
         }
 
@@ -400,24 +330,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
         // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
         // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
-        let mut sql = format!(
-            "INSERT INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite)
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::Sqlite,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            all_values.extend(model.field_values());
-        }
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -433,17 +355,25 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         let refs = self.models.as_refs();
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
-        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = columns.join(", ");
-        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            insert_placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
-        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let where_clauses: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    c,
+                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                )
+            })
+            .collect();
         let delete_sql = format!(
             "DELETE FROM {table_name} WHERE {}",
             where_clauses.join(" AND ")
@@ -507,23 +437,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         }
 
         let columns = I::Model::insert_columns();
-        let col_count = columns.len();
         // turso 不支持 INSERT OR IGNORE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
         // 在执行阶段捕获约束冲突错误并忽略。
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::Sqlite,
+            "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            columns.join(", ")
+            &columns,
+            &refs,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            all_values.extend(model.insert_values());
-        }
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -539,10 +462,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
-        let columns_str = columns.join(", ");
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let placeholders_str = placeholders.join(", ");
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let placeholders_str = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
         let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
 
         for model in refs.iter() {
@@ -835,16 +757,7 @@ impl Database {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            table_name_for::<T>(),
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
         let all_params = values_to_params(&all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
@@ -854,7 +767,8 @@ impl Database {
         if has_auto_increment {
             let last_id = self.conn.last_insert_rowid();
             // 将 i64 转换为对应的主键类型
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            let result =
+                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
             Ok(result)
         } else {
             Ok(T::AutoIncrementKeyType::default())
@@ -871,16 +785,24 @@ impl Database {
         let columns = T::insert_columns();
         let col_count = columns.len();
         let pk_columns = T::primary_key_columns();
-        let table_name = table_name_for::<T>();
+        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
 
-        let columns_str = columns.join(", ");
-        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            insert_placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
-        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let where_clauses: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    c,
+                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                )
+            })
+            .collect();
         let delete_sql = format!(
             "DELETE FROM {table_name} WHERE {}",
             where_clauses.join(" AND ")
@@ -914,14 +836,12 @@ impl Database {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let table_name = table_name_for::<T>();
+        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
 
-        let columns_str = columns.join(", ");
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
 
         for model in models.iter() {
             let values = model.insert_values();
@@ -1152,16 +1072,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -1175,16 +1087,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &columns,
-            refs.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<
-                I::Model,
-            >(&refs);
+        let (sql, all_values) =
+            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
         let all_params = values_to_params(&all_values)?;
 
         self.txn.conn.execute(&sql, all_params).trace().await?;
@@ -1194,8 +1098,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.txn.conn.last_insert_rowid();
-            let result =
-                convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(last_id)?;
+            let result = common_helpers::convert_auto_increment_key::<
+                <I::Model as Model>::AutoIncrementKeyType,
+            >(last_id)?;
             Ok(result)
         } else {
             Ok(<I::Model as Model>::AutoIncrementKeyType::default())
@@ -1217,22 +1122,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let columns = I::Model::COLUMNS.join(", ");
-        let col_count = I::Model::COLUMNS.len();
-        let mut sql = format!(
-            "INSERT INTO {} ({columns}) VALUES ",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite)
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::Sqlite,
+            "INSERT INTO",
+            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            I::Model::COLUMNS,
+            &refs,
+            common_helpers::BatchInsertValuesMode::All,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            all_values.extend(model.field_values());
-        }
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -1248,17 +1145,25 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         let refs = self.models.as_refs();
         let columns = I::Model::COLUMNS;
         let col_count = columns.len();
-        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = columns.join(", ");
-        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            insert_placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
-        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let where_clauses: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    c,
+                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                )
+            })
+            .collect();
         let delete_sql = format!(
             "DELETE FROM {table_name} WHERE {}",
             where_clauses.join(" AND ")
@@ -1302,24 +1207,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         }
 
         let columns = I::Model::insert_columns();
-        let col_count = columns.len();
-
-        let mut sql = format!(
-            "INSERT INTO {} ({}) VALUES ",
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+            DbType::Sqlite,
+            "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            columns.join(", ")
+            &columns,
+            &refs,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        let mut all_values = Vec::new();
-
-        for (idx, model) in refs.iter().enumerate() {
-            if idx > 0 {
-                sql.push_str(", ");
-            }
-
-            let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-            sql.push_str(&format!("({})", placeholders.join(", ")));
-            all_values.extend(model.insert_values());
-        }
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
@@ -1335,14 +1230,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = <I::Model as Model>::table_name_for_db(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
 
-        let columns_str = columns.join(", ");
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
 
         for model in refs.iter() {
             let values = model.insert_values();
@@ -1504,16 +1397,7 @@ impl Transaction {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            table_name_for::<T>(),
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
+        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
         let all_params = values_to_params(&all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
@@ -1522,7 +1406,8 @@ impl Transaction {
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.conn.last_insert_rowid();
-            let result = convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
+            let result =
+                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
             Ok(result)
         } else {
             Ok(T::AutoIncrementKeyType::default())
@@ -1539,16 +1424,24 @@ impl Transaction {
         let columns = T::insert_columns();
         let col_count = columns.len();
         let pk_columns = T::primary_key_columns();
-        let table_name = table_name_for::<T>();
+        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
 
-        let columns_str = columns.join(", ");
-        let insert_placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            insert_placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
-        let where_clauses: Vec<String> = pk_columns.iter().map(|c| format!("{c} = ?")).collect();
+        let where_clauses: Vec<String> = pk_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, c)| {
+                common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    c,
+                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                )
+            })
+            .collect();
         let delete_sql = format!(
             "DELETE FROM {table_name} WHERE {}",
             where_clauses.join(" AND ")
@@ -1582,14 +1475,12 @@ impl Transaction {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let table_name = table_name_for::<T>();
+        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
 
-        let columns_str = columns.join(", ");
-        let placeholders: Vec<String> = (1..=col_count).map(|_| "?".to_string()).collect();
-        let insert_sql = format!(
-            "INSERT INTO {table_name} ({columns_str}) VALUES ({})",
-            placeholders.join(", ")
-        );
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
+        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let insert_sql =
+            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
 
         for model in models.iter() {
             let values = model.insert_values();
@@ -1988,6 +1879,9 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -2080,6 +1974,9 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -2159,6 +2056,9 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -2259,6 +2159,9 @@ impl<
                 .map(|v| match v {
                     crate::model::Value::Integer(i) => turso::Value::Integer(i),
                     crate::model::Value::Text(t) => turso::Value::Text(t),
+                    crate::model::Value::TextArray(v) => {
+                        turso::Value::Text(crate::model::stringify_string_vec(&v))
+                    }
                     crate::model::Value::Real(r) => turso::Value::Real(r),
                     crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                     crate::model::Value::Bytes(b) => turso::Value::Blob(b),
@@ -2427,6 +2330,9 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -2455,15 +2361,10 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         let mut results = Vec::new();
 
         while let Some(row) = rows.next().trace().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                let ormer_value = convert_turso_value(&value)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+                convert_turso_value(&value)
+            })?;
             results.push(model);
         }
 
@@ -2500,6 +2401,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -2528,15 +2432,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mut results = Vec::new();
 
         while let Some(row) = rows.next().trace().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                let ormer_value = convert_turso_value(&value)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+                convert_turso_value(&value)
+            })?;
             results.push(model);
         }
 
@@ -2584,14 +2483,10 @@ impl<T: Model> DeleteExecutor<T> {
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i)?;
-                let ormer_value = convert_turso_value(&value)?;
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+                convert_turso_value(&value)
+            })?;
             results.push(model);
         }
 
@@ -2604,7 +2499,10 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     fn build_ormer_sql(&self) -> (String, Vec<Value>) {
-        let mut sql = format!("DELETE FROM {}", table_name_for::<T>());
+        let mut sql = format!(
+            "DELETE FROM {}",
+            common_helpers::quote_table_name::<T>(DbType::Sqlite)
+        );
         let mut ormer_params = Vec::new();
 
         if !self.filters.is_empty() {
@@ -2722,6 +2620,30 @@ impl<T: Model> UpdateExecutor<T> {
         self
     }
 
+    pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
+        let model_sets = model
+            .non_pk_field_values_for_columns(fields)
+            .into_iter()
+            .map(|(col_name, value)| (col_name.to_string(), value))
+            .collect::<Vec<_>>();
+        let pk_columns = T::primary_key_columns();
+        let pk_values = model.primary_key_values();
+        let model_filters = pk_columns
+            .iter()
+            .zip(pk_values)
+            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
+                column: col.to_string(),
+                operator: "=".to_string(),
+                value: common_helpers::value_to_filter_value(&val),
+            })
+            .collect();
+
+        if !model_sets.is_empty() {
+            self.model_updates.push((model_sets, model_filters));
+        }
+        self
+    }
+
     pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
         let statements = self.build_all_ormer_sql()?;
         Ok(SqlStatement::batch(
@@ -2747,14 +2669,10 @@ impl<T: Model> UpdateExecutor<T> {
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
             let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
             while let Some(row) = rows.next().trace().await? {
-                let mut data = HashMap::new();
-                for (i, col_name) in T::COLUMNS.iter().enumerate() {
+                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
-                    let ormer_value = convert_turso_value(&value)?;
-                    data.insert(col_name.to_string(), ormer_value);
-                }
-                let ormer_row = Row::new(data);
-                let model = T::from_row(&ormer_row)?;
+                    convert_turso_value(&value)
+                })?;
                 results.push(model);
             }
         }
@@ -2770,14 +2688,21 @@ impl<T: Model> UpdateExecutor<T> {
         let mut statements = Vec::new();
 
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::Sqlite)
+            );
             let mut ormer_params = Vec::new();
             let mut first = true;
             for (col_name, value) in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{col_name} = ?"));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    col_name,
+                    "?",
+                ));
                 ormer_params.push(value.clone());
                 first = false;
             }
@@ -2801,14 +2726,21 @@ impl<T: Model> UpdateExecutor<T> {
         }
 
         for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!("UPDATE {} SET ", table_name_for::<T>());
+            let mut sql = format!(
+                "UPDATE {} SET ",
+                common_helpers::quote_table_name::<T>(DbType::Sqlite)
+            );
             let mut ormer_params = Vec::new();
             let mut first = true;
             for (col_name, value) in model_sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&format!("{col_name} = ?"));
+                sql.push_str(&common_helpers::quote_assignment(
+                    DbType::Sqlite,
+                    col_name,
+                    "?",
+                ));
                 ormer_params.push(value.clone());
                 first = false;
             }
@@ -2877,6 +2809,7 @@ fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
         let param = match value {
             Value::Integer(v) => turso::Value::Integer(*v),
             Value::Text(v) => turso::Value::Text(v.clone()),
+            Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(v)),
             Value::Real(v) => turso::Value::Real(*v),
             Value::Boolean(v) => turso::Value::Integer(if *v { 1 } else { 0 }),
             Value::Bytes(v) => turso::Value::Blob(v.clone()),
@@ -3015,6 +2948,9 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -3045,15 +2981,11 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         while let Some(row) = rows.next().trace().await? {
             // 获取行中的所有值
             let column_count = self.select.column_names().len();
-            let mut values = Vec::with_capacity(column_count);
-            for i in 0..column_count {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                let ormer_value = convert_turso_value(&value)?;
-                values.push(ormer_value);
-            }
-
-            // 使用 FromRowValues 从多个值构建类型
-            let typed_value = V::from_row_values(&values)?;
+            let typed_value =
+                common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
+                    let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                    convert_turso_value(&value)
+                })?;
             results.push(typed_value);
         }
 
@@ -3143,6 +3075,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
@@ -3173,15 +3108,11 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         while let Some(row) = rows.next().trace().await? {
             // 获取行中的所有值（从 column_count 获取列数）
             let column_count = self.select.column_count();
-            let mut values = Vec::with_capacity(column_count);
-            for i in 0..column_count {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                let ormer_value = convert_turso_value(&value)?;
-                values.push(ormer_value);
-            }
-
-            // 使用 FromRowValues 从多个值构建类型
-            let typed_value = V::from_row_values(&values)?;
+            let typed_value =
+                common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
+                    let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                    convert_turso_value(&value)
+                })?;
             results.push(typed_value);
         }
 
@@ -3228,6 +3159,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             .map(|v| match v {
                 crate::model::Value::Integer(i) => turso::Value::Integer(i),
                 crate::model::Value::Text(t) => turso::Value::Text(t),
+                crate::model::Value::TextArray(v) => {
+                    turso::Value::Text(crate::model::stringify_string_vec(&v))
+                }
                 crate::model::Value::Real(r) => turso::Value::Real(r),
                 crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
                 crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
