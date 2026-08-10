@@ -11,7 +11,7 @@ struct User {
 
 #[cfg(feature = "sqlite")]
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ormer::Result<()> {
     // 连接数据库并创建表
     let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
     db.create_table::<User>().execute().await?;

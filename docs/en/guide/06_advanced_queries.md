@@ -86,6 +86,78 @@ let sql = Select::<User>::new()
 - `max()` - Maximum, returns original type (numeric types)
 - `min()` - Minimum, returns original type (numeric types)
 
+## Unified Expressions
+
+Fields, projections, filters, ordering, grouping, and selected aggregate features share the same expression AST. Expressions can combine functions, `CASE`, casts, collations, window functions, and backend operators:
+
+```rust
+let rows: Vec<(i32, String, String)> = db
+    .select::<User>()
+    .filter(|u| u.email.to_lower().eq("alice@example.com"))
+    .map_to(|u| {
+        (
+            u.id.alias("user_id"),
+            u.email,
+            ormer::expr!(match u.status {
+                "paid" => "done",
+                "new" => "open",
+                _ => "other",
+            })
+            .alias("status_label"),
+        )
+    })
+    .order_by(|u| u.email.collate("nocase").asc())
+    .collect()
+    .await?;
+```
+
+Aggregate expressions support `FILTER`, inner ordering, and `OVER`:
+
+```rust
+let rows: Vec<(i32, i32)> = db
+    .select::<Order>()
+    .map_to(|o| {
+        (
+            o.user_id,
+            o.total
+                .sum()
+                .filter(|o| o.paid.eq(true))
+                .over(|w| w.partition_by(o.user_id)),
+        )
+    })
+    .collect()
+    .await?;
+```
+
+Grouping supports `ROLLUP`, `CUBE`, and `GROUPING SETS`:
+
+```rust
+let sql = Select::<Sale>::new()
+    .select_column(|s| (s.region, s.amount.sum()))
+    .rollup(|s| (s.region, s.city))
+    .to_sql();
+
+let sql = Select::<Sale>::new()
+    .select_column(|s| (s.region, s.amount.sum()))
+    .grouping_sets(|s| ((s.region,), ()))
+    .to_sql();
+```
+
+You can also combine row values, JSON paths, full text search, `DISTINCT ON`, and row locks:
+
+```rust
+let rows: Vec<User> = db
+    .select::<User>()
+    .distinct_on(|u| u.org_id)
+    .filter(|u| (u.org_id, u.email).eq((org_id, email)))
+    .filter(|u| u.profile.json_text("role").eq("admin"))
+    .filter(|u| u.bio.matches_text("rust"))
+    .for_update()
+    .skip_locked()
+    .collect()
+    .await?;
+```
+
 ## JOIN Queries
 
 ```rust

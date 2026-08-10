@@ -3,9 +3,10 @@
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
-use super::SqlStatement;
+use super::{SqlStatement, common_helpers};
 use crate::model::{Model, Relation, RelationInfo, Value, normalize_table_name_for_db};
 use crate::query::builder::WhereExpr;
+use crate::query::insert::{IntoInsertAssignment, IntoInsertDefaultColumn};
 use crate::raw_sql::{IntoRawSql, RawSql};
 
 // 根据启用的 feature 导入后端实现
@@ -35,6 +36,8 @@ fn model_value_key(value: &Value) -> String {
         Value::BigIntArray(v) => format!("ba:{v:?}"),
         Value::NullableBigIntArray(v) => format!("na:{v:?}"),
         Value::DateTime(v) => format!("dt:{v}"),
+        Value::Date(v) => format!("da:{v}"),
+        Value::Time(v) => format!("ti:{v}"),
         Value::Json(v) => format!("j:{v}"),
         Value::Uuid(v) => format!("u:{v}"),
         Value::Null => "n:".to_string(),
@@ -49,6 +52,46 @@ fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value
         .filter(|value| seen.insert(model_value_key(value)))
         .map(Into::into)
         .collect()
+}
+
+fn primary_key_filter<T: Model>(key: impl crate::model::PrimaryKey) -> crate::Result<WhereExpr> {
+    let pk_columns = T::primary_key_columns();
+    let pk_values = key.into_values();
+
+    if pk_columns.is_empty() {
+        return Err(crate::ormer_error!(
+            "Model {} does not have a primary key",
+            T::TABLE_NAME
+        ));
+    }
+    if pk_columns.len() != pk_values.len() {
+        return Err(crate::ormer_error!(
+            "Primary key column count ({}) does not match value count ({})",
+            pk_columns.len(),
+            pk_values.len()
+        ));
+    }
+
+    let filters = pk_columns.iter().zip(pk_values).map(|(col, val)| {
+        crate::query::filter::FilterExpr::Comparison {
+            column: col.to_string(),
+            operator: "=".to_string(),
+            value: common_helpers::value_to_filter_value(&val),
+        }
+    });
+
+    let mut filters = filters.into_iter();
+    let Some(filter) = filters.next() else {
+        return Err(crate::ormer_error!(
+            "Model {} does not have a primary key filter",
+            T::TABLE_NAME
+        ));
+    };
+    let filter = filters.fold(filter, |a, b| {
+        crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
+    });
+
+    Ok(WhereExpr::from_filter(filter))
 }
 
 fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
@@ -112,7 +155,7 @@ pub enum CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             CreateTableExecutor::Sqlite(exec) => exec.to_sql(),
@@ -125,7 +168,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             CreateTableExecutor::Sqlite(exec) => exec.execute().await,
@@ -152,7 +195,7 @@ pub enum DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             DropTableExecutor::Sqlite(exec) => exec.to_sql(),
@@ -165,7 +208,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             DropTableExecutor::Sqlite(exec) => exec.execute().await,
@@ -191,8 +234,201 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertExecutor<'a, I>),
 }
 
+pub enum InsertPartialExecutor<'a, T: Model> {
+    #[cfg(feature = "sqlite")]
+    Sqlite(
+        sqlite_backend::InsertPartialExecutor<'a, T>,
+        std::marker::PhantomData<&'a T>,
+    ),
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::InsertPartialExecutor<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::InsertPartialExecutor<'a, T>),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::InsertPartialExecutor<'a, T>),
+}
+
+impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
+    pub fn set<F, A>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> A,
+        A: IntoInsertAssignment<T>,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertPartialExecutor::Sqlite(exec, phantom) => {
+                InsertPartialExecutor::Sqlite(exec.set(f), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            InsertPartialExecutor::PostgreSQL(exec) => {
+                InsertPartialExecutor::PostgreSQL(exec.set(f))
+            }
+            #[cfg(feature = "mysql")]
+            InsertPartialExecutor::MySQL(exec) => InsertPartialExecutor::MySQL(exec.set(f)),
+            #[cfg(feature = "mssql")]
+            InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.set(f)),
+        }
+    }
+
+    pub fn default<F, C>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: IntoInsertDefaultColumn<T>,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertPartialExecutor::Sqlite(exec, phantom) => {
+                InsertPartialExecutor::Sqlite(exec.default(f), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            InsertPartialExecutor::PostgreSQL(exec) => {
+                InsertPartialExecutor::PostgreSQL(exec.default(f))
+            }
+            #[cfg(feature = "mysql")]
+            InsertPartialExecutor::MySQL(exec) => InsertPartialExecutor::MySQL(exec.default(f)),
+            #[cfg(feature = "mssql")]
+            InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.default(f)),
+        }
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertPartialExecutor::Sqlite(exec, _) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertPartialExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertPartialExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertPartialExecutor::MSSQL(exec) => exec.to_sql(),
+        }
+    }
+
+    pub async fn execute(self) -> crate::Result<<T as Model>::AutoIncrementKeyType> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertPartialExecutor::Sqlite(exec, _) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertPartialExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertPartialExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mssql")]
+            InsertPartialExecutor::MSSQL(exec) => exec.execute().await,
+        }
+    }
+}
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn on_conflict<F, C>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> C,
+        C: crate::query::insert::ConflictColumns,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.on_conflict(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.on_conflict(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_conflict(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_conflict(f)),
+        }
+    }
+
+    pub fn on_constraint<Target>(self, target: Target) -> Self
+    where
+        Target: crate::query::insert::IntoInsertConflictTarget<I::Model>,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.on_constraint(target)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => {
+                InsertExecutor::PostgreSQL(exec.on_constraint(target))
+            }
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_constraint(target)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_constraint(target)),
+        }
+    }
+
+    pub fn conflict_where<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.conflict_where(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.conflict_where(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.conflict_where(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.conflict_where(f)),
+        }
+    }
+
+    pub fn do_nothing(self) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_nothing()),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_nothing()),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_nothing()),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_nothing()),
+        }
+    }
+
+    pub fn do_update(self) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_update()),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_update()),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update()),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update()),
+        }
+    }
+
+    pub fn do_update_if<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_update_if(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_update_if(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update_if(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update_if(f)),
+        }
+    }
+
+    pub fn set<F>(self, f: F) -> Self
+    where
+        F: FnOnce(&mut <I::Model as Model>::Update),
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.set(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.set(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.set(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.set(f)),
+        }
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.to_sql(),
@@ -207,7 +443,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
     pub async fn execute(
         self,
-    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
+    ) -> crate::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.execute().await,
@@ -220,7 +456,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
     }
 
-    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
+    pub async fn returning(self) -> crate::Result<Vec<I::Model>> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.returning().await,
@@ -247,7 +483,7 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
@@ -260,7 +496,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrUpdateExecutor::Sqlite(exec) => exec.execute().await,
@@ -287,7 +523,7 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
@@ -300,7 +536,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
@@ -319,7 +555,7 @@ impl Database {
     pub async fn connect(
         db_type: super::super::DbType,
         connection_string: &str,
-    ) -> anyhow::Result<Self> {
+    ) -> crate::Result<Self> {
         match db_type {
             #[cfg(feature = "sqlite")]
             super::super::DbType::Sqlite => {
@@ -359,7 +595,7 @@ impl Database {
     }
 
     /// 验证表结构
-    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
+    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.validate_table::<T>().await,
@@ -386,6 +622,44 @@ impl Database {
         }
     }
 
+    pub fn insert_partial<T: Model + Send + Sync>(&self) -> InsertPartialExecutor<'_, T> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                InsertPartialExecutor::Sqlite(db.insert_partial::<T>(), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => InsertPartialExecutor::PostgreSQL(db.insert_partial::<T>()),
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => InsertPartialExecutor::MySQL(db.insert_partial::<T>()),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_partial::<T>()),
+        }
+    }
+
+    pub fn insert_model<T>(
+        &self,
+        model: impl crate::model::InsertModel<T>,
+    ) -> InsertPartialExecutor<'_, T>
+    where
+        T: Model + Send + Sync,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => {
+                InsertPartialExecutor::Sqlite(db.insert_model::<T>(model), std::marker::PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => {
+                InsertPartialExecutor::PostgreSQL(db.insert_model::<T>(model))
+            }
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => InsertPartialExecutor::MySQL(db.insert_model::<T>(model)),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_model::<T>(model)),
+        }
+    }
+
     /// 插入或更新记录 - 返回执行器
     pub fn insert_or_update<I: crate::model::Insertable>(
         &self,
@@ -405,6 +679,10 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrUpdateExecutor::MSSQL(db.insert_or_update::<I>(models)),
         }
+    }
+
+    pub fn upsert<I: crate::model::Insertable>(&self, models: I) -> InsertOrUpdateExecutor<'_, I> {
+        self.insert_or_update(models)
     }
 
     /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
@@ -439,68 +717,8 @@ impl Database {
     pub async fn find_by_id<T: Model + 'static + std::marker::Send + std::marker::Sync>(
         &self,
         key: impl crate::model::PrimaryKey,
-    ) -> anyhow::Result<Option<T>> {
-        let pk_columns = T::primary_key_columns();
-        let pk_values = key.into_values();
-
-        if pk_columns.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Model {} does not have a primary key",
-                T::TABLE_NAME
-            ));
-        }
-        if pk_columns.len() != pk_values.len() {
-            return Err(anyhow::anyhow!(
-                "Primary key column count ({}) does not match value count ({})",
-                pk_columns.len(),
-                pk_values.len()
-            ));
-        }
-
-        // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
-        let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values) {
-            let filter_val = match val {
-                crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
-                crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
-                crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
-                crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
-                crate::model::Value::TextArray(v) => crate::query::filter::Value::TextArray(v),
-                crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
-                crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
-                crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
-                crate::model::Value::IntegerArray(v) => {
-                    crate::query::filter::Value::IntegerArray(v)
-                }
-                crate::model::Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
-                crate::model::Value::NullableBigIntArray(v) => {
-                    crate::query::filter::Value::NullableBigIntArray(v)
-                }
-                crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
-                crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
-                crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
-                crate::model::Value::Null => crate::query::filter::Value::Null,
-            };
-            filters.push(crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: filter_val,
-            });
-        }
-
-        // 组合所有条件为 AND
-        let mut filters = filters.into_iter();
-        let Some(filter) = filters.next() else {
-            return Err(anyhow::anyhow!(
-                "Model {} does not have a primary key filter",
-                T::TABLE_NAME
-            ));
-        };
-        let filter = filters.fold(filter, |a, b| {
-            crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
-        });
-
-        let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
+    ) -> crate::Result<Option<T>> {
+        let where_expr = primary_key_filter::<T>(key)?;
 
         // 执行查询并取第一条
         let results = self
@@ -521,7 +739,7 @@ impl Database {
         &self,
         owner: &T,
         relation: Relation<T, R>,
-    ) -> anyhow::Result<Vec<R>> {
+    ) -> crate::Result<Vec<R>> {
         let relation = relation.info()?;
         let key = owner.relation_key_value(relation)?;
         self.select_related::<R>(relation, vec![key]).await
@@ -535,12 +753,12 @@ impl Database {
         &self,
         owners: &mut [T],
         relation: Relation<T, R>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let relation = relation.info()?;
         let owner_keys = owners
             .iter()
             .map(|owner| owner.relation_key_value(relation))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?;
         let related = self.select_related::<R>(relation, owner_keys).await?;
 
         let mut grouped: std::collections::HashMap<String, Vec<R>> =
@@ -567,7 +785,7 @@ impl Database {
         &self,
         relation: &RelationInfo,
         keys: Vec<Value>,
-    ) -> anyhow::Result<Vec<R>> {
+    ) -> crate::Result<Vec<R>> {
         let values = relation_filter_values(keys);
         if values.is_empty() {
             return Ok(Vec::new());
@@ -663,7 +881,7 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
+    pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => {
@@ -711,7 +929,7 @@ impl Database {
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
         match self {
             #[cfg(feature = "sqlite")]
@@ -738,7 +956,7 @@ impl Database {
     }
 
     /// Count rows in a table using backend-specific identifier quoting.
-    pub async fn table_row_count(&self, table_name: &str) -> anyhow::Result<u64> {
+    pub async fn table_row_count(&self, table_name: &str) -> crate::Result<u64> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
             quote_table_name(self.db_type(), table_name)
@@ -793,7 +1011,7 @@ where
     T: crate::model::FromRowValues + 'static + std::marker::Send,
     C: FromIterator<T> + 'static,
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -856,7 +1074,7 @@ where
     T: crate::model::FromRowValues + 'static + std::marker::Send,
     C: FromIterator<T> + 'static,
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -920,7 +1138,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         &self,
         relation: &RelationInfo,
         keys: Vec<Value>,
-    ) -> anyhow::Result<Vec<R>> {
+    ) -> crate::Result<Vec<R>> {
         let values = relation_filter_values(keys);
         if values.is_empty() {
             return Ok(Vec::new());
@@ -982,12 +1200,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         &self,
         owners: &mut [T],
         relation: Relation<T, R>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let relation = relation.info()?;
         let owner_keys = owners
             .iter()
             .map(|owner| owner.relation_key_value(relation))
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<crate::Result<Vec<_>>>()?;
         let related = self.select_related::<R>(relation, owner_keys).await?;
 
         let mut grouped: std::collections::HashMap<String, Vec<R>> =
@@ -1201,7 +1419,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// COUNT 聚合函数
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1220,7 +1438,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// SUM 聚合函数
     pub fn sum<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
@@ -1240,7 +1458,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// AVG 聚合函数
     pub fn avg<F, C>(self, f: F) -> AggregateFuture<'a, T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
@@ -1260,7 +1478,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MAX 聚合函数
     pub fn max<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
@@ -1280,7 +1498,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MIN 聚合函数
     pub fn min<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         match self {
@@ -1513,7 +1731,7 @@ crate::impl_unified_collect_future!(CollectFuture);
 impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
     for FirstFuture<'a, T>
 {
-    type Output = anyhow::Result<Option<T>>;
+    type Output = crate::Result<Option<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -1577,7 +1795,166 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn on_conflict<F, C>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> C,
+        C: crate::query::insert::ConflictColumns,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.on_conflict(f))
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.on_conflict(f))
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.on_conflict(f))
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.on_conflict(f))
+            }
+        }
+    }
+
+    pub fn on_constraint<Target>(self, target: Target) -> Self
+    where
+        Target: crate::query::insert::IntoInsertConflictTarget<I::Model>,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.on_constraint(target))
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.on_constraint(target))
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.on_constraint(target))
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.on_constraint(target))
+            }
+        }
+    }
+
+    pub fn conflict_where<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.conflict_where(f))
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.conflict_where(f))
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.conflict_where(f))
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.conflict_where(f))
+            }
+        }
+    }
+
+    pub fn do_nothing(self) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.do_nothing())
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.do_nothing())
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.do_nothing())
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.do_nothing())
+            }
+        }
+    }
+
+    pub fn do_update(self) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.do_update())
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.do_update())
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.do_update())
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.do_update())
+            }
+        }
+    }
+
+    pub fn do_update_if<F>(self, f: F) -> Self
+    where
+        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.do_update_if(f))
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.do_update_if(f))
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => {
+                TransactionInsertExecutor::MySQL(exec.do_update_if(f))
+            }
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => {
+                TransactionInsertExecutor::MSSQL(exec.do_update_if(f))
+            }
+        }
+    }
+
+    pub fn set<F>(self, f: F) -> Self
+    where
+        F: FnOnce(&mut <I::Model as Model>::Update),
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            TransactionInsertExecutor::Sqlite(exec) => {
+                TransactionInsertExecutor::Sqlite(exec.set(f))
+            }
+            #[cfg(feature = "postgresql")]
+            TransactionInsertExecutor::PostgreSQL(exec) => {
+                TransactionInsertExecutor::PostgreSQL(exec.set(f))
+            }
+            #[cfg(feature = "mysql")]
+            TransactionInsertExecutor::MySQL(exec) => TransactionInsertExecutor::MySQL(exec.set(f)),
+            #[cfg(feature = "mssql")]
+            TransactionInsertExecutor::MSSQL(exec) => TransactionInsertExecutor::MSSQL(exec.set(f)),
+        }
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertExecutor::Sqlite(exec) => exec.to_sql(),
@@ -1592,7 +1969,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
 
     pub async fn execute(
         self,
-    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
+    ) -> crate::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertExecutor::Sqlite(exec) => exec.execute().await,
@@ -1619,7 +1996,7 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
@@ -1632,7 +2009,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertOrUpdateExecutor::Sqlite(exec) => exec.execute().await,
@@ -1659,7 +2036,7 @@ pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
@@ -1672,7 +2049,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
@@ -1699,7 +2076,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 提交事务
-    pub async fn commit(self) -> anyhow::Result<()> {
+    pub async fn commit(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => txn.commit().await,
@@ -1714,7 +2091,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 回滚事务
-    pub async fn rollback(self) -> anyhow::Result<()> {
+    pub async fn rollback(self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => txn.rollback().await,
@@ -1732,68 +2109,8 @@ impl<'a> Transaction<'a> {
     pub async fn find_by_id<T: Model + 'static + std::marker::Send + std::marker::Sync>(
         &self,
         key: impl crate::model::PrimaryKey,
-    ) -> anyhow::Result<Option<T>> {
-        let pk_columns = T::primary_key_columns();
-        let pk_values = key.into_values();
-
-        if pk_columns.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Model {} does not have a primary key",
-                T::TABLE_NAME
-            ));
-        }
-        if pk_columns.len() != pk_values.len() {
-            return Err(anyhow::anyhow!(
-                "Primary key column count ({}) does not match value count ({})",
-                pk_columns.len(),
-                pk_values.len()
-            ));
-        }
-
-        // 构建 WHERE 条件（将 model::Value 转为 filter::Value）
-        let mut filters: Vec<crate::query::filter::FilterExpr> = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values) {
-            let filter_val = match val {
-                crate::model::Value::Integer(v) => crate::query::filter::Value::Integer(v),
-                crate::model::Value::BigInt(v) => crate::query::filter::Value::BigInt(v),
-                crate::model::Value::Duration(v) => crate::query::filter::Value::Duration(v),
-                crate::model::Value::Text(v) => crate::query::filter::Value::Text(v),
-                crate::model::Value::TextArray(v) => crate::query::filter::Value::TextArray(v),
-                crate::model::Value::Real(v) => crate::query::filter::Value::Real(v),
-                crate::model::Value::Boolean(v) => crate::query::filter::Value::Boolean(v),
-                crate::model::Value::Bytes(v) => crate::query::filter::Value::Bytes(v),
-                crate::model::Value::IntegerArray(v) => {
-                    crate::query::filter::Value::IntegerArray(v)
-                }
-                crate::model::Value::BigIntArray(v) => crate::query::filter::Value::BigIntArray(v),
-                crate::model::Value::NullableBigIntArray(v) => {
-                    crate::query::filter::Value::NullableBigIntArray(v)
-                }
-                crate::model::Value::DateTime(v) => crate::query::filter::Value::DateTime(v),
-                crate::model::Value::Json(v) => crate::query::filter::Value::Json(v),
-                crate::model::Value::Uuid(v) => crate::query::filter::Value::Uuid(v),
-                crate::model::Value::Null => crate::query::filter::Value::Null,
-            };
-            filters.push(crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: filter_val,
-            });
-        }
-
-        // 组合所有条件为 AND
-        let mut filters = filters.into_iter();
-        let Some(filter) = filters.next() else {
-            return Err(anyhow::anyhow!(
-                "Model {} does not have a primary key filter",
-                T::TABLE_NAME
-            ));
-        };
-        let filter = filters.fold(filter, |a, b| {
-            crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
-        });
-
-        let where_expr = crate::query::builder::WhereExpr::from_filter(filter);
+    ) -> crate::Result<Option<T>> {
+        let where_expr = primary_key_filter::<T>(key)?;
 
         // 执行查询并取第一条
         let results = self
@@ -1918,6 +2235,13 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    pub fn upsert<I: crate::model::Insertable>(
+        &mut self,
+        models: I,
+    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
+        self.insert_or_update(models)
+    }
+
     /// 插入或忽略记录 - 返回执行器
     pub fn insert_or_ignore<I: crate::model::Insertable>(
         &mut self,
@@ -2036,16 +2360,13 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 }
 
-crate::impl_unified_join_collect_future!(
-    LeftJoinCollectFuture,
-    anyhow::Result<Vec<(T, Option<J>)>>
-);
+crate::impl_unified_join_collect_future!(LeftJoinCollectFuture, crate::Result<Vec<(T, Option<J>)>>);
 
-crate::impl_unified_join_collect_future!(InnerJoinCollectFuture, anyhow::Result<Vec<(T, J)>>);
+crate::impl_unified_join_collect_future!(InnerJoinCollectFuture, crate::Result<Vec<(T, J)>>);
 
 crate::impl_unified_join_collect_future!(
     RightJoinCollectFuture,
-    anyhow::Result<Vec<(Option<T>, J)>>
+    crate::Result<Vec<(Option<T>, J)>>
 );
 
 /// 统一的 MappedSelectExecutor 枚举
@@ -2210,7 +2531,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2331,7 +2652,7 @@ impl<
     C: FromIterator<T> + 'static,
 > std::future::IntoFuture for IncludedCollectFuture<'a, T, R, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2476,7 +2797,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2502,7 +2823,7 @@ where
     M: 'static + std::marker::Send,
     F: Fn(V) -> M + Clone + Send + 'static,
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2571,7 +2892,7 @@ pub enum SelectStreamIterator<'a, T: Model> {
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
-    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
+    pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         match self {
             #[cfg(feature = "sqlite")]
             SelectStream::Sqlite(stream) => {
@@ -2599,7 +2920,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
-    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
+    pub async fn next(&mut self) -> Option<crate::Result<T>> {
         match self {
             #[cfg(feature = "sqlite")]
             SelectStreamIterator::Sqlite(iter) => iter.next().await,

@@ -13,9 +13,9 @@ struct UserName {
 }
 
 impl FromRowValues for UserName {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+    fn from_row_values(values: &[Value]) -> ormer::Result<Self> {
         if values.len() < 2 {
-            return Err(anyhow::anyhow!("Expected id and name"));
+            return Err(ormer::ormer_error!("Expected id and name"));
         }
         Ok(Self {
             id: i32::from_row_values(&values[0..1])?,

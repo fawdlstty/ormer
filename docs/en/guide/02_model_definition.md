@@ -117,7 +117,7 @@ struct User {
 }
 ```
 
-`insert(&model)` still writes all model fields explicitly; a database default applies only when the column is omitted from the INSERT.
+`insert(&model)` still writes all model fields explicitly; a database default applies only when the column is omitted from the INSERT, which `insert_partial` or `insert_model` can do.
 
 ## Supported Types
 
@@ -129,6 +129,10 @@ struct User {
 | `String` | TEXT | TEXT | TEXT | NVARCHAR(255) |
 | `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN | BIT |
 | `Vec<u8>` | BLOB | BYTEA | BLOB | VARBINARY(MAX) |
+| `chrono::DateTime<chrono::Utc>` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
+| `chrono::NaiveDateTime` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
+| `chrono::NaiveDate` | TEXT | DATE | DATE | DATE |
+| `chrono::NaiveTime` | TEXT | TIME | TIME | TIME |
 
 All basic types can be wrapped with `Option<T>` for nullable fields.
 

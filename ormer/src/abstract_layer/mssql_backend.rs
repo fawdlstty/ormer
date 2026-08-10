@@ -9,8 +9,18 @@ use crate::query::builder::{
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::query::insert::{
+    InsertAssignment, InsertConflict, IntoInsertAssignment, IntoInsertDefaultColumn,
+};
+use crate::query::update::UpdateAssignment;
 use crate::raw_sql::IntoRawSql;
 use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::{
+    impl_backend_executor_methods, impl_backend_four_table_executor_methods_with_lifetime,
+    impl_backend_join_executor_methods_with_lifetime,
+    impl_backend_multi_table_executor_methods_with_lifetime,
+    impl_backend_related_executor_methods_with_lifetime, impl_insert_conflict_methods,
+};
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tiberius::{Client, Config, Query};
@@ -66,9 +76,11 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             "String" => "NVARCHAR(255)",
             "bool" => "BIT",
             "Vec<u8>" | "&[u8]" => "VARBINARY(MAX)",
-            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                "DATETIME2"
-            }
+            "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>"
+            | "NaiveDateTime"
+            | "chrono::NaiveDateTime" => "DATETIME2",
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
             "JsonValue" | "serde_json::Value" => "NVARCHAR(MAX)",
@@ -87,7 +99,7 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
+    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
         let config = Config::from_ado_string(connection_string)
             .trace_for("tiberius::Config::from_ado_string")?;
         let tcp = TcpStream::connect(config.get_addr()).trace().await?;
@@ -107,7 +119,7 @@ impl Database {
         true
     }
 
-    pub async fn exec_sql(&self, sql: &str) -> anyhow::Result<u64> {
+    pub async fn exec_sql(&self, sql: &str) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
         let query = Query::new(sql);
         let result = query.execute(&mut *client).trace().await?;
@@ -133,8 +145,30 @@ impl Database {
         InsertExecutor {
             pool: self.pool.clone(),
             models,
+            conflict: None,
             _marker: PhantomData,
         }
+    }
+
+    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+        InsertPartialExecutor {
+            pool: self.pool.clone(),
+            assignments: Vec::new(),
+            source_table: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn insert_model<T>(
+        &self,
+        model: impl crate::model::InsertModel<T>,
+    ) -> InsertPartialExecutor<'_, T>
+    where
+        T: Model,
+    {
+        self.insert_partial::<T>()
+            .with_source_table(model.insert_table_name())
+            .with_assignments(model.insert_assignments())
     }
 
     pub fn insert_or_update<I: crate::model::Insertable>(
@@ -162,14 +196,14 @@ impl Database {
     pub async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    ) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_mssql_with_columns(
+        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
             DbType::MSSQL,
             T::TABLE_NAME,
             &columns,
@@ -214,7 +248,7 @@ impl Database {
         }
     }
 
-    pub async fn insert_or_update_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_update_impl<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -231,7 +265,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
+    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> crate::Result<u64> {
         if models.is_empty() {
             return Ok(0);
         }
@@ -323,7 +357,7 @@ impl Database {
         }
     }
 
-    pub async fn transaction(&self) -> anyhow::Result<Transaction<'_>> {
+    pub async fn transaction(&self) -> crate::Result<Transaction<'_>> {
         let _client = self.pool.lock().await;
         Ok(Transaction {
             pool: self.pool.clone(),
@@ -332,7 +366,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
+    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let table_filter = if let Some((schema_name, table_name)) = T::TABLE_NAME.rsplit_once('.') {
             format!("TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'")
@@ -348,12 +382,18 @@ impl Database {
             let stream = query.query(&mut *client).trace().await?;
             let rows = stream.into_first_result().trace().await?;
             if rows.is_empty() {
-                return Err(anyhow::anyhow!("Table {} does not exist", T::TABLE_NAME));
+                return Err(crate::ormer_error!(
+                    "Table {} does not exist",
+                    T::TABLE_NAME
+                ));
             }
             // 尝试读取 COUNT 结果
             if let Ok(Some(count)) = rows[0].try_get::<i32, _>(0) {
                 if count == 0 {
-                    return Err(anyhow::anyhow!("Table {} does not exist", T::TABLE_NAME));
+                    return Err(crate::ormer_error!(
+                        "Table {} does not exist",
+                        T::TABLE_NAME
+                    ));
                 }
             }
         }
@@ -381,7 +421,7 @@ impl Database {
 
         // 比较列数量
         if actual_columns.len() != T::COLUMNS.len() {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
                 T::COLUMNS.len(),
@@ -392,7 +432,7 @@ impl Database {
         // 比较每一列的定义
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Missing column: {}",
                     T::TABLE_NAME,
                     expected_col.name
@@ -403,7 +443,7 @@ impl Database {
 
             // 检查列名
             if actual_name != &expected_col.name.to_lowercase() {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
                     T::TABLE_NAME,
                     i,
@@ -435,7 +475,7 @@ impl Database {
                     || (base_expected == "nvarchar" && actual_type == "varchar")
                     || (base_expected == "nchar" && actual_type == "char");
                 if !compatible_type {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Schema mismatch: table {}, reason: Column type mismatch at column '{}': expected '{}', but actual is '{}'",
                         T::TABLE_NAME,
                         expected_col.name,
@@ -468,7 +508,7 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
+    pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
         let mut client = self.pool.lock().await;
         let query = Query::new("BEGIN TRANSACTION");
         query.execute(&mut *client).trace().await?;
@@ -479,13 +519,13 @@ impl Database {
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
         let (sql, params) = sql.render(DbType::MSSQL)?;
         self.exec_raw(&sql, params).await
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
@@ -507,7 +547,7 @@ impl Database {
         Ok(results.into_iter().collect())
     }
 
-    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
+    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(sql);
         for param in &params {
@@ -517,7 +557,7 @@ impl Database {
         Ok(result.total() as u64)
     }
 
-    pub(crate) async fn migration_history(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+    pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
         let mut client = self.pool.lock().await;
         let query =
             Query::new("SELECT version, name, checksum FROM __ormer_migrations ORDER BY version");
@@ -543,7 +583,7 @@ impl Database {
             .map(|(version, name, checksum)| {
                 Ok((
                     u64::try_from(version)
-                        .map_err(|_| anyhow::anyhow!("Migration version cannot be negative"))?,
+                        .map_err(|_| crate::ormer_error!("Migration version cannot be negative"))?,
                     name,
                     checksum,
                 ))
@@ -554,7 +594,7 @@ impl Database {
     pub(crate) async fn schema_columns(
         &self,
         table_name: &str,
-    ) -> anyhow::Result<Option<Vec<SchemaColumn>>> {
+    ) -> crate::Result<Option<Vec<SchemaColumn>>> {
         let (schema_name, table_name) = table_name.rsplit_once('.').unwrap_or(("dbo", table_name));
         let mut client = self.pool.lock().await;
         let exists_sql = format!(
@@ -621,7 +661,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::MSSQL,
             self.table_name.as_deref(),
@@ -629,7 +669,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         Ok(SqlStatement::single(DbType::MSSQL, create_sql, Vec::new()))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -637,11 +677,11 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         CreateTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut client = self.pool.lock().await;
         for statement in sql.statements {
             Query::new(&statement.sql)
@@ -660,7 +700,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::MSSQL,
             format!(
@@ -671,7 +711,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -679,11 +719,11 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DropTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut client = self.pool.lock().await;
         for statement in sql.statements {
             Query::new(&statement.sql)
@@ -699,14 +739,27 @@ impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
 pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: PhantomData<&'a ()>,
 }
 
+impl_insert_conflict_methods!(InsertExecutor, with_conflict);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+        }
+
+        if self
+            .conflict
+            .as_ref()
+            .is_some_and(|conflict| conflict.is_configured())
+        {
+            return Err(crate::ormer_error!(
+                "MSSQL does not support configurable insert conflict handling"
+            ));
         }
 
         let (sql, all_values) =
@@ -718,19 +771,18 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    pub async fn returning(self) -> anyhow::Result<Vec<I::Model>> {
-        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
+    pub async fn returning(self) -> crate::Result<Vec<I::Model>> {
+        Err(crate::ormer_error!(
+            "MSSQL does not support RETURNING clause"
+        ))
     }
 
     #[allow(dead_code)]
-    async fn insert_impl<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    async fn insert_impl<T: Model>(&self, models: &[&T]) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
@@ -776,11 +828,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
@@ -811,6 +863,99 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
     }
 }
 
+pub struct InsertPartialExecutor<'a, T: Model> {
+    pool: Pool,
+    assignments: Vec<InsertAssignment>,
+    source_table: Option<&'static str>,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
+        self.assignments.extend(assignments);
+        self
+    }
+
+    fn with_source_table(mut self, source_table: &'static str) -> Self {
+        self.source_table = Some(source_table);
+        self
+    }
+
+    pub fn set<F, A>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> A,
+        A: IntoInsertAssignment<T>,
+    {
+        self.assignments
+            .push(f(T::Where::default()).into_insert_assignment());
+        self
+    }
+
+    pub fn default<F, C>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: IntoInsertDefaultColumn<T>,
+    {
+        self.assignments.push(InsertAssignment::default(
+            f(T::Where::default()).into_insert_default_column(),
+        ));
+        self
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        common_helpers::validate_insert_model_table::<T>(DbType::MSSQL, self.source_table)?;
+        let statement =
+            common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
+                DbType::MSSQL,
+                &self.assignments,
+            )?;
+        Ok(SqlStatement::single(
+            DbType::MSSQL,
+            statement.sql,
+            statement.params,
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<<T as Model>::AutoIncrementKeyType>
+    where
+        T: Send + Sync,
+    {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
+    type Output = <T as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        InsertPartialExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<T as Model>::AutoIncrementKeyType::default());
+        }
+
+        let statement = &sql.statements[0];
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let mut client = self.pool.lock().await;
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param);
+        }
+
+        if has_auto_increment {
+            let stream = query.query(&mut *client).trace().await?;
+            let row = stream.into_row().trace().await?;
+            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
+            common_helpers::convert_auto_increment_key::<Self::Output>(id)
+        } else {
+            query.execute(&mut *client).trace().await?;
+            Ok(<T as Model>::AutoIncrementKeyType::default())
+        }
+    }
+}
+
 /// 插入或更新执行器
 pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
@@ -819,7 +964,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
@@ -831,12 +976,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
     #[allow(dead_code)]
-    async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
+    async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<u64> {
         if models.is_empty() {
             return Ok(0);
         }
@@ -857,11 +1002,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(0);
         }
@@ -887,7 +1032,7 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
@@ -898,11 +1043,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> anyhow::Result<u64> {
+    pub async fn insert_or_ignore_impl<T: Model>(&self, models: &[&T]) -> crate::Result<u64> {
         if models.is_empty() {
             return Ok(0);
         }
@@ -922,11 +1067,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(0);
         }
@@ -1016,7 +1161,7 @@ pub struct DeleteExecutor<'a, T: Model> {
 
 /// 更新执行器
 pub struct UpdateExecutor<'a, T: Model> {
-    sets: Vec<(String, Value)>,
+    sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
     pool: Pool,
@@ -1030,7 +1175,7 @@ pub struct Transaction<'a> {
 }
 
 impl<'a> Transaction<'a> {
-    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
+    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(sql);
         for param in &params {
@@ -1040,7 +1185,7 @@ impl<'a> Transaction<'a> {
         Ok(result.total() as u64)
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
@@ -1062,14 +1207,14 @@ impl<'a> Transaction<'a> {
         Ok(results.into_iter().collect())
     }
 
-    pub async fn commit(self) -> anyhow::Result<()> {
+    pub async fn commit(self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("COMMIT");
         query.execute(&mut *client).trace().await?;
         Ok(())
     }
 
-    pub async fn rollback(self) -> anyhow::Result<()> {
+    pub async fn rollback(self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("ROLLBACK");
         query.execute(&mut *client).trace().await?;
@@ -1117,6 +1262,7 @@ impl<'a> Transaction<'a> {
         TransactionInsertExecutor {
             pool: self.pool.clone(),
             models,
+            conflict: None,
             _marker: PhantomData,
         }
     }
@@ -1148,14 +1294,27 @@ impl<'a> Transaction<'a> {
 pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: PhantomData<&'a ()>,
 }
 
+impl_insert_conflict_methods!(TransactionInsertExecutor);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+        }
+
+        if self
+            .conflict
+            .as_ref()
+            .is_some_and(|conflict| conflict.is_configured())
+        {
+            return Err(crate::ormer_error!(
+                "MSSQL does not support configurable insert conflict handling"
+            ));
         }
 
         let (sql, all_values) =
@@ -1167,7 +1326,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -1177,11 +1336,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
 {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         TransactionInsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
         }
@@ -1222,7 +1381,7 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
@@ -1234,7 +1393,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -1244,11 +1403,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
 {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         TransactionInsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
@@ -1274,7 +1433,7 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
@@ -1285,7 +1444,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -1295,11 +1454,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
 {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         TransactionInsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
@@ -1377,6 +1536,8 @@ pub struct SelectStream<'a, T: Model> {
     _marker: PhantomData<&'a ()>,
 }
 
+impl_backend_executor_methods!(SelectExecutor, pool, Pool, Select);
+
 // SelectExecutor 实现 - 基础方法（不需要 'static）
 impl<'a, T: Model> SelectExecutor<'a, T> {
     pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
@@ -1395,61 +1556,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 启用 DISTINCT 去重
-    pub fn distinct(self) -> Self {
-        Self {
-            select: self.select.distinct(),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn order_by<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn order_by_desc<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by_desc(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
     {
         AggregateFuture {
             aggregate_select: self.select.count(f),
@@ -1460,7 +1569,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     pub fn sum<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         AggregateFuture {
@@ -1472,7 +1581,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     pub fn avg<F, C>(self, f: F) -> AggregateFuture<'a, T, Option<f64>>
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         AggregateFuture {
@@ -1484,7 +1593,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     pub fn max<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         AggregateFuture {
@@ -1496,7 +1605,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     pub fn min<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         AggregateFuture {
@@ -1701,17 +1810,19 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let (sql, params) = self.build_sql_with_params();
         Ok(SqlStatement::single(DbType::MSSQL, sql, params))
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
-        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
+        Err(crate::ormer_error!(
+            "MSSQL does not support RETURNING clause"
+        ))
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
@@ -1745,11 +1856,11 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DeleteExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(0);
         }
@@ -1776,15 +1887,14 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
-    pub fn set<F, V, C>(mut self, field_fn: F, value: V) -> Self
+    pub fn set<F>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
-        V: Into<Value>,
+        F: FnOnce(&mut T::Update),
     {
-        let where_obj = T::Where::default();
-        let column = field_fn(where_obj);
-        let column_name = column.column_name().to_string();
-        self.sets.push((column_name, value.into()));
+        let mut update = T::Update::default();
+        f(&mut update);
+        self.sets
+            .extend(<T::Update as crate::query::update::UpdateFields>::assignments(&update));
         self
     }
 
@@ -1839,7 +1949,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         Ok(SqlStatement::batch(
             DbType::MSSQL,
@@ -1852,15 +1962,17 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
-        Err(anyhow::anyhow!("MSSQL does not support RETURNING clause"))
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
+        Err(crate::ormer_error!(
+            "MSSQL does not support RETURNING clause"
+        ))
     }
 
-    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<Value>)>> {
+    fn build_all_sql(&self) -> crate::Result<Vec<(String, Vec<Value>)>> {
         let mut statements = Vec::new();
 
         // Base UPDATE from sets/filters (manual .set()/.filter() calls)
@@ -1871,16 +1983,15 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             );
             let mut params = Vec::new();
             let mut first = true;
-            for (col_name, value) in &self.sets {
+            for assignment in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&common_helpers::quote_assignment(
+                sql.push_str(&common_helpers::format_update_assignment(
                     DbType::MSSQL,
-                    col_name,
-                    &common_helpers::placeholder(DbType::MSSQL, params.len() + 1),
+                    assignment,
+                    &mut params,
                 ));
-                params.push(value.clone());
                 first = false;
             }
             if !self.filters.is_empty() {
@@ -1950,11 +2061,11 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         UpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut client = self.pool.lock().await;
         let mut total: u64 = 0;
         for statement in &sql.statements {
@@ -1969,31 +2080,31 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
     }
 }
 
+impl_backend_join_executor_methods_with_lifetime!(
+    LeftJoinedSelectExecutor,
+    pool,
+    Pool,
+    LeftJoinedSelect
+);
+impl_backend_join_executor_methods_with_lifetime!(
+    InnerJoinedSelectExecutor,
+    pool,
+    Pool,
+    InnerJoinedSelect
+);
+impl_backend_join_executor_methods_with_lifetime!(
+    RightJoinedSelectExecutor,
+    pool,
+    Pool,
+    RightJoinedSelect
+);
+
 // Join Executors 实现
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     pub fn clone_with_pool(&self) -> Self {
         Self {
             select: self.select.clone(),
             pool: self.pool.clone(),
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
             _marker: PhantomData,
         }
     }
@@ -2017,25 +2128,6 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<'a, T, J> {
         InnerJoinCollectFuture {
             executor: self.clone_with_pool(),
@@ -2049,25 +2141,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         Self {
             select: self.select.clone(),
             pool: self.pool.clone(),
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
             _marker: PhantomData,
         }
     }
@@ -2110,23 +2183,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
+impl_backend_related_executor_methods_with_lifetime!(
+    RelatedSelectExecutor,
+    pool,
+    Pool,
+    RelatedSelect
+);
+
 impl<'a, T: Model + 'static, R: Model + 'static> RelatedSelectExecutor<'a, T, R> {
-    pub fn filter(self, f: impl FnOnce(T::Where, R::Where) -> WhereExpr) -> Self {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn collect<C: FromIterator<T> + 'static>(self) -> RelatedCollectFuture<'a, T, R> {
         RelatedCollectFuture {
             executor: self,
@@ -2142,50 +2206,24 @@ impl<'a, T: Model + 'static, R: Model + 'static> RelatedSelectExecutor<'a, T, R>
     }
 }
 
-impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2> {
-    pub fn filter(self, f: impl FnOnce(T::Where, R1::Where, R2::Where) -> WhereExpr) -> Self {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, T, R1, R2, R3> {
-    pub fn filter(
-        self,
-        f: impl FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> WhereExpr,
-    ) -> Self {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-}
+impl_backend_multi_table_executor_methods_with_lifetime!(
+    MultiTableSelectExecutor,
+    pool,
+    Pool,
+    MultiTableSelect
+);
+impl_backend_four_table_executor_methods_with_lifetime!(
+    FourTableSelectExecutor,
+    pool,
+    Pool,
+    FourTableSelect
+);
 
 // IntoFuture 实现
 impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
     std::future::IntoFuture for CollectFuture<'a, T, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2222,7 +2260,7 @@ impl<
     R: crate::model::FromValue + 'static + std::marker::Send,
 > std::future::IntoFuture for AggregateFuture<'a, T, R>
 {
-    type Output = anyhow::Result<R>;
+    type Output = crate::Result<R>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2238,7 +2276,7 @@ impl<
             let stream = query.query(&mut *client).trace().await?;
             let rows = stream.into_first_result().trace().await?;
             if rows.is_empty() {
-                return Err(anyhow::anyhow!("Aggregate query returned no rows"));
+                return Err(crate::ormer_error!("Aggregate query returned no rows"));
             }
             let ormer_value = extract_value_from_row(&rows[0], 0)?;
             R::from_value(&ormer_value)
@@ -2249,7 +2287,7 @@ impl<
 impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
     for FirstFuture<'a, T>
 {
-    type Output = anyhow::Result<Option<T>>;
+    type Output = crate::Result<Option<T>>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2263,7 +2301,7 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
 impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for LeftJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(T, Option<J>)>>;
+    type Output = crate::Result<Vec<(T, Option<J>)>>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2300,7 +2338,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
 impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for InnerJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(T, J)>>;
+    type Output = crate::Result<Vec<(T, J)>>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2337,7 +2375,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
 impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for RightJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(Option<T>, J)>>;
+    type Output = crate::Result<Vec<(Option<T>, J)>>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2380,7 +2418,7 @@ impl<
 where
     Self: 'a,
 {
-    type Output = anyhow::Result<Vec<T>>;
+    type Output = crate::Result<Vec<T>>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2416,7 +2454,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2453,7 +2491,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2484,7 +2522,7 @@ impl<
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
-    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
+    pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self
             .executor
             .select
@@ -2517,13 +2555,13 @@ pub struct SelectStreamIterator<'a, T: Model> {
 }
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
-    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
+    pub async fn next(&mut self) -> Option<crate::Result<T>> {
         self.iter.next().map(Ok)
     }
 }
 
 // 辅助函数：从 tiberius Row 中提取 Value
-fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Value> {
+fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Value> {
     // 尝试 i32 (INT)
     if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
         return Ok(Value::Integer(v as i64));
@@ -2562,6 +2600,14 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Val
             chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(v, chrono::Utc),
         ));
     }
+    // 尝试 NaiveDate (DATE)
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveDate, _>(idx) {
+        return Ok(Value::Date(v));
+    }
+    // 尝试 NaiveTime (TIME)
+    if let Ok(Some(v)) = row.try_get::<chrono::NaiveTime, _>(idx) {
+        return Ok(Value::Time(v));
+    }
     // 尝试 &[u8] (VARBINARY, BINARY)
     if let Ok(Some(v)) = row.try_get::<&[u8], _>(idx) {
         return Ok(Value::Bytes(v.to_vec()));
@@ -2572,7 +2618,7 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Val
 
 // 辅助函数：从 tiberius Row 中提取 i64 值（用于聚合查询）
 #[allow(dead_code)]
-fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Option<i64>> {
+fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Option<i64>> {
     if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
         return Ok(Some(v as i64));
     }
@@ -2587,7 +2633,7 @@ fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Optio
 
 // 辅助函数：从 tiberius Row 中提取 f64 值（用于 AVG 聚合）
 #[allow(dead_code)]
-fn extract_f64_from_row(row: &tiberius::Row, idx: usize) -> anyhow::Result<Option<f64>> {
+fn extract_f64_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Option<f64>> {
     if let Ok(Some(v)) = row.try_get::<f64, _>(idx) {
         return Ok(Some(v));
     }
@@ -2619,6 +2665,8 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
         Value::TextArray(v) => query.bind(crate::model::stringify_string_vec(v)),
         Value::Bytes(v) => query.bind(v.as_slice()),
         Value::DateTime(v) => query.bind(v.naive_utc()),
+        Value::Date(v) => query.bind(*v),
+        Value::Time(v) => query.bind(*v),
         Value::Json(v) => query.bind(v.to_string()),
         Value::Uuid(v) => query.bind(v.as_bytes().as_slice()),
         Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {

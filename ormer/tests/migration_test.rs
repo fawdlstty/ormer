@@ -79,12 +79,12 @@ impl Migration for FailingMigration {
     }
 }
 
-async fn database() -> anyhow::Result<Database> {
+async fn database() -> ormer::Result<Database> {
     Ok(Database::connect(DbType::Sqlite, ":memory:").await?)
 }
 
 #[tokio::test]
-async fn table_plan_creates_and_adds_columns() -> anyhow::Result<()> {
+async fn table_plan_creates_and_adds_columns() -> ormer::Result<()> {
     let db = database().await?;
 
     let initial = db.migrate_table::<MigrationUserV1>().plan().await?;
@@ -114,7 +114,7 @@ async fn table_plan_creates_and_adds_columns() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn table_plan_rejects_implicit_not_null_addition_on_populated_sqlite_table()
--> anyhow::Result<()> {
+-> ormer::Result<()> {
     let db = database().await?;
     db.migrate_table::<MigrationUserV1>().execute().await?;
     db.execute_sql("INSERT INTO ormer_migration_users (name) VALUES ('existing')")
@@ -130,7 +130,7 @@ async fn table_plan_rejects_implicit_not_null_addition_on_populated_sqlite_table
 }
 
 #[tokio::test]
-async fn sqlite_migrates_text_to_integer_and_preserves_data() -> anyhow::Result<()> {
+async fn sqlite_migrates_text_to_integer_and_preserves_data() -> ormer::Result<()> {
     let db = database().await?;
     db.execute_sql(
         "CREATE TABLE ormer_migration_type_values (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
@@ -165,7 +165,7 @@ async fn sqlite_migrates_text_to_integer_and_preserves_data() -> anyhow::Result<
 }
 
 #[tokio::test]
-async fn sqlite_migrates_nullable_to_not_null_and_enforces_constraint() -> anyhow::Result<()> {
+async fn sqlite_migrates_nullable_to_not_null_and_enforces_constraint() -> ormer::Result<()> {
     let db = database().await?;
     db.execute_sql(
         "CREATE TABLE ormer_migration_nullable_values (id INTEGER PRIMARY KEY, value TEXT)",
@@ -196,7 +196,7 @@ async fn sqlite_migrates_nullable_to_not_null_and_enforces_constraint() -> anyho
 }
 
 #[tokio::test]
-async fn sqlite_invalid_type_value_rolls_back() -> anyhow::Result<()> {
+async fn sqlite_invalid_type_value_rolls_back() -> ormer::Result<()> {
     let db = database().await?;
     db.execute_sql(
         "CREATE TABLE ormer_migration_type_values (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
@@ -237,7 +237,7 @@ async fn sqlite_invalid_type_value_rolls_back() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn sqlite_not_null_migration_with_existing_null_rolls_back() -> anyhow::Result<()> {
+async fn sqlite_not_null_migration_with_existing_null_rolls_back() -> ormer::Result<()> {
     let db = database().await?;
     db.execute_sql(
         "CREATE TABLE ormer_migration_nullable_bad_values (id INTEGER PRIMARY KEY, value TEXT)",
@@ -273,7 +273,7 @@ async fn sqlite_not_null_migration_with_existing_null_rolls_back() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn versioned_migrations_track_pending_and_rollback() -> anyhow::Result<()> {
+async fn versioned_migrations_track_pending_and_rollback() -> ormer::Result<()> {
     let db = database().await?;
     let create = CreateMigration;
     let failing = FailingMigration;

@@ -129,7 +129,7 @@ mod tuple_wrapper_tests {
         let count = db
             .update::<ArchiveUser>()
             .filter(|p| p.name.eq("Bob"))
-            .set(|p| p.age, 35)
+            .set(|p| p.age = p.age.set(35))
             .execute()
             .await?;
         assert_eq!(count, 1);

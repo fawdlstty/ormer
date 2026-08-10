@@ -193,14 +193,14 @@ impl<Owner: Model, Target: Model> Relation<Owner, Target> {
         }
     }
 
-    pub fn info(&self) -> anyhow::Result<&'static RelationInfo> {
+    pub fn info(&self) -> crate::Result<&'static RelationInfo> {
         Owner::RELATIONS
             .iter()
             .find(|relation| {
                 relation.name == self.name && relation.target_table == Target::TABLE_NAME
             })
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                crate::ormer_error!(
                     "Relation {} -> {} not found on {}",
                     self.name,
                     Target::TABLE_NAME,
@@ -301,11 +301,12 @@ pub trait Model: Sized {
 
     type QueryBuilder;
     type Where: Default;
+    type Update: Default + crate::query::update::UpdateFields;
 
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
-    fn from_row(row: &Row) -> anyhow::Result<Self>;
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self>;
+    fn from_row(row: &Row) -> crate::Result<Self>;
+    fn from_row_values(values: &[Value]) -> crate::Result<Self>;
 
     /// 获取字段值 (用于 INSERT/UPDATE)
     fn field_values(&self) -> Vec<Value>;
@@ -324,9 +325,9 @@ pub trait Model: Sized {
     }
 
     /// 获取关系本地键值。
-    fn relation_key_value(&self, relation: &RelationInfo) -> anyhow::Result<Value> {
+    fn relation_key_value(&self, relation: &RelationInfo) -> crate::Result<Value> {
         self.column_value(relation.local_key).ok_or_else(|| {
-            anyhow::anyhow!(
+            crate::ormer_error!(
                 "Column {} not found on {} for relation {}",
                 relation.local_key,
                 Self::TABLE_NAME,
@@ -340,9 +341,9 @@ pub trait Model: Sized {
         &mut self,
         relation_name: &'static str,
         values: Vec<Target>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let _ = values;
-        Err(anyhow::anyhow!(
+        Err(crate::ormer_error!(
             "Relation {} is not assignable on {}",
             relation_name,
             Self::TABLE_NAME
@@ -486,7 +487,7 @@ pub trait ModelEnum: ModelEnumProvider {
     fn name(&self) -> &'static str;
 
     /// 从名称构造枚举值
-    fn from_name(name: &str) -> anyhow::Result<Self>
+    fn from_name(name: &str) -> crate::Result<Self>
     where
         Self: Sized;
 
@@ -498,11 +499,11 @@ pub trait ModelEnum: ModelEnumProvider {
 
     /// 从数值构造枚举值（用于数值枚举）
     /// 默认返回错误，数值枚举应重写此方法
-    fn from_i64(_value: i64) -> anyhow::Result<Self>
+    fn from_i64(_value: i64) -> crate::Result<Self>
     where
         Self: Sized,
     {
-        Err(anyhow::anyhow!(
+        Err(crate::ormer_error!(
             "This enum does not support numeric conversion"
         ))
     }
@@ -532,7 +533,7 @@ impl<T: ModelEnum> From<Option<T>> for Value {
 
 // 为 Option<T> where T: ModelEnum 实现 FromValue
 impl<T: ModelEnum> FromValue for Option<T> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Integer(v) if T::is_numeric_enum() => T::from_i64(*v).map(Some),
@@ -540,10 +541,10 @@ impl<T: ModelEnum> FromValue for Option<T> {
                 // 使用 ModelEnum::from_name 构造枚举值
                 match T::from_name(s) {
                     Ok(enum_val) => Ok(Some(enum_val)),
-                    Err(_) => Err(anyhow::anyhow!("Unknown enum variant: {}", s)),
+                    Err(_) => Err(crate::ormer_error!("Unknown enum variant: {}", s)),
                 }
             }
-            _ => Err(anyhow::anyhow!(
+            _ => Err(crate::ormer_error!(
                 "Expected Text value for Option<{}>",
                 std::any::type_name::<T>()
             )),
@@ -586,9 +587,67 @@ impl_enum_provider_for_non_enum!(
     std::time::Duration,
     chrono::DateTime<chrono::Utc>,
     chrono::NaiveDateTime,
+    chrono::NaiveDate,
+    chrono::NaiveTime,
     serde_json::Value,
     uuid::Uuid,
 );
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveValue<T> {
+    NotSet,
+    Set(T),
+    Unchanged(T),
+}
+
+impl<T> ActiveValue<T> {
+    pub fn not_set() -> Self {
+        Self::NotSet
+    }
+
+    pub fn set(value: T) -> Self {
+        Self::Set(value)
+    }
+
+    pub fn unchanged(value: T) -> Self {
+        Self::Unchanged(value)
+    }
+
+    pub fn is_not_set(&self) -> bool {
+        matches!(self, Self::NotSet)
+    }
+}
+
+impl<T> Default for ActiveValue<T> {
+    fn default() -> Self {
+        Self::NotSet
+    }
+}
+
+impl<T> From<T> for ActiveValue<T> {
+    fn from(value: T) -> Self {
+        Self::Set(value)
+    }
+}
+
+pub trait InsertModel<T: Model> {
+    fn insert_table_name(&self) -> &'static str;
+    fn insert_assignments(&self) -> Vec<crate::query::insert::InsertAssignment>;
+}
+
+impl<T, M> InsertModel<T> for &M
+where
+    T: Model,
+    M: InsertModel<T> + ?Sized,
+{
+    fn insert_table_name(&self) -> &'static str {
+        (*self).insert_table_name()
+    }
+
+    fn insert_assignments(&self) -> Vec<crate::query::insert::InsertAssignment> {
+        (*self).insert_assignments()
+    }
+}
 
 /// 用于 insert/insert_or_update 的参数类型 trait
 #[async_trait::async_trait]
@@ -603,14 +662,14 @@ pub trait Insertable {
     async fn run_before_insert(
         &mut self,
         _ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         Ok(())
     }
 
     async fn run_after_insert(
         &self,
         _ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -645,15 +704,12 @@ where
     async fn run_before_insert(
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let mut ctx = ctx;
         (**self).before_insert(&mut ctx).await
     }
 
-    async fn run_after_insert(
-        &self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
         let mut ctx = ctx;
         (**self).after_insert(&mut ctx).await
     }
@@ -688,7 +744,7 @@ where
     async fn run_before_insert(
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -696,10 +752,7 @@ where
         Ok(())
     }
 
-    async fn run_after_insert(
-        &self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -737,7 +790,7 @@ where
     async fn run_before_insert(
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -745,10 +798,7 @@ where
         Ok(())
     }
 
-    async fn run_after_insert(
-        &self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -797,7 +847,7 @@ where
     async fn run_before_insert(
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -805,10 +855,7 @@ where
         Ok(())
     }
 
-    async fn run_after_insert(
-        &self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> anyhow::Result<()> {
+    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -959,7 +1006,7 @@ pub fn quote_column_reference(db_type: crate::abstract_layer::DbType, column: &s
 /// 运行时动态生成 CREATE TABLE SQL
 pub fn generate_create_table_sql<T: Model>(
     db_type: crate::abstract_layer::DbType,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     generate_create_table_sql_with_name::<T>(db_type, None)
 }
 
@@ -967,7 +1014,7 @@ pub fn generate_create_table_sql<T: Model>(
 pub fn generate_create_table_sql_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
     let quoted_table_name = quote_qualified_identifier(db_type, table_name);
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", quoted_table_name);
@@ -1135,7 +1182,7 @@ fn generate_unique_constraints<T: Model>(db_type: crate::abstract_layer::DbType)
 fn generate_indexes_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: &str,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     let mut sqls = Vec::new();
 
     // 检查是否为 MySQL 数据库（通过调试字符串）
@@ -1195,10 +1242,10 @@ fn render_index_sql(
     table_name: &str,
     index_name: &str,
     columns: &[&ColumnSchema],
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     let where_clause = columns.iter().find_map(|column| column.index_where);
     if where_clause.is_some() && is_mysql {
-        return Err(anyhow::anyhow!(
+        return Err(crate::ormer_error!(
             "MySQL does not support partial index WHERE clauses"
         ));
     }
@@ -1308,10 +1355,10 @@ impl Row {
         Self { data }
     }
 
-    pub fn get<T: FromValue>(&self, column: &str) -> anyhow::Result<T> {
+    pub fn get<T: FromValue>(&self, column: &str) -> crate::Result<T> {
         self.data
             .get(column)
-            .ok_or_else(|| anyhow::anyhow!("Column not found: {}", column))
+            .ok_or_else(|| crate::ormer_error!("Column not found: {}", column))
             .and_then(|v| T::from_value(v))
     }
 }
@@ -1342,6 +1389,34 @@ pub(crate) fn stringify_string_vec(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn parse_utc_datetime_text(raw: &str) -> crate::Result<chrono::DateTime<chrono::Utc>> {
+    let raw = raw.trim();
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(value.with_timezone(&chrono::Utc));
+    }
+
+    parse_naive_datetime_text(raw)
+        .map(|value| chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(value, chrono::Utc))
+}
+
+fn parse_naive_datetime_text(raw: &str) -> crate::Result<chrono::NaiveDateTime> {
+    let raw = raw.trim();
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw).map(|value| value.naive_utc()))
+        .map_err(|err| crate::ormer_error!("Type mismatch: expected date-time text: {}", err))
+}
+
+fn parse_naive_date_text(raw: &str) -> crate::Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .map_err(|err| crate::ormer_error!("Type mismatch: expected date text: {}", err))
+}
+
+fn parse_naive_time_text(raw: &str) -> crate::Result<chrono::NaiveTime> {
+    chrono::NaiveTime::parse_from_str(raw.trim(), "%H:%M:%S%.f")
+        .map_err(|err| crate::ormer_error!("Type mismatch: expected time text: {}", err))
+}
+
 /// 值类型
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -1357,23 +1432,25 @@ pub enum Value {
     BigIntArray(Vec<i64>),
     NullableBigIntArray(Vec<Option<i64>>),
     DateTime(chrono::DateTime<chrono::Utc>),
+    Date(chrono::NaiveDate),
+    Time(chrono::NaiveTime),
     Json(serde_json::Value),
     Uuid(uuid::Uuid),
     Null,
 }
 
 pub trait FromValue: Sized {
-    fn from_value(value: &Value) -> anyhow::Result<Self>;
+    fn from_value(value: &Value) -> crate::Result<Self>;
 }
 
 pub fn downcast_relation_vec_as<Concrete: Model + 'static, Target: Model + 'static>(
     values: Vec<Target>,
-) -> anyhow::Result<Vec<Concrete>> {
+) -> crate::Result<Vec<Concrete>> {
     let boxed: Box<dyn Any> = Box::new(values);
     boxed
         .downcast::<Vec<Concrete>>()
         .map(|values| *values)
-        .map_err(|_| anyhow::anyhow!("Relation target type mismatch"))
+        .map_err(|_| crate::ormer_error!("Relation target type mismatch"))
 }
 
 #[doc(hidden)]
@@ -1445,7 +1522,7 @@ pub trait I32DataTypeDecode<T> {
         value: i32,
         column_name: &'static str,
         target_type: &'static str,
-    ) -> anyhow::Result<T>;
+    ) -> crate::Result<T>;
 }
 
 impl<T> I32DataTypeDecode<T> for I32DataTypeDecoder<T>
@@ -1458,9 +1535,9 @@ where
         value: i32,
         column_name: &'static str,
         target_type: &'static str,
-    ) -> anyhow::Result<T> {
+    ) -> crate::Result<T> {
         T::try_from(value).map_err(|err| {
-            anyhow::anyhow!(
+            crate::ormer_error!(
                 "Failed to convert column '{}' to {}: {}",
                 column_name,
                 target_type,
@@ -1479,9 +1556,9 @@ where
         value: i32,
         column_name: &'static str,
         target_type: &'static str,
-    ) -> anyhow::Result<T> {
+    ) -> crate::Result<T> {
         if std::mem::size_of::<T>() != std::mem::size_of::<i32>() {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Failed to convert column '{}' to {}: target type must be i32-sized when it does not implement TryFrom<i32>",
                 column_name,
                 target_type
@@ -1496,11 +1573,20 @@ where
 
 /// FromRowValues trait - 用于从一行中的多个值构建类型(如元组、Model)
 pub trait FromRowValues: Sized {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self>;
+    fn from_row_values(values: &[Value]) -> crate::Result<Self>;
+}
+
+fn first_row_value<'a, S>(values: &'a [Value], expected: S) -> crate::Result<&'a Value>
+where
+    S: AsRef<str>,
+{
+    values
+        .first()
+        .ok_or_else(|| crate::ormer_error!("Type mismatch: expected {}", expected.as_ref()))
 }
 
 impl<T: Model> FromRowValues for T {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+    fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         T::from_row_values(values)
     }
 }
@@ -1508,7 +1594,7 @@ impl<T: Model> FromRowValues for T {
 /// FromSingleValue trait - 用于从单个值构建Model(用于map_to后的转换)
 /// 当查询单列结果并想转换为Model时使用
 pub trait FromSingleValue<V>: Sized {
-    fn from_single_value(value: V, column_name: &str) -> anyhow::Result<Self>;
+    fn from_single_value(value: V, column_name: &str) -> crate::Result<Self>;
 }
 
 // 为所有可以转换为Value的类型实现FromSingleValue的blanket implementation
@@ -1518,7 +1604,7 @@ where
     V: Into<Value>,
     T: FromValue,
 {
-    fn from_single_value(value: V, _column_name: &str) -> anyhow::Result<Self> {
+    fn from_single_value(value: V, _column_name: &str) -> crate::Result<Self> {
         let ormer_value: Value = value.into();
         Self::from_value(&ormer_value)
     }
@@ -1529,10 +1615,10 @@ macro_rules! impl_from_value_for {
     ($($type:ty => $variant:ident),* $(,)?) => {
         $(
             impl FromValue for $type {
-                fn from_value(value: &Value) -> anyhow::Result<Self> {
+                fn from_value(value: &Value) -> crate::Result<Self> {
                     match value {
                         Value::$variant(v) => Ok(*v as $type),
-                        _ => Err(anyhow::anyhow!("Type mismatch: expected {}", stringify!($type))),
+                        _ => Err(crate::ormer_error!("Type mismatch: expected {}", stringify!($type))),
                     }
                 }
             }
@@ -1547,88 +1633,65 @@ impl_from_value_for!(
     usize => Integer,
 );
 
-// 为基本类型实现 FromRowValues（从单列构建）
-impl FromRowValues for i32 {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected i32"));
-        }
-        Self::from_value(&values[0])
-    }
+macro_rules! impl_from_row_values_single {
+    ($($type:ty => $expected:expr),* $(,)?) => {
+        $(
+            impl FromRowValues for $type {
+                fn from_row_values(values: &[Value]) -> crate::Result<Self> {
+                    Self::from_value(first_row_value(values, $expected)?)
+                }
+            }
+        )*
+    };
 }
 
-impl FromRowValues for i64 {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected i64"));
-        }
-        Self::from_value(&values[0])
-    }
-}
+// 为单列类型实现 FromRowValues。
+impl_from_row_values_single!(
+    i32 => "i32",
+    i64 => "i64",
+    usize => "usize",
+    std::time::Duration => "Duration",
+    f64 => "f64",
+    String => "String",
+    Vec<String> => "Vec<String>",
+    bool => "bool",
+    Vec<u8> => "Vec<u8>",
+    Vec<i32> => "Vec<i32>",
+    Vec<i64> => "Vec<i64>",
+    Vec<Option<i64>> => "Vec<Option<i64>>",
+    chrono::DateTime<chrono::Utc> => "DateTime<Utc>",
+    chrono::NaiveDateTime => "NaiveDateTime",
+    chrono::NaiveDate => "NaiveDate",
+    chrono::NaiveTime => "NaiveTime",
+);
 
 impl FromValue for std::time::Duration {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Duration(v) => Ok(*v),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Duration")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Duration")),
         }
-    }
-}
-
-impl FromRowValues for std::time::Duration {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Duration"));
-        }
-        Self::from_value(&values[0])
-    }
-}
-
-impl FromRowValues for usize {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected usize"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
 // f64 特殊处理（支持 Integer 和 Real）
 impl FromValue for f64 {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Real(v) => Ok(*v),
             Value::Integer(v) => Ok(*v as f64),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected f64")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected f64")),
         }
-    }
-}
-
-impl FromRowValues for f64 {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected f64"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
 // String 特殊处理（需要 clone）
 impl FromValue for String {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Text(v) => Ok(v.clone()),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected String")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected String")),
         }
-    }
-}
-
-impl FromRowValues for String {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected String"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
@@ -1639,7 +1702,7 @@ impl From<Vec<String>> for Value {
 }
 
 impl FromValue for Vec<String> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
             Value::TextArray(v) => Ok(normalize_string_vec(v.clone())),
@@ -1658,63 +1721,38 @@ impl FromValue for Vec<String> {
                 let users = serde_json::from_value::<Vec<String>>(v.clone())?;
                 Ok(normalize_string_vec(users))
             }
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<String>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Vec<String>")),
         }
-    }
-}
-
-impl From<Option<Vec<String>>> for Value {
-    fn from(v: Option<Vec<String>>) -> Self {
-        match v {
-            Some(values) => Value::TextArray(values),
-            None => Value::Null,
-        }
-    }
-}
-
-impl FromRowValues for Vec<String> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Vec<String>"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
 // bool 特殊处理（从 Boolean 读取）
 impl FromValue for bool {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Boolean(v) => Ok(*v),
             Value::Integer(v) => Ok(*v != 0), // 向后兼容
-            _ => Err(anyhow::anyhow!("Type mismatch: expected bool")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected bool")),
         }
-    }
-}
-
-impl FromRowValues for bool {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected bool"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
 // 为二元组实现 FromValue
 impl<T1: FromValue, T2: FromValue> FromValue for (T1, T2) {
-    fn from_value(_value: &Value) -> anyhow::Result<Self> {
+    fn from_value(_value: &Value) -> crate::Result<Self> {
         // 元组不能从单个Value构建，这个实现仅用于类型系统完整性
         // 实际上元组应该从多个Value构建
-        Err(anyhow::anyhow!("Type mismatch: expected tuple"))
+        Err(crate::ormer_error!("Type mismatch: expected tuple"))
     }
 }
 
 // 为二元组实现 FromRowValues
 impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+    fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         if values.len() < 2 {
-            return Err(anyhow::anyhow!("Type mismatch: expected tuple (T1, T2)"));
+            return Err(crate::ormer_error!(
+                "Type mismatch: expected tuple (T1, T2)"
+            ));
         }
         let v1 = T1::from_row_values(&values[0..1])?;
         let v2 = T2::from_row_values(&values[1..2])?;
@@ -1724,16 +1762,16 @@ impl<T1: FromRowValues, T2: FromRowValues> FromRowValues for (T1, T2) {
 
 // 为三元组实现 FromValue
 impl<T1: FromValue, T2: FromValue, T3: FromValue> FromValue for (T1, T2, T3) {
-    fn from_value(_value: &Value) -> anyhow::Result<Self> {
-        Err(anyhow::anyhow!("Type mismatch: expected tuple"))
+    fn from_value(_value: &Value) -> crate::Result<Self> {
+        Err(crate::ormer_error!("Type mismatch: expected tuple"))
     }
 }
 
 // 为三元组实现 FromRowValues
 impl<T1: FromRowValues, T2: FromRowValues, T3: FromRowValues> FromRowValues for (T1, T2, T3) {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+    fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         if values.len() < 3 {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Type mismatch: expected tuple (T1, T2, T3)"
             ));
         }
@@ -1749,11 +1787,11 @@ macro_rules! impl_from_value_for_option {
     ($($type:ty => $variant:ident),* $(,)?) => {
         $(
             impl FromValue for Option<$type> {
-                fn from_value(value: &Value) -> anyhow::Result<Self> {
+                fn from_value(value: &Value) -> crate::Result<Self> {
                     match value {
                         Value::Null => Ok(None),
                         Value::$variant(v) => Ok(Some(*v as $type)),
-                        _ => Err(anyhow::anyhow!("Type mismatch: expected Option<{}>", stringify!($type))),
+                        _ => Err(crate::ormer_error!("Type mismatch: expected Option<{}>", stringify!($type))),
                     }
                 }
             }
@@ -1768,51 +1806,48 @@ impl_from_value_for_option!(
 );
 
 impl FromValue for Option<String> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Text(v) => Ok(Some(v.clone())),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<String>")),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Option<String>"
+            )),
         }
     }
 }
 
 impl FromValue for Option<bool> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Boolean(v) => Ok(Some(*v)),
             Value::Integer(v) => Ok(Some(*v != 0)), // 向后兼容
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<bool>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Option<bool>")),
         }
     }
 }
 
 impl FromValue for Option<f64> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Real(v) => Ok(Some(*v)),
             Value::Integer(v) => Ok(Some(*v as f64)),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<f64>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Option<f64>")),
         }
     }
 }
 
 // 为 Option 类型实现 FromRowValues
 impl<T: FromValue> FromRowValues for Option<T> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Type mismatch: expected Option<{}>",
-                std::any::type_name::<T>()
-            ));
-        }
+    fn from_row_values(values: &[Value]) -> crate::Result<Self> {
+        let value = first_row_value(values, format!("Option<{}>", std::any::type_name::<T>()))?;
         // 直接使用 Option<T> 的 from_value 实现
-        match &values[0] {
+        match value {
             Value::Null => Ok(None),
             _ => {
-                let inner = T::from_value(&values[0])?;
+                let inner = T::from_value(value)?;
                 Ok(Some(inner))
             }
         }
@@ -1873,12 +1908,12 @@ impl From<bool> for Value {
 
 // 使用宏生成 Option<T> 的 From 实现
 macro_rules! impl_from_option_for_value {
-    ($($type:ty => { Some($variant:ident), None => Null }),* $(,)?) => {
+    ($($type:ty => $some:expr),* $(,)?) => {
         $(
             impl From<Option<$type>> for Value {
                 fn from(v: Option<$type>) -> Self {
                     match v {
-                        Some(val) => Value::$variant(val as i64),
+                        Some(value) => ($some)(value),
                         None => Value::Null,
                     }
                 }
@@ -1887,71 +1922,30 @@ macro_rules! impl_from_option_for_value {
     };
 }
 
-// 为 Option 整数类型生成 From 实现
 impl_from_option_for_value!(
-    i32 => { Some(Integer), None => Null },
-    i64 => { Some(Integer), None => Null },
+    i32 => |value| Value::Integer(value as i64),
+    i64 => |value| Value::Integer(value as i64),
+    String => |value| Value::Text(value),
+    bool => |value| Value::Boolean(value),
+    std::time::Duration => |value| Value::Duration(value),
+    Vec<String> => |value| Value::TextArray(value),
+    Vec<u8> => |value| Value::Bytes(value),
+    chrono::DateTime<chrono::Utc> => |value| Value::DateTime(value),
+    chrono::NaiveDateTime => |value| Value::DateTime(naive_local_to_utc(value)),
+    chrono::NaiveDate => |value| Value::Date(value),
+    chrono::NaiveTime => |value| Value::Time(value),
+    serde_json::Value => |value| Value::Json(value),
+    uuid::Uuid => |value| Value::Uuid(value),
 );
 
-// Option<String> 特殊处理
-impl From<Option<String>> for Value {
-    fn from(v: Option<String>) -> Self {
-        match v {
-            Some(s) => Value::Text(s),
-            None => Value::Null,
-        }
-    }
-}
-
-// Option<bool> 特殊处理
-impl From<Option<bool>> for Value {
-    fn from(v: Option<bool>) -> Self {
-        match v {
-            Some(true) => Value::Boolean(true),
-            Some(false) => Value::Boolean(false),
-            None => Value::Null,
-        }
-    }
-}
-
-impl From<Option<std::time::Duration>> for Value {
-    fn from(v: Option<std::time::Duration>) -> Self {
-        match v {
-            Some(duration) => Value::Duration(duration),
-            None => Value::Null,
-        }
-    }
-}
-
-// 为 FilterValue 实现 Into<Value>
-impl From<crate::query::filter::Value> for Value {
-    fn from(value: crate::query::filter::Value) -> Self {
-        match value {
-            crate::query::filter::Value::Integer(v) => Value::Integer(v),
-            crate::query::filter::Value::BigInt(v) => Value::BigInt(v),
-            crate::query::filter::Value::Duration(v) => Value::Duration(v),
-            crate::query::filter::Value::Text(v) => Value::Text(v),
-            crate::query::filter::Value::TextArray(v) => Value::TextArray(v),
-            crate::query::filter::Value::Real(v) => Value::Real(v),
-            crate::query::filter::Value::Boolean(v) => Value::Boolean(v),
-            crate::query::filter::Value::Bytes(v) => Value::Bytes(v),
-            crate::query::filter::Value::IntegerArray(v) => Value::IntegerArray(v),
-            crate::query::filter::Value::BigIntArray(v) => Value::BigIntArray(v),
-            crate::query::filter::Value::NullableBigIntArray(v) => Value::NullableBigIntArray(v),
-            crate::query::filter::Value::DateTime(v) => Value::DateTime(v),
-            crate::query::filter::Value::Json(v) => Value::Json(v),
-            crate::query::filter::Value::Uuid(v) => Value::Uuid(v),
-            crate::query::filter::Value::Null => Value::Null,
-        }
-    }
-}
-
 impl FromValue for Option<std::time::Duration> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Duration(v) => Ok(Some(*v)),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<Duration>")),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Option<Duration>"
+            )),
         }
     }
 }
@@ -1964,20 +1958,11 @@ impl From<Vec<u8>> for Value {
 }
 
 impl FromValue for Vec<u8> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Bytes(v) => Ok(v.clone()),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Vec<u8>")),
         }
-    }
-}
-
-impl FromRowValues for Vec<u8> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Vec<u8>"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
@@ -1988,21 +1973,12 @@ impl From<Vec<i32>> for Value {
 }
 
 impl FromValue for Vec<i32> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
             Value::IntegerArray(v) => Ok(v.clone()),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<i32>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Vec<i32>")),
         }
-    }
-}
-
-impl FromRowValues for Vec<i32> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Vec<i32>"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
@@ -2013,7 +1989,7 @@ impl From<Vec<i64>> for Value {
 }
 
 impl FromValue for Vec<i64> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
             Value::BigIntArray(v) => Ok(v.clone()),
@@ -2021,18 +1997,9 @@ impl FromValue for Vec<i64> {
                 .iter()
                 .copied()
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| anyhow::anyhow!("Type mismatch: expected Vec<i64>")),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<i64>")),
+                .ok_or_else(|| crate::ormer_error!("Type mismatch: expected Vec<i64>")),
+            _ => Err(crate::ormer_error!("Type mismatch: expected Vec<i64>")),
         }
-    }
-}
-
-impl FromRowValues for Vec<i64> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Vec<i64>"));
-        }
-        Self::from_value(&values[0])
     }
 }
 
@@ -2043,40 +2010,26 @@ impl From<Vec<Option<i64>>> for Value {
 }
 
 impl FromValue for Vec<Option<i64>> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(Vec::new()),
             Value::BigIntArray(v) => Ok(v.iter().copied().map(Some).collect()),
             Value::NullableBigIntArray(v) => Ok(v.clone()),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Vec<Option<i64>>")),
-        }
-    }
-}
-
-impl FromRowValues for Vec<Option<i64>> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected Vec<Option<i64>>"));
-        }
-        Self::from_value(&values[0])
-    }
-}
-
-impl From<Option<Vec<u8>>> for Value {
-    fn from(v: Option<Vec<u8>>) -> Self {
-        match v {
-            Some(bytes) => Value::Bytes(bytes),
-            None => Value::Null,
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Vec<Option<i64>>"
+            )),
         }
     }
 }
 
 impl FromValue for Option<Vec<u8>> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Bytes(v) => Ok(Some(v.clone())),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected Option<Vec<u8>>")),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Option<Vec<u8>>"
+            )),
         }
     }
 }
@@ -2089,38 +2042,34 @@ impl From<chrono::DateTime<chrono::Utc>> for Value {
 }
 
 impl FromValue for chrono::DateTime<chrono::Utc> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::DateTime(v) => Ok(*v),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected DateTime<Utc>")),
-        }
-    }
-}
-
-impl FromRowValues for chrono::DateTime<chrono::Utc> {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected DateTime<Utc>"));
-        }
-        Self::from_value(&values[0])
-    }
-}
-
-impl From<Option<chrono::DateTime<chrono::Utc>>> for Value {
-    fn from(v: Option<chrono::DateTime<chrono::Utc>>) -> Self {
-        match v {
-            Some(dt) => Value::DateTime(dt),
-            None => Value::Null,
+            Value::Date(v) => Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                v.and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| crate::ormer_error!("Invalid date value"))?,
+                chrono::Utc,
+            )),
+            Value::Text(v) => parse_utc_datetime_text(v),
+            _ => Err(crate::ormer_error!("Type mismatch: expected DateTime<Utc>")),
         }
     }
 }
 
 impl FromValue for Option<chrono::DateTime<chrono::Utc>> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::DateTime(v) => Ok(Some(*v)),
-            _ => Err(anyhow::anyhow!(
+            Value::Date(v) => Ok(Some(
+                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                    v.and_hms_opt(0, 0, 0)
+                        .ok_or_else(|| crate::ormer_error!("Invalid date value"))?,
+                    chrono::Utc,
+                ),
+            )),
+            Value::Text(v) => parse_utc_datetime_text(v).map(Some),
+            _ => Err(crate::ormer_error!(
                 "Type mismatch: expected Option<DateTime<Utc>>"
             )),
         }
@@ -2135,39 +2084,93 @@ impl From<chrono::NaiveDateTime> for Value {
 }
 
 impl FromValue for chrono::NaiveDateTime {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::DateTime(v) => Ok(utc_to_naive_local(*v)),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected NaiveDateTime")),
-        }
-    }
-}
-
-impl FromRowValues for chrono::NaiveDateTime {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
-        if values.is_empty() {
-            return Err(anyhow::anyhow!("Type mismatch: expected NaiveDateTime"));
-        }
-        Self::from_value(&values[0])
-    }
-}
-
-impl From<Option<chrono::NaiveDateTime>> for Value {
-    fn from(v: Option<chrono::NaiveDateTime>) -> Self {
-        match v {
-            Some(dt) => Value::DateTime(naive_local_to_utc(dt)),
-            None => Value::Null,
+            Value::Date(v) => v
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| crate::ormer_error!("Invalid date value")),
+            Value::Text(v) => parse_naive_datetime_text(v),
+            _ => Err(crate::ormer_error!("Type mismatch: expected NaiveDateTime")),
         }
     }
 }
 
 impl FromValue for Option<chrono::NaiveDateTime> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::DateTime(v) => Ok(Some(utc_to_naive_local(*v))),
-            _ => Err(anyhow::anyhow!(
+            Value::Date(v) => {
+                Ok(Some(v.and_hms_opt(0, 0, 0).ok_or_else(|| {
+                    crate::ormer_error!("Invalid date value")
+                })?))
+            }
+            Value::Text(v) => parse_naive_datetime_text(v).map(Some),
+            _ => Err(crate::ormer_error!(
                 "Type mismatch: expected Option<NaiveDateTime>"
+            )),
+        }
+    }
+}
+
+impl From<chrono::NaiveDate> for Value {
+    fn from(v: chrono::NaiveDate) -> Self {
+        Value::Date(v)
+    }
+}
+
+impl FromValue for chrono::NaiveDate {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Date(v) => Ok(*v),
+            Value::DateTime(v) => Ok(v.date_naive()),
+            Value::Text(v) => parse_naive_date_text(v),
+            _ => Err(crate::ormer_error!("Type mismatch: expected NaiveDate")),
+        }
+    }
+}
+
+impl FromValue for Option<chrono::NaiveDate> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Date(v) => Ok(Some(*v)),
+            Value::DateTime(v) => Ok(Some(v.date_naive())),
+            Value::Text(v) => parse_naive_date_text(v).map(Some),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Option<NaiveDate>"
+            )),
+        }
+    }
+}
+
+impl From<chrono::NaiveTime> for Value {
+    fn from(v: chrono::NaiveTime) -> Self {
+        Value::Time(v)
+    }
+}
+
+impl FromValue for chrono::NaiveTime {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Time(v) => Ok(*v),
+            Value::DateTime(v) => Ok(v.time()),
+            Value::Text(v) => parse_naive_time_text(v),
+            _ => Err(crate::ormer_error!("Type mismatch: expected NaiveTime")),
+        }
+    }
+}
+
+impl FromValue for Option<chrono::NaiveTime> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            Value::Time(v) => Ok(Some(*v)),
+            Value::DateTime(v) => Ok(Some(v.time())),
+            Value::Text(v) => parse_naive_time_text(v).map(Some),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected Option<NaiveTime>"
             )),
         }
     }
@@ -2181,29 +2184,22 @@ impl From<serde_json::Value> for Value {
 }
 
 impl FromValue for serde_json::Value {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Json(v) => Ok(v.clone()),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected serde_json::Value")),
-        }
-    }
-}
-
-impl From<Option<serde_json::Value>> for Value {
-    fn from(v: Option<serde_json::Value>) -> Self {
-        match v {
-            Some(json) => Value::Json(json),
-            None => Value::Null,
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected serde_json::Value"
+            )),
         }
     }
 }
 
 impl FromValue for Option<serde_json::Value> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Json(v) => Ok(Some(v.clone())),
-            _ => Err(anyhow::anyhow!(
+            _ => Err(crate::ormer_error!(
                 "Type mismatch: expected Option<serde_json::Value>"
             )),
         }
@@ -2218,29 +2214,20 @@ impl From<uuid::Uuid> for Value {
 }
 
 impl FromValue for uuid::Uuid {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Uuid(v) => Ok(*v),
-            _ => Err(anyhow::anyhow!("Type mismatch: expected uuid::Uuid")),
-        }
-    }
-}
-
-impl From<Option<uuid::Uuid>> for Value {
-    fn from(v: Option<uuid::Uuid>) -> Self {
-        match v {
-            Some(uuid) => Value::Uuid(uuid),
-            None => Value::Null,
+            _ => Err(crate::ormer_error!("Type mismatch: expected uuid::Uuid")),
         }
     }
 }
 
 impl FromValue for Option<uuid::Uuid> {
-    fn from_value(value: &Value) -> anyhow::Result<Self> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
             Value::Uuid(v) => Ok(Some(*v)),
-            _ => Err(anyhow::anyhow!(
+            _ => Err(crate::ormer_error!(
                 "Type mismatch: expected Option<uuid::Uuid>"
             )),
         }

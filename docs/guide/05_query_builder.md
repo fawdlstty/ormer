@@ -178,12 +178,31 @@ let name_age: Vec<(String, i32)> = db
     .collect()
     .await?;
 
+let labeled: Vec<(i32, String, String)> = db
+    .select::<User>()
+    .map_to(|u| {
+        (
+            u.id.alias("user_id"),
+            u.email,
+            ormer::expr!(match u.status {
+                "paid" => "done",
+                "new" => "open",
+                _ => "other",
+            })
+            .alias("status_label"),
+        )
+    })
+    .collect()
+    .await?;
+
 let user_ids: Vec<UserId> = db
     .select::<User>()
     .map_to(|u| u.id)
     .collect_with(|id| UserId { id })
     .await?;
 ```
+
+单个投影项可以直接调用 `.alias("...")` 改名。
 
 如果目标仍是另一个 `Model`，可以使用 `map_to_model`，框架会按目标模型的列名生成别名：
 

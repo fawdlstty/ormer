@@ -19,29 +19,29 @@ struct AgeGroupStats {
 }
 
 impl FromRowValues for AgeGroupStats {
-    fn from_row_values(values: &[Value]) -> anyhow::Result<Self> {
+    fn from_row_values(values: &[Value]) -> ormer::Result<Self> {
         if values.len() < 3 {
-            return Err(anyhow::anyhow!("Expected at least 3 values"));
+            return Err(ormer::ormer_error!("Expected at least 3 values"));
         }
 
         let age = match &values[0] {
             Value::Integer(i) => *i as i32,
             _ => {
-                return Err(anyhow::anyhow!("Expected integer for age"));
+                return Err(ormer::ormer_error!("Expected integer for age"));
             }
         };
 
         let user_count = match &values[1] {
             Value::Integer(i) => *i,
             _ => {
-                return Err(anyhow::anyhow!("Expected integer for user_count"));
+                return Err(ormer::ormer_error!("Expected integer for user_count"));
             }
         };
 
         let avg_score = match &values[2] {
             Value::Real(f) => *f,
             _ => {
-                return Err(anyhow::anyhow!("Expected real for avg_score"));
+                return Err(ormer::ormer_error!("Expected real for avg_score"));
             }
         };
 
@@ -102,7 +102,7 @@ async fn test_grouped_select_basic_impl(
     }
 
     // 执行分组聚合查询 - 按年龄分组，统计每组人数
-    let count: Vec<ormer::query::builder::TypedColumn<usize>> = db
+    let count: Vec<ormer::query::builder::TypedColumn<usize, TestGroupedE2EUser>> = db
         .select::<TestGroupedE2EUser>()
         .select_column(|u| u.id.count())
         .group_by(|u| u.age)
@@ -164,7 +164,7 @@ async fn test_grouped_select_with_having_impl(
     }
 
     // 执行分组聚合查询，只返回用户数 >= 2 的年龄组
-    let count: Vec<ormer::query::builder::TypedColumn<usize>> = db
+    let count: Vec<ormer::query::builder::TypedColumn<usize, TestGroupedE2EUserHaving>> = db
         .select::<TestGroupedE2EUserHaving>()
         .select_column(|u| u.id.count())
         .group_by(|u| u.age)
@@ -232,7 +232,7 @@ async fn test_grouped_select_with_filter_impl(
     }
 
     // 执行分组聚合查询，只查询分数 > 80 的用户
-    let count: Vec<ormer::query::builder::TypedColumn<usize>> = db
+    let count: Vec<ormer::query::builder::TypedColumn<usize, TestGroupedE2EUserFilter>> = db
         .select::<TestGroupedE2EUserFilter>()
         .select_column(|u| u.id.count())
         .filter(|u| u.score.gt(80))

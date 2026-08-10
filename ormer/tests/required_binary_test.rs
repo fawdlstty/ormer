@@ -7,7 +7,7 @@ struct RequiredBinary {
 }
 
 #[test]
-fn required_binary_from_row_values() -> anyhow::Result<()> {
+fn required_binary_from_row_values() -> ormer::Result<()> {
     let model = <RequiredBinary as ormer::Model>::from_row_values(&[
         ormer::Value::Integer(1),
         ormer::Value::Bytes(vec![1, 2, 3]),

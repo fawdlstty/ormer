@@ -59,7 +59,7 @@ impl RawSql {
         self
     }
 
-    pub fn to_statement(&self, db_type: DbType) -> anyhow::Result<SqlStatement> {
+    pub fn to_statement(&self, db_type: DbType) -> crate::Result<SqlStatement> {
         let (sql, params) = self.render(db_type)?;
         Ok(SqlStatement::batch(
             db_type,
@@ -67,7 +67,7 @@ impl RawSql {
         ))
     }
 
-    pub fn render(&self, db_type: DbType) -> anyhow::Result<(String, Vec<Value>)> {
+    pub fn render(&self, db_type: DbType) -> crate::Result<(String, Vec<Value>)> {
         if !self.parse_placeholders {
             return Ok((
                 self.sql.clone(),
@@ -143,35 +143,40 @@ impl RawSql {
         }
 
         if positional_idx < self.positional_param_count() {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Unused positional raw SQL parameter at index {}",
                 positional_idx
             ));
         }
         for param in self.params.iter().filter_map(|param| param.name.as_ref()) {
             if !used_named.contains(param) {
-                return Err(anyhow::anyhow!("Unused named raw SQL parameter: {}", param));
+                return Err(crate::ormer_error!(
+                    "Unused named raw SQL parameter: {}",
+                    param
+                ));
             }
         }
 
         Ok((out, params))
     }
 
-    fn named_value(&self, name: &str) -> anyhow::Result<&Value> {
+    fn named_value(&self, name: &str) -> crate::Result<&Value> {
         self.params
             .iter()
             .find(|param| param.name.as_deref() == Some(name))
             .map(|param| &param.value)
-            .ok_or_else(|| anyhow::anyhow!("Missing raw SQL parameter: {}", name))
+            .ok_or_else(|| crate::ormer_error!("Missing raw SQL parameter: {}", name))
     }
 
-    fn positional_value(&self, index: usize) -> anyhow::Result<&Value> {
+    fn positional_value(&self, index: usize) -> crate::Result<&Value> {
         self.params
             .iter()
             .filter(|param| param.name.is_none())
             .nth(index)
             .map(|param| &param.value)
-            .ok_or_else(|| anyhow::anyhow!("Missing raw SQL positional parameter {}", index + 1))
+            .ok_or_else(|| {
+                crate::ormer_error!("Missing raw SQL positional parameter {}", index + 1)
+            })
     }
 
     fn positional_param_count(&self) -> usize {

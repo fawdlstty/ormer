@@ -88,17 +88,17 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
 
         quote! {
             impl ::ormer::model::FromValue for #name {
-                fn from_value(value: &::ormer::model::Value) -> anyhow::Result<Self> {
+                fn from_value(value: &::ormer::model::Value) -> ::ormer::Result<Self> {
                     match value {
                         ::ormer::model::Value::Integer(val) => {
                             match *val {
                                 #(#match_arms)*
-                                _ => Err(anyhow::anyhow!(
+                                _ => Err(::ormer::ormer_error!(
                                     "Unknown numeric value '{}' for {}", val, stringify!(#name)
                                 )),
                             }
                         }
-                        _ => Err(anyhow::anyhow!(
+                        _ => Err(::ormer::ormer_error!(
                             "Expected Integer value for {}", stringify!(#name)
                         )),
                     }
@@ -116,17 +116,17 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
 
         quote! {
             impl ::ormer::model::FromValue for #name {
-                fn from_value(value: &::ormer::model::Value) -> anyhow::Result<Self> {
+                fn from_value(value: &::ormer::model::Value) -> ::ormer::Result<Self> {
                     match value {
                         ::ormer::model::Value::Text(s) => {
                             match s.as_str() {
                                 #(#match_arms)*
-                                _ => Err(anyhow::anyhow!(
+                                _ => Err(::ormer::ormer_error!(
                                     "Unknown enum variant '{}' for {}", s, stringify!(#name)
                                 )),
                             }
                         }
-                        _ => Err(anyhow::anyhow!(
+                        _ => Err(::ormer::ormer_error!(
                             "Expected Text value for {}", stringify!(#name)
                         )),
                     }
@@ -141,9 +141,9 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
     // 生成 FromRowValues for EnumType 实现
     let from_row_values_impl = quote! {
         impl ::ormer::model::FromRowValues for #name {
-            fn from_row_values(values: &[::ormer::model::Value]) -> anyhow::Result<Self> {
+            fn from_row_values(values: &[::ormer::model::Value]) -> ::ormer::Result<Self> {
                 if values.is_empty() {
-                    return Err(anyhow::anyhow!(
+                    return Err(::ormer::ormer_error!(
                         "Expected at least one value for {}", stringify!(#name)
                     ));
                 }
@@ -161,12 +161,12 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
 
         quote! {
             impl ::core::convert::TryFrom<i32> for #name {
-                type Error = anyhow::Error;
+                type Error = ::ormer::OrmerError;
 
-                fn try_from(value: i32) -> anyhow::Result<Self> {
+                fn try_from(value: i32) -> ::ormer::Result<Self> {
                     match value {
                         #(#match_arms)*
-                        _ => Err(anyhow::anyhow!(
+                        _ => Err(::ormer::ormer_error!(
                             "Unknown numeric value '{}' for {}", value, stringify!(#name)
                         )),
                     }
@@ -221,10 +221,10 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                     *self as i64
                 }
 
-                fn from_i64(value: i64) -> anyhow::Result<Self> {
+                fn from_i64(value: i64) -> ::ormer::Result<Self> {
                     match value {
                         #(#from_i64_arms)*
-                        _ => Err(anyhow::anyhow!(
+                        _ => Err(::ormer::ormer_error!(
                             "Unknown numeric value '{}' for {}", value, stringify!(#name)
                         )),
                     }
@@ -258,10 +258,10 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                     }
                 }
 
-                fn from_name(name: &str) -> anyhow::Result<Self> {
+                fn from_name(name: &str) -> ::ormer::Result<Self> {
                     match name {
                         #(#from_name_arms)*
-                        _ => Err(anyhow::anyhow!(
+                        _ => Err(::ormer::ormer_error!(
                             "Unknown enum variant '{}' for {}", name, stringify!(#name)
                         )),
                     }

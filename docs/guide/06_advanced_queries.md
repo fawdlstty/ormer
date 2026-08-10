@@ -86,6 +86,78 @@ let sql = Select::<User>::new()
 - `max()` - 最大值，返回原类型（数值类型）
 - `min()` - 最小值，返回原类型（数值类型）
 
+## 统一表达式
+
+字段、投影、过滤、排序、分组和部分聚合能力共用表达式 AST，可组合函数、`CASE`、cast、collate、窗口函数和后端操作符：
+
+```rust
+let rows: Vec<(i32, String, String)> = db
+    .select::<User>()
+    .filter(|u| u.email.to_lower().eq("alice@example.com"))
+    .map_to(|u| {
+        (
+            u.id.alias("user_id"),
+            u.email,
+            ormer::expr!(match u.status {
+                "paid" => "done",
+                "new" => "open",
+                _ => "other",
+            })
+            .alias("status_label"),
+        )
+    })
+    .order_by(|u| u.email.collate("nocase").asc())
+    .collect()
+    .await?;
+```
+
+聚合表达式支持 `FILTER`、内部排序和 `OVER`：
+
+```rust
+let rows: Vec<(i32, i32)> = db
+    .select::<Order>()
+    .map_to(|o| {
+        (
+            o.user_id,
+            o.total
+                .sum()
+                .filter(|o| o.paid.eq(true))
+                .over(|w| w.partition_by(o.user_id)),
+        )
+    })
+    .collect()
+    .await?;
+```
+
+分组支持 `ROLLUP`、`CUBE` 和 `GROUPING SETS`：
+
+```rust
+let sql = Select::<Sale>::new()
+    .select_column(|s| (s.region, s.amount.sum()))
+    .rollup(|s| (s.region, s.city))
+    .to_sql();
+
+let sql = Select::<Sale>::new()
+    .select_column(|s| (s.region, s.amount.sum()))
+    .grouping_sets(|s| ((s.region,), ()))
+    .to_sql();
+```
+
+也可组合 row value、JSON 路径、全文检索、`DISTINCT ON` 和行锁：
+
+```rust
+let rows: Vec<User> = db
+    .select::<User>()
+    .distinct_on(|u| u.org_id)
+    .filter(|u| (u.org_id, u.email).eq((org_id, email)))
+    .filter(|u| u.profile.json_text("role").eq("admin"))
+    .filter(|u| u.bio.matches_text("rust"))
+    .for_update()
+    .skip_locked()
+    .collect()
+    .await?;
+```
+
 ## JOIN 查询
 
 ```rust

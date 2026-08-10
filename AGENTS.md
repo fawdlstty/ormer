@@ -15,6 +15,14 @@
 - `docs/guide/`、`docs/en/guide/`：中英文使用文档。
 - `docs/.vuepress/`、`docs/package.json`：文档站点配置与构建脚本。
 
+# 限制性架构约束
+
+- 新增后端能力或查询能力前，先检查 `ormer/src/abstract_layer/common/`、`ormer/src/query/` 与 `ormer/src/model.rs` 中已有 helper、macro、trait；能复用或轻量扩展公共层时，不在各后端重复手写。
+- 后端执行器的链式 API（如 `filter`、`order_by`、`range`、`distinct`、insert conflict 配置）默认由公共 macro/trait 生成；只把真正后端特有的执行逻辑留在后端文件。
+- 参数转换、`model::Value` / `query::filter::Value` 转换、数据库原生 value 转换必须集中到公共 helper；禁止在 select、join、aggregate、raw SQL、stream 等路径内联重复 `match Value`。
+- SQL 拼接优先复用查询构造器公共函数，过滤、排序、分页、锁定、JOIN 与 related/multi select 的共有尾部逻辑不得在不同查询类型中复制。
+- row 解析、列值解析、单列 `FromRowValues` 模板优先复用公共 helper/macro；缺失值策略、nullable 分支和错误信息保持集中维护。
+
 # 编译与测试
 
 - 修改代码后，必须同时进行编译和测试，不能只执行 `cargo check`。

@@ -75,7 +75,7 @@ mod validate_table_tests {
             "validate_table should fail for non-existent table"
         );
 
-        // 错误已被包装为 anyhow::Error，只需验证它确实是错误
+        // 错误已被包装为 ormer::OrmerError，只需验证它确实是错误
         println!("Correctly detected non-existent table: {:?}", result.err());
 
         Ok(())
@@ -120,7 +120,7 @@ mod validate_table_tests {
             r#"
             CREATE TABLE validate_table_hypertable_mismatch_1 (
                 id INTEGER PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMP NOT NULL,
                 name VARCHAR(255) NOT NULL
             )
             "#,

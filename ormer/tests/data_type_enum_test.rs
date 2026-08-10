@@ -28,9 +28,9 @@ impl From<WrappedStatus> for i32 {
 }
 
 impl TryFrom<i32> for WrappedStatus {
-    type Error = anyhow::Error;
+    type Error = ormer::OrmerError;
 
-    fn try_from(value: i32) -> anyhow::Result<Self> {
+    fn try_from(value: i32) -> ormer::Result<Self> {
         Ok(Self(u16::try_from(value)?))
     }
 }
@@ -45,7 +45,7 @@ struct DataTypeWrappedModel {
 }
 
 #[test]
-fn data_type_enum_without_model_enum_uses_i32_values() -> anyhow::Result<()> {
+fn data_type_enum_without_model_enum_uses_i32_values() -> ormer::Result<()> {
     let status_column = <DataTypeEnumModel as ormer::Model>::COLUMN_SCHEMA
         .iter()
         .find(|column| column.name == "status")
@@ -98,7 +98,7 @@ fn data_type_enum_without_model_enum_uses_i32_values() -> anyhow::Result<()> {
 }
 
 #[test]
-fn data_type_i32_where_uses_database_type_for_in_filter() -> anyhow::Result<()> {
+fn data_type_i32_where_uses_database_type_for_in_filter() -> ormer::Result<()> {
     let sql = ormer::Select::<DataTypeWrappedModel>::new()
         .filter(|w| w.status.is_in(&[1, 2, 3]))
         .to_sql();

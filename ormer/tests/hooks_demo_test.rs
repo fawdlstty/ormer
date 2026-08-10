@@ -27,7 +27,7 @@ struct HookDemoUser {
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl BeforeInsert for HookDemoUser {
-    async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         INSERT_COUNT.fetch_add(1, Ordering::SeqCst);
         println!("BeforeInsert: 准备插入用户 {}", self.name);
         Ok(())
@@ -38,7 +38,7 @@ impl BeforeInsert for HookDemoUser {
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl AfterInsert for HookDemoUser {
-    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         println!("AfterInsert: 用户 {} 已成功插入", self.name);
         Ok(())
     }
@@ -48,7 +48,7 @@ impl AfterInsert for HookDemoUser {
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl BeforeUpdate for HookDemoUser {
-    async fn before_update(&mut self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn before_update(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         UPDATE_COUNT.fetch_add(1, Ordering::SeqCst);
         println!("BeforeUpdate: 准备更新用户 {}", self.name);
         Ok(())
@@ -59,7 +59,7 @@ impl BeforeUpdate for HookDemoUser {
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
 impl AfterUpdate for HookDemoUser {
-    async fn after_update(&self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn after_update(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         println!("AfterUpdate: 用户 {} 已成功更新", self.name);
         Ok(())
     }

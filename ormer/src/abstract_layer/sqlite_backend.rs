@@ -9,8 +9,12 @@ use crate::query::builder::{
     MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
+use crate::query::insert::{
+    InsertAssignment, InsertConflict, IntoInsertAssignment, IntoInsertDefaultColumn,
+};
+use crate::query::update::UpdateAssignment;
 use crate::raw_sql::IntoRawSql;
-use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
+use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -19,32 +23,9 @@ type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 
 /// 判断错误是否为约束冲突错误（如主键/唯一键重复）
 /// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
-fn is_constraint_error(e: &anyhow::Error) -> bool {
+fn is_constraint_error(e: &crate::OrmerError) -> bool {
     let msg = e.to_string();
     msg.contains("UNIQUE constraint failed") || msg.contains("constraint")
-}
-
-fn turso_values_from_ormer_values(values: &[Value]) -> Vec<turso::Value> {
-    values
-        .iter()
-        .map(|v| match v {
-            Value::Integer(i) => turso::Value::Integer(*i),
-            Value::Text(t) => turso::Value::Text(t.clone()),
-            Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
-            Value::Real(r) => turso::Value::Real(*r),
-            Value::Boolean(b) => turso::Value::Integer(if *b { 1 } else { 0 }),
-            Value::Bytes(b) => turso::Value::Blob(b.clone()),
-            Value::Duration(d) => turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64),
-            Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-            Value::Json(j) => turso::Value::Text(j.to_string()),
-            Value::Uuid(u) => turso::Value::Text(u.to_string()),
-            Value::BigInt(b) => turso::Value::Integer(*b as i64),
-            Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-                panic!("SQLite backend does not support PostgreSQL array values")
-            }
-            Value::Null => turso::Value::Null,
-        })
-        .collect()
 }
 
 fn table_name_for<T: Model>() -> &'static str {
@@ -55,6 +36,7 @@ fn table_name_for<T: Model>() -> &'static str {
 use crate::impl_backend_executor_methods;
 use crate::impl_backend_join_executor_methods;
 use crate::impl_backend_related_executor_methods;
+use crate::impl_insert_conflict_methods;
 
 /// Sqlite 类型映射器
 pub struct SqliteTypeMapper;
@@ -96,7 +78,11 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             // 字节数组
             "Vec<u8>" | "&[u8]" => "BLOB",
             // 日期时间类型（SQLite 存储为 TEXT 或 INTEGER）
-            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => "TEXT",
+            "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>"
+            | "NaiveDateTime"
+            | "chrono::NaiveDateTime" => "TEXT",
             "NaiveDate" | "chrono::NaiveDate" => "TEXT",
             "NaiveTime" | "chrono::NaiveTime" => "TEXT",
             // JSON 类型（SQLite 存储为 TEXT）
@@ -136,7 +122,7 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::Sqlite,
             self.table_name.as_deref(),
@@ -144,7 +130,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         Ok(SqlStatement::single(DbType::Sqlite, create_sql, Vec::new()))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -152,11 +138,11 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         CreateTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
             self.db.conn.execute(&statement.sql, ()).trace().await?;
         }
@@ -171,7 +157,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::Sqlite,
             format!(
@@ -182,7 +168,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -190,11 +176,11 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DropTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
             self.db.conn.execute(&statement.sql, ()).trace().await?;
         }
@@ -206,53 +192,34 @@ impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
 pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     db: &'a Database,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: std::marker::PhantomData<I::Model>,
 }
 
+impl_insert_conflict_methods!(InsertExecutor, with_conflict);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
+        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+            DbType::Sqlite,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        if self.models.as_refs().is_empty() {
-            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
-        }
-
-        let hook_ctx = HookContext::new(HookOperation::Insert);
-        self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
-        let all_params = values_to_params(&all_values)?;
-
-        self.db.conn.execute(&sql, all_params).trace().await?;
-        self.models.run_after_insert(hook_ctx).await?;
-
-        // 获取自增ID（如果有自增主键）
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            let last_id = self.db.conn.last_insert_rowid();
-            let result = common_helpers::convert_auto_increment_key::<
-                <I::Model as Model>::AutoIncrementKeyType,
-            >(last_id)?;
-            Ok(result)
-        } else {
-            Ok(<I::Model as Model>::AutoIncrementKeyType::default())
-        }
+    pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行插入并返回插入的行数据（SQLite RETURNING 支持）
-    pub async fn returning(mut self) -> anyhow::Result<Vec<I::Model>> {
+    pub async fn returning(mut self) -> crate::Result<Vec<I::Model>> {
         if self.models.as_refs().is_empty() {
             return Ok(Vec::new());
         }
@@ -261,9 +228,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
-        let all_params = values_to_params(&all_values)?;
+        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+            DbType::Sqlite,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
+        let all_params = values_into_params(all_values)?;
 
         let sql_with_returning = format!("{} RETURNING *", sql);
         let mut rows = self
@@ -290,29 +260,123 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
 
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
 
-        self.db.conn.execute(&statement.sql, params).trace().await?;
+        let rows_affected = self.db.conn.execute(&statement.sql, params).trace().await?;
+        self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
+            if rows_affected == 0 {
+                return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+            }
             let last_id = self.db.conn.last_insert_rowid();
             let result = common_helpers::convert_auto_increment_key::<Self::Output>(last_id)?;
             return Ok(result);
         }
 
         Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+    }
+}
+
+pub struct InsertPartialExecutor<'a, T: Model> {
+    db: &'a Database,
+    assignments: Vec<InsertAssignment>,
+    source_table: Option<&'static str>,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
+        self.assignments.extend(assignments);
+        self
+    }
+
+    fn with_source_table(mut self, source_table: &'static str) -> Self {
+        self.source_table = Some(source_table);
+        self
+    }
+
+    pub fn set<F, A>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> A,
+        A: IntoInsertAssignment<T>,
+    {
+        self.assignments
+            .push(f(T::Where::default()).into_insert_assignment());
+        self
+    }
+
+    pub fn default<F, C>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: IntoInsertDefaultColumn<T>,
+    {
+        self.assignments.push(InsertAssignment::default(
+            f(T::Where::default()).into_insert_default_column(),
+        ));
+        self
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        common_helpers::validate_insert_model_table::<T>(DbType::Sqlite, self.source_table)?;
+        let statement =
+            common_helpers::build_partial_insert_statement::<T>(DbType::Sqlite, &self.assignments)?;
+        Ok(SqlStatement::batch(
+            DbType::Sqlite,
+            vec![SingleSqlStatement::new(statement.sql, statement.params)],
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<<T as Model>::AutoIncrementKeyType>
+    where
+        T: Send + Sync,
+    {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
+    type Output = <T as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        InsertPartialExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<T as Model>::AutoIncrementKeyType::default());
+        }
+
+        let statement = &sql.statements[0];
+        let params = values_to_params(&statement.params)?;
+        let rows_affected = self.db.conn.execute(&statement.sql, params).trace().await?;
+
+        if rows_affected == 0 {
+            return Ok(<T as Model>::AutoIncrementKeyType::default());
+        }
+
+        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        if has_auto_increment {
+            let last_id = self.db.conn.last_insert_rowid();
+            return common_helpers::convert_auto_increment_key::<Self::Output>(last_id);
+        }
+
+        Ok(<T as Model>::AutoIncrementKeyType::default())
     }
 }
 
@@ -324,7 +388,7 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
@@ -344,7 +408,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         if self.models.as_refs().is_empty() {
             return Ok(());
         }
@@ -382,7 +446,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         for model in refs.iter() {
             // 先删除已有记录
             let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
+            let delete_params = values_into_params(pk_values)?;
             self.db
                 .conn
                 .execute(&delete_sql, delete_params)
@@ -391,7 +455,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 
             // 然后插入新记录
             let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
+            let insert_params = values_into_params(all_values)?;
             self.db
                 .conn
                 .execute(&insert_sql, insert_params)
@@ -407,11 +471,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
@@ -430,7 +494,7 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
@@ -451,7 +515,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         if self.models.as_refs().is_empty() {
             return Ok(());
         }
@@ -469,7 +533,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 
         for model in refs.iter() {
             let values = model.insert_values();
-            let params = values_to_params(&values)?;
+            let params = values_into_params(values)?;
             match self.db.conn.execute(&sql, params).trace().await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
@@ -487,11 +551,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
@@ -510,7 +574,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
 
 impl Database {
     /// 连接到 Sqlite 数据库 (本地模式)
-    pub async fn connect(_db_type: super::DbType, path: &str) -> anyhow::Result<Self> {
+    pub async fn connect(_db_type: super::DbType, path: &str) -> crate::Result<Self> {
         let db = turso::Builder::new_local(path).build().trace().await?;
 
         let conn = Arc::new(db.connect().trace_for("turso::Database::connect")?);
@@ -528,12 +592,12 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
+    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().trace().await?;
 
         if !table_exists {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {} does not exist",
                 T::TABLE_NAME
             ));
@@ -544,7 +608,7 @@ impl Database {
     }
 
     /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
+    async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
 
         let mut rows = self
@@ -566,7 +630,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
+    async fn validate_table_schema<T: Model>(&self) -> crate::Result<()> {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", table_name_for::<T>());
 
@@ -593,7 +657,7 @@ impl Database {
 
         // 比较列数量
         if actual_columns.len() != T::COLUMNS.len() {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
                 T::COLUMNS.len(),
@@ -604,7 +668,7 @@ impl Database {
         // 比较每一列的定义
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Missing column: {}",
                     T::TABLE_NAME,
                     expected_col.name
@@ -615,7 +679,7 @@ impl Database {
 
             // 检查列名
             if actual_name != expected_col.name {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
                     T::TABLE_NAME,
                     i,
@@ -626,7 +690,7 @@ impl Database {
 
             // 检查主键约束
             if expected_col.is_primary != *actual_pk {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
                     T::TABLE_NAME,
                     expected_col.name,
@@ -671,7 +735,7 @@ impl Database {
             };
 
             if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
                     T::TABLE_NAME,
                     expected_col.name
@@ -682,7 +746,7 @@ impl Database {
             if !expected_col.is_primary {
                 let expected_notnull = !expected_col.is_nullable;
                 if *actual_notnull != expected_notnull {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
                         T::TABLE_NAME,
                         expected_col.name,
@@ -719,8 +783,30 @@ impl Database {
         InsertExecutor {
             db: self,
             models,
+            conflict: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+        InsertPartialExecutor {
+            db: self,
+            assignments: Vec::new(),
+            source_table: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn insert_model<T>(
+        &self,
+        model: impl crate::model::InsertModel<T>,
+    ) -> InsertPartialExecutor<'_, T>
+    where
+        T: Model,
+    {
+        self.insert_partial::<T>()
+            .with_source_table(model.insert_table_name())
+            .with_assignments(model.insert_assignments())
     }
 
     /// 插入或更新记录 - 返回执行器
@@ -752,13 +838,13 @@ impl Database {
     pub(crate) async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    ) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
         let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
-        let all_params = values_to_params(&all_values)?;
+        let all_params = values_into_params(all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
 
@@ -777,7 +863,7 @@ impl Database {
 
     /// 批量插入或更新记录（遇到重复键时更新）
     /// turso 不支持 ON CONFLICT，因此通过 DELETE + INSERT 实现 upsert 语义。
-    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -810,14 +896,14 @@ impl Database {
 
         for model in models.iter() {
             let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
+            let delete_params = values_into_params(pk_values)?;
             self.conn
                 .execute(&delete_sql, delete_params)
                 .trace()
                 .await?;
 
             let all_values = model.insert_values();
-            let insert_params = values_to_params(&all_values)?;
+            let insert_params = values_into_params(all_values)?;
             self.conn
                 .execute(&insert_sql, insert_params)
                 .trace()
@@ -829,7 +915,7 @@ impl Database {
 
     /// 批量插入或忽略记录（遇到重复键时忽略）
     /// turso 不支持 ON CONFLICT，因此通过捕获约束错误实现忽略语义。
-    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -845,7 +931,7 @@ impl Database {
 
         for model in models.iter() {
             let values = model.insert_values();
-            let params = values_to_params(&values)?;
+            let params = values_into_params(values)?;
             match self.conn.execute(&insert_sql, params).trace().await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
@@ -906,7 +992,7 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> anyhow::Result<Transaction> {
+    pub async fn begin(&self) -> crate::Result<Transaction> {
         self.conn.execute("BEGIN", ()).trace().await?;
         Ok(Transaction {
             conn: self.conn.clone(),
@@ -924,18 +1010,18 @@ impl Database {
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
         let (sql, params) = sql.render(DbType::Sqlite)?;
         self.exec_raw(&sql, params).await
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let turso_params = turso_values_from_ormer_values(&params);
+        let turso_params = values_into_params(params)?;
         let mut rows = if turso_params.is_empty() {
             self.conn.query(sql, ()).trace().await?
         } else {
@@ -955,8 +1041,8 @@ impl Database {
         Ok(results.into_iter().collect())
     }
 
-    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
-        let turso_params = turso_values_from_ormer_values(&params);
+    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
+        let turso_params = values_into_params(params)?;
         if turso_params.is_empty() {
             Ok(self.conn.execute(sql, ()).trace().await?)
         } else {
@@ -964,7 +1050,7 @@ impl Database {
         }
     }
 
-    pub(crate) async fn migration_history(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+    pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
         let mut rows = self
             .conn
             .query(
@@ -996,7 +1082,7 @@ impl Database {
     pub(crate) async fn schema_columns(
         &self,
         table_name: &str,
-    ) -> anyhow::Result<Option<Vec<SchemaColumn>>> {
+    ) -> crate::Result<Option<Vec<SchemaColumn>>> {
         let mut exists = self
             .conn
             .query(
@@ -1062,41 +1148,54 @@ pub struct Transaction {
 pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     txn: &'a mut Transaction,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: std::marker::PhantomData<I::Model>,
 }
 
+impl_insert_conflict_methods!(TransactionInsertExecutor);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
+        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+            DbType::Sqlite,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
 
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        if self.models.as_refs().is_empty() {
+    pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        let sql = self.to_sql()?;
+        if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
 
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
 
-        let refs = self.models.as_refs();
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::Sqlite, &refs);
-        let all_params = values_to_params(&all_values)?;
+        let statement = &sql.statements[0];
+        let all_params = values_to_params(&statement.params)?;
 
-        self.txn.conn.execute(&sql, all_params).trace().await?;
+        let rows_affected = self
+            .txn
+            .conn
+            .execute(&statement.sql, all_params)
+            .trace()
+            .await?;
         self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
+            if rows_affected == 0 {
+                return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+            }
             let last_id = self.txn.conn.last_insert_rowid();
             let result = common_helpers::convert_auto_increment_key::<
                 <I::Model as Model>::AutoIncrementKeyType,
@@ -1116,7 +1215,7 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
@@ -1134,7 +1233,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         if self.models.as_refs().is_empty() {
             return Ok(());
         }
@@ -1171,7 +1270,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
 
         for model in refs.iter() {
             let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
+            let delete_params = values_into_params(pk_values)?;
             self.txn
                 .conn
                 .execute(&delete_sql, delete_params)
@@ -1179,7 +1278,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
                 .await?;
 
             let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
+            let insert_params = values_into_params(all_values)?;
             self.txn
                 .conn
                 .execute(&insert_sql, insert_params)
@@ -1200,7 +1299,7 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
@@ -1219,7 +1318,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         if self.models.as_refs().is_empty() {
             return Ok(());
         }
@@ -1239,7 +1338,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 
         for model in refs.iter() {
             let values = model.insert_values();
-            let params = values_to_params(&values)?;
+            let params = values_into_params(values)?;
             match self.txn.conn.execute(&insert_sql, params).trace().await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
@@ -1255,8 +1354,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 }
 
 impl Transaction {
-    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
-        let turso_params = turso_values_from_ormer_values(&params);
+    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
+        let turso_params = values_into_params(params)?;
         if turso_params.is_empty() {
             Ok(self.conn.execute(sql, ()).trace().await?)
         } else {
@@ -1264,12 +1363,12 @@ impl Transaction {
         }
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let turso_params = turso_values_from_ormer_values(&params);
+        let turso_params = values_into_params(params)?;
         let mut rows = if turso_params.is_empty() {
             self.conn.query(sql, ()).trace().await?
         } else {
@@ -1290,9 +1389,9 @@ impl Transaction {
     }
 
     /// 提交事务
-    pub async fn commit(mut self) -> anyhow::Result<()> {
+    pub async fn commit(mut self) -> crate::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back"
             ));
         }
@@ -1302,9 +1401,9 @@ impl Transaction {
     }
 
     /// 回滚事务
-    pub async fn rollback(mut self) -> anyhow::Result<()> {
+    pub async fn rollback(mut self) -> crate::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back"
             ));
         }
@@ -1359,6 +1458,7 @@ impl Transaction {
         TransactionInsertExecutor {
             txn: self,
             models,
+            conflict: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -1392,13 +1492,13 @@ impl Transaction {
     async fn insert_impl<T: Model>(
         &mut self,
         models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    ) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
         let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
-        let all_params = values_to_params(&all_values)?;
+        let all_params = values_into_params(all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
 
@@ -1416,7 +1516,7 @@ impl Transaction {
 
     /// 批量插入或更新记录（遇到重复键时更新）（内部使用）
     #[allow(dead_code)]
-    async fn insert_or_update_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
+    async fn insert_or_update_impl<T: Model>(&mut self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -1449,14 +1549,14 @@ impl Transaction {
 
         for model in models.iter() {
             let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
+            let delete_params = values_into_params(pk_values)?;
             self.conn
                 .execute(&delete_sql, delete_params)
                 .trace()
                 .await?;
 
             let all_values = model.insert_values();
-            let insert_params = values_to_params(&all_values)?;
+            let insert_params = values_into_params(all_values)?;
             self.conn
                 .execute(&insert_sql, insert_params)
                 .trace()
@@ -1468,7 +1568,7 @@ impl Transaction {
 
     /// 批量插入或忽略记录（遇到重复键时忽略）（内部使用）
     #[allow(dead_code)]
-    async fn insert_or_ignore_impl<T: Model>(&mut self, models: &[&T]) -> anyhow::Result<()> {
+    async fn insert_or_ignore_impl<T: Model>(&mut self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -1484,7 +1584,7 @@ impl Transaction {
 
         for model in models.iter() {
             let values = model.insert_values();
-            let params = values_to_params(&values)?;
+            let params = values_into_params(values)?;
             match self.conn.execute(&insert_sql, params).trace().await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
@@ -1728,7 +1828,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// COUNT 聚合函数
     pub fn count<F, C>(self, f: F) -> AggregateFuture<T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
     {
         let aggregate_select = self.select.count(f);
         AggregateFuture {
@@ -1741,7 +1841,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// SUM 聚合函数
     pub fn sum<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.sum(f);
@@ -1755,7 +1855,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// AVG 聚合函数
     pub fn avg<F, C>(self, f: F) -> AggregateFuture<T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.avg(f);
@@ -1769,7 +1869,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MAX 聚合函数
     pub fn max<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.max(f);
@@ -1783,7 +1883,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MIN 聚合函数
     pub fn min<F, C>(self, f: F) -> AggregateFuture<T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.min(f);
@@ -1872,34 +1972,9 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         }
     }
 
-    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -1967,34 +2042,9 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         }
     }
 
-    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -2049,34 +2099,9 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         }
     }
 
-    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -2147,44 +2172,19 @@ impl<
     R: crate::model::FromValue + 'static + std::marker::Send,
 > std::future::IntoFuture for AggregateFuture<T, R>
 {
-    type Output = anyhow::Result<R>;
+    type Output = crate::Result<R>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Sqlite);
 
-            let values: Vec<turso::Value> = params
-                .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                    crate::model::Value::Text(t) => turso::Value::Text(t),
-                    crate::model::Value::TextArray(v) => {
-                        turso::Value::Text(crate::model::stringify_string_vec(&v))
-                    }
-                    crate::model::Value::Real(r) => turso::Value::Real(r),
-                    crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                    crate::model::Value::Bytes(b) => turso::Value::Blob(b),
-                    crate::model::Value::Duration(d) => {
-                        turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                    }
-                    crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                    crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                    crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                    crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64),
-                    crate::model::Value::IntegerArray(_)
-                    | crate::model::Value::BigIntArray(_)
-                    | crate::model::Value::NullableBigIntArray(_) => {
-                        panic!("SQLite backend does not support PostgreSQL array values")
-                    }
-                    crate::model::Value::Null => turso::Value::Null,
-                })
-                .collect();
+            let turso_params = values_into_params(params)?;
 
-            let mut rows = if values.is_empty() {
+            let mut rows = if turso_params.is_empty() {
                 self.conn.query(&sql, ()).trace().await?
             } else {
-                self.conn.query(&sql, values).trace().await?
+                self.conn.query(&sql, turso_params).trace().await?
             };
 
             if let Some(row) = rows.next().trace().await? {
@@ -2247,7 +2247,7 @@ unsafe impl<'a, T: Model + Send, V: Send, C: Send> Send for GroupedCollectFuture
 impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, C: FromIterator<T> + 'static>
     std::future::IntoFuture for CollectFuture<'a, T, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2259,7 +2259,7 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync, C: FromIter
 impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future::IntoFuture
     for FirstFuture<'a, T>
 {
-    type Output = anyhow::Result<Option<T>>;
+    type Output = crate::Result<Option<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2274,7 +2274,7 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
 impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for LeftJoinCollectFuture<T, J>
 {
-    type Output = anyhow::Result<Vec<(T, Option<J>)>>;
+    type Output = crate::Result<Vec<(T, Option<J>)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2285,7 +2285,7 @@ impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::S
 impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for InnerJoinCollectFuture<T, J>
 {
-    type Output = anyhow::Result<Vec<(T, J)>>;
+    type Output = crate::Result<Vec<(T, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2296,7 +2296,7 @@ impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::S
 impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::Send>
     std::future::IntoFuture for RightJoinCollectFuture<T, J>
 {
-    type Output = anyhow::Result<Vec<(Option<T>, J)>>;
+    type Output = crate::Result<Vec<(Option<T>, J)>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2323,34 +2323,9 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         RelatedCollectFuture { executor: self }
     }
 
-    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -2383,7 +2358,7 @@ unsafe impl<T: Model + Send, R: Model + Send> Send for RelatedCollectFuture<T, R
 impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::Send>
     std::future::IntoFuture for RelatedCollectFuture<T, R>
 {
-    type Output = anyhow::Result<Vec<T>>;
+    type Output = crate::Result<Vec<T>>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2392,36 +2367,10 @@ impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::S
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
-        // 将 ormer::Value 转换为 turso::Value
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -2462,18 +2411,18 @@ impl<T: Model> DeleteExecutor<T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let (sql, params) = self.build_ormer_sql();
         Ok(SqlStatement::single(DbType::Sqlite, sql, params))
     }
 
     /// 执行删除操作并返回影响的行数
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行删除并返回被删除的行数据（SQLite RETURNING 支持）
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
         let sql = self.to_sql()?;
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
@@ -2494,7 +2443,7 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     /// 执行删除操作并返回影响的行数（execute 的别名）
-    pub async fn exec(self) -> anyhow::Result<u64> {
+    pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
 
@@ -2528,7 +2477,7 @@ impl<T: Model> DeleteExecutor<T> {
     #[allow(dead_code)]
     fn build_sql(&self) -> (String, Vec<turso::Value>) {
         let (sql, ormer_params) = self.build_ormer_sql();
-        let turso_params = values_to_params(&ormer_params).unwrap_or_default();
+        let turso_params = values_into_params(ormer_params).unwrap_or_default();
         (sql, turso_params)
     }
 }
@@ -2536,11 +2485,11 @@ impl<T: Model> DeleteExecutor<T> {
 impl<T: Model> SqlExecutor for DeleteExecutor<T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DeleteExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(0);
         }
@@ -2552,7 +2501,7 @@ impl<T: Model> SqlExecutor for DeleteExecutor<T> {
 }
 
 impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for DeleteExecutor<T> {
-    type Output = anyhow::Result<u64>;
+    type Output = crate::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2562,7 +2511,7 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for DeleteE
 
 /// Update 执行器
 pub struct UpdateExecutor<T: Model> {
-    sets: Vec<(String, Value)>,
+    sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
     conn: Arc<turso::Connection>,
@@ -2582,15 +2531,14 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 设置要更新的字段
-    pub fn set<F, V, C>(mut self, field_fn: F, value: V) -> Self
+    pub fn set<F>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
-        V: Into<Value>,
+        F: FnOnce(&mut T::Update),
     {
-        let where_obj = T::Where::default();
-        let column = field_fn(where_obj);
-        let column_name = column.column_name().to_string();
-        self.sets.push((column_name, value.into()));
+        let mut update = T::Update::default();
+        f(&mut update);
+        self.sets
+            .extend(<T::Update as crate::query::update::UpdateFields>::assignments(&update));
         self
     }
 
@@ -2644,7 +2592,7 @@ impl<T: Model> UpdateExecutor<T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let statements = self.build_all_ormer_sql()?;
         Ok(SqlStatement::batch(
             DbType::Sqlite,
@@ -2656,12 +2604,12 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 执行更新操作
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行更新并返回被更新的行数据（SQLite RETURNING 支持）
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
         let statements = self.to_sql()?;
         let mut results = Vec::new();
         for statement in &statements.statements {
@@ -2680,11 +2628,11 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 执行更新操作（execute 的别名）
-    pub async fn exec(self) -> anyhow::Result<u64> {
+    pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
 
-    fn build_all_ormer_sql(&self) -> anyhow::Result<Vec<(String, Vec<Value>)>> {
+    fn build_all_ormer_sql(&self) -> crate::Result<Vec<(String, Vec<Value>)>> {
         let mut statements = Vec::new();
 
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
@@ -2694,16 +2642,15 @@ impl<T: Model> UpdateExecutor<T> {
             );
             let mut ormer_params = Vec::new();
             let mut first = true;
-            for (col_name, value) in &self.sets {
+            for assignment in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&common_helpers::quote_assignment(
+                sql.push_str(&common_helpers::format_update_assignment(
                     DbType::Sqlite,
-                    col_name,
-                    "?",
+                    assignment,
+                    &mut ormer_params,
                 ));
-                ormer_params.push(value.clone());
                 first = false;
             }
             if !self.filters.is_empty() {
@@ -2767,10 +2714,10 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     #[allow(dead_code)]
-    fn build_all_sql(&self) -> anyhow::Result<Vec<(String, Vec<turso::Value>)>> {
+    fn build_all_sql(&self) -> crate::Result<Vec<(String, Vec<turso::Value>)>> {
         self.build_all_ormer_sql()?
             .into_iter()
-            .map(|(sql, ormer_params)| Ok((sql, values_to_params(&ormer_params)?)))
+            .map(|(sql, ormer_params)| Ok((sql, values_into_params(ormer_params)?)))
             .collect()
     }
 }
@@ -2778,11 +2725,11 @@ impl<T: Model> UpdateExecutor<T> {
 impl<T: Model> SqlExecutor for UpdateExecutor<T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         UpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut total = 0;
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
@@ -2793,7 +2740,7 @@ impl<T: Model> SqlExecutor for UpdateExecutor<T> {
 }
 
 impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateExecutor<T> {
-    type Output = anyhow::Result<u64>;
+    type Output = crate::Result<u64>;
     type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -2802,35 +2749,38 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateE
 }
 
 /// 将 ormer Value 转换为 turso 参数
-fn values_to_params(values: &[Value]) -> anyhow::Result<Vec<turso::Value>> {
-    let mut params = Vec::new();
-
-    for value in values {
-        let param = match value {
-            Value::Integer(v) => turso::Value::Integer(*v),
-            Value::Text(v) => turso::Value::Text(v.clone()),
-            Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(v)),
-            Value::Real(v) => turso::Value::Real(*v),
-            Value::Boolean(v) => turso::Value::Integer(if *v { 1 } else { 0 }),
-            Value::Bytes(v) => turso::Value::Blob(v.clone()),
-            Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
-            Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
-            Value::Json(v) => turso::Value::Text(v.to_string()),
-            Value::Uuid(v) => turso::Value::Text(v.to_string()),
-            Value::BigInt(v) => turso::Value::Integer(*v as i64),
-            Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-                panic!("SQLite backend does not support PostgreSQL array values")
-            }
-            Value::Null => turso::Value::Null,
-        };
-        params.push(param);
+fn value_to_turso_value(value: Value) -> turso::Value {
+    match value {
+        Value::Integer(v) => turso::Value::Integer(v),
+        Value::Text(v) => turso::Value::Text(v),
+        Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
+        Value::Real(v) => turso::Value::Real(v),
+        Value::Boolean(v) => turso::Value::Integer(if v { 1 } else { 0 }),
+        Value::Bytes(v) => turso::Value::Blob(v),
+        Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
+        Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
+        Value::Date(date) => turso::Value::Text(date.to_string()),
+        Value::Time(time) => turso::Value::Text(time.to_string()),
+        Value::Json(v) => turso::Value::Text(v.to_string()),
+        Value::Uuid(v) => turso::Value::Text(v.to_string()),
+        Value::BigInt(v) => turso::Value::Integer(v as i64),
+        Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
+            panic!("SQLite backend does not support PostgreSQL array values")
+        }
+        Value::Null => turso::Value::Null,
     }
+}
 
-    Ok(params)
+fn values_to_params(values: &[Value]) -> crate::Result<Vec<turso::Value>> {
+    Ok(values.iter().cloned().map(value_to_turso_value).collect())
+}
+
+fn values_into_params(values: Vec<Value>) -> crate::Result<Vec<turso::Value>> {
+    Ok(values.into_iter().map(value_to_turso_value).collect())
 }
 
 /// 将 turso Value 转换为 ormer Value
-fn convert_turso_value(value: &turso::Value) -> anyhow::Result<Value> {
+fn convert_turso_value(value: &turso::Value) -> crate::Result<Value> {
     match value {
         turso::Value::Integer(v) => Ok(Value::Integer(*v)),
         turso::Value::Text(v) => {
@@ -2865,7 +2815,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2895,7 +2845,7 @@ where
     M: 'static + std::marker::Send,
     F: Fn(V) -> M + Clone + Send + 'static,
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2937,38 +2887,13 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         }
     }
 
-    async fn collect_inner<C: FromIterator<V>>(self) -> anyhow::Result<C>
+    async fn collect_inner<C: FromIterator<V>>(self) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
     {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -3051,7 +2976,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3064,38 +2989,13 @@ impl<
 }
 
 impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
-    async fn collect_inner<C: FromIterator<V>>(self) -> anyhow::Result<C>
+    async fn collect_inner<C: FromIterator<V>>(self) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
     {
         let (sql, params) = self.select.build_sql(DbType::Sqlite);
 
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let mut rows = if turso_params.is_empty() {
             self.conn.query(&sql, ()).trace().await?
@@ -3147,39 +3047,13 @@ pub struct SelectStream<'a, T: Model> {
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
-    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
+    pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
         // 从 StreamConnection 获取连接
         let conn = self.conn.expect_sqlite().clone();
 
-        // 将 ormer::Value 转换为 turso::Value
-        let turso_params: Vec<turso::Value> = params
-            .into_iter()
-            .map(|v| match v {
-                crate::model::Value::Integer(i) => turso::Value::Integer(i),
-                crate::model::Value::Text(t) => turso::Value::Text(t),
-                crate::model::Value::TextArray(v) => {
-                    turso::Value::Text(crate::model::stringify_string_vec(&v))
-                }
-                crate::model::Value::Real(r) => turso::Value::Real(r),
-                crate::model::Value::Boolean(b) => turso::Value::Integer(if b { 1 } else { 0 }),
-                crate::model::Value::Bytes(b) => turso::Value::Blob(b.clone()),
-                crate::model::Value::Duration(d) => {
-                    turso::Value::Integer(d.as_micros().min(i64::MAX as u128) as i64)
-                }
-                crate::model::Value::DateTime(dt) => turso::Value::Text(dt.to_rfc3339()),
-                crate::model::Value::Json(j) => turso::Value::Text(j.to_string()),
-                crate::model::Value::Uuid(u) => turso::Value::Text(u.to_string()),
-                crate::model::Value::BigInt(b) => turso::Value::Integer(b as i64), // 可能丢失精度
-                crate::model::Value::IntegerArray(_)
-                | crate::model::Value::BigIntArray(_)
-                | crate::model::Value::NullableBigIntArray(_) => {
-                    panic!("SQLite backend does not support PostgreSQL array values")
-                }
-                crate::model::Value::Null => turso::Value::Null,
-            })
-            .collect();
+        let turso_params = values_into_params(params)?;
 
         let rows = if turso_params.is_empty() {
             conn.query(&sql, ()).trace().await?
@@ -3228,7 +3102,7 @@ impl<'a, T: Model> Drop for SelectStreamIterator<'a, T> {
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
-    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
+    pub async fn next(&mut self) -> Option<crate::Result<T>> {
         // 如果已经污染，直接返回 None
         if self.polluted {
             return None;
@@ -3251,7 +3125,9 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                         },
                         Err(e) => {
                             self.polluted = true;
-                            return Some(Err(anyhow::anyhow!("turso::Row::get_value failed: {e}")));
+                            return Some(Err(crate::ormer_error!(
+                                "turso::Row::get_value failed: {e}"
+                            )));
                         }
                     }
                 }

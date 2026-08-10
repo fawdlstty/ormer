@@ -1,7 +1,9 @@
 use super::super::DbType;
 use super::common_helpers;
 use super::{SqlExecutor, SqlStatement};
+use crate::impl_insert_conflict_methods;
 use crate::model::{FromRowValues, Model};
+use crate::query::insert::InsertConflict;
 use crate::raw_sql::{IntoRawSql, RawSql};
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::collections::VecDeque;
@@ -31,11 +33,14 @@ use super::unified::{CreateTableExecutor, DropTableExecutor};
 pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
     pooled_conn: &'a PooledConnection<'a>,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: PhantomData<I>,
 }
 
+impl_insert_conflict_methods!(PooledInsertExecutor);
+
 impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(
@@ -48,24 +53,25 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(_) => {
                 let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
                         DbType::Sqlite,
                         &refs,
-                    );
+                        self.conflict.as_ref(),
+                    )?;
                 Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(_) => {
                 let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
                         DbType::PostgreSQL,
                         &refs,
-                    );
-                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-                    .iter()
-                    .filter(|col| !col.is_auto_increment)
-                    .map(|col| col.data_type.unwrap_or(col.rust_type))
-                    .collect();
+                        self.conflict.as_ref(),
+                    )?;
+                let rust_types = postgresql_backend::pg_insert_param_rust_types::<I::Model>(
+                    refs.len(),
+                    self.conflict.as_ref(),
+                );
                 Ok(SqlStatement::batch(
                     DbType::PostgreSQL,
                     vec![
@@ -77,19 +83,21 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(_) => {
                 let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
                         DbType::MySQL,
                         &refs,
-                    );
+                        self.conflict.as_ref(),
+                    )?;
                 Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(_) => {
                 let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
                         DbType::MSSQL,
                         &refs,
-                    );
+                        self.conflict.as_ref(),
+                    )?;
                 Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
             }
         }
@@ -97,19 +105,59 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
 
     pub async fn execute(
         self,
-    ) -> anyhow::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
+    ) -> crate::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType>
+    where
+        I: Send + Sync,
+    {
         <Self as SqlExecutor>::execute(self).await
     }
 }
 
-impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertExecutor<'a, I> {
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsertExecutor<'a, I> {
     type Output = <I::Model as crate::model::Model>::AutoIncrementKeyType;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         PooledInsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
+        if self
+            .conflict
+            .as_ref()
+            .is_some_and(|conflict| conflict.is_configured())
+        {
+            return match self.pooled_conn.get_connection() {
+                #[cfg(feature = "sqlite")]
+                ConnectionWrapper::Sqlite(db) => {
+                    db.insert(self.models)
+                        .with_conflict(self.conflict)
+                        .execute()
+                        .await
+                }
+                #[cfg(feature = "postgresql")]
+                ConnectionWrapper::PostgreSQL(db) => {
+                    db.insert(self.models)
+                        .with_conflict(self.conflict)
+                        .execute()
+                        .await
+                }
+                #[cfg(feature = "mysql")]
+                ConnectionWrapper::MySQL(db) => {
+                    db.insert(self.models)
+                        .with_conflict(self.conflict)
+                        .execute()
+                        .await
+                }
+                #[cfg(feature = "mssql")]
+                ConnectionWrapper::MSSQL(db) => {
+                    db.insert(self.models)
+                        .with_conflict(self.conflict)
+                        .execute()
+                        .await
+                }
+            };
+        }
+
         let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
@@ -132,7 +180,7 @@ pub struct PooledInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(
@@ -243,7 +291,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -251,11 +299,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
 impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         PooledInsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
         let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
@@ -278,7 +326,7 @@ pub struct PooledInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(
@@ -355,7 +403,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
         }
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -376,11 +424,11 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
 impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         PooledInsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, _sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
         let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
@@ -474,29 +522,31 @@ impl ManualPool {
     }
 
     /// 创建新的数据库连接
-    async fn create_connection(&self) -> anyhow::Result<ConnectionWrapper> {
+    async fn create_connection(&self) -> crate::Result<ConnectionWrapper> {
         match self.db_type {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
-                let db = crate::utils::AnyhowFutureTraceExt::trace(
-                    sqlite_backend::Database::connect(self.db_type, &self.connection_string),
-                )
+                let db = crate::utils::FutureTraceExt::trace(sqlite_backend::Database::connect(
+                    self.db_type,
+                    &self.connection_string,
+                ))
                 .await?;
                 Ok(ConnectionWrapper::Sqlite(db))
             }
             #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => Err(anyhow::anyhow!(
+            DbType::PostgreSQL => Err(crate::ormer_error!(
                 "Build the pool through PoolBuilder/ConnectionPool"
             )),
             #[cfg(feature = "mysql")]
-            DbType::MySQL => Err(anyhow::anyhow!(
+            DbType::MySQL => Err(crate::ormer_error!(
                 "Build the pool through PoolBuilder/ConnectionPool"
             )),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => {
-                let db = crate::utils::AnyhowFutureTraceExt::trace(
-                    mssql_backend::Database::connect(self.db_type, &self.connection_string),
-                )
+                let db = crate::utils::FutureTraceExt::trace(mssql_backend::Database::connect(
+                    self.db_type,
+                    &self.connection_string,
+                ))
                 .await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
@@ -504,7 +554,7 @@ impl ManualPool {
     }
 
     /// 获取连接(异步)
-    async fn get(&self) -> anyhow::Result<ConnectionWrapper> {
+    async fn get(&self) -> crate::Result<ConnectionWrapper> {
         // 尝试从空闲队列获取
         {
             let mut idle = self.idle_connections.lock().await;
@@ -522,7 +572,7 @@ impl ManualPool {
         let current_total = self.total_connections.load(Ordering::SeqCst);
         if current_total < self.config.max_size {
             // 可以增加连接数
-            let conn = crate::utils::AnyhowFutureTraceExt::trace(self.create_connection()).await?;
+            let conn = crate::utils::FutureTraceExt::trace(self.create_connection()).await?;
             self.total_connections.fetch_add(1, Ordering::SeqCst);
             return Ok(conn);
         }
@@ -613,7 +663,7 @@ impl PoolBuilder {
     }
 
     /// 构建连接池
-    pub async fn build(self) -> anyhow::Result<ConnectionPool> {
+    pub async fn build(self) -> crate::Result<ConnectionPool> {
         // 注意：SQLite 后端建议设置 max_size=1，因为其嵌入式特性不支持多线程共享连接
         // 如需并发支持，可考虑启用 MVCC 模式（PRAGMA journal_mode = 'mvcc'）
 
@@ -680,11 +730,11 @@ impl ConnectionPool {
     ///
     /// 此方法会等待直到有可用连接或创建新连接
     /// 如果池中没有连接且未达到 max_size,会自动创建新连接
-    pub async fn get(&self) -> anyhow::Result<PooledConnection<'_>> {
+    pub async fn get(&self) -> crate::Result<PooledConnection<'_>> {
         match self {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
-                let conn = crate::utils::AnyhowFutureTraceExt::trace(pool.get()).await?;
+                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
                     connection: Some(conn),
@@ -712,7 +762,7 @@ impl ConnectionPool {
             }
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(pool) => {
-                let conn = crate::utils::AnyhowFutureTraceExt::trace(pool.get()).await?;
+                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MSSQL(pool.clone()),
                     connection: Some(conn),
@@ -765,7 +815,7 @@ pub struct PooledRawSelectExecutor<'conn, 'pool, T> {
 }
 
 impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
-    pub async fn collect<C>(self) -> anyhow::Result<C>
+    pub async fn collect<C>(self) -> crate::Result<C>
     where
         T: FromRowValues,
         C: FromIterator<T>,
@@ -853,7 +903,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 验证表结构
-    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
+    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
@@ -871,6 +921,7 @@ impl<'a> PooledConnection<'a> {
         PooledInsertExecutor {
             pooled_conn: self,
             models,
+            conflict: None,
             _marker: PhantomData,
         }
     }
@@ -885,6 +936,13 @@ impl<'a> PooledConnection<'a> {
             models,
             _marker: PhantomData,
         }
+    }
+
+    pub fn upsert<I: crate::model::Insertable>(
+        &self,
+        models: I,
+    ) -> PooledInsertOrUpdateExecutor<'_, I> {
+        self.insert_or_update(models)
     }
 
     /// 插入或忽略记录 - 返回执行器（存在重复主键时忽略）
@@ -984,26 +1042,26 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> anyhow::Result<super::unified::Transaction<'_>> {
+    pub async fn begin(&self) -> crate::Result<super::unified::Transaction<'_>> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
+                let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::Sqlite(txn))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
-                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
+                let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::PostgreSQL(txn))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => {
-                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
+                let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::MySQL(txn))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
-                let txn = crate::utils::AnyhowFutureTraceExt::trace(db.begin()).await?;
+                let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::MSSQL(txn))
             }
         }
@@ -1034,7 +1092,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 执行原生非查询 SQL
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let raw_sql = sql.into_raw_sql();
         match self.get_connection() {
             #[cfg(feature = "sqlite")]

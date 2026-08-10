@@ -105,6 +105,27 @@ async fn test_set_model_impl(
     assert_eq!(partial_users[0].age, 25);
     assert_eq!(partial_users[0].email, Some("carol@test.com".to_string()));
 
+    let increment_sql = db
+        .update::<SetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .set(|p| p.age += 1)
+        .to_sql()?;
+    assert!(increment_sql.statements[0].sql.contains("age = age +"));
+
+    db.update::<SetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .set(|p| p.age += 1)
+        .execute()
+        .await?;
+
+    let incremented_users: Vec<SetModelUser> = db
+        .select::<SetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(incremented_users.len(), 1);
+    assert_eq!(incremented_users[0].age, 26);
+
     // 清理
     db.drop_table::<SetModelUser>().execute().await?;
 

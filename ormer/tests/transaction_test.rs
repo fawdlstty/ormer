@@ -208,7 +208,7 @@ async fn test_transaction_with_update_impl(
     use ormer::WhereColumn;
     txn.update::<TestUser>()
         .filter(|w| w.name.eq("Original"))
-        .set(|w| w.name, "Updated".to_string())
+        .set(|w| w.name = w.name.set("Updated".to_string()))
         .execute()
         .await?;
 

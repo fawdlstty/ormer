@@ -37,6 +37,41 @@ db.insert(&[user1, user2])
     .await?;
 ```
 
+### Partial Insert and Form Models
+
+`insert_partial::<User>()` writes only columns selected with `set`; `default` omits the column from the INSERT so the database default is used:
+
+```rust
+db.insert_partial::<User>()
+    .set(|u| u.name.set("Alice"))
+    .set(|u| (u.email, Some("alice@example.com".to_string())))
+    .default(|u| u.created_at)
+    .execute()
+    .await?;
+```
+
+Form structs can derive `InsertModel` and be inserted with `insert_model::<User>(&value)`. `ActiveValue::not_set()` omits a column, while `set(value)` and `unchanged(value)` write the value:
+
+```rust
+#[derive(ormer::InsertModel)]
+#[table = "users"]
+struct NewUser {
+    name: String,
+    email: Option<String>,
+    created_at: ormer::ActiveValue<chrono::NaiveDateTime>,
+}
+
+let new_user = NewUser {
+    name: "Bob".to_string(),
+    email: None,
+    created_at: ormer::ActiveValue::not_set(),
+};
+
+db.insert_model::<User>(&new_user)
+    .execute()
+    .await?;
+```
+
 ### Insert or Update
 
 ```rust
@@ -47,6 +82,58 @@ db.insert_or_update(&vec![user1, user2])
     .execute()
     .await?;
 ```
+
+`upsert` is a short alias for `insert_or_update` and keeps the primary-key conflict behavior:
+
+```rust
+db.upsert(&user).execute().await?;
+```
+
+### Configurable Insert Conflict
+
+Use `insert()` when you need a unique-key conflict target, selected update fields, or an update condition:
+
+```rust
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .do_update_if(|u| u.active.eq(true))
+    .set(|u| u.name = u.name.incoming())
+    .execute()
+    .await?;
+
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .do_nothing()
+    .execute()
+    .await?;
+
+db.insert(&membership)
+    .on_conflict(|m| (m.org_id, m.user_id))
+    .do_update()
+    .set(|m| m.role = m.role.incoming())
+    .execute()
+    .await?;
+
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .conflict_where(|u| u.deleted_at.is_null())
+    .do_update()
+    .set(|u| u.name = u.name.incoming())
+    .execute()
+    .await?;
+```
+
+PostgreSQL can target a named constraint:
+
+```rust
+db.insert(&user)
+    .on_constraint("users_email_key")
+    .do_nothing()
+    .execute()
+    .await?;
+```
+
+MySQL maps this to `ON DUPLICATE KEY UPDATE` or `INSERT IGNORE`; it cannot select a specific unique key, partial index, or `DO UPDATE WHERE`.
 
 ### Insert or Ignore
 
@@ -109,15 +196,21 @@ txn.commit().await?;
 let count = db
     .update::<User>()
     .filter(|u| u.age.ge(18))
-    .set(|u| u.name, "Adult".to_string())
+    .set(|u| u.name = u.name.set("Adult".to_string()))
     .execute()
     .await?;
 
 // Multiple fields
 db.update::<User>()
     .filter(|u| u.id.eq(1))
-    .set(|u| u.name, "New Name".to_string())
-    .set(|u| u.age, 26)
+    .set(|u| u.name = u.name.set("New Name".to_string()))
+    .set(|u| u.age = u.age.set(26))
+    .execute()
+    .await?;
+
+db.update::<User>()
+    .filter(|u| u.id.eq(1))
+    .set(|u| u.age += 1)
     .execute()
     .await?;
 
@@ -241,7 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Update
     db.update::<User>()
         .filter(|u| u.id.eq(1))
-        .set(|u| u.age, 26)
+        .set(|u| u.age = u.age.set(26))
         .execute()
         .await?;
     

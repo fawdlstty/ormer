@@ -5,6 +5,7 @@ use syn::{DeriveInput, Lit, Meta};
 pub fn derive_model(input: DeriveInput) -> TokenStream {
     let name = &input.ident;
     let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
+    let update_name = syn::Ident::new(&format!("{name}Update"), name.span());
 
     // 提取表名
     let table_name = extract_table_name(&input);
@@ -25,32 +26,29 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         _ => panic!("Model must be a struct"),
     };
 
-    for field in fields {
-        validate_data_type(field);
+    let mut field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    let mut normal_index = 0;
+    for info in &mut field_infos {
+        if !info.is_relation() {
+            info.normal_index = Some(normal_index);
+            normal_index += 1;
+        }
     }
 
-    let normal_fields: Vec<&syn::Field> = fields.iter().filter(|f| !is_relation_field(f)).collect();
-    let relation_fields: Vec<RelationField> =
-        fields.iter().filter_map(extract_relation_field).collect();
+    let normal_fields: Vec<_> = field_infos
+        .iter()
+        .filter(|info| !info.is_relation())
+        .collect();
+    let relation_fields: Vec<RelationField> = field_infos
+        .iter()
+        .filter_map(|info| info.relation.clone())
+        .collect();
 
     // 提取主键字段列表（支持复合主键）
     let primary_keys: Vec<_> = normal_fields
         .iter()
-        .filter_map(|f| {
-            for attr in &f.attrs {
-                if attr.path().is_ident("primary") {
-                    let field_name = f.ident.as_ref().unwrap().clone();
-                    // 检查是否有 (auto) 参数
-                    let is_auto = if let Meta::List(list) = &attr.meta {
-                        list.tokens.to_string().contains("auto")
-                    } else {
-                        false
-                    };
-                    return Some((field_name, is_auto));
-                }
-            }
-            None
-        })
+        .copied()
+        .filter(|info| info.is_primary)
         .collect();
 
     // 至少需要一个主键
@@ -59,23 +57,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     }
 
     // 检查是否有多个主键且标记了 auto（只有第一个主键可以是 auto）
-    let auto_count = primary_keys.iter().filter(|(_, is_auto)| *is_auto).count();
+    let auto_count = primary_keys.iter().filter(|info| info.primary_auto).count();
     if auto_count > 1 {
         panic!("Only one primary key field can have #[primary(auto)]");
     }
 
     // 获取第一个主键（用于向后兼容）
-    let primary_key_field = &primary_keys[0].0;
-    let is_auto_increment = primary_keys[0].1;
+    let primary_key_field = primary_keys[0].field_name;
+    let is_auto_increment = primary_keys[0].primary_auto;
 
     // 生成 AutoIncrementKeyType
     // 如果有自增主键，类型为第一个主键的 Rust 类型；否则为 ()
     let auto_increment_key_type = if is_auto_increment {
-        let pk_type = &fields
-            .iter()
-            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
-            .map(|f| &f.ty)
-            .expect("Primary key field not found");
+        let pk_type = primary_keys[0].field_type;
         quote! { #pk_type }
     } else {
         quote! { () }
@@ -84,47 +78,25 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成主键列名列表（支持复合主键）
     let primary_key_field_names: Vec<_> = primary_keys
         .iter()
-        .map(|(field_name, _)| {
-            let field = normal_fields
-                .iter()
-                .find(|f| f.ident.as_ref().unwrap() == field_name)
-                .expect("Primary key field not found");
-            let column_name = extract_column_name(field);
+        .map(|info| {
+            let column_name = &info.column_name;
             quote! { #column_name }
         })
         .collect();
-    let primary_key_column_name = {
-        let field = normal_fields
-            .iter()
-            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
-            .expect("Primary key field not found");
-        extract_column_name(field)
-    };
+    let primary_key_column_name = primary_keys[0].column_name.clone();
 
     // 生成主键值获取（支持复合主键）
     let primary_key_values: Vec<_> = primary_keys
         .iter()
-        .map(|(field_name, _)| {
-            let field = fields
-                .iter()
-                .find(|f| f.ident.as_ref().unwrap() == field_name)
-                .expect("Primary key field not found");
-            field_to_value_expr(field)
-        })
+        .map(|info| field_to_value_expr(info))
         .collect();
 
-    let primary_key_value_expr = {
-        let field = fields
-            .iter()
-            .find(|f| f.ident.as_ref().unwrap() == primary_key_field)
-            .expect("Primary key field not found");
-        field_to_value_expr(field)
-    };
+    let primary_key_value_expr = field_to_value_expr(primary_keys[0]);
 
     // 生成字段名列表
     let field_names: Vec<String> = normal_fields
         .iter()
-        .map(|f| extract_column_name(f))
+        .map(|info| info.column_name.clone())
         .collect();
 
     let field_names_lit = field_names.iter().map(|name| {
@@ -132,69 +104,48 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成字段元数据 (COLUMN_SCHEMA)
-    let column_schema_entries = normal_fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
+    let column_schema_entries = normal_fields.iter().map(|info| {
+        let field_name = info.field_name;
         let rust_field_name = field_name.to_string();
-        let column_name = extract_column_name(f);
-        let field_type = &f.ty;
-        let type_str = normalize_type_string(quote! { #field_type }.to_string());
-
-        // 检查是否是主键字段
-        let is_primary = f.attrs.iter().any(|attr| attr.path().is_ident("primary"));
+        let column_name = info.column_name.as_str();
+        let field_type = info.field_type;
 
         // 检查是否是自增主键（只有主键字段才可能是自增）
+        let is_primary = info.is_primary;
         let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
-
-        // 检查是否是 Option<T>
-        let is_nullable = type_str.starts_with("Option<");
-
-        // 提取基础 Rust 类型
-        let rust_type = if is_nullable {
-            type_str
-                .strip_prefix("Option<")
-                .and_then(|ty| ty.strip_suffix('>'))
-                .unwrap_or(&type_str)
-                .trim()
-                .to_string()
-        } else {
-            type_str
-        };
+        let is_nullable = info.is_nullable;
+        let rust_type = &info.rust_type;
 
         // 检查 unique 属性
-        let unique_attr = extract_unique_attr(f);
+        let unique_attr = &info.unique_attr;
         let unique_group = option_i32_tokens(unique_attr.group);
         let unique_name = option_string_tokens(unique_attr.name.as_deref());
 
         // 检查 index 属性
-        let index_attr = extract_index_attr(f);
+        let index_attr = info.index_attr.as_ref();
         let is_indexed = index_attr.is_some();
-        let index_group = option_i32_tokens(index_attr.as_ref().and_then(|attr| attr.group));
-        let index_name =
-            option_string_tokens(index_attr.as_ref().and_then(|attr| attr.name.as_deref()));
-        let index_order =
-            option_string_tokens(index_attr.as_ref().and_then(|attr| attr.order.as_deref()));
-        let index_where = option_string_tokens(
-            index_attr
-                .as_ref()
-                .and_then(|attr| attr.where_clause.as_deref()),
-        );
+        let index_group = option_i32_tokens(index_attr.and_then(|attr| attr.group));
+        let index_name = option_string_tokens(index_attr.and_then(|attr| attr.name.as_deref()));
+        let index_order = option_string_tokens(index_attr.and_then(|attr| attr.order.as_deref()));
+        let index_where =
+            option_string_tokens(index_attr.and_then(|attr| attr.where_clause.as_deref()));
 
         // 检查 foreign 属性
-        let foreign_key = extract_foreign_key(f);
+        let foreign_key = &info.foreign_key;
 
         // 检查 data_type 属性
-        let data_type = extract_data_type(f);
-        let has_data_type = has_data_type(f);
+        let data_type = &info.data_type;
+        let has_data_type = info.has_data_type;
 
         // 检查 default/check 属性
-        let default = extract_default(f);
-        let check = extract_check(f);
+        let default = &info.default;
+        let check = &info.check;
 
         // 检查 hypertable 属性
-        let hypertable = extract_hypertable(f);
+        let hypertable = &info.hypertable;
 
         // 检查 compress 属性
-        let compress = f.attrs.iter().any(|attr| attr.path().is_ident("compress"));
+        let compress = info.compress;
 
         let enum_variants = if has_data_type {
             quote! { None }
@@ -229,24 +180,24 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 from_row 实现
-    let from_row_fields = fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
-        if let Some(default_expr) = relation_default_expr(f) {
+    let from_row_fields = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        if let Some(default_expr) = &info.relation_default {
             quote! {
                 #field_name: #default_expr
             }
-        } else if has_i32_data_type(f) {
-            let column_name = extract_column_name(f);
+        } else if info.has_i32_data_type {
+            let column_name = &info.column_name;
             field_from_i32_expr(
-                f,
+                info.field,
                 quote! { row.get::<i32>(#column_name)? },
                 quote! { row.get::<Option<i32>>(#column_name)? },
             )
-        } else if has_vec_i32_data_type(f) {
-            let column_name = extract_column_name(f);
-            field_from_vec_i32_expr(f, quote! { row.get::<Vec<i32>>(#column_name)? })
+        } else if info.has_vec_i32_data_type {
+            let column_name = &info.column_name;
+            field_from_vec_i32_expr(info.field, quote! { row.get::<Vec<i32>>(#column_name)? })
         } else {
-            let column_name = extract_column_name(f);
+            let column_name = &info.column_name;
             quote! {
                 #field_name: row.get(#column_name)?
             }
@@ -254,20 +205,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 from_row_values 实现（按顺序从行值中读取）
-    let from_row_values_fields = fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
-        if let Some(default_expr) = relation_default_expr(f) {
+    let from_row_values_fields = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        if let Some(default_expr) = &info.relation_default {
             quote! {
                 #field_name: #default_expr
             }
         } else {
-            let i = normal_fields
-                .iter()
-                .position(|normal| normal.ident == f.ident)
+            let i = info
+                .normal_index
                 .expect("normal field should have an index");
-            if has_i32_data_type(f) {
+            if info.has_i32_data_type {
                 field_from_i32_expr(
-                    f,
+                    info.field,
                     quote! {
                         <i32 as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
                     },
@@ -277,9 +227,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                         )?
                     },
                 )
-            } else if has_vec_i32_data_type(f) {
+            } else if info.has_vec_i32_data_type {
                 field_from_vec_i32_expr(
-                    f,
+                    info.field,
                     quote! {
                         <Vec<i32> as ::ormer::FromRowValues>::from_row_values(
                             &values[#i..#i+1]
@@ -287,7 +237,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     },
                 )
             } else {
-                let field_type = &f.ty;
+                let field_type = info.field_type;
                 quote! {
                     #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
                         &values[#i..#i+1]
@@ -298,39 +248,67 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     });
 
     // 生成 field_values 实现
-    let field_names_for_values = normal_fields.iter().map(|f| field_to_value_expr(f));
+    let field_names_for_values = normal_fields.iter().map(|info| field_to_value_expr(info));
 
     // 生成 Where 结构体的字段
     // 为所有字段生成类型化列代理
-    let where_fields = fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
-        if let Some(relation) = relation_fields
-            .iter()
-            .find(|relation| relation.field_name == *field_name)
-        {
+    let where_fields = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        if let Some(relation) = &info.relation {
             let target_type = &relation.target_type;
             quote! {
                 pub #field_name: ::ormer::model::Relation<#name, #target_type>
             }
         } else {
-            let field_type = effective_data_type_type(f).unwrap_or_else(|| f.ty.clone());
+            let field_type = info
+                .effective_data_type_type
+                .as_ref()
+                .unwrap_or(info.field_type);
             quote! {
-                pub #field_name: ::ormer::query::builder::TypedColumn<#field_type>
+                pub #field_name: ::ormer::query::builder::TypedColumn<#field_type, #name>
             }
         }
     });
 
     // 生成 Where 的 Default 实现
-    let where_default_fields = fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
-        if is_relation_field(f) {
+    let where_default_fields = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        if info.is_relation() {
             quote! {
                 #field_name: ::ormer::model::Relation::new(stringify!(#field_name))
             }
         } else {
-            let column_name = extract_column_name(f);
+            let column_name = &info.column_name;
             quote! {
                 #field_name: ::ormer::query::builder::TypedColumn::new(#column_name)
+            }
+        }
+    });
+
+    let update_fields = normal_fields.iter().map(|info| {
+        let field_name = info.field_name;
+        let field_type = info
+            .effective_data_type_type
+            .as_ref()
+            .unwrap_or(info.field_type);
+        quote! {
+            pub #field_name: ::ormer::query::update::UpdateField<#field_type>
+        }
+    });
+
+    let update_default_fields = normal_fields.iter().map(|info| {
+        let field_name = info.field_name;
+        let column_name = &info.column_name;
+        quote! {
+            #field_name: ::ormer::query::update::UpdateField::new(#column_name)
+        }
+    });
+
+    let update_assignment_fields = normal_fields.iter().map(|info| {
+        let field_name = info.field_name;
+        quote! {
+            if let Some(assignment) = self.#field_name.assignment() {
+                assignments.push(assignment);
             }
         }
     });
@@ -365,11 +343,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         }
     });
 
-    let column_value_arms = normal_fields.iter().map(|f| {
-        let field_name = f.ident.as_ref().unwrap();
+    let column_value_arms = normal_fields.iter().map(|info| {
+        let field_name = info.field_name;
         let rust_field_name = field_name.to_string();
-        let column_name = extract_column_name(f);
-        let value_expr = field_to_value_expr(f);
+        let column_name = info.column_name.as_str();
+        let value_expr = field_to_value_expr(info);
         if rust_field_name == column_name {
             quote! {
                 #column_name => Some(#value_expr)
@@ -420,6 +398,26 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
 
+        pub struct #update_name {
+            #(#update_fields),*
+        }
+
+        impl Default for #update_name {
+            fn default() -> Self {
+                Self {
+                    #(#update_default_fields),*
+                }
+            }
+        }
+
+        impl ::ormer::query::update::UpdateFields for #update_name {
+            fn assignments(&self) -> Vec<::ormer::query::update::UpdateAssignment> {
+                let mut assignments = Vec::new();
+                #(#update_assignment_fields)*
+                assignments
+            }
+        }
+
         impl ::ormer::Model for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
@@ -430,6 +428,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = #where_name;
+            type Update = #update_name;
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -439,15 +438,15 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 ::ormer::Select::new()
             }
 
-            fn from_row(row: &::ormer::Row) -> anyhow::Result<Self> {
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
                 Ok(Self {
                     #(#from_row_fields),*
                 })
             }
 
-            fn from_row_values(values: &[::ormer::Value]) -> anyhow::Result<Self> {
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
                 if values.len() < Self::COLUMNS.len() {
-                    return Err(anyhow::anyhow!(
+                    return Err(::ormer::ormer_error!(
                         "Expected {} values for {}", Self::COLUMNS.len(), stringify!(#name)
                     ));
                 }
@@ -473,10 +472,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 &mut self,
                 relation_name: &'static str,
                 values: Vec<Target>,
-            ) -> anyhow::Result<()> {
+            ) -> ::ormer::Result<()> {
                 match relation_name {
                     #(#assign_relation_arms,)*
-                    _ => Err(anyhow::anyhow!(
+                    _ => Err(::ormer::ormer_error!(
                         "Relation {} is not assignable on {}",
                         relation_name,
                         Self::TABLE_NAME
@@ -515,6 +514,62 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     }
 }
 
+pub fn derive_insert_model(input: DeriveInput) -> TokenStream {
+    let name = &input.ident;
+    let table_name = extract_table_name(&input);
+
+    let fields = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Named(fields) => &fields.named,
+            _ => panic!("InsertModel must have named fields"),
+        },
+        _ => panic!("InsertModel must be a struct"),
+    };
+
+    let assignment_fields = fields.iter().map(|field| {
+        let field_name = field
+            .ident
+            .as_ref()
+            .expect("InsertModel field must be named");
+        let column_name = extract_column_name(field);
+        if active_value_inner_type(&field.ty).is_some() {
+            quote! {
+                match &self.#field_name {
+                    ::ormer::ActiveValue::NotSet => {}
+                    ::ormer::ActiveValue::Set(value)
+                    | ::ormer::ActiveValue::Unchanged(value) => {
+                        assignments.push(::ormer::query::insert::InsertAssignment::value(
+                            #column_name,
+                            value.clone(),
+                        ));
+                    }
+                }
+            }
+        } else {
+            quote! {
+                assignments.push(::ormer::query::insert::InsertAssignment::value(
+                    #column_name,
+                    self.#field_name.clone(),
+                ));
+            }
+        }
+    });
+
+    quote! {
+        impl<T: ::ormer::Model> ::ormer::model::InsertModel<T> for #name {
+            fn insert_table_name(&self) -> &'static str {
+                #table_name
+            }
+
+            fn insert_assignments(&self) -> Vec<::ormer::query::insert::InsertAssignment> {
+                let mut assignments = Vec::new();
+                #(#assignment_fields)*
+                assignments
+            }
+        }
+    }
+}
+
 fn normalize_type_string(type_str: String) -> String {
     type_str
         .replace(" :: ", "::")
@@ -538,29 +593,129 @@ struct RelationField {
     target_key: String,
 }
 
-fn is_relation_field(field: &syn::Field) -> bool {
-    field
-        .attrs
-        .iter()
-        .any(|attr| attr.path().is_ident("has_many") || attr.path().is_ident("belongs_to"))
+struct FieldInfo<'a> {
+    field: &'a syn::Field,
+    field_name: &'a syn::Ident,
+    field_type: &'a syn::Type,
+    column_name: String,
+    rust_type: String,
+    is_nullable: bool,
+    is_primary: bool,
+    primary_auto: bool,
+    relation: Option<RelationField>,
+    relation_default: Option<proc_macro2::TokenStream>,
+    unique_attr: UniqueAttr,
+    index_attr: Option<IndexAttr>,
+    foreign_key: proc_macro2::TokenStream,
+    data_type: proc_macro2::TokenStream,
+    effective_data_type_type: Option<syn::Type>,
+    has_data_type: bool,
+    has_i32_data_type: bool,
+    has_vec_i32_data_type: bool,
+    default: proc_macro2::TokenStream,
+    check: proc_macro2::TokenStream,
+    hypertable: proc_macro2::TokenStream,
+    compress: bool,
+    normal_index: Option<usize>,
 }
 
-fn relation_default_expr(field: &syn::Field) -> Option<proc_macro2::TokenStream> {
-    if field
-        .attrs
-        .iter()
-        .any(|attr| attr.path().is_ident("has_many"))
-    {
-        return Some(quote! { Vec::new() });
+impl<'a> FieldInfo<'a> {
+    fn new(field: &'a syn::Field) -> Self {
+        let field_name = field.ident.as_ref().unwrap();
+        let field_type = &field.ty;
+        let column_name = extract_column_name(field);
+        let type_str = normalize_type_string(quote! { #field_type }.to_string());
+        let is_nullable = type_str.starts_with("Option<");
+        let rust_type = if is_nullable {
+            type_str
+                .strip_prefix("Option<")
+                .and_then(|ty| ty.strip_suffix('>'))
+                .unwrap_or(&type_str)
+                .trim()
+                .to_string()
+        } else {
+            type_str
+        };
+
+        let data_type_type = extract_data_type_type(field);
+        validate_data_type(field, data_type_type.as_ref());
+        let effective_data_type_type = data_type_type.as_ref().map(|data_type| {
+            if option_inner_type(field_type).is_some() {
+                option_inner_type(data_type)
+                    .cloned()
+                    .unwrap_or_else(|| data_type.clone())
+            } else {
+                data_type.clone()
+            }
+        });
+        let has_data_type = data_type_type.is_some();
+        let has_i32_data_type = effective_data_type_type
+            .as_ref()
+            .map(is_i32_type)
+            .unwrap_or(false);
+        let has_vec_i32_data_type = effective_data_type_type
+            .as_ref()
+            .map(is_vec_i32_type)
+            .unwrap_or(false);
+        let data_type = data_type_tokens(effective_data_type_type.as_ref());
+        let (is_primary, primary_auto) = extract_primary_attr(field);
+        let relation = extract_relation_field(field);
+        let relation_default = relation_default_expr(relation.as_ref());
+
+        Self {
+            field,
+            field_name,
+            field_type,
+            column_name,
+            rust_type,
+            is_nullable,
+            is_primary,
+            primary_auto,
+            relation,
+            relation_default,
+            unique_attr: extract_unique_attr(field),
+            index_attr: extract_index_attr(field),
+            foreign_key: extract_foreign_key(field),
+            data_type,
+            effective_data_type_type,
+            has_data_type,
+            has_i32_data_type,
+            has_vec_i32_data_type,
+            default: extract_default(field),
+            check: extract_check(field),
+            hypertable: extract_hypertable(field),
+            compress: field
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("compress")),
+            normal_index: None,
+        }
     }
-    if field
-        .attrs
-        .iter()
-        .any(|attr| attr.path().is_ident("belongs_to"))
-    {
-        return Some(quote! { None });
+
+    fn is_relation(&self) -> bool {
+        self.relation.is_some()
     }
-    None
+}
+
+fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
+    for attr in &field.attrs {
+        if attr.path().is_ident("primary") {
+            let is_auto = if let Meta::List(list) = &attr.meta {
+                list.tokens.to_string().contains("auto")
+            } else {
+                false
+            };
+            return (true, is_auto);
+        }
+    }
+    (false, false)
+}
+
+fn relation_default_expr(relation: Option<&RelationField>) -> Option<proc_macro2::TokenStream> {
+    relation.map(|relation| match relation.kind {
+        RelationKindAttr::HasMany => quote! { Vec::new() },
+        RelationKindAttr::BelongsTo => quote! { None },
+    })
 }
 
 fn extract_relation_field(field: &syn::Field) -> Option<RelationField> {
@@ -648,6 +803,7 @@ fn derive_model_tuple_wrapper(
 
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = <#inner_type as ::ormer::Model>::Where;
+            type Update = <#inner_type as ::ormer::Model>::Update;
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -657,12 +813,12 @@ fn derive_model_tuple_wrapper(
                 ::ormer::Select::new()
             }
 
-            fn from_row(row: &::ormer::Row) -> anyhow::Result<Self> {
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
                 let inner = <#inner_type as ::ormer::Model>::from_row(row)?;
                 Ok(#name(inner))
             }
 
-            fn from_row_values(values: &[::ormer::Value]) -> anyhow::Result<Self> {
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
                 let inner = <#inner_type as ::ormer::Model>::from_row_values(values)?;
                 Ok(#name(inner))
             }
@@ -925,51 +1081,21 @@ fn option_string_tokens(value: Option<&str>) -> proc_macro2::TokenStream {
 ///
 /// `Option<T>` 字段允许使用 `#[data_type(Option<U>)]`，但数据库后端只需要
 /// 基础类型 `U`，所以这里去掉属性中的 `Option<>` 包装。
-fn extract_data_type(field: &syn::Field) -> proc_macro2::TokenStream {
-    if let Some(data_type) = effective_data_type_type(field) {
+fn data_type_tokens(data_type: Option<&syn::Type>) -> proc_macro2::TokenStream {
+    if let Some(data_type) = data_type {
         let type_str = normalize_type_string(quote! { #data_type }.to_string());
         return quote! { Some(#type_str) };
-    }
-
-    for attr in &field.attrs {
-        if attr.path().is_ident("data_type") {
-            if let Meta::List(list) = &attr.meta {
-                let tokens_str = list.tokens.to_string().replace('"', "");
-                return quote! { Some(#tokens_str) };
-            }
-        }
     }
     quote! { None }
 }
 
-fn has_data_type(field: &syn::Field) -> bool {
-    field
-        .attrs
-        .iter()
-        .any(|attr| attr.path().is_ident("data_type"))
-}
-
-fn has_i32_data_type(field: &syn::Field) -> bool {
-    effective_data_type_type(field)
-        .as_ref()
-        .map(is_i32_type)
-        .unwrap_or(false)
-}
-
-fn has_vec_i32_data_type(field: &syn::Field) -> bool {
-    effective_data_type_type(field)
-        .as_ref()
-        .map(is_vec_i32_type)
-        .unwrap_or(false)
-}
-
-fn validate_data_type(field: &syn::Field) {
-    let Some(data_type) = extract_data_type_type(field) else {
+fn validate_data_type(field: &syn::Field, data_type: Option<&syn::Type>) {
+    let Some(data_type) = data_type else {
         return;
     };
 
     let field_is_optional = option_inner_type(&field.ty).is_some();
-    let data_type_is_optional = option_inner_type(&data_type).is_some();
+    let data_type_is_optional = option_inner_type(data_type).is_some();
     if field_is_optional == data_type_is_optional {
         return;
     }
@@ -991,15 +1117,6 @@ fn validate_data_type(field: &syn::Field) {
         "field `{field_name}` is not nullable, so its database type must not use \
          #[data_type(Option<...>)]"
     );
-}
-
-fn effective_data_type_type(field: &syn::Field) -> Option<syn::Type> {
-    let data_type = extract_data_type_type(field)?;
-    if option_inner_type(&field.ty).is_some() {
-        option_inner_type(&data_type).cloned()
-    } else {
-        Some(data_type)
-    }
 }
 
 fn extract_data_type_type(field: &syn::Field) -> Option<syn::Type> {
@@ -1054,6 +1171,29 @@ fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     }
 }
 
+fn active_value_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let segment = type_path.path.segments.last()?;
+            if segment.ident != "ActiveValue" {
+                return None;
+            }
+
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => args.args.first().and_then(|arg| {
+                    if let syn::GenericArgument::Type(inner) = arg {
+                        Some(inner)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn vec_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     match ty {
         syn::Type::Path(type_path) if type_path.qself.is_none() => {
@@ -1077,12 +1217,12 @@ fn vec_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     }
 }
 
-fn field_to_value_expr(field: &syn::Field) -> proc_macro2::TokenStream {
-    let field_name = field.ident.as_ref().unwrap();
-    let field_type = &field.ty;
+fn field_to_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
+    let field_name = info.field_name;
+    let field_type = info.field_type;
     let value_type = option_inner_type(field_type).unwrap_or(field_type);
 
-    if has_i32_data_type(field) {
+    if info.has_i32_data_type {
         if option_inner_type(field_type).is_some() {
             quote! {
                 match self.#field_name.clone() {
@@ -1113,7 +1253,7 @@ fn field_to_value_expr(field: &syn::Field) -> proc_macro2::TokenStream {
                 }
             }
         }
-    } else if has_vec_i32_data_type(field) {
+    } else if info.has_vec_i32_data_type {
         let Some(_) = vec_inner_type(field_type) else {
             panic!("#[data_type(Vec<i32>)] requires a Vec<T> field");
         };
@@ -1179,7 +1319,7 @@ fn field_from_vec_i32_expr(
                     ::ormer::model::I32DataTypeDecoder::<#inner_type>::new()
                         .decode(value, stringify!(#field_name), stringify!(#inner_type))
                 })
-                .collect::<anyhow::Result<Vec<#inner_type>>>()?
+                .collect::<::ormer::Result<Vec<#inner_type>>>()?
         }
     }
 }
@@ -1466,9 +1606,13 @@ mod tests {
     fn unwraps_nullable_data_type_for_backend_mapping() {
         let field: syn::Field =
             syn::parse_quote! { #[data_type(Option<i32>)] optional_status: Option<i32> };
-        assert!(has_i32_data_type(&field));
+        let info = FieldInfo::new(&field);
+        assert!(info.has_i32_data_type);
 
-        let effective_type = effective_data_type_type(&field).expect("data type should exist");
+        let effective_type = info
+            .effective_data_type_type
+            .as_ref()
+            .expect("data type should exist");
         assert_eq!(
             normalize_type_string(quote! { #effective_type }.to_string()),
             "i32"

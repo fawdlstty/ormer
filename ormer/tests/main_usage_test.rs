@@ -140,7 +140,7 @@ async fn test_main_rs_usage_impl(
     let count = db
         .update::<TestUser>()
         .filter(|p| p.age.ge(18))
-        .set(|p| p.age, 10)
+        .set(|p| p.age = p.age.set(10))
         .execute()
         .await?;
     println!("updated rows: {count}");

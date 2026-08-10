@@ -38,7 +38,7 @@ let mut txn = db.begin().await?;
 let count = txn
     .update::<User>()
     .filter(|u| u.age.ge(18))
-    .set(|u| u.name, "Adult".to_string())
+    .set(|u| u.name = u.name.set("Adult".to_string()))
     .execute()
     .await?;
 txn.commit().await?;
@@ -149,13 +149,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     txn.update::<Account>()
         .filter(|a| a.id.eq(1))
-        .set(|a| a.balance, from_account.balance - 200.0)
+        .set(|a| a.balance = a.balance.set(from_account.balance - 200.0))
         .execute()
         .await?;
     
     txn.update::<Account>()
         .filter(|a| a.id.eq(2))
-        .set(|a| a.balance, 700.0)
+        .set(|a| a.balance = a.balance.set(700.0))
         .execute()
         .await?;
     

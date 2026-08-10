@@ -178,12 +178,31 @@ let name_age: Vec<(String, i32)> = db
     .collect()
     .await?;
 
+let labeled: Vec<(i32, String, String)> = db
+    .select::<User>()
+    .map_to(|u| {
+        (
+            u.id.alias("user_id"),
+            u.email,
+            ormer::expr!(match u.status {
+                "paid" => "done",
+                "new" => "open",
+                _ => "other",
+            })
+            .alias("status_label"),
+        )
+    })
+    .collect()
+    .await?;
+
 let user_ids: Vec<UserId> = db
     .select::<User>()
     .map_to(|u| u.id)
     .collect_with(|id| UserId { id })
     .await?;
 ```
+
+Individual projection items can be renamed directly with `.alias("...")`.
 
 When the target is another `Model`, use `map_to_model`; Ormer generates aliases from the target model's column names:
 

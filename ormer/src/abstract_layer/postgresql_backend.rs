@@ -10,9 +10,21 @@ use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
+use crate::query::expr::SqlExpr;
 use crate::query::filter::{FilterExpr, infer_filter_value_rust_type, infer_model_value_rust_type};
+use crate::query::insert::{
+    InsertAssignment, InsertConflict, IntoInsertAssignment, IntoInsertDefaultColumn,
+};
+use crate::query::update::UpdateAssignment;
+use crate::query::update::{UpdateExpr, UpdateValue};
 use crate::raw_sql::IntoRawSql;
-use crate::utils::{AnyhowFutureTraceExt, FutureTraceExt, ResultTraceExt};
+use crate::utils::{FutureTraceExt, ResultTraceExt};
+use crate::{
+    impl_backend_executor_methods, impl_backend_four_table_executor_methods_with_lifetime,
+    impl_backend_join_executor_methods_with_lifetime,
+    impl_backend_multi_table_executor_methods_with_lifetime,
+    impl_backend_related_executor_methods_with_lifetime, impl_insert_conflict_methods,
+};
 use bytes::{BufMut, BytesMut};
 use postgres_types::{FromSql, FromSqlOwned, IsNull, ToSql, Type as PgType};
 use std::collections::HashMap;
@@ -22,11 +34,175 @@ use tokio_postgres::types::Type;
 
 type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
 type UpdateSqlBatch = Vec<(String, Vec<Value>, Vec<&'static str>)>;
+type PostgreSQLParam = Box<dyn ToSql + Sync + Send>;
 
-// 导入宏
-// use crate::impl_backend_executor_methods_with_lifetime;
-// use crate::impl_backend_join_executor_methods_with_lifetime;
-// use crate::impl_backend_related_executor_methods_with_lifetime;
+fn pg_param_refs(params: &[PostgreSQLParam]) -> Vec<&(dyn ToSql + Sync)> {
+    params
+        .iter()
+        .map(|param| param.as_ref() as &(dyn ToSql + Sync))
+        .collect()
+}
+
+async fn pg_query_with_types(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+    rust_types: &[&str],
+) -> crate::Result<Vec<tokio_postgres::Row>> {
+    let pg_params = values_to_params_with_types(params, rust_types)?;
+    let param_refs = pg_param_refs(&pg_params);
+    client.query(sql, &param_refs).trace().await
+}
+
+async fn pg_execute_with_types(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+    rust_types: &[&str],
+) -> crate::Result<u64> {
+    let pg_params = values_to_params_with_types(params, rust_types)?;
+    let param_refs = pg_param_refs(&pg_params);
+    client.execute(sql, &param_refs).trace().await
+}
+
+async fn pg_query_for_query(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+    rust_types: &[&str],
+) -> crate::Result<Vec<tokio_postgres::Row>> {
+    let pg_params = values_to_params_for_query(params, rust_types)?;
+    let param_refs = pg_param_refs(&pg_params);
+    client.query(sql, &param_refs).trace().await
+}
+
+async fn pg_query_untyped(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> crate::Result<Vec<tokio_postgres::Row>> {
+    let pg_params = values_to_params(params)?;
+    let param_refs = pg_param_refs(&pg_params);
+    client.query(sql, &param_refs).trace().await
+}
+
+async fn pg_execute_untyped(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> crate::Result<u64> {
+    let pg_params = values_to_params(params)?;
+    let param_refs = pg_param_refs(&pg_params);
+    client.execute(sql, &param_refs).trace().await
+}
+
+fn append_postgresql_upsert_clause<T: Model>(sql: &mut String, columns: &[&str]) {
+    let primary_key_columns = T::primary_key_columns();
+    let quoted_primary_keys =
+        common_helpers::quote_column_list(DbType::PostgreSQL, primary_key_columns);
+
+    sql.push_str(&format!(
+        " ON CONFLICT ({quoted_primary_keys}) DO UPDATE SET "
+    ));
+
+    let mut first = true;
+    for col_name in columns.iter() {
+        if primary_key_columns.contains(col_name) {
+            continue;
+        }
+        if !first {
+            sql.push_str(", ");
+        }
+        sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
+            DbType::PostgreSQL,
+            col_name,
+        ));
+        first = false;
+    }
+}
+
+fn pg_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
+    let column = column.rsplit('.').next().unwrap_or(column);
+    T::COLUMN_SCHEMA
+        .iter()
+        .find(|schema| schema.name == column)
+        .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
+}
+
+fn pg_collect_update_value_rust_types<T: Model>(
+    column: &str,
+    value: &UpdateValue,
+    rust_types: &mut Vec<&'static str>,
+) {
+    let column_rust_type = pg_column_rust_type::<T>(column).unwrap_or("String");
+    match value {
+        UpdateValue::Literal(value) => {
+            rust_types.push(if matches!(value, crate::model::Value::Null) {
+                column_rust_type
+            } else {
+                infer_model_value_rust_type(value)
+            })
+        }
+        UpdateValue::Expr(expr) => {
+            pg_collect_update_expr_rust_types::<T>(column_rust_type, expr, rust_types)
+        }
+    }
+}
+
+fn pg_collect_update_expr_rust_types<T: Model>(
+    column_rust_type: &'static str,
+    expr: &UpdateExpr,
+    rust_types: &mut Vec<&'static str>,
+) {
+    match expr {
+        UpdateExpr::Column(_) | UpdateExpr::IncomingColumn(_) => {}
+        UpdateExpr::Value(value) => {
+            rust_types.push(if matches!(value, crate::model::Value::Null) {
+                column_rust_type
+            } else {
+                infer_model_value_rust_type(value)
+            })
+        }
+        UpdateExpr::Binary { left, right, .. } => {
+            pg_collect_update_expr_rust_types::<T>(column_rust_type, left, rust_types);
+            pg_collect_update_expr_rust_types::<T>(column_rust_type, right, rust_types);
+        }
+    }
+}
+
+fn pg_collect_conflict_rust_types<T: Model>(
+    conflict: &InsertConflict,
+    rust_types: &mut Vec<&'static str>,
+) {
+    if let Some(target_filter) = &conflict.target_filter {
+        pg_collect_filter_param_rust_types::<T>(target_filter, rust_types);
+    }
+    for assignment in &conflict.assignments {
+        pg_collect_update_value_rust_types::<T>(&assignment.column, &assignment.value, rust_types);
+    }
+    if let Some(filter) = &conflict.update_filter {
+        pg_collect_filter_param_rust_types::<T>(filter, rust_types);
+    }
+}
+
+pub(crate) fn pg_insert_param_rust_types<T: Model>(
+    row_count: usize,
+    conflict: Option<&InsertConflict>,
+) -> Vec<&'static str> {
+    let insert_types: Vec<&str> = T::COLUMN_SCHEMA
+        .iter()
+        .filter(|col| !col.is_auto_increment)
+        .map(|col| col.data_type.unwrap_or(col.rust_type))
+        .collect();
+    let mut rust_types = Vec::with_capacity(row_count * insert_types.len());
+    for _ in 0..row_count {
+        rust_types.extend(insert_types.iter().copied());
+    }
+    if let Some(conflict) = conflict {
+        pg_collect_conflict_rust_types::<T>(conflict, &mut rust_types);
+    }
+    rust_types
+}
 
 /// PostgreSQL 类型映射器
 pub struct PostgreSQLTypeMapper;
@@ -221,7 +397,7 @@ fn from_postgres_interval(interval: PgInterval) -> std::time::Duration {
 fn pg_datetime_value_from_row(
     row: &tokio_postgres::Row,
     idx: usize,
-) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+) -> crate::Result<Option<chrono::DateTime<chrono::Utc>>> {
     if let Ok(value) = row.try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(idx) {
         return Ok(value);
     }
@@ -230,23 +406,45 @@ fn pg_datetime_value_from_row(
             value.map(|value| chrono::DateTime::from_naive_utc_and_offset(value, chrono::Utc))
         );
     }
-    Err(anyhow::anyhow!(
+    Err(crate::ormer_error!(
         "Failed to parse column at index {idx} (expected PostgreSQL timestamp type)"
     ))
+}
+
+fn pg_date_value_from_row(
+    row: &tokio_postgres::Row,
+    idx: usize,
+) -> crate::Result<Option<chrono::NaiveDate>> {
+    row.try_get(idx).map_err(|err| {
+        crate::ormer_error!(
+            "Failed to parse column at index {idx} (expected PostgreSQL date type): {err}"
+        )
+    })
+}
+
+fn pg_time_value_from_row(
+    row: &tokio_postgres::Row,
+    idx: usize,
+) -> crate::Result<Option<chrono::NaiveTime>> {
+    row.try_get(idx).map_err(|err| {
+        crate::ormer_error!(
+            "Failed to parse column at index {idx} (expected PostgreSQL time type): {err}"
+        )
+    })
 }
 
 fn pg_try_get<T: FromSqlOwned>(
     row: &tokio_postgres::Row,
     idx: usize,
     expected_type: &str,
-) -> anyhow::Result<Option<T>> {
+) -> crate::Result<Option<T>> {
     let actual_type = row
         .columns()
         .get(idx)
         .map(|column| column.type_().name())
         .unwrap_or("<out of range>");
     row.try_get(idx).map_err(|err| {
-        anyhow::anyhow!(
+        crate::ormer_error!(
             "Failed to parse column at index {idx} (expected {expected_type}, actual PostgreSQL type {actual_type}): {err}"
         )
     })
@@ -294,7 +492,7 @@ fn pg_value_from_row_cell(
     rust_type: &str,
     is_nullable: bool,
     enum_variants: Option<&[&str]>,
-) -> anyhow::Result<crate::model::Value> {
+) -> crate::Result<crate::model::Value> {
     if enum_variants.is_some() {
         let value: Option<PgEnumText> = pg_try_get(row, idx, rust_type)?;
         return Ok(match value {
@@ -303,7 +501,7 @@ fn pg_value_from_row_cell(
                 if is_nullable {
                     crate::model::Value::Null
                 } else {
-                    return Err(anyhow::anyhow!(format!(
+                    return Err(crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected enum type {})",
                         idx, rust_type
                     )));
@@ -317,7 +515,7 @@ fn pg_value_from_row_cell(
         return match value {
             Some(value) => Ok(crate::model::Value::IntegerArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
-            None => Err(anyhow::anyhow!(format!(
+            None => Err(crate::ormer_error!(format!(
                 "Failed to parse non-nullable column at index {} (expected Vec<i32> type)",
                 idx
             ))),
@@ -329,7 +527,7 @@ fn pg_value_from_row_cell(
         return match value {
             Some(value) => Ok(crate::model::Value::BigIntArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
-            None => Err(anyhow::anyhow!(format!(
+            None => Err(crate::ormer_error!(format!(
                 "Failed to parse non-nullable column at index {} (expected Vec<i64> type)",
                 idx
             ))),
@@ -341,7 +539,7 @@ fn pg_value_from_row_cell(
         return match value {
             Some(value) => Ok(crate::model::Value::NullableBigIntArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
-            None => Err(anyhow::anyhow!(format!(
+            None => Err(crate::ormer_error!(format!(
                 "Failed to parse non-nullable column at index {} (expected Vec<Option<i64>> type)",
                 idx
             ))),
@@ -353,7 +551,7 @@ fn pg_value_from_row_cell(
         return match value {
             Some(value) => Ok(crate::model::Value::TextArray(value)),
             None if is_nullable => Ok(crate::model::Value::Null),
-            None => Err(anyhow::anyhow!(format!(
+            None => Err(crate::ormer_error!(format!(
                 "Failed to parse non-nullable column at index {} (expected Vec<String> type)",
                 idx
             ))),
@@ -406,12 +604,20 @@ fn pg_value_from_row_cell(
                     .map(crate::model::Value::Bytes)
                     .unwrap_or(crate::model::Value::Null))
             }
-            "NaiveDateTime" | "chrono::NaiveDateTime" | "DateTime" | "chrono::DateTime" => {
-                Ok(pg_datetime_value_from_row(row, idx)?
-                    .map(crate::model::Value::DateTime)
-                    .unwrap_or(crate::model::Value::Null))
-            }
-            _ => Err(anyhow::anyhow!(
+            "NaiveDateTime"
+            | "chrono::NaiveDateTime"
+            | "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>" => Ok(pg_datetime_value_from_row(row, idx)?
+                .map(crate::model::Value::DateTime)
+                .unwrap_or(crate::model::Value::Null)),
+            "NaiveDate" | "chrono::NaiveDate" => Ok(pg_date_value_from_row(row, idx)?
+                .map(crate::model::Value::Date)
+                .unwrap_or(crate::model::Value::Null)),
+            "NaiveTime" | "chrono::NaiveTime" => Ok(pg_time_value_from_row(row, idx)?
+                .map(crate::model::Value::Time)
+                .unwrap_or(crate::model::Value::Null)),
+            _ => Err(crate::ormer_error!(
                 "Unsupported nullable column type: {rust_type}"
             )),
         }
@@ -422,7 +628,7 @@ fn pg_value_from_row_cell(
                 value
                     .map(|value| crate::model::Value::Integer(value as i64))
                     .ok_or_else(|| {
-                        anyhow::anyhow!(format!(
+                        crate::ormer_error!(format!(
                             "Failed to parse non-nullable column at index {} (expected integer type)",
                             idx
                         ))
@@ -431,7 +637,7 @@ fn pg_value_from_row_cell(
             "i64" | "u64" => {
                 let value: Option<i64> = pg_try_get(row, idx, "i64")?;
                 value.map(crate::model::Value::Integer).ok_or_else(|| {
-                    anyhow::anyhow!(format!(
+                    crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected i64 type)",
                         idx
                     ))
@@ -442,7 +648,7 @@ fn pg_value_from_row_cell(
                 value
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .ok_or_else(|| {
-                        anyhow::anyhow!(format!(
+                        crate::ormer_error!(format!(
                             "Failed to parse non-nullable column at index {} (expected Duration type)",
                             idx
                         ))
@@ -451,7 +657,7 @@ fn pg_value_from_row_cell(
             "String" => {
                 let value: Option<String> = pg_try_get(row, idx, "String")?;
                 value.map(crate::model::Value::Text).ok_or_else(|| {
-                    anyhow::anyhow!(format!(
+                    crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected String type)",
                         idx
                     ))
@@ -460,7 +666,7 @@ fn pg_value_from_row_cell(
             "f32" | "f64" => {
                 let value: Option<f64> = pg_try_get(row, idx, "f64")?;
                 value.map(crate::model::Value::Real).ok_or_else(|| {
-                    anyhow::anyhow!(format!(
+                    crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected float type)",
                         idx
                     ))
@@ -471,7 +677,7 @@ fn pg_value_from_row_cell(
                 match value {
                     Some(true) => Ok(crate::model::Value::Integer(1)),
                     Some(false) => Ok(crate::model::Value::Integer(0)),
-                    None => Err(anyhow::anyhow!(format!(
+                    None => Err(crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected bool type)",
                         idx
                     ))),
@@ -480,23 +686,41 @@ fn pg_value_from_row_cell(
             "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
                 let value: Option<Vec<u8>> = pg_try_get(row, idx, "Vec<u8>")?;
                 value.map(crate::model::Value::Bytes).ok_or_else(|| {
-                    anyhow::anyhow!(format!(
+                    crate::ormer_error!(format!(
                         "Failed to parse non-nullable column at index {} (expected Vec<u8> type)",
                         idx
                     ))
                 })
             }
-            "NaiveDateTime" | "chrono::NaiveDateTime" | "DateTime" | "chrono::DateTime" => {
-                pg_datetime_value_from_row(row, idx)?
-                    .map(crate::model::Value::DateTime)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(format!(
-                            "Failed to parse non-nullable column at index {} (expected timestamp type)",
-                            idx
-                        ))
-                    })
-            }
-            _ => Err(anyhow::anyhow!("Unsupported column type: {rust_type}")),
+            "NaiveDateTime"
+            | "chrono::NaiveDateTime"
+            | "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>" => pg_datetime_value_from_row(row, idx)?
+                .map(crate::model::Value::DateTime)
+                .ok_or_else(|| {
+                    crate::ormer_error!(format!(
+                        "Failed to parse non-nullable column at index {} (expected timestamp type)",
+                        idx
+                    ))
+                }),
+            "NaiveDate" | "chrono::NaiveDate" => pg_date_value_from_row(row, idx)?
+                .map(crate::model::Value::Date)
+                .ok_or_else(|| {
+                    crate::ormer_error!(format!(
+                        "Failed to parse non-nullable column at index {} (expected date type)",
+                        idx
+                    ))
+                }),
+            "NaiveTime" | "chrono::NaiveTime" => pg_time_value_from_row(row, idx)?
+                .map(crate::model::Value::Time)
+                .ok_or_else(|| {
+                    crate::ormer_error!(format!(
+                        "Failed to parse non-nullable column at index {} (expected time type)",
+                        idx
+                    ))
+                }),
+            _ => Err(crate::ormer_error!("Unsupported column type: {rust_type}")),
         }
     }
 }
@@ -505,7 +729,7 @@ fn pg_model_value_from_row<T: Model>(
     row: &tokio_postgres::Row,
     schema_idx: usize,
     row_idx: usize,
-) -> anyhow::Result<crate::model::Value> {
+) -> crate::Result<crate::model::Value> {
     let column = &T::COLUMN_SCHEMA[schema_idx];
     let rust_type = column.data_type.unwrap_or(column.rust_type);
     pg_value_from_row_cell(
@@ -521,10 +745,29 @@ fn pg_outer_join_model_value_from_row<T: Model>(
     row: &tokio_postgres::Row,
     schema_idx: usize,
     row_idx: usize,
-) -> anyhow::Result<crate::model::Value> {
+) -> crate::Result<crate::model::Value> {
     let column = &T::COLUMN_SCHEMA[schema_idx];
     let rust_type = column.data_type.unwrap_or(column.rust_type);
     pg_value_from_row_cell(row, row_idx, rust_type, true, column.enum_variants)
+}
+
+fn pg_decode_model_from_row<T: Model>(row: &tokio_postgres::Row) -> crate::Result<T> {
+    common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+        pg_model_value_from_row::<T>(row, i, i)
+    })
+}
+
+fn pg_decode_returning_model_from_row<T: Model>(row: &tokio_postgres::Row) -> crate::Result<T> {
+    common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| convert_postgres_value(row, i))
+}
+
+fn pg_decode_row_values_from_row<V: crate::model::FromRowValues>(
+    row: &tokio_postgres::Row,
+    column_count: usize,
+) -> crate::Result<V> {
+    common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
+        convert_postgres_value(row, i)
+    })
 }
 
 fn pg_collect_filter_param_rust_types<T: Model>(
@@ -584,6 +827,81 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
         | FilterExpr::IsNotNull { .. } => {}
+        FilterExpr::ExprComparison { left, right, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        FilterExpr::ExprIn { expr, values } | FilterExpr::ExprNotIn { expr, values } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            for value in values {
+                pg_collect_sql_expr_param_rust_types::<T>(value, rust_types);
+            }
+        }
+        FilterExpr::ExprBetween { expr, min, max } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(min, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(max, rust_types);
+        }
+        FilterExpr::ExprIsNull { expr } | FilterExpr::ExprIsNotNull { expr } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        FilterExpr::TextSearch { expr, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            rust_types.push("String");
+        }
+    }
+}
+
+fn pg_collect_sql_expr_param_rust_types<T: Model>(
+    expr: &SqlExpr,
+    rust_types: &mut Vec<&'static str>,
+) {
+    match expr {
+        SqlExpr::Column(_) | SqlExpr::Raw(_) => {}
+        SqlExpr::Value(value) => rust_types.push(infer_model_value_rust_type(value)),
+        SqlExpr::Binary { left, right, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
+            for arg in args {
+                pg_collect_sql_expr_param_rust_types::<T>(arg, rust_types);
+            }
+        }
+        SqlExpr::Cast { expr, .. }
+        | SqlExpr::Collate { expr, .. }
+        | SqlExpr::JsonText { expr, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        SqlExpr::Aggregate {
+            expr,
+            filter,
+            order_by: _,
+            over,
+            ..
+        } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            if let Some(filter) = filter {
+                pg_collect_filter_param_rust_types::<T>(filter, rust_types);
+            }
+            if let Some(over) = over {
+                for expr in &over.partition_by {
+                    pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+                }
+            }
+        }
+        SqlExpr::CaseMatch {
+            expr,
+            branches,
+            else_expr,
+        } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            for (when, then) in branches {
+                pg_collect_sql_expr_param_rust_types::<T>(when, rust_types);
+                pg_collect_sql_expr_param_rust_types::<T>(then, rust_types);
+            }
+            pg_collect_sql_expr_param_rust_types::<T>(else_expr, rust_types);
+        }
     }
 }
 
@@ -635,9 +953,8 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
             // 日期时间类型（如果使用 chrono crate）
-            "DateTime" | "chrono::DateTime" | "NaiveDateTime" | "chrono::NaiveDateTime" => {
-                "TIMESTAMPTZ"
-            }
+            "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => "TIMESTAMPTZ",
+            "NaiveDateTime" | "chrono::NaiveDateTime" => "TIMESTAMPTZ",
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
             // JSON 类型
@@ -694,7 +1011,7 @@ pub struct CreateTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> CreateTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
         let mut statements = Vec::new();
 
@@ -745,7 +1062,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
         Ok(SqlStatement::batch(DbType::PostgreSQL, statements))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -753,11 +1070,11 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         CreateTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
             self.client.execute(&statement.sql, &[]).trace().await?;
         }
@@ -772,7 +1089,7 @@ pub struct DropTableExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DropTableExecutor<'a, T> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::PostgreSQL,
             format!(
@@ -783,7 +1100,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -791,11 +1108,11 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DropTableExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
             self.client.execute(&statement.sql, &[]).trace().await?;
         }
@@ -807,24 +1124,26 @@ impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
 pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     db: &'a Database,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: std::marker::PhantomData<I::Model>,
 }
 
+impl_insert_conflict_methods!(InsertExecutor, with_conflict);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
         let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::PostgreSQL, &refs);
-        let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
+        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
+        let rust_types = pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
         let sql = if has_auto_increment {
             let pk_col = I::Model::COLUMN_SCHEMA
                 .iter()
@@ -843,7 +1162,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     }
 
     /// 执行插入并返回插入的行数据（PostgreSQL RETURNING 支持）
-    pub async fn returning(mut self) -> anyhow::Result<Vec<I::Model>> {
+    pub async fn returning(mut self) -> crate::Result<Vec<I::Model>> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
         let mut sql = self.to_sql()?;
@@ -862,17 +1181,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             &statement.params,
             statement.param_rust_types.as_deref().unwrap_or(&[]),
         )?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
+        let param_refs = pg_param_refs(&params);
         let rows = self.db.client.query(&statement.sql, &param_refs).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
-                convert_postgres_value(&row, i)
-            })?;
+            let model = pg_decode_returning_model_from_row::<I::Model>(&row)?;
             results.push(model);
         }
 
@@ -880,7 +1194,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         Ok(results)
     }
 
-    pub async fn execute(self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -888,11 +1202,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
     type Output = <I::Model as Model>::AutoIncrementKeyType;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
@@ -903,31 +1217,24 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
         let result = if has_auto_increment {
-            let rows = self
-                .db
-                .client
-                .query(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            let rows = pg_query_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
             let row = match rows.first() {
                 Some(row) => row,
-                None => {
-                    return Err(anyhow::anyhow!("No rows returned from batch insert"));
-                }
+                None => return Ok(Self::Output::default()),
             };
             let id: i64 = match *row.columns()[0].type_() {
                 Type::INT2 => row.try_get::<_, i16>(0)? as i64,
                 Type::INT4 => row.try_get::<_, i32>(0)? as i64,
                 Type::INT8 => row.try_get::<_, i64>(0)?,
                 _ => {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Unexpected column type for auto-increment key: {}",
                         row.columns()[0].type_()
                     ));
@@ -935,15 +1242,133 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             };
             common_helpers::convert_auto_increment_key::<Self::Output>(id)
         } else {
-            self.db
-                .client
-                .execute(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            pg_execute_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
             Ok(Self::Output::default())
         }?;
 
         self.models.run_after_insert(hook_ctx).await?;
+        Ok(result)
+    }
+}
+
+pub struct InsertPartialExecutor<'a, T: Model> {
+    db: &'a Database,
+    assignments: Vec<InsertAssignment>,
+    source_table: Option<&'static str>,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
+        self.assignments.extend(assignments);
+        self
+    }
+
+    fn with_source_table(mut self, source_table: &'static str) -> Self {
+        self.source_table = Some(source_table);
+        self
+    }
+
+    pub fn set<F, A>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> A,
+        A: IntoInsertAssignment<T>,
+    {
+        self.assignments
+            .push(f(T::Where::default()).into_insert_assignment());
+        self
+    }
+
+    pub fn default<F, C>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: IntoInsertDefaultColumn<T>,
+    {
+        self.assignments.push(InsertAssignment::default(
+            f(T::Where::default()).into_insert_default_column(),
+        ));
+        self
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        common_helpers::validate_insert_model_table::<T>(DbType::PostgreSQL, self.source_table)?;
+        let statement =
+            common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
+                DbType::PostgreSQL,
+                &self.assignments,
+            )?;
+        Ok(SqlStatement::batch(
+            DbType::PostgreSQL,
+            vec![
+                SingleSqlStatement::new(statement.sql, statement.params)
+                    .with_param_rust_types(statement.param_rust_types),
+            ],
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<<T as Model>::AutoIncrementKeyType>
+    where
+        T: Send + Sync,
+    {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
+    type Output = <T as Model>::AutoIncrementKeyType;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        InsertPartialExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if sql.statements.is_empty() {
+            return Ok(<T as Model>::AutoIncrementKeyType::default());
+        }
+
+        let statement = &sql.statements[0];
+        let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+        let result = if T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment) {
+            let rows = pg_query_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
+            let row = match rows.first() {
+                Some(row) => row,
+                None => return Ok(Self::Output::default()),
+            };
+            let id: i64 = match *row.columns()[0].type_() {
+                Type::INT2 => row.try_get::<_, i16>(0)? as i64,
+                Type::INT4 => row.try_get::<_, i32>(0)? as i64,
+                Type::INT8 => row.try_get::<_, i64>(0)?,
+                _ => {
+                    return Err(crate::ormer_error!(
+                        "Unexpected column type for auto-increment key: {}",
+                        row.columns()[0].type_()
+                    ));
+                }
+            };
+            common_helpers::convert_auto_increment_key::<Self::Output>(id)
+        } else {
+            pg_execute_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
+            Ok(Self::Output::default())
+        }?;
+
         Ok(result)
     }
 }
@@ -956,15 +1381,12 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let primary_key = I::Model::primary_key_columns()[0];
-        let quoted_primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
         let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::PostgreSQL,
             "INSERT INTO",
@@ -973,24 +1395,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
-
-        sql.push_str(&format!(
-            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
-        ));
-        let mut first = true;
-        for col_name in I::Model::COLUMNS.iter() {
-            if col_name == &primary_key {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
-                DbType::PostgreSQL,
-                col_name,
-            ));
-            first = false;
-        }
+        append_postgresql_upsert_clause::<I::Model>(&mut sql, I::Model::COLUMNS);
 
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
             .iter()
@@ -1003,7 +1408,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -1011,25 +1416,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
         for statement in sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-            let params = values_to_params_with_types(&statement.params, rust_types)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            self.db
-                .client
-                .execute(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            pg_execute_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
         }
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
@@ -1044,7 +1446,7 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -1077,7 +1479,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         ))
     }
 
-    pub async fn execute(self) -> anyhow::Result<()> {
+    pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
 }
@@ -1085,25 +1487,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(mut self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
         for statement in sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-            let params = values_to_params_with_types(&statement.params, rust_types)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            self.db
-                .client
-                .execute(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            pg_execute_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
         }
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
@@ -1112,7 +1511,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
 
 impl Database {
     /// 连接到 PostgreSQL 数据库
-    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> anyhow::Result<Self> {
+    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
         let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
             .trace()
             .await?;
@@ -1167,8 +1566,30 @@ impl Database {
         InsertExecutor {
             db: self,
             models,
+            conflict: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+        InsertPartialExecutor {
+            db: self,
+            assignments: Vec::new(),
+            source_table: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn insert_model<T>(
+        &self,
+        model: impl crate::model::InsertModel<T>,
+    ) -> InsertPartialExecutor<'_, T>
+    where
+        T: Model,
+    {
+        self.insert_partial::<T>()
+            .with_source_table(model.insert_table_name())
+            .with_assignments(model.insert_assignments())
     }
 
     /// 插入或更新记录 - 返回执行器
@@ -1196,12 +1617,12 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> anyhow::Result<()> {
+    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().trace().await?;
 
         if !table_exists {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Table does not exist",
                 T::TABLE_NAME
             ));
@@ -1213,7 +1634,7 @@ impl Database {
     }
 
     /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> anyhow::Result<bool> {
+    async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
         let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema=$1 AND table_name=$2";
 
@@ -1228,7 +1649,7 @@ impl Database {
         Ok(count > 0)
     }
 
-    async fn check_table_is_hypertable<T: Model>(&self) -> anyhow::Result<bool> {
+    async fn check_table_is_hypertable<T: Model>(&self) -> crate::Result<bool> {
         let sql = "SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL";
         let row = self.client.query_one(sql, &[]).trace().await?;
         let has_hypertables_view: bool =
@@ -1254,12 +1675,12 @@ impl Database {
         Ok(count > 0)
     }
 
-    async fn validate_table_hypertable<T: Model>(&self) -> anyhow::Result<()> {
+    async fn validate_table_hypertable<T: Model>(&self) -> crate::Result<()> {
         let expected_hypertable = T::hypertable_info().is_some();
         let actual_hypertable = self.check_table_is_hypertable::<T>().trace().await?;
 
         if expected_hypertable != actual_hypertable {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Hypertable mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
                 if expected_hypertable {
@@ -1279,7 +1700,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> anyhow::Result<()> {
+    async fn validate_table_schema<T: Model>(&self) -> crate::Result<()> {
         // 查询表的列信息
         let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let sql = r#"
@@ -1313,7 +1734,7 @@ impl Database {
 
         // 比较列数量
         if actual_columns.len() != T::COLUMNS.len() {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
                 T::COLUMNS.len(),
@@ -1324,7 +1745,7 @@ impl Database {
         // 比较每一列的定义
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Missing column: {}",
                     T::TABLE_NAME,
                     expected_col.name
@@ -1335,7 +1756,7 @@ impl Database {
 
             // 检查列名
             if actual_name != expected_col.name {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
                     T::TABLE_NAME,
                     i,
@@ -1395,8 +1816,8 @@ impl Database {
                 full_type.replace(" NOT NULL", "")
             };
 
-            if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(anyhow::anyhow!(
+            if !Self::types_compatible(actual_type, &type_to_compare) {
+                return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
                     T::TABLE_NAME,
                     expected_col.name
@@ -1407,7 +1828,7 @@ impl Database {
             if !expected_col.is_primary {
                 let expected_nullable = expected_col.is_nullable;
                 if *actual_nullable != expected_nullable {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
                         T::TABLE_NAME,
                         expected_col.name,
@@ -1422,7 +1843,7 @@ impl Database {
     }
 
     /// 检查 SQL 类型是否兼容
-    fn types_compatible(&self, actual: &str, expected: &str) -> bool {
+    fn types_compatible(actual: &str, expected: &str) -> bool {
         // 标准化类型名称 - 只提取基础类型，去除约束
         fn normalize(s: &str) -> String {
             let upper = s.to_uppercase();
@@ -1477,7 +1898,11 @@ impl Database {
 
         let actual = normalize(actual);
         let expected = normalize(expected);
-        actual == expected || (actual == "TIMESTAMP" && expected == "TIMESTAMPTZ")
+        actual == expected
+            || matches!(
+                (actual.as_str(), expected.as_str()),
+                ("TIMESTAMP", "TIMESTAMPTZ") | ("TIMESTAMPTZ", "TIMESTAMP")
+            )
     }
 
     /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
@@ -1485,7 +1910,7 @@ impl Database {
     pub(crate) async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    ) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
@@ -1502,12 +1927,6 @@ impl Database {
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
 
-        let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
         if has_auto_increment {
             // 获取自增主键列名
             let pk_col = T::COLUMN_SCHEMA
@@ -1517,15 +1936,13 @@ impl Database {
                 .unwrap_or("id");
             // 使用 RETURNING 子句获取插入的ID
             let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
-            let rows = self
-                .client
-                .query(&sql_with_returning, &param_refs)
-                .trace()
-                .await?;
+            let rows =
+                pg_query_with_types(&self.client, &sql_with_returning, &all_values, &rust_types)
+                    .await?;
             let row = match rows.first() {
                 Some(row) => row,
                 None => {
-                    return Err(anyhow::anyhow!("No rows returned from batch insert"));
+                    return Err(crate::ormer_error!("No rows returned from batch insert"));
                 }
             };
             // 根据列类型读取自增主键值（SERIAL = INT4, BIGSERIAL = INT8）
@@ -1534,7 +1951,7 @@ impl Database {
                 Type::INT4 => row.try_get::<_, i32>(0)? as i64,
                 Type::INT8 => row.try_get::<_, i64>(0)?,
                 _ => {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Unexpected column type for auto-increment key: {}",
                         row.columns()[0].type_()
                     ));
@@ -1543,22 +1960,18 @@ impl Database {
             let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&sql, &param_refs).trace().await?;
+            pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        let primary_key = T::primary_key_columns()[0];
-        let quoted_primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
-
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
         let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
@@ -1569,41 +1982,19 @@ impl Database {
         );
 
         // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(
-            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
-        ));
-        let mut first = true;
-        for col_name in T::COLUMNS.iter() {
-            if col_name == &primary_key {
-                continue; // 跳过主键
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
-                DbType::PostgreSQL,
-                col_name,
-            ));
-            first = false;
-        }
+        append_postgresql_upsert_clause::<T>(&mut sql, T::COLUMNS);
 
         // 获取列的rust_type信息
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
-        let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        self.client.execute(&sql, &param_refs).trace().await?;
+        pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
         Ok(())
     }
 
     /// 批量插入或忽略记录（遇到重复键时忽略）
-    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
@@ -1632,13 +2023,7 @@ impl Database {
             .filter(|col| !col.is_auto_increment)
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
-        let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        self.client.execute(&sql, &param_refs).trace().await?;
+        pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
         Ok(())
     }
 
@@ -1690,7 +2075,7 @@ impl Database {
     }
 
     /// 开始事务
-    pub async fn begin(&self) -> anyhow::Result<Transaction<'_>> {
+    pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
         self.client.execute("BEGIN", &[]).trace().await?;
         Ok(Transaction {
             client: &self.client,
@@ -1708,43 +2093,30 @@ impl Database {
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
         let (sql, params) = sql.render(DbType::PostgreSQL)?;
         self.exec_raw(&sql, params).await
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let pg_params = values_to_params(&params)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        let rows = self.client.query(sql, &param_refs).trace().await?;
+        let rows = pg_query_untyped(&self.client, sql, &params).await?;
         let mut results = Vec::new();
         for row in rows {
-            results.push(common_helpers::decode_row_values_from_indexed_values(
-                row.columns().len(),
-                |i| convert_postgres_value(&row, i),
-            )?);
+            results.push(pg_decode_row_values_from_row(&row, row.columns().len())?);
         }
         Ok(results.into_iter().collect())
     }
 
-    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
-        let pg_params = values_to_params(&params)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        Ok(self.client.execute(sql, &param_refs).trace().await?)
+    pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
+        pg_execute_untyped(&self.client, sql, &params).await
     }
 
-    pub(crate) async fn migration_history(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+    pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
         let rows = self
             .client
             .query(
@@ -1760,10 +2132,10 @@ impl Database {
                 let checksum: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
                 Ok((
                     u64::try_from(version)
-                        .map_err(|_| anyhow::anyhow!("Migration version cannot be negative"))?,
+                        .map_err(|_| crate::ormer_error!("Migration version cannot be negative"))?,
                     name,
                     checksum.parse::<u64>().map_err(|_| {
-                        anyhow::anyhow!("Migration checksum is not a valid unsigned integer")
+                        crate::ormer_error!("Migration checksum is not a valid unsigned integer")
                     })?,
                 ))
             })
@@ -1773,7 +2145,7 @@ impl Database {
     pub(crate) async fn schema_columns(
         &self,
         table_name: &str,
-    ) -> anyhow::Result<Option<Vec<SchemaColumn>>> {
+    ) -> crate::Result<Option<Vec<SchemaColumn>>> {
         let (schema_name, table_name) = split_schema_table_name(table_name, "public");
         let exists = self
             .client
@@ -1847,24 +2219,26 @@ pub struct Transaction<'a> {
 pub struct TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     client: &'a tokio_postgres::Client,
     models: I,
+    conflict: Option<InsertConflict>,
     _marker: std::marker::PhantomData<I::Model>,
 }
 
+impl_insert_conflict_methods!(TransactionInsertExecutor);
+
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
         let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
-        let (sql, all_values) =
-            common_helpers::build_insert_statement::<I::Model>(DbType::PostgreSQL, &refs);
-        let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
+        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
+        let rust_types = pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
         let sql = if has_auto_increment {
             let pk_col = I::Model::COLUMN_SCHEMA
                 .iter()
@@ -1882,7 +2256,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         ))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<<I::Model as Model>::AutoIncrementKeyType> {
+    pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let sql = self.to_sql()?;
         if sql.statements.is_empty() {
             return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
@@ -1892,23 +2266,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
         let result = if has_auto_increment {
-            let rows = self
-                .client
-                .query(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            let rows =
+                pg_query_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                    .await?;
             let row = match rows.first() {
                 Some(row) => row,
-                None => {
-                    return Err(anyhow::anyhow!("No rows returned from batch insert"));
-                }
+                None => return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default()),
             };
             // 根据列类型读取自增主键值（SERIAL = INT4, BIGSERIAL = INT8）
             let id: i64 = match *row.columns()[0].type_() {
@@ -1916,7 +2280,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
                 Type::INT4 => row.try_get::<_, i32>(0)? as i64,
                 Type::INT8 => row.try_get::<_, i64>(0)?,
                 _ => {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Unexpected column type for auto-increment key: {}",
                         row.columns()[0].type_()
                     ));
@@ -1926,9 +2290,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
                 id,
             )
         } else {
-            self.client
-                .execute(&statement.sql, &param_refs)
-                .trace()
+            pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
                 .await?;
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }?;
@@ -1946,15 +2308,12 @@ pub struct TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
         let columns = I::Model::insert_columns();
-        let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
         let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::PostgreSQL,
             "INSERT INTO",
@@ -1963,21 +2322,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-        sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-        let mut first = true;
-        for col_name in columns.iter() {
-            if primary_key_columns.contains(col_name) {
-                continue;
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
-                DbType::PostgreSQL,
-                col_name,
-            ));
-            first = false;
-        }
+        append_postgresql_upsert_clause::<I::Model>(&mut sql, &columns);
         let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
             .iter()
             .filter(|col| !col.is_auto_increment)
@@ -1989,7 +2334,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         ))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         let sql = self.to_sql()?;
         if sql.statements.is_empty() {
             return Ok(());
@@ -1998,15 +2343,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        self.client
-            .execute(&statement.sql, &param_refs)
-            .trace()
-            .await?;
+        pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types).await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -2020,7 +2357,7 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -2051,7 +2388,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         ))
     }
 
-    pub async fn execute(mut self) -> anyhow::Result<()> {
+    pub async fn execute(mut self) -> crate::Result<()> {
         let sql = self.to_sql()?;
         if sql.statements.is_empty() {
             return Ok(());
@@ -2060,56 +2397,34 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         self.models.run_before_insert(hook_ctx).await?;
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        self.client
-            .execute(&statement.sql, &param_refs)
-            .trace()
-            .await?;
+        pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types).await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
 
 impl<'a> Transaction<'a> {
-    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> anyhow::Result<u64> {
-        let pg_params = values_to_params(&params)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        Ok(self.client.execute(sql, &param_refs).trace().await?)
+    pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
+        pg_execute_untyped(self.client, sql, &params).await
     }
 
-    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> anyhow::Result<C>
+    pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let pg_params = values_to_params(&params)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        let rows = self.client.query(sql, &param_refs).trace().await?;
+        let rows = pg_query_untyped(self.client, sql, &params).await?;
         let mut results = Vec::new();
         for row in rows {
-            results.push(common_helpers::decode_row_values_from_indexed_values(
-                row.columns().len(),
-                |i| convert_postgres_value(&row, i),
-            )?);
+            results.push(pg_decode_row_values_from_row(&row, row.columns().len())?);
         }
         Ok(results.into_iter().collect())
     }
 
     /// 提交事务
-    pub async fn commit(mut self) -> anyhow::Result<()> {
+    pub async fn commit(mut self) -> crate::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
@@ -2119,9 +2434,9 @@ impl<'a> Transaction<'a> {
     }
 
     /// 回滚事务
-    pub async fn rollback(mut self) -> anyhow::Result<()> {
+    pub async fn rollback(mut self) -> crate::Result<()> {
         if self.committed || self.rolled_back {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
@@ -2176,6 +2491,7 @@ impl<'a> Transaction<'a> {
         TransactionInsertExecutor {
             client: self.client,
             models,
+            conflict: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -2209,7 +2525,7 @@ impl<'a> Transaction<'a> {
     pub(crate) async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
-    ) -> anyhow::Result<T::AutoIncrementKeyType> {
+    ) -> crate::Result<T::AutoIncrementKeyType> {
         if models.is_empty() {
             return Ok(T::AutoIncrementKeyType::default());
         }
@@ -2225,12 +2541,6 @@ impl<'a> Transaction<'a> {
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
 
-        let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
         if has_auto_increment {
             // 获取自增主键列名
             let pk_col = T::COLUMN_SCHEMA
@@ -2240,15 +2550,13 @@ impl<'a> Transaction<'a> {
                 .unwrap_or("id");
             // 使用 RETURNING 子句获取插入的ID
             let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
-            let rows = self
-                .client
-                .query(&sql_with_returning, &param_refs)
-                .trace()
-                .await?;
+            let rows =
+                pg_query_with_types(self.client, &sql_with_returning, &all_values, &rust_types)
+                    .await?;
             let row = match rows.first() {
                 Some(row) => row,
                 None => {
-                    return Err(anyhow::anyhow!("No rows returned from batch insert"));
+                    return Err(crate::ormer_error!("No rows returned from batch insert"));
                 }
             };
             // 根据列类型读取自增主键值（SERIAL = INT4, BIGSERIAL = INT8）
@@ -2257,7 +2565,7 @@ impl<'a> Transaction<'a> {
                 Type::INT4 => row.try_get::<_, i32>(0)? as i64,
                 Type::INT8 => row.try_get::<_, i64>(0)?,
                 _ => {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Unexpected column type for auto-increment key: {}",
                         row.columns()[0].type_()
                     ));
@@ -2266,22 +2574,18 @@ impl<'a> Transaction<'a> {
             let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
             Ok(result)
         } else {
-            self.client.execute(&sql, &param_refs).trace().await?;
+            pg_execute_with_types(self.client, &sql, &all_values, &rust_types).await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> anyhow::Result<()> {
+    pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        let primary_key = T::primary_key_columns()[0];
-        let quoted_primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &[primary_key]);
-
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO UPDATE SET ...
+        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
         let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
@@ -2292,36 +2596,14 @@ impl<'a> Transaction<'a> {
         );
 
         // 添加 ON CONFLICT DO UPDATE 子句
-        sql.push_str(&format!(
-            " ON CONFLICT ({quoted_primary_key}) DO UPDATE SET "
-        ));
-        let mut first = true;
-        for col_name in T::COLUMNS.iter() {
-            if col_name == &primary_key {
-                continue; // 跳过主键
-            }
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&common_helpers::quote_postgres_excluded_assignment(
-                DbType::PostgreSQL,
-                col_name,
-            ));
-            first = false;
-        }
+        append_postgresql_upsert_clause::<T>(&mut sql, T::COLUMNS);
 
         // 获取列的rust_type信息
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
             .iter()
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
-        let params = values_to_params_with_types(&all_values, &rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        self.client.execute(&sql, &param_refs).trace().await?;
+        pg_execute_with_types(self.client, &sql, &all_values, &rust_types).await?;
 
         Ok(())
     }
@@ -2412,7 +2694,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2420,20 +2702,11 @@ impl<
         Box::pin(async move {
             let param_rust_types = self.select.param_rust_types();
             let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-            let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-
-            let rows = self.client.query(&sql, &param_refs).trace().await?;
+            let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
             let mut results = Vec::new();
             for row in rows {
-                let v = common_helpers::decode_row_values_from_indexed_values(
-                    row.columns().len(),
-                    |i| convert_postgres_value(&row, i),
-                )?;
+                let v = pg_decode_row_values_from_row(&row, row.columns().len())?;
                 results.push(v);
             }
 
@@ -2441,6 +2714,104 @@ impl<
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CompositePkModel;
+
+    impl Model for CompositePkModel {
+        const TABLE_NAME: &'static str = "composite_pk_models";
+        const COLUMNS: &'static [&'static str] = &["tenant_id", "user_id", "role"];
+        const COLUMN_SCHEMA: &'static [crate::model::ColumnSchema] = &[];
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn query() -> Self::QueryBuilder {}
+
+        fn select() -> Self::QueryBuilder {}
+
+        fn from_row(_row: &Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+
+        fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+
+        fn field_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+
+        fn primary_key_columns() -> &'static [&'static str] {
+            &["tenant_id", "user_id"]
+        }
+
+        fn primary_key_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn upsert_clause_uses_all_primary_key_columns() {
+        let mut sql =
+            "INSERT INTO composite_pk_models (tenant_id, user_id, role) VALUES ($1, $2, $3)"
+                .to_string();
+
+        append_postgresql_upsert_clause::<CompositePkModel>(&mut sql, CompositePkModel::COLUMNS);
+
+        assert!(sql.contains("ON CONFLICT (tenant_id, user_id) DO UPDATE SET"));
+        assert!(sql.contains("role = EXCLUDED.role"));
+        assert!(!sql.contains("tenant_id = EXCLUDED.tenant_id"));
+        assert!(!sql.contains("user_id = EXCLUDED.user_id"));
+    }
+
+    #[test]
+    fn nullable_duration_null_is_bound_as_interval() {
+        let params = values_to_params_with_types(&[Value::Null], &["std::time::Duration"]).unwrap();
+        let mut out = BytesMut::new();
+
+        let is_null = params[0]
+            .to_sql_checked(&PgType::INTERVAL, &mut out)
+            .unwrap();
+
+        assert!(matches!(is_null, IsNull::Yes));
+    }
+
+    #[test]
+    fn datetime_parameters_support_timestamp_and_timestamptz() {
+        let value = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+
+        for ty in [PgType::TIMESTAMP, PgType::TIMESTAMPTZ] {
+            let mut out = BytesMut::new();
+            let is_null = PgDateTimeParam(value)
+                .to_sql_checked(&ty, &mut out)
+                .unwrap();
+
+            assert!(matches!(is_null, IsNull::No));
+            assert!(!out.is_empty());
+        }
+    }
+
+    #[test]
+    fn timestamp_and_timestamptz_schema_types_are_compatible() {
+        assert!(Database::types_compatible(
+            "timestamp without time zone",
+            "TIMESTAMPTZ"
+        ));
+        assert!(Database::types_compatible(
+            "timestamp with time zone",
+            "TIMESTAMP"
+        ));
+        assert!(!Database::types_compatible("DATE", "TIMESTAMPTZ"));
+    }
+}
+
+impl_backend_executor_methods!(SelectExecutor, client, &'a tokio_postgres::Client, Select);
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
@@ -2455,62 +2826,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     pub fn clone_with_client(&self) -> Self {
         Self {
             select: self.select.clone(),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加 WHERE 条件
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加排序
-    pub fn order_by<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加降序排序
-    pub fn order_by_desc<F, O>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> O,
-        O: Into<crate::OrderBy>,
-    {
-        Self {
-            select: self.select.order_by_desc(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 设置范围
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 启用 DISTINCT 去重
-    pub fn distinct(self) -> Self {
-        Self {
-            select: self.select.distinct(),
             client: self.client,
             _marker: PhantomData,
         }
@@ -2609,7 +2924,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// COUNT 聚合函数
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
     {
         let aggregate_select = self.select.count(f);
         AggregateFuture {
@@ -2622,7 +2937,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// SUM 聚合函数
     pub fn sum<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.sum(f);
@@ -2636,7 +2951,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// AVG 聚合函数
     pub fn avg<F, C>(self, f: F) -> AggregateFuture<'a, T, Option<f64>>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.avg(f);
@@ -2650,7 +2965,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MAX 聚合函数
     pub fn max<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.max(f);
@@ -2664,7 +2979,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// MIN 聚合函数
     pub fn min<F, C>(self, f: F) -> AggregateFuture<'a, T, C::Output>
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C>,
+        F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
         C: crate::query::builder::AggregateResultType + 'static,
     {
         let aggregate_select = self.select.min(f);
@@ -2738,7 +3053,7 @@ pub struct AggregateFuture<'a, T: Model, R> {
 impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
     std::future::IntoFuture for AggregateFuture<'a, T, R>
 {
-    type Output = anyhow::Result<R>;
+    type Output = crate::Result<R>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2798,6 +3113,12 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     crate::model::Value::DateTime(dt) => {
                         Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::Date(date) => {
+                        Box::new(date) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::Time(time) => {
+                        Box::new(time) as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::Json(j) => {
                         Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
@@ -2815,10 +3136,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                 })
                 .collect();
 
-            let params_ref: Vec<&(dyn postgres_types::ToSql + Sync)> = pg_params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn postgres_types::ToSql + Sync))
-                .collect();
+            let params_ref = pg_param_refs(&pg_params);
 
             let row = self.client.query_one(&sql, &params_ref).trace().await?;
 
@@ -2892,7 +3210,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
 impl<'a, T: Model + 'static + Send, C: FromIterator<T> + 'static> std::future::IntoFuture
     for CollectFuture<'a, T, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2904,7 +3222,7 @@ impl<'a, T: Model + 'static + Send, C: FromIterator<T> + 'static> std::future::I
 impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
     for FirstFuture<'a, T>
 {
-    type Output = anyhow::Result<Option<T>>;
+    type Output = crate::Result<Option<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -2917,24 +3235,16 @@ impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    async fn collect_inner<C: FromIterator<T>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &param_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
 
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                pg_model_value_from_row::<T>(&row, i, i)
-            })?;
+            let model = pg_decode_model_from_row::<T>(&row)?;
             results.push(model);
         }
 
@@ -2961,7 +3271,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let (sql, params) = self.build_sql_with_params();
         let rust_types = self.filter_param_rust_types();
         Ok(SqlStatement::batch(
@@ -2971,12 +3281,12 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     /// 执行删除操作并返回影响的行数
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行删除并返回被删除的行数据（PostgreSQL RETURNING 支持）
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
         let mut sql = self.to_sql()?;
         if sql.statements.is_empty() {
             return Ok(Vec::new());
@@ -2986,22 +3296,12 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         statement.sql = format!("{} RETURNING *", statement.sql);
 
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let pg_params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        let rows = self
-            .client
-            .query(&statement.sql, &param_refs)
-            .trace()
-            .await?;
+        let rows =
+            pg_query_with_types(self.client, &statement.sql, &statement.params, rust_types).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                convert_postgres_value(&row, i)
-            })?;
+            let model = pg_decode_returning_model_from_row::<T>(&row)?;
             results.push(model);
         }
 
@@ -3053,34 +3353,26 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         DeleteExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(0);
         }
 
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        let pg_params = values_to_params_with_types(&statement.params, rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let result = self
-            .client
-            .execute(&statement.sql, &param_refs)
-            .trace()
-            .await?;
+        let result =
+            pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                .await?;
         Ok(result)
     }
 }
 
 impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'a, T> {
-    type Output = anyhow::Result<u64>;
+    type Output = crate::Result<u64>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3091,7 +3383,7 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'
 
 /// Update 执行器
 pub struct UpdateExecutor<'a, T: Model> {
-    sets: Vec<(String, Value)>,
+    sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
     client: &'a tokio_postgres::Client,
@@ -3111,15 +3403,14 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     /// 设置要更新的字段
-    pub fn set<F, V, C>(mut self, field_fn: F, value: V) -> Self
+    pub fn set<F>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C>,
-        V: Into<Value>,
+        F: FnOnce(&mut T::Update),
     {
-        let where_obj = T::Where::default();
-        let column = field_fn(where_obj);
-        let column_name = column.column_name().to_string();
-        self.sets.push((column_name, value.into()));
+        let mut update = T::Update::default();
+        f(&mut update);
+        self.sets
+            .extend(<T::Update as crate::query::update::UpdateFields>::assignments(&update));
         self
     }
 
@@ -3174,7 +3465,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         self
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         let mut sql_statements = Vec::with_capacity(statements.len());
         for (sql, params, rust_types) in statements {
@@ -3185,37 +3476,29 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     /// 执行更新操作
-    pub async fn execute(self) -> anyhow::Result<u64> {
+    pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
     }
 
     /// 执行更新并返回被更新的行数据（PostgreSQL RETURNING 支持）
-    pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+    pub async fn returning(self) -> crate::Result<Vec<T>> {
         let sql = self.to_sql()?;
         let mut results = Vec::new();
         for statement in &sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-            let pg_params = values_to_params_with_types(&statement.params, rust_types)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            let rows = self
-                .client
-                .query(&format!("{} RETURNING *", statement.sql), &param_refs)
-                .trace()
-                .await?;
+            let returning_sql = format!("{} RETURNING *", statement.sql);
+            let rows =
+                pg_query_with_types(self.client, &returning_sql, &statement.params, rust_types)
+                    .await?;
             for row in rows {
-                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                    convert_postgres_value(&row, i)
-                })?;
+                let model = pg_decode_returning_model_from_row::<T>(&row)?;
                 results.push(model);
             }
         }
         Ok(results)
     }
 
-    fn build_all_sql(&self) -> anyhow::Result<UpdateSqlBatch> {
+    fn build_all_sql(&self) -> crate::Result<UpdateSqlBatch> {
         let mut statements = Vec::new();
 
         // Base UPDATE from sets/filters
@@ -3227,20 +3510,22 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             let mut params = Vec::new();
             let mut rust_types = Vec::new();
             let mut first = true;
-            for (col_name, value) in &self.sets {
+            for assignment in &self.sets {
                 if !first {
                     sql.push_str(", ");
                 }
-                sql.push_str(&common_helpers::quote_assignment(
+                let param_start = params.len();
+                sql.push_str(&common_helpers::format_update_assignment(
                     DbType::PostgreSQL,
-                    col_name,
-                    &common_helpers::placeholder(DbType::PostgreSQL, params.len() + 1),
+                    assignment,
+                    &mut params,
                 ));
-                params.push(value.clone());
-                rust_types.push(
-                    pg_model_column_rust_type::<T>(col_name)
-                        .unwrap_or_else(|| infer_model_value_rust_type(value)),
-                );
+                for value in &params[param_start..] {
+                    rust_types.push(
+                        pg_model_column_rust_type::<T>(&assignment.column)
+                            .unwrap_or_else(|| infer_model_value_rust_type(value)),
+                    );
+                }
                 first = false;
             }
             if !self.filters.is_empty() {
@@ -3319,24 +3604,17 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
     type Output = u64;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement> {
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
         UpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output> {
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut total: u64 = 0;
         for statement in &sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-            let pg_params = values_to_params_with_types(&statement.params, rust_types)?;
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
-            let result = self
-                .client
-                .execute(&statement.sql, &param_refs)
-                .trace()
-                .await?;
+            let result =
+                pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                    .await?;
             total += result;
         }
         Ok(total)
@@ -3344,7 +3622,7 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
 }
 
 impl<'a, T: Model + 'static + Send> std::future::IntoFuture for UpdateExecutor<'a, T> {
-    type Output = anyhow::Result<u64>;
+    type Output = crate::Result<u64>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3353,162 +3631,98 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for UpdateExecutor<'
     }
 }
 
-/// 将 ormer Value 转换为 tokio-postgres 参数
-/// 根据列的rust_type选择正确的参数类型（i32或i64）
-fn values_to_params_with_types(
-    values: &[crate::model::Value],
-    rust_types: &[&str],
-) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
-    // ToSql trait is used in the trait object type above
-    #[allow(unused_imports)]
-    use tokio_postgres::types::ToSql;
-
-    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-
-    for (idx, value) in values.iter().enumerate() {
-        // 循环使用rust_types，因为values可能包含多个记录的所有字段
-        let rust_type = rust_types[idx % rust_types.len()];
-
-        let param: Box<dyn tokio_postgres::types::ToSql + Sync + Send> = match value {
-            crate::model::Value::Integer(v) => {
-                // 根据列的rust_type选择合适的整数类型
-                // tokio-postgres要求Rust类型与PostgreSQL类型严格匹配
-                let use_i64 = matches!(rust_type, "i64" | "u64");
-                let is_known_int = matches!(
+fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam {
+    match value {
+        Value::Integer(value) => match rust_type {
+            Some(rust_type) if matches!(rust_type, "i64" | "u64") => Box::new(*value),
+            Some(rust_type)
+                if matches!(
                     rust_type,
-                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize"
-                );
-                if use_i64 {
-                    Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else if is_known_int {
-                    // 对于i32列，将值转换为i32
-                    Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
-                    // 非标准整数类型（如 flatbuffers newtype），数据库列可能是 TEXT
-                    // 转为字符串传递，避免类型不匹配导致序列化失败
-                    Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                }
+                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "usize" | "isize"
+                ) =>
+            {
+                Box::new(*value as i32)
             }
-            crate::model::Value::Text(v) => {
-                if is_vec_string_type(rust_type) {
-                    let values = crate::model::parse_string_vec_text(v);
-                    Box::new(values) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
-                    Box::new(PgTextParam::from(v.clone()))
-                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                }
+            Some(_) => Box::new(value.to_string()),
+            None => Box::new(*value as i32),
+        },
+        Value::Text(value) => match rust_type {
+            Some(rust_type) if is_vec_string_type(rust_type) => {
+                Box::new(crate::model::parse_string_vec_text(value))
             }
-            crate::model::Value::TextArray(v) => {
-                if is_vec_string_type(rust_type) {
-                    Box::new(crate::model::normalize_string_vec(v.clone()))
-                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
-                    Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                }
+            Some(_) => Box::new(PgTextParam::from(value.clone())),
+            None => Box::new(value.clone()),
+        },
+        Value::TextArray(value) => match rust_type {
+            Some(rust_type) if is_vec_string_type(rust_type) => {
+                Box::new(crate::model::normalize_string_vec(value.clone()))
             }
-            crate::model::Value::Real(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            _ => Box::new(value.clone()),
+        },
+        Value::Real(value) => Box::new(*value),
+        Value::Boolean(value) => Box::new(*value),
+        Value::Bytes(value) => Box::new(value.clone()),
+        Value::IntegerArray(value) => Box::new(value.clone()),
+        Value::BigIntArray(value) => Box::new(value.clone()),
+        Value::NullableBigIntArray(value) => Box::new(value.clone()),
+        Value::Duration(value) => Box::new(to_postgres_interval(*value)),
+        Value::DateTime(value) => match rust_type {
+            Some(_) => Box::new(PgDateTimeParam(*value)),
+            None => Box::new(*value),
+        },
+        Value::Date(value) => Box::new(*value),
+        Value::Time(value) => Box::new(*value),
+        Value::Json(value) => Box::new(value.to_string()),
+        Value::Uuid(value) => Box::new(value.to_string()),
+        Value::BigInt(value) => Box::new(*value as i64),
+        Value::Null => match rust_type {
+            None => Box::new(None::<i32>),
+            Some(rust_type) if is_vec_i32_type(rust_type) => Box::new(None::<Vec<i32>>),
+            Some(rust_type) if is_vec_i64_type(rust_type) => Box::new(None::<Vec<i64>>),
+            Some(rust_type) if is_vec_option_i64_type(rust_type) => {
+                Box::new(None::<Vec<Option<i64>>>)
             }
-            crate::model::Value::Boolean(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+            Some(rust_type) if is_vec_string_type(rust_type) => Box::new(None::<Vec<String>>),
+            Some("i64" | "u64") => Box::new(None::<i64>),
+            Some("i32" | "i16" | "i8" | "u16" | "u32" | "u8") => Box::new(None::<i32>),
+            Some("String" | "&str") => Box::new(PgMaybeTextParam(None)),
+            Some("f32" | "f64") => Box::new(None::<f64>),
+            Some("Duration" | "std::time::Duration") => Box::new(None::<PgInterval>),
+            Some("bool") => Box::new(None::<bool>),
+            Some("Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]") => {
+                Box::new(None::<Vec<u8>>)
             }
-            crate::model::Value::Bytes(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::IntegerArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::BigIntArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::NullableBigIntArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
-                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-            crate::model::Value::DateTime(v) => {
-                Box::new(PgDateTimeParam(*v)) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Json(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Uuid(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::BigInt(v) => {
-                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Null => {
-                // 根据列类型选择NULL的类型
-                if is_vec_i32_type(rust_type) {
-                    let null_val: Option<Vec<i32>> = None;
-                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else if is_vec_i64_type(rust_type) {
-                    let null_val: Option<Vec<i64>> = None;
-                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else if is_vec_option_i64_type(rust_type) {
-                    let null_val: Option<Vec<Option<i64>>> = None;
-                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else if is_vec_string_type(rust_type) {
-                    let null_val: Option<Vec<String>> = None;
-                    Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                } else {
-                    match rust_type {
-                        "i64" | "u64" => {
-                            let null_val: Option<i64> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "i32" | "i16" | "i8" | "u16" | "u32" | "u8" => {
-                            let null_val: Option<i32> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "String" | "&str" => {
-                            let null_val = PgMaybeTextParam(None);
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "f32" | "f64" => {
-                            let null_val: Option<f64> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "bool" => {
-                            let null_val: Option<bool> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]" => {
-                            let null_val: Option<Vec<u8>> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                        "DateTime"
-                        | "chrono::DateTime"
-                        | "NaiveDateTime"
-                        | "chrono::NaiveDateTime" => Box::new(PgMaybeDateTimeParam(None))
-                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-                        _ => {
-                            // 未知类型优先按文本 NULL 处理，覆盖 PostgreSQL enum 等自定义类型
-                            let null_val = PgMaybeTextParam(None);
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                    }
-                }
-            }
-        };
-        params.push(param);
+            Some(
+                "DateTime"
+                | "chrono::DateTime"
+                | "chrono::DateTime<chrono::Utc>"
+                | "NaiveDateTime"
+                | "chrono::NaiveDateTime",
+            ) => Box::new(PgMaybeDateTimeParam(None)),
+            Some("NaiveDate" | "chrono::NaiveDate") => Box::new(None::<chrono::NaiveDate>),
+            Some("NaiveTime" | "chrono::NaiveTime") => Box::new(None::<chrono::NaiveTime>),
+            Some(_) => Box::new(PgMaybeTextParam(None)),
+        },
     }
+}
 
+/// 将 ormer Value 转换为 tokio-postgres 参数，并按列类型选择整数和 NULL 类型。
+fn values_to_params_with_types(
+    values: &[Value],
+    rust_types: &[&str],
+) -> crate::Result<Vec<PostgreSQLParam>> {
+    let mut params = Vec::with_capacity(values.len());
+    for (idx, value) in values.iter().enumerate() {
+        let rust_type = rust_types[idx % rust_types.len()];
+        params.push(pg_value_to_param(value, Some(rust_type)));
+    }
     Ok(params)
 }
 
 fn values_to_params_for_query(
-    values: &[crate::model::Value],
+    values: &[Value],
     rust_types: &[&str],
-) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
+) -> crate::Result<Vec<PostgreSQLParam>> {
     if values.len() == rust_types.len() {
         values_to_params_with_types(values, rust_types)
     } else {
@@ -3516,71 +3730,12 @@ fn values_to_params_for_query(
     }
 }
 
-/// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）
-fn values_to_params(
-    values: &[crate::model::Value],
-) -> anyhow::Result<Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>>> {
-    // ToSql trait is used in the trait object type above
-    #[allow(unused_imports)]
-    use tokio_postgres::types::ToSql;
-
-    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-
-    for value in values {
-        let param: Box<dyn tokio_postgres::types::ToSql + Sync + Send> = match value {
-            crate::model::Value::Integer(v) => {
-                // 使用 i32 作为默认,因为大多数用户定义的列是 INTEGER
-                // 对于聚合函数(COUNT等返回BIGINT)的比较,PostgreSQL会自动提升i32到i64
-                Box::new(*v as i32) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Text(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::TextArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Real(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Boolean(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Bytes(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::IntegerArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::BigIntArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::NullableBigIntArray(v) => {
-                Box::new(v.clone()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Duration(v) => Box::new(to_postgres_interval(*v))
-                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-            crate::model::Value::DateTime(v) => {
-                Box::new(*v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Json(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Uuid(v) => {
-                Box::new(v.to_string()) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::BigInt(v) => {
-                Box::new(*v as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-            crate::model::Value::Null => {
-                // 使用 Option<i32> 的 None 来表示 NULL
-                let null_val: Option<i32> = None;
-                Box::new(null_val) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-            }
-        };
-        params.push(param);
-    }
-
-    Ok(params)
+/// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）。
+fn values_to_params(values: &[Value]) -> crate::Result<Vec<PostgreSQLParam>> {
+    Ok(values
+        .iter()
+        .map(|value| pg_value_to_param(value, None))
+        .collect())
 }
 
 /// Related 查询执行器（支持2表关联查询）
@@ -3610,14 +3765,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器  
-    pub async fn into_iter(self) -> anyhow::Result<SelectStreamIterator<'a, T>> {
+    pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
         let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
+        let param_refs = pg_param_refs(&pg_params);
 
         // 从 StreamConnection 获取 client 引用
         let client = *self.conn.expect_postgresql();
@@ -3643,7 +3795,7 @@ pub struct SelectStreamIterator<'a, T: Model> {
 
 impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     /// 获取下一行数据
-    pub async fn next(&mut self) -> Option<anyhow::Result<T>> {
+    pub async fn next(&mut self) -> Option<crate::Result<T>> {
         use futures::StreamExt;
 
         match self.row_stream.next().await {
@@ -3663,7 +3815,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                 let ormer_row = crate::model::Row::new(data);
                 Some(T::from_row(&ormer_row))
             }
-            Some(Err(e)) => Some(Err(anyhow::anyhow!(
+            Some(Err(e)) => Some(Err(crate::ormer_error!(
                 "tokio_postgres::RowStream::next failed: {e}"
             ))),
             None => None,
@@ -3671,27 +3823,15 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     }
 }
 
+impl_backend_related_executor_methods_with_lifetime!(
+    RelatedSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    RelatedSelect
+);
+
 impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where, R::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub async fn collect<C: FromIterator<T>>(self) -> anyhow::Result<C> {
+    pub async fn collect<C: FromIterator<T>>(self) -> crate::Result<C> {
         let results = self.collect_inner().trace().await?;
         Ok(results.into_iter().collect())
     }
@@ -3700,22 +3840,14 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
         RelatedCollectFuture { executor: self }
     }
 
-    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+    async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &param_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                pg_model_value_from_row::<T>(&row, i, i)
-            })?;
+            let model = pg_decode_model_from_row::<T>(&row)?;
             results.push(model);
         }
         Ok(results)
@@ -3729,7 +3861,7 @@ pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
 impl<'a, T: Model + 'static + Send, R: Model + 'static + Send> std::future::IntoFuture
     for RelatedCollectFuture<'a, T, R>
 {
-    type Output = anyhow::Result<Vec<T>>;
+    type Output = crate::Result<Vec<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3745,42 +3877,22 @@ pub struct MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
     _marker: PhantomData<(T, R1, R2)>,
 }
 
+impl_backend_multi_table_executor_methods_with_lifetime!(
+    MultiTableSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    MultiTableSelect
+);
+
 impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where, R1::Where, R2::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+    async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &param_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                pg_model_value_from_row::<T>(&row, i, i)
-            })?;
+            let model = pg_decode_model_from_row::<T>(&row)?;
             results.push(model);
         }
         Ok(results)
@@ -3794,7 +3906,7 @@ pub struct MultiTableCollectFuture<'a, T: Model, R1: Model, R2: Model> {
 impl<'a, T: Model + 'static + Send, R1: Model + 'static + Send, R2: Model + 'static + Send>
     std::future::IntoFuture for MultiTableCollectFuture<'a, T, R1, R2>
 {
-    type Output = anyhow::Result<Vec<T>>;
+    type Output = crate::Result<Vec<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3810,42 +3922,22 @@ pub struct FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
+impl_backend_four_table_executor_methods_with_lifetime!(
+    FourTableSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    FourTableSelect
+);
+
 impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, T, R1, R2, R3> {
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    async fn collect_inner(self) -> anyhow::Result<Vec<T>> {
+    async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &param_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         for row in rows {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                pg_model_value_from_row::<T>(&row, i, i)
-            })?;
+            let model = pg_decode_model_from_row::<T>(&row)?;
             results.push(model);
         }
         Ok(results)
@@ -3864,7 +3956,7 @@ impl<
     R3: Model + 'static + Send,
 > std::future::IntoFuture for FourTableCollectFuture<'a, T, R1, R2, R3>
 {
-    type Output = anyhow::Result<Vec<T>>;
+    type Output = crate::Result<Vec<T>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3873,31 +3965,31 @@ impl<
     }
 }
 
+impl_backend_join_executor_methods_with_lifetime!(
+    LeftJoinedSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    LeftJoinedSelect
+);
+impl_backend_join_executor_methods_with_lifetime!(
+    InnerJoinedSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    InnerJoinedSelect
+);
+impl_backend_join_executor_methods_with_lifetime!(
+    RightJoinedSelectExecutor,
+    client,
+    &'a tokio_postgres::Client,
+    RightJoinedSelect
+);
+
 /// LeftJoinedSelectExecutor 实现
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
     /// 克隆executor（保持相同的client引用）
     pub fn clone_with_client(&self) -> Self {
         Self {
             select: self.select.clone(),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
             client: self.client,
             _marker: PhantomData,
         }
@@ -3922,7 +4014,7 @@ pub struct LeftJoinCollectFuture<'a, T: Model, J: Model> {
 impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for LeftJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(T, Option<J>)>>;
+    type Output = crate::Result<Vec<(T, Option<J>)>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -3932,16 +4024,10 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 }
 
 impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3989,25 +4075,6 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn collect<C: FromIterator<(T, J)> + 'static>(&self) -> InnerJoinCollectFuture<'a, T, J> {
         InnerJoinCollectFuture {
             executor: self.clone_with_client(),
@@ -4025,7 +4092,7 @@ pub struct InnerJoinCollectFuture<'a, T: Model, J: Model> {
 impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for InnerJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(T, J)>>;
+    type Output = crate::Result<Vec<(T, J)>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -4035,16 +4102,10 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 }
 
 impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(T, J)>>(self) -> crate::Result<C> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -4083,25 +4144,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         }
     }
 
-    pub fn filter<F>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> WhereExpr,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-        Self {
-            select: self.select.range(range),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
     pub fn collect<C: FromIterator<(Option<T>, J)> + 'static>(
         &self,
     ) -> RightJoinCollectFuture<'a, T, J> {
@@ -4127,7 +4169,7 @@ pub struct GroupedCollectFuture<'a, T: Model, V, C> {
 impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
-    type Output = anyhow::Result<Vec<(Option<T>, J)>>;
+    type Output = crate::Result<Vec<(Option<T>, J)>>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -4137,16 +4179,10 @@ impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::Into
 }
 
 impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
-    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> anyhow::Result<C> {
+    async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> crate::Result<C> {
         let param_rust_types = self.select.param_rust_types();
         let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
-        let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
-        let pg_params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-            .iter()
-            .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-
-        let rows = self.client.query(&sql, &pg_params_refs).trace().await?;
+        let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -4187,7 +4223,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 fn convert_postgres_value(
     row: &tokio_postgres::Row,
     index: usize,
-) -> anyhow::Result<crate::model::Value> {
+) -> crate::Result<crate::model::Value> {
     use tokio_postgres::types::Type;
 
     let col_type = row.columns()[index].type_();
@@ -4320,10 +4356,26 @@ fn convert_postgres_value(
                 });
             }
         }
+        Type::DATE => {
+            if let Ok(v) = row.try_get::<_, Option<chrono::NaiveDate>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Date(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
+        Type::TIME => {
+            if let Ok(v) = row.try_get::<_, Option<chrono::NaiveTime>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Time(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         _ => {}
     }
 
-    Err(anyhow::anyhow!(format!(
+    Err(crate::ormer_error!(format!(
         "Unsupported column type {:?} at index {}",
         col_type, index
     )))
@@ -4391,7 +4443,7 @@ impl<
     C: FromIterator<V> + 'static,
 > std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
 {
-    type Output = anyhow::Result<C>;
+    type Output = crate::Result<C>;
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -4444,6 +4496,12 @@ impl<
                     crate::model::Value::DateTime(dt) => {
                         Box::new(dt) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::Date(date) => {
+                        Box::new(date) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::Time(time) => {
+                        Box::new(time) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::Json(j) => Box::new(j.to_string())
                         as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
                     crate::model::Value::Uuid(u) => Box::new(u.to_string())
@@ -4465,10 +4523,7 @@ impl<
                 })
                 .collect();
 
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = pg_params
-                .iter()
-                .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-                .collect();
+            let param_refs = pg_param_refs(&pg_params);
 
             let rows = self
                 .executor
@@ -4480,9 +4535,7 @@ impl<
             let mut results = Vec::new();
             let column_count = self.executor.select.column_count();
             for row in rows {
-                let v = common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
-                    convert_postgres_value(&row, i)
-                })?;
+                let v = pg_decode_row_values_from_row(&row, column_count)?;
                 results.push(v);
             }
 

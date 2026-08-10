@@ -16,32 +16,13 @@ async fn test_count_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggCountUser>().execute().await;
-    db.create_table::<TestAggCountUser>().execute().await?;
-
-    db.insert(&TestAggCountUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggCountUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggCountUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggCountUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggCountUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let count: usize = db.select::<TestAggCountUser>().count(|p| p.id).await?;
@@ -49,7 +30,7 @@ async fn test_count_aggregate_impl(
 
     assert_eq!(count, 3);
 
-    let _ = db.drop_table::<TestAggCountUser>().execute().await;
+    _test_common::clean_table::<TestAggCountUser>(&db).await?;
 
     Ok(())
 }
@@ -60,32 +41,13 @@ async fn test_sum_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggSumUser>().execute().await;
-    db.create_table::<TestAggSumUser>().execute().await?;
-
-    db.insert(&TestAggSumUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggSumUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggSumUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggSumUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggSumUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let sum: Option<i32> = db.select::<TestAggSumUser>().sum(|p| p.age).await?;
@@ -93,7 +55,7 @@ async fn test_sum_aggregate_impl(
 
     assert_eq!(sum, Some(67)); // 20 + 25 + 22
 
-    db.drop_table::<TestAggSumUser>().execute().await?;
+    _test_common::clean_table::<TestAggSumUser>(&db).await?;
 
     Ok(())
 }
@@ -104,32 +66,13 @@ async fn test_avg_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggAvgUser>().execute().await;
-    db.create_table::<TestAggAvgUser>().execute().await?;
-
-    db.insert(&TestAggAvgUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggAvgUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggAvgUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggAvgUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggAvgUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let avg: Option<f64> = db.select::<TestAggAvgUser>().avg(|p| p.score).await?;
@@ -137,7 +80,7 @@ async fn test_avg_aggregate_impl(
 
     assert!((avg.unwrap() - 85.0).abs() < 0.01);
 
-    db.drop_table::<TestAggAvgUser>().execute().await?;
+    _test_common::clean_table::<TestAggAvgUser>(&db).await?;
 
     Ok(())
 }
@@ -148,32 +91,13 @@ async fn test_max_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggMaxUser>().execute().await;
-    db.create_table::<TestAggMaxUser>().execute().await?;
-
-    db.insert(&TestAggMaxUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggMaxUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggMaxUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggMaxUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggMaxUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let max: Option<i32> = db.select::<TestAggMaxUser>().max(|p| p.age).await?;
@@ -181,7 +105,7 @@ async fn test_max_aggregate_impl(
 
     assert_eq!(max, Some(25));
 
-    db.drop_table::<TestAggMaxUser>().execute().await?;
+    _test_common::clean_table::<TestAggMaxUser>(&db).await?;
 
     Ok(())
 }
@@ -192,32 +116,13 @@ async fn test_min_aggregate_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggMinUser>().execute().await;
-    db.create_table::<TestAggMinUser>().execute().await?;
-
-    db.insert(&TestAggMinUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggMinUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggMinUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggMinUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggMinUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let min: Option<i32> = db.select::<TestAggMinUser>().min(|p| p.age).await?;
@@ -225,7 +130,7 @@ async fn test_min_aggregate_impl(
 
     assert_eq!(min, Some(20));
 
-    db.drop_table::<TestAggMinUser>().execute().await?;
+    _test_common::clean_table::<TestAggMinUser>(&db).await?;
 
     Ok(())
 }
@@ -236,32 +141,13 @@ async fn test_aggregate_with_filter_impl(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let db = _test_common::create_db_connection(config).await?;
 
-    let _ = db.drop_table::<TestAggFilterUser>().execute().await;
-    db.create_table::<TestAggFilterUser>().execute().await?;
-
-    db.insert(&TestAggFilterUser {
-        id: 1,
-        name: "Alice".to_string(),
-        age: 20,
-        score: 85,
+    _test_common::prepare_table::<TestAggFilterUser>(&db).await?;
+    _test_common::seed_score_users(&db, |id, name, age, score| TestAggFilterUser {
+        id,
+        name: name.to_string(),
+        age,
+        score,
     })
-    .execute()
-    .await?;
-    db.insert(&TestAggFilterUser {
-        id: 2,
-        name: "Bob".to_string(),
-        age: 25,
-        score: 92,
-    })
-    .execute()
-    .await?;
-    db.insert(&TestAggFilterUser {
-        id: 3,
-        name: "Charlie".to_string(),
-        age: 22,
-        score: 78,
-    })
-    .execute()
     .await?;
 
     let count: usize = db
@@ -282,7 +168,7 @@ async fn test_aggregate_with_filter_impl(
 
     assert_eq!(max, Some(92));
 
-    db.drop_table::<TestAggFilterUser>().execute().await?;
+    _test_common::clean_table::<TestAggFilterUser>(&db).await?;
 
     Ok(())
 }

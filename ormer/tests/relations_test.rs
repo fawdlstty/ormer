@@ -25,7 +25,7 @@ struct RelationPost {
 }
 
 #[tokio::test]
-async fn relations_support_metadata_find_related_preload_and_include() -> anyhow::Result<()> {
+async fn relations_support_metadata_find_related_preload_and_include() -> ormer::Result<()> {
     assert_eq!(RelationUser::COLUMNS, &["id", "name"]);
     assert_eq!(RelationPost::COLUMNS, &["id", "user_id", "title"]);
     assert_eq!(RelationUser::RELATIONS[0].kind, RelationKind::HasMany);

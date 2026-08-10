@@ -1,6 +1,7 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers::placeholder;
 use crate::model::{Value, quote_column_reference};
+use crate::query::expr::SqlExpr;
 use crate::query::filter::FilterExpr;
 
 /// 通用的 WHERE 条件格式化器
@@ -125,110 +126,35 @@ impl FilterFormatter {
                 .unwrap_or_else(|e| panic!("Failed to write column comparison SQL: {}", e));
             }
             FilterExpr::In { column, values } => {
-                // 生成 IN 语句: column IN (?, ?, ...)
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
-
-                use std::fmt::Write;
-                write!(
-                    sql,
-                    "{} IN (",
-                    quote_column_reference(self.db_type, &col_name)
-                )
-                .unwrap_or_else(|e| panic!("Failed to write IN clause: {}", e));
-                for (i, value) in values.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
-                        .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
-                    params.push(value.clone().into());
-                    *param_idx += 1;
-                }
-                sql.push(')');
+                self.format_column_values_clause(sql, column, "IN", values, param_idx, params);
             }
             FilterExpr::NotIn { column, values } => {
-                // 生成 NOT IN 语句: column NOT IN (?, ?, ...)
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
-
-                use std::fmt::Write;
-                write!(
-                    sql,
-                    "{} NOT IN (",
-                    quote_column_reference(self.db_type, &col_name)
-                )
-                .unwrap_or_else(|e| panic!("Failed to write NOT IN clause: {}", e));
-                for (i, value) in values.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(", ");
-                    }
-                    write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
-                        .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
-                    params.push(value.clone().into());
-                    *param_idx += 1;
-                }
-                sql.push(')');
+                self.format_column_values_clause(sql, column, "NOT IN", values, param_idx, params);
             }
             FilterExpr::InSubquery {
                 column,
                 subquery_sql,
                 subquery_params,
             } => {
-                // 生成子查询 IN 语句: column IN (SELECT ...)
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
-
                 use std::fmt::Write;
-                write!(
-                    sql,
-                    "{} IN ({})",
-                    quote_column_reference(self.db_type, &col_name),
-                    subquery_sql
-                )
-                .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
-
-                // 添加子查询的参数
-                for param in subquery_params {
-                    params.push(param.clone());
-                    *param_idx += 1;
-                }
+                write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
+                self.append_subquery_params(subquery_params, param_idx, params);
             }
             FilterExpr::NotInSubquery {
                 column,
                 subquery_sql,
                 subquery_params,
             } => {
-                // 生成子查询 NOT IN 语句: column NOT IN (SELECT ...)
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
-
                 use std::fmt::Write;
                 write!(
                     sql,
                     "{} NOT IN ({})",
-                    quote_column_reference(self.db_type, &col_name),
+                    self.quoted_column(column),
                     subquery_sql
                 )
                 .unwrap_or_else(|e| panic!("Failed to write subquery NOT IN clause: {}", e));
-
-                // 添加子查询的参数
-                for param in subquery_params {
-                    params.push(param.clone());
-                    *param_idx += 1;
-                }
+                self.append_subquery_params(subquery_params, param_idx, params);
             }
             FilterExpr::And(left, right) => {
                 self.format_recursive(left, sql, param_idx, params);
@@ -241,32 +167,14 @@ impl FilterFormatter {
                 self.format_recursive(right, sql, param_idx, params);
             }
             FilterExpr::IsNull { column } => {
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
                 use std::fmt::Write;
-                write!(
-                    sql,
-                    "{} IS NULL",
-                    quote_column_reference(self.db_type, &col_name)
-                )
-                .unwrap_or_else(|e| panic!("Failed to write IS NULL clause: {}", e));
+                write!(sql, "{} IS NULL", self.quoted_column(column))
+                    .unwrap_or_else(|e| panic!("Failed to write IS NULL clause: {}", e));
             }
             FilterExpr::IsNotNull { column } => {
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
                 use std::fmt::Write;
-                write!(
-                    sql,
-                    "{} IS NOT NULL",
-                    quote_column_reference(self.db_type, &col_name)
-                )
-                .unwrap_or_else(|e| panic!("Failed to write IS NOT NULL clause: {}", e));
+                write!(sql, "{} IS NOT NULL", self.quoted_column(column))
+                    .unwrap_or_else(|e| panic!("Failed to write IS NOT NULL clause: {}", e));
             }
             FilterExpr::Between { column, min, max } => {
                 let col_name = if let Some(ref prefix) = self.table_prefix {
@@ -297,10 +205,7 @@ impl FilterFormatter {
                 use std::fmt::Write;
                 write!(sql, "EXISTS ({})", subquery_sql)
                     .unwrap_or_else(|e| panic!("Failed to write EXISTS clause: {}", e));
-                for param in subquery_params {
-                    params.push(param.clone());
-                    *param_idx += 1;
-                }
+                self.append_subquery_params(subquery_params, param_idx, params);
             }
             FilterExpr::NotExists {
                 subquery_sql,
@@ -309,11 +214,193 @@ impl FilterFormatter {
                 use std::fmt::Write;
                 write!(sql, "NOT EXISTS ({})", subquery_sql)
                     .unwrap_or_else(|e| panic!("Failed to write NOT EXISTS clause: {}", e));
-                for param in subquery_params {
-                    params.push(param.clone());
-                    *param_idx += 1;
-                }
+                self.append_subquery_params(subquery_params, param_idx, params);
             }
+            FilterExpr::ExprComparison {
+                left,
+                operator,
+                right,
+            } => {
+                use std::fmt::Write;
+                let left_sql = left.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                let right_sql = right.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                write!(sql, "{} {} {}", left_sql, operator, right_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write expression comparison: {}", e));
+            }
+            FilterExpr::ExprIn { expr, values } => {
+                self.format_expr_in(expr, values, false, sql, param_idx, params);
+            }
+            FilterExpr::ExprNotIn { expr, values } => {
+                self.format_expr_in(expr, values, true, sql, param_idx, params);
+            }
+            FilterExpr::ExprBetween { expr, min, max } => {
+                use std::fmt::Write;
+                let expr_sql = expr.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                let min_sql = min.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                let max_sql = max.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                write!(sql, "{} BETWEEN {} AND {}", expr_sql, min_sql, max_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write expression BETWEEN clause: {}", e));
+            }
+            FilterExpr::ExprIsNull { expr } => {
+                let expr_sql = expr.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                sql.push_str(&expr_sql);
+                sql.push_str(" IS NULL");
+            }
+            FilterExpr::ExprIsNotNull { expr } => {
+                let expr_sql = expr.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                sql.push_str(&expr_sql);
+                sql.push_str(" IS NOT NULL");
+            }
+            FilterExpr::TextSearch { expr, query } => {
+                use std::fmt::Write;
+                let expr_sql = expr.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                let query_value = crate::model::Value::Text(query.clone());
+                let query_sql = crate::query::expr::SqlExpr::Value(query_value).to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                let sql_fragment = match self.db_type {
+                    #[cfg(feature = "postgresql")]
+                    crate::DbType::PostgreSQL => format!(
+                        "to_tsvector('simple', {}) @@ plainto_tsquery('simple', {})",
+                        expr_sql, query_sql
+                    ),
+                    #[cfg(feature = "mysql")]
+                    crate::DbType::MySQL => {
+                        format!("MATCH({}) AGAINST ({})", expr_sql, query_sql)
+                    }
+                    #[cfg(feature = "sqlite")]
+                    crate::DbType::Sqlite => format!("{} MATCH {}", expr_sql, query_sql),
+                    #[cfg(feature = "mssql")]
+                    crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
+                };
+                write!(sql, "{sql_fragment}")
+                    .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));
+            }
+        }
+    }
+
+    fn format_expr_in(
+        &self,
+        expr: &SqlExpr,
+        values: &[SqlExpr],
+        negated: bool,
+        sql: &mut String,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        let expr_sql = expr.to_sql(
+            self.db_type,
+            param_idx,
+            params,
+            self.table_prefix.as_deref(),
+        );
+        use std::fmt::Write;
+        write!(
+            sql,
+            "{} {} (",
+            expr_sql,
+            if negated { "NOT IN" } else { "IN" }
+        )
+        .unwrap_or_else(|e| panic!("Failed to write expression IN clause: {}", e));
+        for (idx, value) in values.iter().enumerate() {
+            if idx > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&value.to_sql(
+                self.db_type,
+                param_idx,
+                params,
+                self.table_prefix.as_deref(),
+            ));
+        }
+        sql.push(')');
+    }
+
+    fn quoted_column(&self, column: &str) -> String {
+        let col_name = if let Some(ref prefix) = self.table_prefix {
+            format!("{}.{}", prefix, column)
+        } else {
+            column.to_owned()
+        };
+        quote_column_reference(self.db_type, &col_name)
+    }
+
+    fn format_column_values_clause(
+        &self,
+        sql: &mut String,
+        column: &str,
+        keyword: &str,
+        values: &[crate::query::filter::Value],
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        use std::fmt::Write;
+        write!(sql, "{} {} (", self.quoted_column(column), keyword)
+            .unwrap_or_else(|e| panic!("Failed to write {} clause: {}", keyword, e));
+        for (i, value) in values.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
+                .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
+            params.push(value.clone().into());
+            *param_idx += 1;
+        }
+        sql.push(')');
+    }
+
+    fn append_subquery_params(
+        &self,
+        subquery_params: &[Value],
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        for param in subquery_params {
+            params.push(param.clone());
+            *param_idx += 1;
         }
     }
 

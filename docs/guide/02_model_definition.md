@@ -117,7 +117,7 @@ struct User {
 }
 ```
 
-`insert(&model)` 仍会显式写入模型的全部字段；数据库默认值只会在 INSERT 省略列时生效。
+`insert(&model)` 仍会显式写入模型的全部字段；数据库默认值只会在 INSERT 省略列时生效，可用 `insert_partial` 或 `insert_model` 省略列。
 
 ## 支持的类型
 
@@ -129,6 +129,10 @@ struct User {
 | `String` | TEXT | TEXT | TEXT | NVARCHAR(255) |
 | `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN | BIT |
 | `Vec<u8>` | BLOB | BYTEA | BLOB | VARBINARY(MAX) |
+| `chrono::DateTime<chrono::Utc>` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
+| `chrono::NaiveDateTime` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
+| `chrono::NaiveDate` | TEXT | DATE | DATE | DATE |
+| `chrono::NaiveTime` | TEXT | TIME | TIME | TIME |
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
 

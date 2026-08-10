@@ -139,6 +139,7 @@ db.insert(&[user1, user2]).execute().await?;
 
 // 插入或更新
 db.insert_or_update(&user).execute().await?;
+db.upsert(&user).execute().await?;
 ```
 
 ### 查询数据
@@ -169,7 +170,7 @@ let page: Vec<User> = db
 let count = db
     .update::<User>()
     .filter(|u| u.age.ge(18))
-    .set(|u| u.name, "Adult".to_string())
+    .set(|u| u.name = u.name.set("Adult".to_string()))
     .execute()
     .await?;
 

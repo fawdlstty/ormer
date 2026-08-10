@@ -19,12 +19,13 @@ mod unified;
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
     DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
-    IncludedSelectExecutor, InsertExecutor, InsertOrUpdateExecutor, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
-    SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor,
+    IncludedSelectExecutor, InsertExecutor, InsertOrUpdateExecutor, InsertPartialExecutor,
+    LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
+    ModelCollectWithFuture, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    RelatedSelectExecutor, SelectExecutor, SelectStream, SelectStreamIterator, Transaction,
+    TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
@@ -78,11 +79,11 @@ impl SqlStatement {
 pub trait SqlExecutor: Sized {
     type Output;
 
-    fn to_sql(&self) -> anyhow::Result<SqlStatement>;
+    fn to_sql(&self) -> crate::Result<SqlStatement>;
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> anyhow::Result<Self::Output>;
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output>;
 
-    async fn execute(self) -> anyhow::Result<Self::Output> {
+    async fn execute(self) -> crate::Result<Self::Output> {
         let sql = self.to_sql()?;
         self.execute_with_sql(sql).await
     }

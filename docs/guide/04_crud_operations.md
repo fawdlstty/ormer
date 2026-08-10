@@ -37,6 +37,41 @@ db.insert(&[user1, user2])
     .await?;
 ```
 
+### 部分插入和表单模型
+
+`insert_partial::<User>()` 只写入通过 `set` 指定的列；`default` 表示 INSERT 时省略该列以使用数据库默认值：
+
+```rust
+db.insert_partial::<User>()
+    .set(|u| u.name.set("Alice"))
+    .set(|u| (u.email, Some("alice@example.com".to_string())))
+    .default(|u| u.created_at)
+    .execute()
+    .await?;
+```
+
+表单结构可派生 `InsertModel`，用 `insert_model::<User>(&value)` 插入。`ActiveValue::not_set()` 会省略列，`set(value)` 和 `unchanged(value)` 会写入该值：
+
+```rust
+#[derive(ormer::InsertModel)]
+#[table = "users"]
+struct NewUser {
+    name: String,
+    email: Option<String>,
+    created_at: ormer::ActiveValue<chrono::NaiveDateTime>,
+}
+
+let new_user = NewUser {
+    name: "Bob".to_string(),
+    email: None,
+    created_at: ormer::ActiveValue::not_set(),
+};
+
+db.insert_model::<User>(&new_user)
+    .execute()
+    .await?;
+```
+
 ### 插入或更新
 
 ```rust
@@ -48,6 +83,58 @@ db.insert_or_update(&vec![user1, user2])
     .execute()
     .await?;
 ```
+
+`upsert` 是 `insert_or_update` 的短别名，仍按主键处理冲突：
+
+```rust
+db.upsert(&user).execute().await?;
+```
+
+### 可配置插入冲突
+
+在 `insert()` 上指定唯一键冲突目标、更新字段和更新条件：
+
+```rust
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .do_update_if(|u| u.active.eq(true))
+    .set(|u| u.name = u.name.incoming())
+    .execute()
+    .await?;
+
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .do_nothing()
+    .execute()
+    .await?;
+
+db.insert(&membership)
+    .on_conflict(|m| (m.org_id, m.user_id))
+    .do_update()
+    .set(|m| m.role = m.role.incoming())
+    .execute()
+    .await?;
+
+db.insert(&user)
+    .on_conflict(|u| u.email)
+    .conflict_where(|u| u.deleted_at.is_null())
+    .do_update()
+    .set(|u| u.name = u.name.incoming())
+    .execute()
+    .await?;
+```
+
+PostgreSQL 可使用命名约束：
+
+```rust
+db.insert(&user)
+    .on_constraint("users_email_key")
+    .do_nothing()
+    .execute()
+    .await?;
+```
+
+MySQL 会映射到 `ON DUPLICATE KEY UPDATE` 或 `INSERT IGNORE`，不能指定具体唯一键、部分索引或 `DO UPDATE WHERE`。
 
 ### 插入或忽略
 
@@ -111,14 +198,20 @@ txn.commit().await?;
 let count = db
     .update::<User>()
     .filter(|u| u.age.ge(18))
-    .set(|u| u.name, "Adult".to_string())
+    .set(|u| u.name = u.name.set("Adult".to_string()))
     .execute()
     .await?;
 
 db.update::<User>()
     .filter(|u| u.id.eq(1))
-    .set(|u| u.name, "New Name".to_string())
-    .set(|u| u.age, 26)
+    .set(|u| u.name = u.name.set("New Name".to_string()))
+    .set(|u| u.age = u.age.set(26))
+    .execute()
+    .await?;
+
+db.update::<User>()
+    .filter(|u| u.id.eq(1))
+    .set(|u| u.age += 1)
     .execute()
     .await?;
 
@@ -238,7 +331,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     db.update::<User>()
         .filter(|u| u.id.eq(1))
-        .set(|u| u.age, 26)
+        .set(|u| u.age = u.age.set(26))
         .execute()
         .await?;
     

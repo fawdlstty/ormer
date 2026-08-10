@@ -36,13 +36,13 @@ struct HookTestUser {
 
 #[async_trait::async_trait]
 impl BeforeInsert for HookTestUser {
-    async fn before_insert(&mut self, ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn before_insert(&mut self, ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         BEFORE_INSERT_COUNT.fetch_add(1, Ordering::SeqCst);
         if ctx.in_transaction() {
             TRANSACTION_INSERT_COUNT.fetch_add(1, Ordering::SeqCst);
         }
         if self.email == "reject@example.com" {
-            return Err(anyhow::anyhow!("email rejected by hook"));
+            return Err(ormer::ormer_error!("email rejected by hook"));
         }
         Ok(())
     }
@@ -50,7 +50,7 @@ impl BeforeInsert for HookTestUser {
 
 #[async_trait::async_trait]
 impl AfterInsert for HookTestUser {
-    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn after_insert(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         AFTER_INSERT_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -58,7 +58,7 @@ impl AfterInsert for HookTestUser {
 
 #[async_trait::async_trait]
 impl BeforeUpdate for HookTestUser {
-    async fn before_update(&mut self, ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn before_update(&mut self, ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         BEFORE_UPDATE_COUNT.fetch_add(1, Ordering::SeqCst);
         if let Some(index) = ctx.batch_index() {
             UPDATE_BATCH_INDEX_SUM.fetch_add(index, Ordering::SeqCst);
@@ -69,7 +69,7 @@ impl BeforeUpdate for HookTestUser {
 
 #[async_trait::async_trait]
 impl AfterUpdate for HookTestUser {
-    async fn after_update(&self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn after_update(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         AFTER_UPDATE_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -77,7 +77,7 @@ impl AfterUpdate for HookTestUser {
 
 #[async_trait::async_trait]
 impl BeforeDelete for HookTestUser {
-    async fn before_delete(&self, ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn before_delete(&self, ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         BEFORE_DELETE_COUNT.fetch_add(1, Ordering::SeqCst);
         if let Some(index) = ctx.batch_index() {
             DELETE_BATCH_INDEX_SUM.fetch_add(index, Ordering::SeqCst);
@@ -88,7 +88,7 @@ impl BeforeDelete for HookTestUser {
 
 #[async_trait::async_trait]
 impl AfterDelete for HookTestUser {
-    async fn after_delete(&self, _ctx: &mut HookContext<'_>) -> anyhow::Result<()> {
+    async fn after_delete(&self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         AFTER_DELETE_COUNT.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -107,7 +107,7 @@ fn reset_counters() {
 }
 
 #[tokio::test]
-async fn test_hooks_trait_definition() -> anyhow::Result<()> {
+async fn test_hooks_trait_definition() -> ormer::Result<()> {
     let _guard = HOOKS_TEST_MUTEX.lock().await;
     reset_counters();
 
@@ -262,7 +262,7 @@ async fn test_hooks_with_batch_update_and_delete_executors() {
     let updated = db
         .update::<HookTestUser>()
         .filter(|fields| fields.id.gt(0))
-        .set(|fields| fields.name, "Batch Updated".to_string())
+        .set(|fields| fields.name = fields.name.set("Batch Updated".to_string()))
         .execute_models_with_hooks(&mut users)
         .await
         .unwrap();

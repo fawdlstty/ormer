@@ -1,6 +1,265 @@
 /// 宏定义 - 用于减少重复代码
 ///
 /// 本文件包含用于生成重复代码模式的宏
+/// 为 Insert Executor 生成通用的 conflict 配置方法
+#[macro_export]
+macro_rules! impl_insert_conflict_methods {
+    ($executor_type:ident $(, $with_conflict:ident)?) => {
+        impl<'a, I: $crate::model::Insertable> $executor_type<'a, I> {
+            fn conflict_mut(&mut self) -> &mut $crate::query::insert::InsertConflict {
+                self.conflict
+                    .get_or_insert_with($crate::query::insert::InsertConflict::default)
+            }
+
+            $(
+                pub(crate) fn $with_conflict(
+                    mut self,
+                    conflict: Option<$crate::query::insert::InsertConflict>,
+                ) -> Self {
+                    self.conflict = conflict;
+                    self
+                }
+            )?
+
+            pub fn on_conflict<F, C>(mut self, f: F) -> Self
+            where
+                F: FnOnce(<I::Model as $crate::Model>::Where) -> C,
+                C: $crate::query::insert::ConflictColumns,
+            {
+                self.conflict_mut().target = Some(
+                    $crate::query::insert::InsertConflictTarget::Columns(
+                        f(<I::Model as $crate::Model>::Where::default()).conflict_columns(),
+                    ),
+                );
+                self
+            }
+
+            pub fn on_constraint<Target>(mut self, target: Target) -> Self
+            where
+                Target: $crate::query::insert::IntoInsertConflictTarget<I::Model>,
+            {
+                self.conflict_mut().target = Some(target.into_insert_conflict_target());
+                self
+            }
+
+            pub fn conflict_where<F>(mut self, f: F) -> Self
+            where
+                F: FnOnce(<I::Model as $crate::Model>::Where) -> $crate::WhereExpr,
+            {
+                self.conflict_mut().target_filter =
+                    Some($crate::query::insert::where_expr_to_filter(f(
+                        <I::Model as $crate::Model>::Where::default(),
+                    )));
+                self
+            }
+
+            pub fn do_nothing(mut self) -> Self {
+                self.conflict_mut().action =
+                    Some($crate::query::insert::InsertConflictAction::DoNothing);
+                self
+            }
+
+            pub fn do_update(mut self) -> Self {
+                self.conflict_mut().action =
+                    Some($crate::query::insert::InsertConflictAction::DoUpdate);
+                self
+            }
+
+            pub fn do_update_if<F>(mut self, f: F) -> Self
+            where
+                F: FnOnce(<I::Model as $crate::Model>::Where) -> $crate::WhereExpr,
+            {
+                let conflict = self.conflict_mut();
+                conflict.action = Some($crate::query::insert::InsertConflictAction::DoUpdate);
+                conflict.update_filter =
+                    Some($crate::query::insert::where_expr_to_filter(f(
+                        <I::Model as $crate::Model>::Where::default(),
+                    )));
+                self
+            }
+
+            pub fn set<F>(mut self, f: F) -> Self
+            where
+                F: FnOnce(&mut <I::Model as $crate::Model>::Update),
+            {
+                let mut update = <I::Model as $crate::Model>::Update::default();
+                f(&mut update);
+                let conflict = self.conflict_mut();
+                conflict
+                    .action
+                    .get_or_insert($crate::query::insert::InsertConflictAction::DoUpdate);
+                conflict.assignments.extend(
+                    <<I::Model as $crate::Model>::Update as $crate::query::update::UpdateFields>::assignments(
+                        &update,
+                    ),
+                );
+                self
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_backend_select_methods {
+    ($conn_field:ident) => {
+        pub fn filter<F>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn order_by<F, O>(self, f: F) -> Self
+        where
+            F: FnOnce(<T as $crate::Model>::Where) -> O,
+            O: Into<$crate::OrderBy>,
+        {
+            Self {
+                select: self.select.order_by(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn order_by_desc<F, O>(self, f: F) -> Self
+        where
+            F: FnOnce(<T as $crate::Model>::Where) -> O,
+            O: Into<$crate::OrderBy>,
+        {
+            Self {
+                select: self.select.order_by_desc(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+            Self {
+                select: self.select.range(range),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+
+    ($conn_field:ident, distinct) => {
+        $crate::__ormer_backend_select_methods!($conn_field);
+
+        pub fn distinct(self) -> Self {
+            Self {
+                select: self.select.distinct(),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_backend_join_methods {
+    ($conn_field:ident) => {
+        pub fn filter<F>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+            Self {
+                select: self.select.range(range),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_backend_related_methods {
+    ($conn_field:ident) => {
+        pub fn filter<F>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+            Self {
+                select: self.select.range(range),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_backend_multi_table_methods {
+    ($conn_field:ident) => {
+        pub fn filter<F>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where, R1::Where, R2::Where) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+            Self {
+                select: self.select.range(range),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_backend_four_table_methods {
+    ($conn_field:ident) => {
+        pub fn filter<F>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
+            Self {
+                select: self.select.range(range),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+    };
+}
+
 /// 为 JOIN Executor 生成通用的 filter/range 方法
 #[macro_export]
 macro_rules! impl_join_executor_methods {
@@ -10,24 +269,7 @@ macro_rules! impl_join_executor_methods {
         $conn_type:ty
     ) => {
         impl<T: $crate::Model, J: $crate::Model> $executor_type<T, J> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_join_methods!($conn_field);
         }
     };
 }
@@ -87,48 +329,7 @@ macro_rules! impl_executor_methods {
         $conn_type:ty
     ) => {
         impl<'a, T: $crate::Model> $executor_type<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by_desc<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by_desc(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_select_methods!($conn_field);
         }
     };
 }
@@ -264,7 +465,7 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
-            pub fn to_sql(&self) -> anyhow::Result<$crate::SqlStatement> {
+            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.to_sql(),
@@ -277,7 +478,7 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
-            pub async fn execute(self) -> anyhow::Result<u64> {
+            pub async fn execute(self) -> crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -295,7 +496,7 @@ macro_rules! impl_unified_delete_executor {
             /// `AfterDelete` runs only when the statement affects at least one
             /// row. The supplied model is the hook subject; filters remain
             /// fully controlled by the executor.
-            pub async fn execute_with_hooks(self, model: &T) -> anyhow::Result<u64>
+            pub async fn execute_with_hooks(self, model: &T) -> crate::Result<u64>
             where
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
@@ -309,7 +510,7 @@ macro_rules! impl_unified_delete_executor {
             }
 
             /// Execute the configured delete with per-model hooks.
-            pub async fn execute_models_with_hooks(self, models: &[T]) -> anyhow::Result<u64>
+            pub async fn execute_models_with_hooks(self, models: &[T]) -> crate::Result<u64>
             where
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
@@ -330,7 +531,7 @@ macro_rules! impl_unified_delete_executor {
                 Ok(affected)
             }
 
-            pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+            pub async fn returning(self) -> crate::Result<Vec<T>> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.returning().await,
@@ -345,7 +546,7 @@ macro_rules! impl_unified_delete_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = anyhow::Result<u64>;
+            type Output = crate::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -379,24 +580,21 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
-            pub fn set<F, V, C>(self, field_fn: F, value: V) -> Self
+            pub fn set<F>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where) -> $crate::query::builder::TypedColumn<C>,
-                V: Into<$crate::model::Value>,
+                F: FnOnce(&mut T::Update),
             {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, phantom) => {
-                        $executor_name::Sqlite(exec.set(field_fn, value), phantom)
+                        $executor_name::Sqlite(exec.set(f), phantom)
                     }
                     #[cfg(feature = "postgresql")]
-                    $executor_name::PostgreSQL(exec) => {
-                        $executor_name::PostgreSQL(exec.set(field_fn, value))
-                    }
+                    $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.set(f)),
                     #[cfg(feature = "mysql")]
-                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(field_fn, value)),
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(f)),
                     #[cfg(feature = "mssql")]
-                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(field_fn, value)),
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(f)),
                 }
             }
 
@@ -479,7 +677,7 @@ macro_rules! impl_unified_update_executor {
                 result
             }
 
-            pub fn to_sql(&self) -> anyhow::Result<$crate::SqlStatement> {
+            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.to_sql(),
@@ -492,7 +690,7 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
-            pub async fn execute(self) -> anyhow::Result<u64> {
+            pub async fn execute(self) -> crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -510,7 +708,7 @@ macro_rules! impl_unified_update_executor {
             /// The model supplied here is also the model observed by hooks;
             /// use `set_model(model)` when the update should be derived from
             /// that model's values.
-            pub async fn execute_with_hooks(self, model: &mut T) -> anyhow::Result<u64>
+            pub async fn execute_with_hooks(self, model: &mut T) -> crate::Result<u64>
             where
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
@@ -524,7 +722,7 @@ macro_rules! impl_unified_update_executor {
             }
 
             /// Execute the configured update with per-model hooks.
-            pub async fn execute_models_with_hooks(self, models: &mut [T]) -> anyhow::Result<u64>
+            pub async fn execute_models_with_hooks(self, models: &mut [T]) -> crate::Result<u64>
             where
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
@@ -545,7 +743,7 @@ macro_rules! impl_unified_update_executor {
                 Ok(affected)
             }
 
-            pub async fn returning(self) -> anyhow::Result<Vec<T>> {
+            pub async fn returning(self) -> crate::Result<Vec<T>> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.returning().await,
@@ -560,7 +758,7 @@ macro_rules! impl_unified_update_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = anyhow::Result<u64>;
+            type Output = crate::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -581,7 +779,7 @@ macro_rules! impl_unified_collect_future {
             C: FromIterator<T> + 'static,
         > std::future::IntoFuture for $future_name<'a, T, C>
         {
-            type Output = anyhow::Result<C>;
+            type Output = crate::Result<C>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -611,7 +809,7 @@ macro_rules! impl_unified_aggregate_future {
             R: $crate::model::FromValue + 'static + std::marker::Send,
         > std::future::IntoFuture for $future_name<'a, T, R>
         {
-            type Output = anyhow::Result<R>;
+            type Output = crate::Result<R>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -784,7 +982,7 @@ macro_rules! impl_unified_related_collect_future {
         where
             Self: 'a,
         {
-            type Output = anyhow::Result<Vec<T>>;
+            type Output = crate::Result<Vec<T>>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -815,57 +1013,7 @@ macro_rules! impl_backend_executor_methods {
         $select_type:ident
     ) => {
         impl<'a, T: $crate::Model> $executor_type<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by_desc<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by_desc(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            /// 启用 DISTINCT 去重
-            pub fn distinct(self) -> Self {
-                Self {
-                    select: self.select.distinct(),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_select_methods!($conn_field, distinct);
         }
     };
 }
@@ -880,24 +1028,7 @@ macro_rules! impl_backend_join_executor_methods {
         $select_type:ident
     ) => {
         impl<T: $crate::Model, J: $crate::Model> $executor_type<T, J> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_join_methods!($conn_field);
         }
     };
 }
@@ -912,24 +1043,7 @@ macro_rules! impl_backend_related_executor_methods {
         $select_type:ident
     ) => {
         impl<T: $crate::Model, R: $crate::Model> $executor_type<T, R> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_related_methods!($conn_field);
         }
     };
 }
@@ -944,48 +1058,7 @@ macro_rules! impl_backend_executor_methods_with_lifetime {
         $select_type:ident
     ) => {
         impl<'a, T: $crate::Model> $executor_type<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn order_by_desc<F, O>(self, f: F) -> Self
-            where
-                F: FnOnce(<T as $crate::Model>::Where) -> O,
-                O: Into<$crate::OrderBy>,
-            {
-                Self {
-                    select: self.select.order_by_desc(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_select_methods!($conn_field);
         }
     };
 }
@@ -1000,24 +1073,7 @@ macro_rules! impl_backend_join_executor_methods_with_lifetime {
         $select_type:ident
     ) => {
         impl<'a, T: $crate::Model, J: $crate::Model> $executor_type<'a, T, J> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
-
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_join_methods!($conn_field);
         }
     };
 }
@@ -1032,24 +1088,41 @@ macro_rules! impl_backend_related_executor_methods_with_lifetime {
         $select_type:ident
     ) => {
         impl<'a, T: $crate::Model, R: $crate::Model> $executor_type<'a, T, R> {
-            pub fn filter<F>(self, f: F) -> Self
-            where
-                F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
-            {
-                Self {
-                    select: self.select.filter(f),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+            $crate::__ormer_backend_related_methods!($conn_field);
+        }
+    };
+}
 
-            pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
-                Self {
-                    select: self.select.range(range),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                }
-            }
+/// 为带有生命周期参数的数据库后端 MultiTableSelectExecutor 生成通用方法
+#[macro_export]
+macro_rules! impl_backend_multi_table_executor_methods_with_lifetime {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model>
+            $executor_type<'a, T, R1, R2>
+        {
+            $crate::__ormer_backend_multi_table_methods!($conn_field);
+        }
+    };
+}
+
+/// 为带有生命周期参数的数据库后端 FourTableSelectExecutor 生成通用方法
+#[macro_export]
+macro_rules! impl_backend_four_table_executor_methods_with_lifetime {
+    (
+        $executor_type:ident,
+        $conn_field:ident,
+        $conn_type:ty,
+        $select_type:ident
+    ) => {
+        impl<'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model, R3: $crate::Model>
+            $executor_type<'a, T, R1, R2, R3>
+        {
+            $crate::__ormer_backend_four_table_methods!($conn_field);
         }
     };
 }

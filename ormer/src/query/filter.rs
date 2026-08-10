@@ -1,3 +1,5 @@
+use crate::query::expr::SqlExpr;
+
 /// 过滤表达式
 #[derive(Debug, Clone)]
 pub enum FilterExpr {
@@ -53,49 +55,32 @@ pub enum FilterExpr {
         subquery_sql: String,
         subquery_params: Vec<crate::model::Value>,
     },
+    /// 表达式比较:left operator right
+    ExprComparison {
+        left: SqlExpr,
+        operator: String,
+        right: SqlExpr,
+    },
+    /// 表达式 IN 语句
+    ExprIn { expr: SqlExpr, values: Vec<SqlExpr> },
+    /// 表达式 NOT IN 语句
+    ExprNotIn { expr: SqlExpr, values: Vec<SqlExpr> },
+    /// 表达式 BETWEEN min AND max
+    ExprBetween {
+        expr: SqlExpr,
+        min: SqlExpr,
+        max: SqlExpr,
+    },
+    /// 表达式 IS NULL
+    ExprIsNull { expr: SqlExpr },
+    /// 表达式 IS NOT NULL
+    ExprIsNotNull { expr: SqlExpr },
+    /// Full text search
+    TextSearch { expr: SqlExpr, query: String },
 }
 
 /// 值类型（用于过滤）
-#[derive(Debug, Clone)]
-pub enum Value {
-    Integer(i64),
-    BigInt(i128),
-    Duration(std::time::Duration),
-    Text(String),
-    TextArray(Vec<String>),
-    Real(f64),
-    Boolean(bool),
-    Bytes(Vec<u8>),
-    IntegerArray(Vec<i32>),
-    BigIntArray(Vec<i64>),
-    NullableBigIntArray(Vec<Option<i64>>),
-    DateTime(chrono::DateTime<chrono::Utc>),
-    Json(serde_json::Value),
-    Uuid(uuid::Uuid),
-    Null,
-}
-
-impl From<crate::model::Value> for Value {
-    fn from(value: crate::model::Value) -> Self {
-        match value {
-            crate::model::Value::Integer(v) => Value::Integer(v),
-            crate::model::Value::BigInt(v) => Value::BigInt(v),
-            crate::model::Value::Duration(v) => Value::Duration(v),
-            crate::model::Value::Text(v) => Value::Text(v),
-            crate::model::Value::TextArray(v) => Value::TextArray(v),
-            crate::model::Value::Real(v) => Value::Real(v),
-            crate::model::Value::Boolean(v) => Value::Boolean(v),
-            crate::model::Value::Bytes(v) => Value::Bytes(v),
-            crate::model::Value::IntegerArray(v) => Value::IntegerArray(v),
-            crate::model::Value::BigIntArray(v) => Value::BigIntArray(v),
-            crate::model::Value::NullableBigIntArray(v) => Value::NullableBigIntArray(v),
-            crate::model::Value::DateTime(v) => Value::DateTime(v),
-            crate::model::Value::Json(v) => Value::Json(v),
-            crate::model::Value::Uuid(v) => Value::Uuid(v),
-            crate::model::Value::Null => Value::Null,
-        }
-    }
-}
+pub type Value = crate::model::Value;
 
 #[cfg(feature = "postgresql")]
 pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
@@ -112,6 +97,8 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
         Value::BigIntArray(_) => "Vec<i64>",
         Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
         Value::DateTime(_) => "NaiveDateTime",
+        Value::Date(_) => "NaiveDate",
+        Value::Time(_) => "NaiveTime",
         Value::Json(_) => "String",
         Value::Uuid(_) => "String",
         Value::Null => "i32",
@@ -120,23 +107,7 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
 
 #[cfg(feature = "postgresql")]
 pub(crate) fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
-    match value {
-        crate::model::Value::Integer(_) => "i32",
-        crate::model::Value::BigInt(_) => "i64",
-        crate::model::Value::Duration(_) => "Duration",
-        crate::model::Value::Text(_) => "String",
-        crate::model::Value::TextArray(_) => "Vec<String>",
-        crate::model::Value::Real(_) => "f64",
-        crate::model::Value::Boolean(_) => "bool",
-        crate::model::Value::Bytes(_) => "Vec<u8>",
-        crate::model::Value::IntegerArray(_) => "Vec<i32>",
-        crate::model::Value::BigIntArray(_) => "Vec<i64>",
-        crate::model::Value::NullableBigIntArray(_) => "Vec<Option<i64>>",
-        crate::model::Value::DateTime(_) => "NaiveDateTime",
-        crate::model::Value::Json(_) => "String",
-        crate::model::Value::Uuid(_) => "String",
-        crate::model::Value::Null => "i32",
-    }
+    infer_filter_value_rust_type(value)
 }
 
 /// 子查询 trait - 用于 is_in 方法
@@ -167,6 +138,7 @@ pub enum OrderDirection {
 pub struct OrderBy {
     pub column: String,
     pub direction: OrderDirection,
+    expr: Option<SqlExpr>,
 }
 
 impl OrderBy {
@@ -174,6 +146,7 @@ impl OrderBy {
         Self {
             column,
             direction: OrderDirection::Asc,
+            expr: None,
         }
     }
 
@@ -181,6 +154,23 @@ impl OrderBy {
         Self {
             column,
             direction: OrderDirection::Desc,
+            expr: None,
+        }
+    }
+
+    pub fn asc_expr(expr: SqlExpr) -> Self {
+        Self {
+            column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
+            direction: OrderDirection::Asc,
+            expr: Some(expr),
+        }
+    }
+
+    pub fn desc_expr(expr: SqlExpr) -> Self {
+        Self {
+            column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
+            direction: OrderDirection::Desc,
+            expr: Some(expr),
         }
     }
 
@@ -190,7 +180,12 @@ impl OrderBy {
             OrderDirection::Asc => "ASC",
             OrderDirection::Desc => "DESC",
         };
-        format!("{} {}", self.column, dir)
+        let expr_sql = self
+            .expr
+            .as_ref()
+            .map(|expr| expr.to_sql_no_params(crate::query::builder::default_db_type()))
+            .unwrap_or_else(|| self.column.clone());
+        format!("{} {}", expr_sql, dir)
     }
 
     /// 将 OrderBy 转换为指定后端的 SQL 字符串
@@ -199,10 +194,11 @@ impl OrderBy {
             OrderDirection::Asc => "ASC",
             OrderDirection::Desc => "DESC",
         };
-        format!(
-            "{} {}",
-            crate::model::quote_column_reference(db_type, &self.column),
-            dir
-        )
+        let expr_sql = self
+            .expr
+            .as_ref()
+            .map(|expr| expr.to_sql_no_params(db_type))
+            .unwrap_or_else(|| crate::model::quote_column_reference(db_type, &self.column));
+        format!("{} {}", expr_sql, dir)
     }
 }

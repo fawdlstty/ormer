@@ -33,7 +33,7 @@ impl BeforeInsert for User {
     async fn before_insert(&mut self, _ctx: &mut HookContext<'_>) -> ormer::Result<()> {
         self.email = self.email.trim().to_lowercase();
         if !self.email.contains('@') {
-            return Err(anyhow::anyhow!("invalid email"));
+            return Err(ormer::ormer_error!("invalid email"));
         }
         Ok(())
     }

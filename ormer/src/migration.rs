@@ -66,7 +66,7 @@ pub enum MigrationStep {
 }
 
 impl MigrationStep {
-    pub fn sql(&self, db_type: DbType) -> anyhow::Result<String> {
+    pub fn sql(&self, db_type: DbType) -> crate::Result<String> {
         match self {
             Self::CreateType { definition, .. } | Self::AlterType { definition, .. } => {
                 Ok(definition.clone())
@@ -93,7 +93,7 @@ impl MigrationStep {
                 let _ = (table, column, definition, using);
                 match db_type {
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => Err(anyhow::anyhow!(
+                    DbType::Sqlite => Err(crate::ormer_error!(
                         "SQLite does not support ALTER COLUMN; use a hand-written table rebuild"
                     )),
                     #[cfg(feature = "postgresql")]
@@ -149,7 +149,7 @@ impl MigrationStep {
             } => {
                 #[cfg(feature = "sqlite")]
                 if matches!(db_type, DbType::Sqlite) {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "SQLite does not support adding a foreign key after table creation"
                     ));
                 }
@@ -201,7 +201,7 @@ impl MigrationPlan {
         self.steps.is_empty()
     }
 
-    pub fn to_sql(&self) -> anyhow::Result<String> {
+    pub fn to_sql(&self) -> crate::Result<String> {
         let mut sql = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
             sql.push(step.sql(self.db_type)?);
@@ -296,11 +296,11 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
         Self { db, migrations }
     }
 
-    pub async fn pending(&self) -> anyhow::Result<Vec<MigrationInfo>> {
+    pub async fn pending(&self) -> crate::Result<Vec<MigrationInfo>> {
         self.db.pending_migrations(self.migrations).await
     }
 
-    pub async fn execute(&self) -> anyhow::Result<usize> {
+    pub async fn execute(&self) -> crate::Result<usize> {
         self.db.apply_migrations(self.migrations).await
     }
 }
@@ -312,7 +312,7 @@ pub struct TableMigration<'a, T: Model> {
 }
 
 impl<'a, T: Model> TableMigration<'a, T> {
-    pub async fn plan(&self) -> anyhow::Result<MigrationPlan> {
+    pub async fn plan(&self) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
         let table_name = T::table_name_for_db(db_type);
         let mut plan = MigrationPlan::new(table_name, db_type);
@@ -337,7 +337,7 @@ impl<'a, T: Model> TableMigration<'a, T> {
 
         for column in &actual {
             if !expected_names.contains(column.name.as_str()) {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Cannot migrate table {} because existing column {} is not present in the model",
                     table_name,
                     column.name
@@ -351,13 +351,13 @@ impl<'a, T: Model> TableMigration<'a, T> {
         for column in T::COLUMN_SCHEMA {
             if !actual_names.contains(column.name) {
                 if column.is_primary {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Cannot infer adding primary key column {}; write an explicit migration",
                         column.name
                     ));
                 }
                 if !column.is_nullable && self.db.table_row_count(table_name).await? > 0 {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Cannot add NOT NULL column {} to populated table {}; \
                          write an explicit migration with a backfill",
                         column.name,
@@ -387,14 +387,14 @@ impl<'a, T: Model> TableMigration<'a, T> {
                 continue;
             };
             if actual.primary_key != expected.is_primary {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Cannot infer primary-key migration for column {}; write an explicit migration",
                     expected.name
                 ));
             }
 
             if actual.type_name.is_empty() {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Cannot determine the database type of column {}",
                     expected.name
                 ));
@@ -409,7 +409,7 @@ impl<'a, T: Model> TableMigration<'a, T> {
             }
 
             if expected.is_primary && type_changed {
-                return Err(anyhow::anyhow!(
+                return Err(crate::ormer_error!(
                     "Cannot infer primary-key type migration for column {}; write an explicit migration",
                     expected.name
                 ));
@@ -488,7 +488,7 @@ impl<'a, T: Model> TableMigration<'a, T> {
         Ok(plan)
     }
 
-    pub async fn execute(&self) -> anyhow::Result<()> {
+    pub async fn execute(&self) -> crate::Result<()> {
         let plan = self.plan().await?;
         if plan.is_empty() {
             return Ok(());
@@ -692,7 +692,7 @@ fn postgresql_using_expression(
 fn sqlite_rebuild_sql<T: Model>(
     table_name: &str,
     actual_by_name: &BTreeMap<&str, &SchemaColumn>,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -712,7 +712,7 @@ fn sqlite_rebuild_sql<T: Model>(
     let create_table = temporary_statements
         .drain(..1)
         .next()
-        .ok_or_else(|| anyhow::anyhow!("Generated SQLite migration table SQL is empty"))?;
+        .ok_or_else(|| crate::ormer_error!("Generated SQLite migration table SQL is empty"))?;
 
     let mut statements = Vec::new();
     let mut validation_statements = Vec::new();
@@ -781,14 +781,14 @@ fn sqlite_conversion_expression(
     column: &str,
     actual_type: &str,
     target_type: &str,
-) -> anyhow::Result<String> {
+) -> crate::Result<String> {
     let actual = normalize_type(DbType::Sqlite, actual_type);
     let target = normalize_type(DbType::Sqlite, target_type);
     match (actual.as_str(), target.as_str()) {
         ("TEXT", "INTEGER") => Ok(format!("CAST(trim({column}) AS INTEGER)")),
         ("INTEGER", "REAL") => Ok(format!("CAST({column} AS REAL)")),
         (_, "TEXT") => Ok(format!("CAST({column} AS TEXT)")),
-        _ => Err(anyhow::anyhow!(
+        _ => Err(crate::ormer_error!(
             "Cannot safely infer SQLite type migration for column {column}: {actual_type} -> {target_type}"
         )),
     }
@@ -829,7 +829,7 @@ async fn execute_steps(
     transaction: &mut Transaction<'_>,
     db_type: DbType,
     steps: &[MigrationStep],
-) -> anyhow::Result<()> {
+) -> crate::Result<()> {
     for step in steps {
         let sql = step.sql(db_type)?;
         for statement in split_sql_statements(&sql) {
@@ -1023,13 +1023,13 @@ fn flush_sql_word(word: &mut String, trigger_mode: bool, trigger_depth: &mut usi
     word.clear();
 }
 
-fn validate_migrations<M: Migration>(migrations: &[M]) -> anyhow::Result<Vec<&M>> {
+fn validate_migrations<M: Migration>(migrations: &[M]) -> crate::Result<Vec<&M>> {
     let mut sorted: Vec<&M> = migrations.iter().collect();
     sorted.sort_by_key(|migration| migration.version());
     let mut versions = BTreeSet::new();
     for migration in &sorted {
         if !versions.insert(migration.version()) {
-            return Err(anyhow::anyhow!(
+            return Err(crate::ormer_error!(
                 "Duplicate migration version {}",
                 migration.version()
             ));
@@ -1063,7 +1063,7 @@ impl Database {
         MigrationRunner::new(self, migrations)
     }
 
-    pub async fn migration_history(&self) -> anyhow::Result<Vec<MigrationInfo>> {
+    pub async fn migration_history(&self) -> crate::Result<Vec<MigrationInfo>> {
         self.ensure_migration_table().await?;
         let rows = self.migration_history_rows().await?;
         Ok(rows
@@ -1075,7 +1075,7 @@ impl Database {
     pub async fn pending_migrations<M: Migration>(
         &self,
         migrations: &[M],
-    ) -> anyhow::Result<Vec<MigrationInfo>> {
+    ) -> crate::Result<Vec<MigrationInfo>> {
         self.ensure_migration_table().await?;
         let applied: BTreeMap<u64, u64> = self
             .migration_history_rows()
@@ -1088,7 +1088,7 @@ impl Database {
         for migration in sorted {
             if let Some(checksum) = applied.get(&migration.version()) {
                 if *checksum != migration.checksum() {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Migration {} checksum changed after it was applied",
                         migration.version()
                     ));
@@ -1104,7 +1104,7 @@ impl Database {
         Ok(pending)
     }
 
-    pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> anyhow::Result<usize> {
+    pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> crate::Result<usize> {
         self.ensure_migration_table().await?;
         let applied: BTreeMap<u64, u64> = self
             .migration_history_rows()
@@ -1117,7 +1117,7 @@ impl Database {
         for migration in sorted {
             if let Some(checksum) = applied.get(&migration.version()) {
                 if *checksum != migration.checksum() {
-                    return Err(anyhow::anyhow!(
+                    return Err(crate::ormer_error!(
                         "Migration {} checksum changed after it was applied",
                         migration.version()
                     ));
@@ -1144,7 +1144,7 @@ impl Database {
                 );
                 transaction.execute_sql(&sql).await?;
             }
-            Ok::<(), anyhow::Error>(())
+            Ok::<(), crate::OrmerError>(())
         }
         .await;
 
@@ -1160,7 +1160,7 @@ impl Database {
         }
     }
 
-    async fn ensure_migration_table(&self) -> anyhow::Result<()> {
+    async fn ensure_migration_table(&self) -> crate::Result<()> {
         let sql = match self.db_type() {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => format!(
@@ -1188,7 +1188,7 @@ impl Database {
         Ok(())
     }
 
-    async fn migration_history_rows(&self) -> anyhow::Result<Vec<(u64, String, u64)>> {
+    async fn migration_history_rows(&self) -> crate::Result<Vec<(u64, String, u64)>> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.migration_history().await,
@@ -1204,7 +1204,7 @@ impl Database {
     async fn schema_columns(
         &self,
         table_name: &str,
-    ) -> anyhow::Result<Option<Vec<crate::migration::SchemaColumn>>> {
+    ) -> crate::Result<Option<Vec<crate::migration::SchemaColumn>>> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.schema_columns(table_name).await,
@@ -1219,7 +1219,7 @@ impl Database {
 }
 
 impl Transaction<'_> {
-    pub async fn execute_sql(&mut self, sql: impl IntoRawSql) -> anyhow::Result<u64> {
+    pub async fn execute_sql(&mut self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
         match self {
             #[cfg(feature = "sqlite")]
@@ -1242,7 +1242,7 @@ impl Transaction<'_> {
                 let (sql, params) = sql.render(DbType::MSSQL)?;
                 transaction.exec_raw(&sql, params).await
             }
-            Transaction::_Phantom(_) => Err(anyhow::anyhow!("No database backend is enabled")),
+            Transaction::_Phantom(_) => Err(crate::ormer_error!("No database backend is enabled")),
         }
     }
 }
