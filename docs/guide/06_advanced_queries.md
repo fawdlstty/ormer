@@ -331,7 +331,7 @@ let users_with_roles: Vec<User> = db
 
 ## 模型关系加载
 
-模型使用 `#[has_many]` 或 `#[belongs_to]` 声明关系后，可以按需加载关联对象：
+模型使用 `#[has_many]`、`#[belongs_to]`、`#[has_one]` 或 `#[through]` 声明关系后，可以按需加载关联对象：
 
 ```rust
 let user = db.find_by_id::<User>(1).await?.unwrap();
@@ -347,7 +347,7 @@ let mut users = db.select::<User>().collect::<Vec<_>>().await?;
 db.preload(&mut users, UserWhere::default().posts).await?;
 ```
 
-`include` 用于在查询结果中加载 `belongs_to` 关系：
+`include` 用于在查询结果中加载关系，也支持关系内排序、分页和嵌套加载：
 
 ```rust
 let posts: Vec<Post> = db
@@ -355,9 +355,17 @@ let posts: Vec<Post> = db
     .include(|post| post.user)
     .collect()
     .await?;
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|user| user.roles.any(|role| role.name.eq("admin")))
+    .include(|user| user.roles.order_by(|role| role.name.asc()).range(..20))
+    .include(|user| user.user_roles.include(|user_role| user_role.role))
+    .collect()
+    .await?;
 ```
 
-关系字段不会参与表列映射；`has_many` 结果为空时返回空 `Vec`，`belongs_to` 未找到目标时为 `None`。
+关系字段不会参与表列映射；集合关系结果为空时返回空 `Vec`，单对象关系未找到目标时为 `None`。
 
 ## 集合操作
 

@@ -1,6 +1,6 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers::placeholder;
-use crate::model::{Value, quote_column_reference};
+use crate::model::{Value, normalize_table_name_for_db, quote_column_reference};
 use crate::query::expr::SqlExpr;
 use crate::query::filter::FilterExpr;
 
@@ -216,6 +216,48 @@ impl FilterFormatter {
                     .unwrap_or_else(|e| panic!("Failed to write NOT EXISTS clause: {}", e));
                 self.append_subquery_params(subquery_params, param_idx, params);
             }
+            FilterExpr::RelationExists {
+                owner_table,
+                owner_key,
+                target_table,
+                target_key,
+                filter,
+            } => {
+                self.format_relation_exists(
+                    sql,
+                    *owner_table,
+                    *owner_key,
+                    *target_table,
+                    *target_key,
+                    filter.as_deref(),
+                    param_idx,
+                    params,
+                );
+            }
+            FilterExpr::ThroughRelationExists {
+                owner_table,
+                owner_key,
+                via_table,
+                via_owner_key,
+                via_target_key,
+                target_table,
+                target_key,
+                filter,
+            } => {
+                self.format_through_relation_exists(
+                    sql,
+                    *owner_table,
+                    *owner_key,
+                    *via_table,
+                    *via_owner_key,
+                    *via_target_key,
+                    *target_table,
+                    *target_key,
+                    filter.as_deref(),
+                    param_idx,
+                    params,
+                );
+            }
             FilterExpr::ExprComparison {
                 left,
                 operator,
@@ -401,6 +443,100 @@ impl FilterFormatter {
         for param in subquery_params {
             params.push(param.clone());
             *param_idx += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn format_relation_exists(
+        &self,
+        sql: &mut String,
+        owner_table: &str,
+        owner_key: &str,
+        target_table: &str,
+        target_key: &str,
+        filter: Option<&FilterExpr>,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        use std::fmt::Write;
+
+        let owner_column = self.outer_column(owner_table, owner_key);
+        let target_table = crate::model::quote_qualified_identifier(
+            self.db_type,
+            normalize_table_name_for_db(self.db_type, target_table),
+        );
+        let target_key = quote_column_reference(self.db_type, &format!("r0.{target_key}"));
+        write!(
+            sql,
+            "{} IN (SELECT {} FROM {} AS r0",
+            owner_column, target_key, target_table
+        )
+        .unwrap_or_else(|e| panic!("Failed to write relation EXISTS clause: {}", e));
+
+        if let Some(filter) = filter {
+            let filter_sql = FilterFormatter::new(self.db_type)
+                .with_table_prefix("r0")
+                .format(filter, param_idx, params);
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter_sql);
+        }
+
+        sql.push(')');
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn format_through_relation_exists(
+        &self,
+        sql: &mut String,
+        owner_table: &str,
+        owner_key: &str,
+        via_table: &str,
+        via_owner_key: &str,
+        via_target_key: &str,
+        target_table: &str,
+        target_key: &str,
+        filter: Option<&FilterExpr>,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        use std::fmt::Write;
+
+        let owner_column = self.outer_column(owner_table, owner_key);
+        let via_table = crate::model::quote_qualified_identifier(
+            self.db_type,
+            normalize_table_name_for_db(self.db_type, via_table),
+        );
+        let target_table = crate::model::quote_qualified_identifier(
+            self.db_type,
+            normalize_table_name_for_db(self.db_type, target_table),
+        );
+        let via_owner_key = quote_column_reference(self.db_type, &format!("r0.{via_owner_key}"));
+        let via_target_key = quote_column_reference(self.db_type, &format!("r0.{via_target_key}"));
+        let target_key = quote_column_reference(self.db_type, &format!("r1.{target_key}"));
+        write!(
+            sql,
+            "{} IN (SELECT {} FROM {} AS r0 INNER JOIN {} AS r1 ON {} = {}",
+            owner_column, via_owner_key, via_table, target_table, via_target_key, target_key
+        )
+        .unwrap_or_else(|e| panic!("Failed to write through relation EXISTS clause: {}", e));
+
+        if let Some(filter) = filter {
+            let filter_sql = FilterFormatter::new(self.db_type)
+                .with_table_prefix("r1")
+                .format(filter, param_idx, params);
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter_sql);
+        }
+
+        sql.push(')');
+    }
+
+    fn outer_column(&self, owner_table: &str, owner_key: &str) -> String {
+        if let Some(prefix) = self.table_prefix.as_deref() {
+            quote_column_reference(self.db_type, &format!("{prefix}.{owner_key}"))
+        } else {
+            let table = normalize_table_name_for_db(self.db_type, owner_table);
+            quote_column_reference(self.db_type, &format!("{table}.{owner_key}"))
         }
     }
 

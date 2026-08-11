@@ -145,6 +145,48 @@ macro_rules! __ormer_backend_select_methods {
                 _marker: std::marker::PhantomData,
             }
         }
+
+        pub fn cursor_by<F, G>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where) -> G,
+            G: $crate::query::builder::GroupByColumns,
+        {
+            Self {
+                select: self.select.cursor_by(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn after<C>(self, cursor: C) -> Self
+        where
+            C: Into<$crate::query::builder::PageCursor>,
+        {
+            Self {
+                select: self.select.after(cursor),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn before<C>(self, cursor: C) -> Self
+        where
+            C: Into<$crate::query::builder::PageCursor>,
+        {
+            Self {
+                select: self.select.before(cursor),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn limit(self, limit: usize) -> Self {
+            Self {
+                select: self.select.limit(limit),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
     };
 
     ($conn_field:ident, distinct) => {
@@ -393,6 +435,76 @@ macro_rules! impl_unified_select_executor_methods {
                 }
             }
 
+            pub fn cursor_by<F, G>(self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> G,
+                G: $crate::query::builder::GroupByColumns,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.cursor_by(f)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.cursor_by(f))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.cursor_by(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.cursor_by(f)),
+                }
+            }
+
+            pub fn after<C>(self, cursor: C) -> Self
+            where
+                C: Into<$crate::query::builder::PageCursor>,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.after(cursor)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.after(cursor))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.after(cursor)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.after(cursor)),
+                }
+            }
+
+            pub fn before<C>(self, cursor: C) -> Self
+            where
+                C: Into<$crate::query::builder::PageCursor>,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.before(cursor)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.before(cursor))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.before(cursor)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.before(cursor)),
+                }
+            }
+
+            pub fn limit(self, limit: usize) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.limit(limit)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.limit(limit))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.limit(limit)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.limit(limit)),
+                }
+            }
+
             pub fn range<RR: Into<$crate::query::builder::RangeBounds>>(self, range: RR) -> Self {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -405,6 +517,22 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
+                }
+            }
+
+            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
+            where
+                T: 'static + std::marker::Send + std::marker::Sync,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => exec.fetch_page().await,
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.fetch_page().await,
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => exec.fetch_page().await,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => exec.fetch_page().await,
                 }
             }
 
@@ -1014,6 +1142,24 @@ macro_rules! impl_backend_executor_methods {
     ) => {
         impl<'a, T: $crate::Model> $executor_type<'a, T> {
             $crate::__ormer_backend_select_methods!($conn_field, distinct);
+
+            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
+            where
+                T: 'static + std::marker::Send + std::marker::Sync,
+            {
+                let (select, cursor_columns) = self.select.prepare_cursor_page()?;
+                let executor = Self {
+                    select: select.clone(),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                };
+                let items: Vec<T> = executor.collect().await?;
+                let next_cursor = match items.last() {
+                    Some(item) => Some(select.cursor_values_from_model(item, &cursor_columns)?),
+                    None => None,
+                };
+                Ok($crate::query::builder::CursorPage::new(items, next_cursor))
+            }
         }
     };
 }
@@ -1059,6 +1205,24 @@ macro_rules! impl_backend_executor_methods_with_lifetime {
     ) => {
         impl<'a, T: $crate::Model> $executor_type<'a, T> {
             $crate::__ormer_backend_select_methods!($conn_field);
+
+            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
+            where
+                T: 'static + std::marker::Send + std::marker::Sync,
+            {
+                let (select, cursor_columns) = self.select.prepare_cursor_page()?;
+                let executor = Self {
+                    select: select.clone(),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                };
+                let items: Vec<T> = executor.collect().await?;
+                let next_cursor = match items.last() {
+                    Some(item) => Some(select.cursor_values_from_model(item, &cursor_columns)?),
+                    None => None,
+                };
+                Ok($crate::query::builder::CursorPage::new(items, next_cursor))
+            }
         }
     };
 }

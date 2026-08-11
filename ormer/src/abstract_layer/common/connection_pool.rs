@@ -1,8 +1,8 @@
 use super::super::DbType;
 use super::common_helpers;
-use super::{SqlExecutor, SqlStatement};
+use super::{DbExecutor, SqlExecutor, SqlStatement};
 use crate::impl_insert_conflict_methods;
-use crate::model::{FromRowValues, Model};
+use crate::model::{FromRowValues, Model, WritableModel};
 use crate::query::insert::InsertConflict;
 use crate::raw_sql::{IntoRawSql, RawSql};
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
@@ -887,7 +887,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 创建表 - 返回执行器
-    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+    pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => CreateTableExecutor::Sqlite(db.create_table::<T>()),
@@ -903,7 +903,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 验证表结构
-    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
@@ -977,11 +977,11 @@ impl<'a> PooledConnection<'a> {
 
     /// 创建流式查询执行器
     pub fn stream<T: Model>(&self) -> super::unified::SelectStream<'_, T> {
-        self.select::<T>().stream()
+        PooledConnection::select::<T>(self).stream()
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> super::unified::DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> super::unified::DeleteExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -999,7 +999,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> super::unified::UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> super::unified::UpdateExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -1068,7 +1068,7 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 删除表 - 返回执行器
-    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+    pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => DropTableExecutor::Sqlite(db.drop_table::<T>()),
@@ -1114,6 +1114,35 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => {
                 let (sql, params) = raw_sql.render(DbType::MSSQL)?;
                 db.exec_raw(&sql, params).await
+            }
+        }
+    }
+}
+
+impl<'a> DbExecutor for PooledConnection<'a> {
+    fn select<T: crate::model::Model>(&self) -> super::unified::SelectExecutor<'_, T> {
+        PooledConnection::select::<T>(self)
+    }
+
+    fn select_column<T: crate::model::Model, V>(
+        &self,
+    ) -> super::unified::GroupedSelectExecutor<'_, T, V> {
+        match self.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                super::unified::GroupedSelectExecutor::Sqlite(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => {
+                super::unified::GroupedSelectExecutor::PostgreSQL(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => {
+                super::unified::GroupedSelectExecutor::MySQL(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => {
+                super::unified::GroupedSelectExecutor::MSSQL(db.select_column::<T, V>())
             }
         }
     }

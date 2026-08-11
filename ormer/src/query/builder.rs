@@ -4,7 +4,7 @@ use crate::model::{
     quote_qualified_identifier,
 };
 use crate::query::expr::{AliasedExpr, IntoSqlExpr, SqlExpr, TypedExpr, WindowSpecBuilder};
-use crate::query::filter::{FilterExpr, OrderBy};
+use crate::query::filter::{FilterExpr, OrderBy, OrderDirection};
 #[cfg(feature = "postgresql")]
 use crate::query::filter::{infer_filter_value_rust_type, infer_model_value_rust_type};
 use crate::query::filter_formatter::FilterFormatter;
@@ -372,6 +372,149 @@ fn append_order_by_clause(sql: &mut String, order_by: &[OrderBy], db_type: DbTyp
     sql.push_str(" ORDER BY ");
     let order_strs: Vec<String> = order_by.iter().map(|o| o.to_sql_for(db_type)).collect();
     sql.push_str(&order_strs.join(", "));
+}
+
+struct RelationJoinFilter {
+    filter: FilterExpr,
+    table_prefix: String,
+}
+
+enum RelationJoin {
+    Direct {
+        table: &'static str,
+        alias: String,
+        owner_key: &'static str,
+        target_key: &'static str,
+    },
+    Through {
+        via_table: &'static str,
+        via_alias: String,
+        target_table: &'static str,
+        target_alias: String,
+        owner_key: &'static str,
+        via_owner_key: &'static str,
+        via_target_key: &'static str,
+        target_key: &'static str,
+    },
+}
+
+fn filter_has_relation(filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::RelationExists { .. } | FilterExpr::ThroughRelationExists { .. } => true,
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            filter_has_relation(left) || filter_has_relation(right)
+        }
+        _ => false,
+    }
+}
+
+fn split_relation_join_filter(
+    filter: &FilterExpr,
+    base_filters: &mut Vec<FilterExpr>,
+    relation_filters: &mut Vec<RelationJoinFilter>,
+    joins: &mut Vec<RelationJoin>,
+) -> bool {
+    match filter {
+        FilterExpr::And(left, right) => {
+            split_relation_join_filter(left, base_filters, relation_filters, joins)
+                && split_relation_join_filter(right, base_filters, relation_filters, joins)
+        }
+        FilterExpr::Or(_, _) if filter_has_relation(filter) => false,
+        FilterExpr::RelationExists {
+            target_table,
+            owner_key,
+            target_key,
+            filter,
+            ..
+        } => {
+            let alias = format!("r{}", joins.len());
+            joins.push(RelationJoin::Direct {
+                table: target_table,
+                alias: alias.clone(),
+                owner_key,
+                target_key,
+            });
+            if let Some(filter) = filter {
+                relation_filters.push(RelationJoinFilter {
+                    filter: (**filter).clone(),
+                    table_prefix: alias,
+                });
+            }
+            true
+        }
+        FilterExpr::ThroughRelationExists {
+            owner_key,
+            via_table,
+            via_owner_key,
+            via_target_key,
+            target_table,
+            target_key,
+            filter,
+            ..
+        } => {
+            let index = joins.len();
+            let via_alias = format!("r{index}_via");
+            let target_alias = format!("r{index}_target");
+            joins.push(RelationJoin::Through {
+                via_table,
+                via_alias: via_alias.clone(),
+                target_table,
+                target_alias: target_alias.clone(),
+                owner_key,
+                via_owner_key,
+                via_target_key,
+                target_key,
+            });
+            if let Some(filter) = filter {
+                relation_filters.push(RelationJoinFilter {
+                    filter: (**filter).clone(),
+                    table_prefix: target_alias,
+                });
+            }
+            true
+        }
+        _ => {
+            base_filters.push(filter.clone());
+            true
+        }
+    }
+}
+
+fn relation_join_sql(join: &RelationJoin, db_type: DbType) -> String {
+    match join {
+        RelationJoin::Direct {
+            table,
+            alias,
+            owner_key,
+            target_key,
+        } => format!(
+            " INNER JOIN {} AS {} ON {} = {}",
+            quote_qualified_identifier(db_type, normalize_table_name_for_db(db_type, table)),
+            alias,
+            quote_column_reference(db_type, &format!("{}.{}", alias, target_key)),
+            quote_column_reference(db_type, &format!("t0.{owner_key}")),
+        ),
+        RelationJoin::Through {
+            via_table,
+            via_alias,
+            target_table,
+            target_alias,
+            owner_key,
+            via_owner_key,
+            via_target_key,
+            target_key,
+        } => format!(
+            " INNER JOIN {} AS {} ON {} = {} INNER JOIN {} AS {} ON {} = {}",
+            quote_qualified_identifier(db_type, normalize_table_name_for_db(db_type, via_table)),
+            via_alias,
+            quote_column_reference(db_type, &format!("{}.{}", via_alias, via_owner_key)),
+            quote_column_reference(db_type, &format!("t0.{owner_key}")),
+            quote_qualified_identifier(db_type, normalize_table_name_for_db(db_type, target_table)),
+            target_alias,
+            quote_column_reference(db_type, &format!("{}.{}", via_alias, via_target_key)),
+            quote_column_reference(db_type, &format!("{}.{}", target_alias, target_key)),
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -813,6 +956,12 @@ fn collect_filter_param_rust_types<T: Model>(
             collect_filter_param_rust_types::<T>(left, rust_types);
             collect_filter_param_rust_types::<T>(right, rust_types);
         }
+        FilterExpr::RelationExists { filter, .. }
+        | FilterExpr::ThroughRelationExists { filter, .. } => {
+            if let Some(filter) = filter {
+                collect_filter_param_rust_types::<T>(filter, rust_types);
+            }
+        }
         FilterExpr::Between { column, min, max } => {
             let rust_type = model_column_rust_type::<T>(column);
             rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(min)));
@@ -929,11 +1078,57 @@ fn normalize_filter_column_name(column: &str) -> &str {
 /// Select 查询结构体
 ///
 /// 使用方式:`Select::<User>`().filter(|p| p.age > 12).to_sql()
+#[derive(Debug, Clone)]
+pub struct PageCursor {
+    values: Vec<crate::model::Value>,
+}
+
+impl PageCursor {
+    pub fn new(values: Vec<crate::model::Value>) -> Self {
+        Self { values }
+    }
+
+    pub fn values(&self) -> &[crate::model::Value] {
+        &self.values
+    }
+}
+
+impl From<Vec<crate::model::Value>> for PageCursor {
+    fn from(values: Vec<crate::model::Value>) -> Self {
+        Self::new(values)
+    }
+}
+
+impl From<&PageCursor> for PageCursor {
+    fn from(cursor: &PageCursor) -> Self {
+        cursor.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CursorPage<T> {
+    pub items: Vec<T>,
+    next_cursor: Option<PageCursor>,
+}
+
+impl<T> CursorPage<T> {
+    pub fn new(items: Vec<T>, next_cursor: Option<PageCursor>) -> Self {
+        Self { items, next_cursor }
+    }
+
+    pub fn next_cursor(&self) -> Option<PageCursor> {
+        self.next_cursor.clone()
+    }
+}
+
 pub struct Select<T: Model> {
     filters: Vec<FilterExpr>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    cursor_columns: Vec<String>,
+    cursor_after: Option<PageCursor>,
+    cursor_before: Option<PageCursor>,
     distinct: bool,
     distinct_on: Vec<SqlExpr>,
     lock: Option<RowLock>,
@@ -948,6 +1143,9 @@ impl<T: Model> Clone for Select<T> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            cursor_columns: self.cursor_columns.clone(),
+            cursor_after: self.cursor_after.clone(),
+            cursor_before: self.cursor_before.clone(),
             distinct: self.distinct,
             distinct_on: self.distinct_on.clone(),
             lock: self.lock,
@@ -1589,6 +1787,9 @@ impl<T: Model> Select<T> {
             order_by: Vec::new(),
             range_start: None,
             range_end: None,
+            cursor_columns: Vec::new(),
+            cursor_after: None,
+            cursor_before: None,
             distinct: false,
             distinct_on: Vec::new(),
             lock: None,
@@ -1834,6 +2035,16 @@ impl<T: Model> Select<T> {
         self
     }
 
+    /// 将当前查询标记为 cursor 分页查询，并声明用于生成 cursor 的列。
+    pub fn cursor_by<F, G>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> G,
+        G: GroupByColumns,
+    {
+        self.cursor_columns = f(T::Where::default()).column_names();
+        self
+    }
+
     /// 添加 WHERE 条件 (使用宏支持 >= 和 > 运算符语法)
     #[doc(hidden)]
     pub fn filter_cmp<F>(self, f: F) -> Self
@@ -1865,6 +2076,33 @@ impl<T: Model> Select<T> {
         let mut order = f(where_obj).into();
         order.direction = crate::query::filter::OrderDirection::Desc;
         self.order_by.push(order);
+        self
+    }
+
+    /// 设置分页游标之后的结果。
+    pub fn after<C>(mut self, cursor: C) -> Self
+    where
+        C: Into<PageCursor>,
+    {
+        self.cursor_after = Some(cursor.into());
+        self.cursor_before = None;
+        self
+    }
+
+    /// 设置分页游标之前的结果。
+    pub fn before<C>(mut self, cursor: C) -> Self
+    where
+        C: Into<PageCursor>,
+    {
+        self.cursor_before = Some(cursor.into());
+        self.cursor_after = None;
+        self
+    }
+
+    /// 仅限制返回行数，不设置 offset。
+    pub fn limit(mut self, limit: usize) -> Self {
+        self.range_start = None;
+        self.range_end = Some(limit);
         self
     }
 
@@ -1996,6 +2234,28 @@ impl<T: Model> Select<T> {
 
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        if self.filters.iter().any(filter_has_relation) {
+            let mut base_filters = Vec::new();
+            let mut relation_filters = Vec::new();
+            let mut joins = Vec::new();
+            let can_use_joins = self.filters.iter().all(|filter| {
+                split_relation_join_filter(
+                    filter,
+                    &mut base_filters,
+                    &mut relation_filters,
+                    &mut joins,
+                )
+            });
+            if can_use_joins {
+                return self.to_sql_with_relation_joins(
+                    db_type,
+                    &base_filters,
+                    &relation_filters,
+                    &joins,
+                );
+            }
+        }
+
         let mut sql = String::new();
 
         // SELECT 子句
@@ -2036,10 +2296,240 @@ impl<T: Model> Select<T> {
         (sql, params)
     }
 
+    fn to_sql_with_relation_joins(
+        &self,
+        db_type: DbType,
+        base_filters: &[FilterExpr],
+        relation_filters: &[RelationJoinFilter],
+        joins: &[RelationJoin],
+    ) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut param_idx = 1;
+        let mut params = Vec::new();
+        let distinct_str = select_modifier_sql(
+            true,
+            &self.distinct_on,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+        write!(
+            &mut sql,
+            "SELECT {}{} FROM {} AS t0",
+            distinct_str,
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
+            table_name_for::<T>(db_type)
+        )
+        .unwrap_or_else(|e| panic!("Failed to write relation SELECT clause: {}", e));
+
+        for join in joins {
+            sql.push_str(&relation_join_sql(join, db_type));
+        }
+
+        let mut first_filter = true;
+        for filter in base_filters {
+            if first_filter {
+                sql.push_str(" WHERE ");
+                first_filter = false;
+            } else {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(
+                &FilterFormatter::new(db_type)
+                    .with_table_prefix("t0")
+                    .format(filter, &mut param_idx, &mut params),
+            );
+        }
+        for filter in relation_filters {
+            if first_filter {
+                sql.push_str(" WHERE ");
+                first_filter = false;
+            } else {
+                sql.push_str(" AND ");
+            }
+            sql.push_str(
+                &FilterFormatter::new(db_type)
+                    .with_table_prefix(&filter.table_prefix)
+                    .format(&filter.filter, &mut param_idx, &mut params),
+            );
+        }
+
+        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_range_clause(
+            &mut sql,
+            self.range_start,
+            self.range_end,
+            !self.order_by.is_empty(),
+            db_type,
+        );
+        append_lock_clause(&mut sql, self.lock);
+
+        (sql, params)
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         collect_model_filter_param_rust_types::<T>(&self.filters)
     }
+
+    pub(crate) fn prepare_cursor_page(&self) -> crate::Result<(Self, Vec<String>)> {
+        let mut select = self.clone();
+        let mut order_by = select.order_by.clone();
+        let mut cursor_columns = if select.cursor_columns.is_empty() {
+            if order_by.is_empty() {
+                T::primary_key_columns()
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect()
+            } else {
+                if order_by.iter().any(|order| order.cloned_expr().is_some()) {
+                    return Err(crate::ormer_error!(
+                        "cursor pagination requires cursor_by when order_by uses expressions"
+                    ));
+                }
+                order_by.iter().map(|order| order.column.clone()).collect()
+            }
+        } else {
+            select.cursor_columns.clone()
+        };
+
+        if order_by.is_empty() {
+            order_by = cursor_columns
+                .iter()
+                .map(|column| OrderBy::asc(column.clone()))
+                .collect();
+        } else if !select.cursor_columns.is_empty() && select.cursor_columns.len() != order_by.len()
+        {
+            return Err(crate::ormer_error!(
+                "cursor_by must match the number of order_by columns"
+            ));
+        }
+
+        if order_by.iter().all(|order| order.cloned_expr().is_none()) {
+            for pk in T::primary_key_columns() {
+                let pk = (*pk).to_string();
+                let exists = order_by
+                    .iter()
+                    .any(|order| order.cloned_expr().is_none() && order.column == pk);
+                if !exists {
+                    order_by.push(OrderBy::asc(pk.clone()));
+                    cursor_columns.push(pk);
+                }
+            }
+        }
+
+        if cursor_columns.len() != order_by.len() {
+            return Err(crate::ormer_error!(
+                "cursor pagination requires cursor columns to match order_by columns"
+            ));
+        }
+
+        let seek = select
+            .cursor_after
+            .as_ref()
+            .map(|cursor| (CursorSeekKind::After, cursor))
+            .or_else(|| {
+                select
+                    .cursor_before
+                    .as_ref()
+                    .map(|cursor| (CursorSeekKind::Before, cursor))
+            });
+
+        if let Some((kind, cursor)) = seek {
+            if cursor.values().len() != cursor_columns.len() {
+                return Err(crate::ormer_error!(
+                    "cursor value count does not match cursor columns"
+                ));
+            }
+            let filter = build_cursor_seek_filter(&order_by, cursor.values(), kind)?;
+            select.filters.push(filter.into());
+            select.range_start = None;
+        }
+
+        select.order_by = order_by;
+        select.cursor_columns = Vec::new();
+        select.cursor_after = None;
+        select.cursor_before = None;
+        Ok((select, cursor_columns))
+    }
+
+    pub(crate) fn cursor_values_from_model(
+        &self,
+        model: &T,
+        cursor_columns: &[String],
+    ) -> crate::Result<PageCursor> {
+        let mut values = Vec::with_capacity(cursor_columns.len());
+        for column in cursor_columns {
+            let value = model.column_value(column).ok_or_else(|| {
+                crate::ormer_error!("Cursor column {} not found on {}", column, T::TABLE_NAME)
+            })?;
+            values.push(value);
+        }
+        Ok(PageCursor::new(values))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CursorSeekKind {
+    After,
+    Before,
+}
+
+fn build_cursor_seek_filter(
+    order_by: &[OrderBy],
+    cursor_values: &[crate::model::Value],
+    kind: CursorSeekKind,
+) -> crate::Result<WhereExpr> {
+    let mut result: Option<WhereExpr> = None;
+
+    for index in 0..order_by.len() {
+        let mut term: Option<WhereExpr> = None;
+
+        for prefix_index in 0..index {
+            let expr = order_by[prefix_index]
+                .cloned_expr()
+                .unwrap_or_else(|| SqlExpr::Column(order_by[prefix_index].column.clone()));
+            let value = SqlExpr::Value(cursor_values[prefix_index].clone());
+            let eq = WhereExpr::from_filter(FilterExpr::ExprComparison {
+                left: expr,
+                operator: "=".to_string(),
+                right: value,
+            });
+            term = Some(match term {
+                Some(existing) => existing.and(eq),
+                None => eq,
+            });
+        }
+
+        let current = &order_by[index];
+        let expr = current
+            .cloned_expr()
+            .unwrap_or_else(|| SqlExpr::Column(current.column.clone()));
+        let operator = match (kind, current.direction) {
+            (CursorSeekKind::After, OrderDirection::Asc) => ">",
+            (CursorSeekKind::After, OrderDirection::Desc) => "<",
+            (CursorSeekKind::Before, OrderDirection::Asc) => "<",
+            (CursorSeekKind::Before, OrderDirection::Desc) => ">",
+        };
+        let cmp = WhereExpr::from_filter(FilterExpr::ExprComparison {
+            left: expr,
+            operator: operator.to_string(),
+            right: SqlExpr::Value(cursor_values[index].clone()),
+        });
+        let term = match term {
+            Some(existing) => existing.and(cmp),
+            None => cmp,
+        };
+
+        result = Some(match result {
+            Some(existing) => existing.or(term),
+            None => term,
+        });
+    }
+
+    result.ok_or_else(|| {
+        crate::ormer_error!("cursor pagination requires at least one order_by column")
+    })
 }
 
 // 实现 Default trait,支持 Select::<User>() 语法

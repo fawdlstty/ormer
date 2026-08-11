@@ -18,14 +18,15 @@ pub use stream_connection::StreamConnection;
 mod unified;
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
-    IncludedSelectExecutor, InsertExecutor, InsertOrUpdateExecutor, InsertPartialExecutor,
+    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
+    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
+    InsertExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor,
     LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
-    ModelCollectWithFuture, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
-    RelatedSelectExecutor, SelectExecutor, SelectStream, SelectStreamIterator, Transaction,
-    TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
-    UpdateExecutor,
+    ModelCollectWithFuture, NestedInclude, RawCollectFuture, RawSelectExecutor,
+    RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, SelectExecutor,
+    SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
@@ -87,4 +88,14 @@ pub trait SqlExecutor: Sized {
         let sql = self.to_sql()?;
         self.execute_with_sql(sql).await
     }
+}
+
+/// 统一的数据库执行入口。
+///
+/// 这个 trait 只覆盖 repository/service 最常用的读写方法，返回现有执行器类型，
+/// 避免再包一层 Box/Rc 之类的间接层。
+pub trait DbExecutor {
+    fn select<T: crate::model::Model>(&self) -> SelectExecutor<'_, T>;
+
+    fn select_column<T: crate::model::Model, V>(&self) -> GroupedSelectExecutor<'_, T, V>;
 }

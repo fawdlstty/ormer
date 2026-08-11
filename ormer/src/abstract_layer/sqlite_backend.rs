@@ -3,7 +3,7 @@ use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
-use crate::model::{DbBackendTypeMapper, Model, Row, Value};
+use crate::model::{DbBackendTypeMapper, Model, Row, Value, WritableModel};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MappedSelect,
     MultiTableSelect, RelatedSelect, RightJoinedSelect, Select, WhereExpr,
@@ -115,13 +115,13 @@ struct SendableConnection(turso::Connection);
 unsafe impl Send for SendableConnection {}
 
 /// 创建表执行器
-pub struct CreateTableExecutor<'a, T: Model> {
+pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
     db: &'a Database,
     table_name: Option<String>,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T: Model> CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::Sqlite,
@@ -135,7 +135,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -151,12 +151,12 @@ impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
 }
 
 /// 删除表执行器（基于Model）
-pub struct DropTableExecutor<'a, T: Model> {
+pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
     db: &'a Database,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T: Model> DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::Sqlite,
@@ -173,7 +173,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -583,7 +583,7 @@ impl Database {
     }
 
     /// 创建表 - 返回执行器
-    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+    pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         CreateTableExecutor {
             db: self,
             table_name: None,
@@ -592,7 +592,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().trace().await?;
 
@@ -788,7 +788,7 @@ impl Database {
         }
     }
 
-    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+    pub fn insert_partial<T: WritableModel>(&self) -> InsertPartialExecutor<'_, T> {
         InsertPartialExecutor {
             db: self,
             assignments: Vec::new(),
@@ -802,7 +802,7 @@ impl Database {
         model: impl crate::model::InsertModel<T>,
     ) -> InsertPartialExecutor<'_, T>
     where
-        T: Model,
+        T: WritableModel,
     {
         self.insert_partial::<T>()
             .with_source_table(model.insert_table_name())
@@ -963,7 +963,7 @@ impl Database {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<T> {
         DeleteExecutor {
             filters: Vec::new(),
             conn: self.conn.clone(),
@@ -972,7 +972,7 @@ impl Database {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -1002,7 +1002,7 @@ impl Database {
     }
 
     /// 删除表 - 返回执行器
-    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+    pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
             db: self,
             _marker: std::marker::PhantomData,
@@ -1142,6 +1142,21 @@ pub struct Transaction {
     conn: Arc<turso::Connection>,
     committed: bool,
     rolled_back: bool,
+}
+
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        if self.committed || self.rolled_back {
+            return;
+        }
+
+        let conn = Arc::clone(&self.conn);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = conn.execute("ROLLBACK", ()).trace().await;
+            });
+        }
+    }
 }
 
 /// 事务中的插入执行器
@@ -1431,7 +1446,7 @@ impl Transaction {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<T> {
         DeleteExecutor {
             filters: Vec::new(),
             conn: self.conn.clone(),
@@ -1440,7 +1455,7 @@ impl Transaction {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),

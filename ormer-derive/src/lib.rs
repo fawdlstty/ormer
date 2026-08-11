@@ -7,12 +7,18 @@ use proc_macro::TokenStream;
     Model,
     attributes(
         table, column, primary, unique, index, foreign, data_type, default, check, hypertable,
-        compress, has_many, belongs_to
+        compress, has_many, belongs_to, has_one, through
     )
 )]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model::derive_model(input).into()
+}
+
+#[proc_macro_derive(ViewModel, attributes(table, column, data_type))]
+pub fn derive_view_model(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    model::derive_view_model(input).into()
 }
 
 #[proc_macro_derive(ModelEnum)]

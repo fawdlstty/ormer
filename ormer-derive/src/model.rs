@@ -99,153 +99,164 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .map(|info| info.column_name.clone())
         .collect();
 
-    let field_names_lit = field_names.iter().map(|name| {
-        quote! { #name }
-    });
+    let field_names_lit = field_names
+        .iter()
+        .map(|name| quote! { #name })
+        .collect::<Vec<_>>();
 
     // 生成字段元数据 (COLUMN_SCHEMA)
-    let column_schema_entries = normal_fields.iter().map(|info| {
-        let field_name = info.field_name;
-        let rust_field_name = field_name.to_string();
-        let column_name = info.column_name.as_str();
-        let field_type = info.field_type;
+    let column_schema_entries = normal_fields
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            let rust_field_name = field_name.to_string();
+            let column_name = info.column_name.as_str();
+            let field_type = info.field_type;
 
-        // 检查是否是自增主键（只有主键字段才可能是自增）
-        let is_primary = info.is_primary;
-        let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
-        let is_nullable = info.is_nullable;
-        let rust_type = &info.rust_type;
+            // 检查是否是自增主键（只有主键字段才可能是自增）
+            let is_primary = info.is_primary;
+            let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
+            let is_nullable = info.is_nullable;
+            let rust_type = &info.rust_type;
 
-        // 检查 unique 属性
-        let unique_attr = &info.unique_attr;
-        let unique_group = option_i32_tokens(unique_attr.group);
-        let unique_name = option_string_tokens(unique_attr.name.as_deref());
+            // 检查 unique 属性
+            let unique_attr = &info.unique_attr;
+            let unique_group = option_i32_tokens(unique_attr.group);
+            let unique_name = option_string_tokens(unique_attr.name.as_deref());
 
-        // 检查 index 属性
-        let index_attr = info.index_attr.as_ref();
-        let is_indexed = index_attr.is_some();
-        let index_group = option_i32_tokens(index_attr.and_then(|attr| attr.group));
-        let index_name = option_string_tokens(index_attr.and_then(|attr| attr.name.as_deref()));
-        let index_order = option_string_tokens(index_attr.and_then(|attr| attr.order.as_deref()));
-        let index_where =
-            option_string_tokens(index_attr.and_then(|attr| attr.where_clause.as_deref()));
+            // 检查 index 属性
+            let index_attr = info.index_attr.as_ref();
+            let is_indexed = index_attr.is_some();
+            let index_group = option_i32_tokens(index_attr.and_then(|attr| attr.group));
+            let index_name = option_string_tokens(index_attr.and_then(|attr| attr.name.as_deref()));
+            let index_order =
+                option_string_tokens(index_attr.and_then(|attr| attr.order.as_deref()));
+            let index_where =
+                option_string_tokens(index_attr.and_then(|attr| attr.where_clause.as_deref()));
 
-        // 检查 foreign 属性
-        let foreign_key = &info.foreign_key;
+            // 检查 foreign 属性
+            let foreign_key = &info.foreign_key;
 
-        // 检查 data_type 属性
-        let data_type = &info.data_type;
-        let has_data_type = info.has_data_type;
+            // 检查 data_type 属性
+            let data_type = &info.data_type;
+            let has_data_type = info.has_data_type;
 
-        // 检查 default/check 属性
-        let default = &info.default;
-        let check = &info.check;
+            // 检查 default/check 属性
+            let default = &info.default;
+            let check = &info.check;
 
-        // 检查 hypertable 属性
-        let hypertable = &info.hypertable;
+            // 检查 hypertable 属性
+            let hypertable = &info.hypertable;
 
-        // 检查 compress 属性
-        let compress = info.compress;
+            // 检查 compress 属性
+            let compress = info.compress;
 
-        let enum_variants = if has_data_type {
-            quote! { None }
-        } else {
-            quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
-        };
-
-        quote! {
-            ::ormer::model::ColumnSchema {
-                rust_name: #rust_field_name,
-                name: #column_name,
-                rust_type: #rust_type,
-                is_primary: #is_primary,
-                is_auto_increment: #field_is_auto_increment,
-                is_nullable: #is_nullable,
-                unique_group: #unique_group,
-                unique_name: #unique_name,
-                is_indexed: #is_indexed,
-                index_group: #index_group,
-                index_name: #index_name,
-                index_order: #index_order,
-                index_where: #index_where,
-                foreign_key: #foreign_key,
-                enum_variants: #enum_variants,
-                data_type: #data_type,
-                default: #default,
-                check: #check,
-                hypertable: #hypertable,
-                compress: #compress,
-            }
-        }
-    });
-
-    // 生成 from_row 实现
-    let from_row_fields = field_infos.iter().map(|info| {
-        let field_name = info.field_name;
-        if let Some(default_expr) = &info.relation_default {
-            quote! {
-                #field_name: #default_expr
-            }
-        } else if info.has_i32_data_type {
-            let column_name = &info.column_name;
-            field_from_i32_expr(
-                info.field,
-                quote! { row.get::<i32>(#column_name)? },
-                quote! { row.get::<Option<i32>>(#column_name)? },
-            )
-        } else if info.has_vec_i32_data_type {
-            let column_name = &info.column_name;
-            field_from_vec_i32_expr(info.field, quote! { row.get::<Vec<i32>>(#column_name)? })
-        } else {
-            let column_name = &info.column_name;
-            quote! {
-                #field_name: row.get(#column_name)?
-            }
-        }
-    });
-
-    // 生成 from_row_values 实现（按顺序从行值中读取）
-    let from_row_values_fields = field_infos.iter().map(|info| {
-        let field_name = info.field_name;
-        if let Some(default_expr) = &info.relation_default {
-            quote! {
-                #field_name: #default_expr
-            }
-        } else {
-            let i = info
-                .normal_index
-                .expect("normal field should have an index");
-            if info.has_i32_data_type {
-                field_from_i32_expr(
-                    info.field,
-                    quote! {
-                        <i32 as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
-                    },
-                    quote! {
-                        <Option<i32> as ::ormer::FromRowValues>::from_row_values(
-                            &values[#i..#i+1]
-                        )?
-                    },
-                )
-            } else if info.has_vec_i32_data_type {
-                field_from_vec_i32_expr(
-                    info.field,
-                    quote! {
-                        <Vec<i32> as ::ormer::FromRowValues>::from_row_values(
-                            &values[#i..#i+1]
-                        )?
-                    },
-                )
+            let enum_variants = if has_data_type {
+                quote! { None }
             } else {
-                let field_type = info.field_type;
-                quote! {
-                    #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
-                        &values[#i..#i+1]
-                    )?
+                quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
+            };
+
+            quote! {
+                ::ormer::model::ColumnSchema {
+                    rust_name: #rust_field_name,
+                    name: #column_name,
+                    rust_type: #rust_type,
+                    is_primary: #is_primary,
+                    is_auto_increment: #field_is_auto_increment,
+                    is_nullable: #is_nullable,
+                    unique_group: #unique_group,
+                    unique_name: #unique_name,
+                    is_indexed: #is_indexed,
+                    index_group: #index_group,
+                    index_name: #index_name,
+                    index_order: #index_order,
+                    index_where: #index_where,
+                    foreign_key: #foreign_key,
+                    enum_variants: #enum_variants,
+                    data_type: #data_type,
+                    default: #default,
+                    check: #check,
+                    hypertable: #hypertable,
+                    compress: #compress,
                 }
             }
-        }
-    });
+        })
+        .collect::<Vec<_>>();
+
+    // 生成 from_row 实现
+    let from_row_fields = field_infos
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            if let Some(default_expr) = &info.relation_default {
+                quote! {
+                    #field_name: #default_expr
+                }
+            } else if info.has_i32_data_type {
+                let column_name = &info.column_name;
+                field_from_i32_expr(
+                    info.field,
+                    quote! { row.get::<i32>(#column_name)? },
+                    quote! { row.get::<Option<i32>>(#column_name)? },
+                )
+            } else if info.has_vec_i32_data_type {
+                let column_name = &info.column_name;
+                field_from_vec_i32_expr(info.field, quote! { row.get::<Vec<i32>>(#column_name)? })
+            } else {
+                let column_name = &info.column_name;
+                quote! {
+                    #field_name: row.get(#column_name)?
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // 生成 from_row_values 实现（按顺序从行值中读取）
+    let from_row_values_fields = field_infos
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            if let Some(default_expr) = &info.relation_default {
+                quote! {
+                    #field_name: #default_expr
+                }
+            } else {
+                let i = info
+                    .normal_index
+                    .expect("normal field should have an index");
+                if info.has_i32_data_type {
+                    field_from_i32_expr(
+                        info.field,
+                        quote! {
+                            <i32 as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
+                        },
+                        quote! {
+                            <Option<i32> as ::ormer::FromRowValues>::from_row_values(
+                                &values[#i..#i+1]
+                            )?
+                        },
+                    )
+                } else if info.has_vec_i32_data_type {
+                    field_from_vec_i32_expr(
+                        info.field,
+                        quote! {
+                            <Vec<i32> as ::ormer::FromRowValues>::from_row_values(
+                                &values[#i..#i+1]
+                            )?
+                        },
+                    )
+                } else {
+                    let field_type = info.field_type;
+                    quote! {
+                        #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
+                            &values[#i..#i+1]
+                        )?
+                    }
+                }
+            }
+        })
+        .collect::<Vec<_>>();
 
     // 生成 field_values 实现
     let field_names_for_values = normal_fields.iter().map(|info| field_to_value_expr(info));
@@ -256,8 +267,15 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         let field_name = info.field_name;
         if let Some(relation) = &info.relation {
             let target_type = &relation.target_type;
-            quote! {
-                pub #field_name: ::ormer::model::Relation<#name, #target_type>
+            if let RelationKindAttr::Through = relation.kind {
+                let via_type = through_via_type(relation, &relation_fields);
+                quote! {
+                    pub #field_name: ::ormer::model::ThroughRelation<#name, #via_type, #target_type>
+                }
+            } else {
+                quote! {
+                    pub #field_name: ::ormer::model::Relation<#name, #target_type>
+                }
             }
         } else {
             let field_type = info
@@ -273,9 +291,21 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 生成 Where 的 Default 实现
     let where_default_fields = field_infos.iter().map(|info| {
         let field_name = info.field_name;
-        if info.is_relation() {
-            quote! {
-                #field_name: ::ormer::model::Relation::new(stringify!(#field_name))
+        if let Some(relation) = &info.relation {
+            if let Some(through) = &relation.through {
+                let via_relation = &through.via_relation;
+                let target_relation = &through.target_relation;
+                quote! {
+                    #field_name: ::ormer::model::ThroughRelation::new(
+                        stringify!(#field_name),
+                        #via_relation,
+                        #target_relation
+                    )
+                }
+            } else {
+                quote! {
+                    #field_name: ::ormer::model::Relation::new(stringify!(#field_name))
+                }
             }
         } else {
             let column_name = &info.column_name;
@@ -331,6 +361,20 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         let kind = match relation.kind {
             RelationKindAttr::HasMany => quote! { ::ormer::model::RelationKind::HasMany },
             RelationKindAttr::BelongsTo => quote! { ::ormer::model::RelationKind::BelongsTo },
+            RelationKindAttr::HasOne => quote! { ::ormer::model::RelationKind::HasOne },
+            RelationKindAttr::Through => quote! { ::ormer::model::RelationKind::Through },
+        };
+        let through = if let Some(through) = &relation.through {
+            let via_relation = &through.via_relation;
+            let target_relation = &through.target_relation;
+            quote! {
+                Some(::ormer::model::ThroughInfo {
+                    via_relation: #via_relation,
+                    target_relation: #target_relation,
+                })
+            }
+        } else {
+            quote! { None }
         };
         quote! {
             ::ormer::model::RelationInfo {
@@ -339,6 +383,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 target_table: <#target_type as ::ormer::Model>::TABLE_NAME,
                 local_key: #local_key,
                 target_key: #target_key,
+                through: #through,
             }
         }
     });
@@ -363,7 +408,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         let field_name = &relation.field_name;
         let target_type = &relation.target_type;
         match relation.kind {
-            RelationKindAttr::HasMany => quote! {
+            RelationKindAttr::HasMany | RelationKindAttr::Through => quote! {
                 stringify!(#field_name)
                     if ::std::any::TypeId::of::<Target>() == ::std::any::TypeId::of::<#target_type>() =>
                 {
@@ -372,7 +417,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     Ok(())
                 }
             },
-            RelationKindAttr::BelongsTo => quote! {
+            RelationKindAttr::BelongsTo | RelationKindAttr::HasOne => quote! {
                 stringify!(#field_name)
                     if ::std::any::TypeId::of::<Target>() == ::std::any::TypeId::of::<#target_type>() =>
                 {
@@ -418,6 +463,42 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
 
+        impl ::ormer::ViewModel for #name {
+            const TABLE_NAME: &'static str = #table_name;
+            const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
+
+            type QueryBuilder = ::ormer::Select<Self>;
+            type Where = #where_name;
+
+            fn query() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn select() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
+                Ok(Self {
+                    #(#from_row_fields),*
+                })
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
+                if values.len() < <Self as ::ormer::ViewModel>::COLUMNS.len() {
+                    return Err(::ormer::ormer_error!(
+                        "Expected {} values for {}",
+                        <Self as ::ormer::ViewModel>::COLUMNS.len(),
+                        stringify!(#name)
+                    ));
+                }
+                Ok(Self {
+                    #(#from_row_values_fields),*
+                })
+            }
+        }
+
         impl ::ormer::Model for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
@@ -445,9 +526,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
 
             fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
-                if values.len() < Self::COLUMNS.len() {
+                if values.len() < <Self as ::ormer::Model>::COLUMNS.len() {
                     return Err(::ormer::ormer_error!(
-                        "Expected {} values for {}", Self::COLUMNS.len(), stringify!(#name)
+                        "Expected {} values for {}",
+                        <Self as ::ormer::Model>::COLUMNS.len(),
+                        stringify!(#name)
                     ));
                 }
                 Ok(Self {
@@ -500,6 +583,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 #primary_key_value_expr
             }
         }
+
+        impl ::ormer::WritableModel for #name {}
 
         // 生成 inherent 方法，使得不需要 import Model trait 也能调用
         impl #name {
@@ -570,6 +655,302 @@ pub fn derive_insert_model(input: DeriveInput) -> TokenStream {
     }
 }
 
+pub fn derive_view_model(input: DeriveInput) -> TokenStream {
+    let name = &input.ident;
+    let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
+    let table_name = extract_table_name(&input);
+
+    let fields = match &input.data {
+        syn::Data::Struct(data) => match &data.fields {
+            syn::Fields::Named(fields) => &fields.named,
+            _ => panic!("ViewModel must have named fields"),
+        },
+        _ => panic!("ViewModel must be a struct"),
+    };
+
+    let field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    if field_infos
+        .iter()
+        .any(|info| info.is_primary || info.is_relation())
+    {
+        panic!(
+            "ViewModel cannot use #[primary], #[has_many], #[belongs_to], #[has_one], or #[through]"
+        );
+    }
+
+    let field_names: Vec<String> = field_infos
+        .iter()
+        .map(|info| info.column_name.clone())
+        .collect();
+    let field_names_lit = field_names
+        .iter()
+        .map(|name| quote! { #name })
+        .collect::<Vec<_>>();
+
+    let column_schema_entries = field_infos
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            let rust_field_name = field_name.to_string();
+            let column_name = info.column_name.as_str();
+            let field_type = info.field_type;
+            let is_nullable = info.is_nullable;
+            let rust_type = &info.rust_type;
+            let data_type = &info.data_type;
+            let enum_variants = if info.has_data_type {
+                quote! { None }
+            } else {
+                quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
+            };
+
+            quote! {
+                ::ormer::model::ColumnSchema {
+                    rust_name: #rust_field_name,
+                    name: #column_name,
+                    rust_type: #rust_type,
+                    is_primary: false,
+                    is_auto_increment: false,
+                    is_nullable: #is_nullable,
+                    unique_group: None,
+                    unique_name: None,
+                    is_indexed: false,
+                    index_group: None,
+                    index_name: None,
+                    index_order: None,
+                    index_where: None,
+                    foreign_key: None,
+                    enum_variants: #enum_variants,
+                    data_type: #data_type,
+                    default: None,
+                    check: None,
+                    hypertable: None,
+                    compress: false,
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let from_row_fields = field_infos
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            if info.has_i32_data_type {
+                let column_name = &info.column_name;
+                field_from_i32_expr(
+                    info.field,
+                    quote! { row.get::<i32>(#column_name)? },
+                    quote! { row.get::<Option<i32>>(#column_name)? },
+                )
+            } else if info.has_vec_i32_data_type {
+                let column_name = &info.column_name;
+                field_from_vec_i32_expr(info.field, quote! { row.get::<Vec<i32>>(#column_name)? })
+            } else {
+                let column_name = &info.column_name;
+                quote! {
+                    #field_name: row.get(#column_name)?
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let from_row_values_fields = field_infos
+        .iter()
+        .enumerate()
+        .map(|(index, info)| {
+            let field_name = info.field_name;
+            let i = syn::Index::from(index);
+            if info.has_i32_data_type {
+                field_from_i32_expr(
+                    info.field,
+                    quote! {
+                        <i32 as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
+                    },
+                    quote! {
+                        <Option<i32> as ::ormer::FromRowValues>::from_row_values(
+                            &values[#i..#i+1]
+                        )?
+                    },
+                )
+            } else if info.has_vec_i32_data_type {
+                field_from_vec_i32_expr(
+                    info.field,
+                    quote! {
+                        <Vec<i32> as ::ormer::FromRowValues>::from_row_values(
+                            &values[#i..#i+1]
+                        )?
+                    },
+                )
+            } else {
+                let field_type = info.field_type;
+                quote! {
+                    #field_name: <#field_type as ::ormer::FromRowValues>::from_row_values(
+                        &values[#i..#i+1]
+                    )?
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let where_fields = field_infos
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            let field_type = info
+                .effective_data_type_type
+                .as_ref()
+                .unwrap_or(info.field_type);
+            quote! {
+                pub #field_name: ::ormer::query::builder::TypedColumn<#field_type, #name>
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let where_default_fields = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        let column_name = &info.column_name;
+        quote! {
+            #field_name: ::ormer::query::builder::TypedColumn::new(#column_name)
+        }
+    });
+
+    let field_values = field_infos.iter().map(|info| field_to_value_expr(info));
+    let column_value_arms = field_infos.iter().map(|info| {
+        let field_name = info.field_name;
+        let rust_field_name = field_name.to_string();
+        let column_name = info.column_name.as_str();
+        let value_expr = field_to_value_expr(info);
+        if rust_field_name == column_name {
+            quote! {
+                #column_name => Some(#value_expr)
+            }
+        } else {
+            quote! {
+                #column_name | #rust_field_name => Some(#value_expr)
+            }
+        }
+    });
+
+    quote! {
+        pub struct #where_name {
+            #(#where_fields),*
+        }
+
+        impl Default for #where_name {
+            fn default() -> Self {
+                Self {
+                    #(#where_default_fields),*
+                }
+            }
+        }
+
+        impl ::ormer::ViewModel for #name {
+            const TABLE_NAME: &'static str = #table_name;
+            const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
+
+            type QueryBuilder = ::ormer::Select<Self>;
+            type Where = #where_name;
+
+            fn query() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn select() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
+                Ok(Self {
+                    #(#from_row_fields),*
+                })
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
+                if values.len() < <Self as ::ormer::ViewModel>::COLUMNS.len() {
+                    return Err(::ormer::ormer_error!(
+                        "Expected {} values for {}",
+                        <Self as ::ormer::ViewModel>::COLUMNS.len(),
+                        stringify!(#name)
+                    ));
+                }
+                Ok(Self {
+                    #(#from_row_values_fields),*
+                })
+            }
+        }
+
+        impl ::ormer::Model for #name {
+            const TABLE_NAME: &'static str = #table_name;
+            const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
+            const RELATIONS: &'static [::ormer::model::RelationInfo] = &[];
+
+            type AutoIncrementKeyType = ();
+            type QueryBuilder = ::ormer::Select<Self>;
+            type Where = #where_name;
+            type Update = ();
+
+            fn query() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn select() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
+                Ok(Self {
+                    #(#from_row_fields),*
+                })
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
+                if values.len() < <Self as ::ormer::Model>::COLUMNS.len() {
+                    return Err(::ormer::ormer_error!(
+                        "Expected {} values for {}",
+                        <Self as ::ormer::Model>::COLUMNS.len(),
+                        stringify!(#name)
+                    ));
+                }
+                Ok(Self {
+                    #(#from_row_values_fields),*
+                })
+            }
+
+            fn field_values(&self) -> Vec<::ormer::Value> {
+                vec![
+                    #(#field_values),*
+                ]
+            }
+
+            fn column_value(&self, column: &str) -> Option<::ormer::Value> {
+                match column {
+                    #(#column_value_arms,)*
+                    _ => None,
+                }
+            }
+
+            fn primary_key_columns() -> &'static [&'static str] {
+                &[]
+            }
+
+            fn primary_key_values(&self) -> Vec<::ormer::Value> {
+                Vec::new()
+            }
+        }
+
+        impl #name {
+            pub fn select() -> ::ormer::Select<Self> {
+                ::ormer::Select::new()
+            }
+
+            pub fn query() -> ::ormer::Select<Self> {
+                ::ormer::Select::new()
+            }
+        }
+    }
+}
+
 fn normalize_type_string(type_str: String) -> String {
     type_str
         .replace(" :: ", "::")
@@ -582,6 +963,14 @@ fn normalize_type_string(type_str: String) -> String {
 enum RelationKindAttr {
     HasMany,
     BelongsTo,
+    HasOne,
+    Through,
+}
+
+#[derive(Clone)]
+struct ThroughAttr {
+    via_relation: String,
+    target_relation: String,
 }
 
 #[derive(Clone)]
@@ -591,6 +980,7 @@ struct RelationField {
     kind: RelationKindAttr,
     local_key: String,
     target_key: String,
+    through: Option<ThroughAttr>,
 }
 
 struct FieldInfo<'a> {
@@ -713,8 +1103,8 @@ fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
 
 fn relation_default_expr(relation: Option<&RelationField>) -> Option<proc_macro2::TokenStream> {
     relation.map(|relation| match relation.kind {
-        RelationKindAttr::HasMany => quote! { Vec::new() },
-        RelationKindAttr::BelongsTo => quote! { None },
+        RelationKindAttr::HasMany | RelationKindAttr::Through => quote! { Vec::new() },
+        RelationKindAttr::BelongsTo | RelationKindAttr::HasOne => quote! { None },
     })
 }
 
@@ -729,6 +1119,7 @@ fn extract_relation_field(field: &syn::Field) -> Option<RelationField> {
                 kind: RelationKindAttr::HasMany,
                 local_key: String::new(),
                 target_key,
+                through: None,
             });
         }
         if attr.path().is_ident("belongs_to") {
@@ -742,6 +1133,35 @@ fn extract_relation_field(field: &syn::Field) -> Option<RelationField> {
                 kind: RelationKindAttr::BelongsTo,
                 local_key,
                 target_key: String::new(),
+                through: None,
+            });
+        }
+        if attr.path().is_ident("has_one") {
+            let (target_type, target_key) = parse_has_one(attr);
+            if option_inner_type(&field.ty).is_none() {
+                panic!("#[has_one] field must be Option<T>");
+            }
+            return Some(RelationField {
+                field_name,
+                target_type,
+                kind: RelationKindAttr::HasOne,
+                local_key: String::new(),
+                target_key,
+                through: None,
+            });
+        }
+        if attr.path().is_ident("through") {
+            let through = parse_through(attr);
+            let target_type = vec_inner_type(&field.ty)
+                .cloned()
+                .unwrap_or_else(|| panic!("#[through] field must be Vec<T>"));
+            return Some(RelationField {
+                field_name,
+                target_type,
+                kind: RelationKindAttr::Through,
+                local_key: String::new(),
+                target_key: String::new(),
+                through: Some(through),
             });
         }
     }
@@ -761,6 +1181,19 @@ fn parse_has_many(attr: &syn::Attribute) -> (syn::Type, String) {
     panic!("#[has_many] must use #[has_many(Target.foreign_key)]");
 }
 
+fn parse_has_one(attr: &syn::Attribute) -> (syn::Type, String) {
+    if let Meta::List(list) = &attr.meta {
+        let tokens_str = list.tokens.to_string();
+        let parts: Vec<&str> = tokens_str.split('.').collect();
+        if parts.len() == 2 {
+            let target_type: syn::Type =
+                syn::parse_str(parts[0].trim()).expect("#[has_one] target type is invalid");
+            return (target_type, parts[1].trim().to_string());
+        }
+    }
+    panic!("#[has_one] must use #[has_one(Target.foreign_key)]");
+}
+
 fn parse_belongs_to(attr: &syn::Attribute) -> String {
     if let Meta::List(list) = &attr.meta {
         let key = list.tokens.to_string().trim().to_string();
@@ -769,6 +1202,35 @@ fn parse_belongs_to(attr: &syn::Attribute) -> String {
         }
     }
     panic!("#[belongs_to] must use #[belongs_to(local_foreign_key)]");
+}
+
+fn parse_through(attr: &syn::Attribute) -> ThroughAttr {
+    if let Meta::List(list) = &attr.meta {
+        let tokens_str = list.tokens.to_string();
+        let parts: Vec<&str> = tokens_str.split('.').collect();
+        if parts.len() == 2 {
+            return ThroughAttr {
+                via_relation: parts[0].trim().to_string(),
+                target_relation: parts[1].trim().to_string(),
+            };
+        }
+    }
+    panic!("#[through] must use #[through(via_relation.target_relation)]");
+}
+
+fn through_via_type<'a>(
+    relation: &RelationField,
+    relation_fields: &'a [RelationField],
+) -> &'a syn::Type {
+    let through = relation
+        .through
+        .as_ref()
+        .expect("#[through] relation metadata is missing");
+    relation_fields
+        .iter()
+        .find(|candidate| candidate.field_name.to_string() == through.via_relation)
+        .map(|candidate| &candidate.target_type)
+        .unwrap_or_else(|| panic!("#[through] via relation must reference a relation field"))
 }
 
 /// 为元组结构体包装模型生成实现（例如：struct NewUser(User);）
@@ -794,6 +1256,33 @@ fn derive_model_tuple_wrapper(
 
     // 生成代码：元组结构体包装器将委托给内部类型的所有 Model 功能，但使用自定义表名
     quote! {
+        impl ::ormer::ViewModel for #name {
+            const TABLE_NAME: &'static str = #table_name;
+            const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = <#inner_type as ::ormer::Model>::COLUMN_SCHEMA;
+
+            type QueryBuilder = ::ormer::Select<Self>;
+            type Where = <#inner_type as ::ormer::Model>::Where;
+
+            fn query() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn select() -> Self::QueryBuilder {
+                ::ormer::Select::new()
+            }
+
+            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
+                let inner = <#inner_type as ::ormer::Model>::from_row(row)?;
+                Ok(#name(inner))
+            }
+
+            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
+                let inner = <#inner_type as ::ormer::Model>::from_row_values(values)?;
+                Ok(#name(inner))
+            }
+        }
+
         impl ::ormer::Model for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
@@ -843,6 +1332,8 @@ fn derive_model_tuple_wrapper(
                 self.0.primary_key_value()
             }
         }
+
+        impl ::ormer::WritableModel for #name {}
 
         // 生成 inherent 方法
         impl #name {
@@ -1336,6 +1827,33 @@ fn data_type_i32_decode_expr(
             ::ormer::model::I32DataTypeDecoder::<#target_type>::new()
                 .decode(value, stringify!(#field_name), stringify!(#target_type))?
         }
+    }
+}
+
+#[cfg(test)]
+mod view_model_tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn derive_view_model_generates_read_only_tokens() {
+        let input: DeriveInput = parse_quote! {
+            #[derive(Debug, ViewModel)]
+            #[table = "view_users"]
+            struct ViewUser {
+                id: i32,
+                name: String,
+            }
+        };
+
+        let tokens = derive_view_model(input).to_string();
+
+        assert!(tokens.contains("impl :: ormer :: ViewModel for ViewUser"));
+        assert!(tokens.contains("impl :: ormer :: Model for ViewUser"));
+        assert!(!tokens.contains("impl :: ormer :: WritableModel for ViewUser"));
+        assert!(tokens.contains("type Update = ()"));
+        assert!(tokens.contains("primary_key_columns"));
+        assert!(tokens.contains("& []"));
     }
 }
 

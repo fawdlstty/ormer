@@ -166,6 +166,15 @@ impl ForeignKeyAction {
 pub enum RelationKind {
     HasMany,
     BelongsTo,
+    HasOne,
+    Through,
+}
+
+/// through 关系路径元数据。
+#[derive(Debug, Clone)]
+pub struct ThroughInfo {
+    pub via_relation: &'static str,
+    pub target_relation: &'static str,
 }
 
 /// 关系元数据
@@ -176,13 +185,63 @@ pub struct RelationInfo {
     pub target_table: &'static str,
     pub local_key: &'static str,
     pub target_key: &'static str,
+    pub through: Option<ThroughInfo>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RelationPathInfo {
+    Direct {
+        relation: &'static RelationInfo,
+    },
+    Through {
+        relation: &'static RelationInfo,
+        via_relation: &'static RelationInfo,
+        target_relation: &'static RelationInfo,
+    },
+}
+
+pub trait RelationHandle<Owner: Model, Target: Model>: Clone {
+    type Via: Model + Clone + 'static;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo>;
+}
+
+pub trait RelationSelection<Owner: Model>: Clone {
+    type Target: Model + Clone + 'static;
+    type Via: Model + Clone + 'static;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo>;
+
+    fn filters(&self) -> &[crate::query::filter::FilterExpr] {
+        &[]
+    }
+
+    fn order_by(&self) -> &[crate::query::filter::OrderBy] {
+        &[]
+    }
+
+    fn range_start(&self) -> Option<usize> {
+        None
+    }
+
+    fn range_end(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// 类型化关系句柄，用于 include/preload/find_related。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct Relation<Owner: Model, Target: Model> {
     name: &'static str,
     _marker: PhantomData<(Owner, Target)>,
+}
+
+impl<Owner: Model, Target: Model> Copy for Relation<Owner, Target> {}
+
+impl<Owner: Model, Target: Model> Clone for Relation<Owner, Target> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 
 impl<Owner: Model, Target: Model> Relation<Owner, Target> {
@@ -207,6 +266,391 @@ impl<Owner: Model, Target: Model> Relation<Owner, Target> {
                     Owner::TABLE_NAME
                 )
             })
+    }
+
+    pub fn any<F>(self, f: F) -> crate::query::builder::WhereExpr
+    where
+        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+    {
+        let relation = self.info().expect("relation metadata not found");
+        crate::query::builder::WhereExpr::from_filter(
+            crate::query::filter::FilterExpr::RelationExists {
+                owner_table: Owner::TABLE_NAME,
+                owner_key: relation.local_key,
+                target_table: Target::TABLE_NAME,
+                target_key: relation.target_key,
+                filter: Some(Box::new(f(Target::Where::default()).into())),
+            },
+        )
+    }
+
+    pub fn filter<F>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+    {
+        RelationQuery::new(self).filter(f)
+    }
+
+    pub fn order_by<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        RelationQuery::new(self).order_by(f)
+    }
+
+    pub fn order_by_desc<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        RelationQuery::new(self).order_by_desc(f)
+    }
+
+    pub fn range<R>(self, range: R) -> RelationQuery<Owner, Target, Self>
+    where
+        R: Into<crate::query::builder::RangeBounds>,
+    {
+        RelationQuery::new(self).range(range)
+    }
+
+    pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Self, I>
+    where
+        F: FnOnce(Target::Where) -> I,
+    {
+        RelationQuery::new(self).include(f)
+    }
+}
+
+impl<Owner: Model, Target: Model + Clone + 'static> RelationHandle<Owner, Target>
+    for Relation<Owner, Target>
+{
+    type Via = Target;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo> {
+        Ok(RelationPathInfo::Direct {
+            relation: self.info()?,
+        })
+    }
+}
+
+impl<Owner: Model, Target: Model + Clone + 'static> RelationSelection<Owner>
+    for Relation<Owner, Target>
+{
+    type Target = Target;
+    type Via = Target;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo> {
+        <Self as RelationHandle<Owner, Target>>::path_info(self)
+    }
+}
+
+/// 类型化 through 关系句柄，用于多对多或跨中间模型的关系路径。
+#[derive(Debug)]
+pub struct ThroughRelation<Owner: Model, Via: Model, Target: Model> {
+    name: &'static str,
+    via_relation: &'static str,
+    target_relation: &'static str,
+    _marker: PhantomData<(Owner, Via, Target)>,
+}
+
+impl<Owner: Model, Via: Model, Target: Model> Copy for ThroughRelation<Owner, Via, Target> {}
+
+impl<Owner: Model, Via: Model, Target: Model> Clone for ThroughRelation<Owner, Via, Target> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Owner: Model, Via: Model, Target: Model> ThroughRelation<Owner, Via, Target> {
+    pub const fn new(
+        name: &'static str,
+        via_relation: &'static str,
+        target_relation: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            via_relation,
+            target_relation,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn info(&self) -> crate::Result<&'static RelationInfo> {
+        Owner::RELATIONS
+            .iter()
+            .find(|relation| {
+                relation.name == self.name && relation.target_table == Target::TABLE_NAME
+            })
+            .ok_or_else(|| {
+                crate::ormer_error!(
+                    "Relation {} -> {} not found on {}",
+                    self.name,
+                    Target::TABLE_NAME,
+                    Owner::TABLE_NAME
+                )
+            })
+    }
+
+    fn via_info(&self) -> crate::Result<&'static RelationInfo> {
+        Owner::RELATIONS
+            .iter()
+            .find(|relation| {
+                relation.name == self.via_relation && relation.target_table == Via::TABLE_NAME
+            })
+            .ok_or_else(|| {
+                crate::ormer_error!(
+                    "Through relation {} -> {} not found on {}",
+                    self.via_relation,
+                    Via::TABLE_NAME,
+                    Owner::TABLE_NAME
+                )
+            })
+    }
+
+    fn target_info(&self) -> crate::Result<&'static RelationInfo> {
+        Via::RELATIONS
+            .iter()
+            .find(|relation| {
+                relation.name == self.target_relation && relation.target_table == Target::TABLE_NAME
+            })
+            .ok_or_else(|| {
+                crate::ormer_error!(
+                    "Through target relation {} -> {} not found on {}",
+                    self.target_relation,
+                    Target::TABLE_NAME,
+                    Via::TABLE_NAME
+                )
+            })
+    }
+
+    pub fn any<F>(self, f: F) -> crate::query::builder::WhereExpr
+    where
+        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+    {
+        let via_relation = self
+            .via_info()
+            .expect("through relation metadata not found");
+        let target_relation = self
+            .target_info()
+            .expect("through target relation metadata not found");
+        crate::query::builder::WhereExpr::from_filter(
+            crate::query::filter::FilterExpr::ThroughRelationExists {
+                owner_table: Owner::TABLE_NAME,
+                owner_key: via_relation.local_key,
+                via_table: Via::TABLE_NAME,
+                via_owner_key: via_relation.target_key,
+                via_target_key: target_relation.local_key,
+                target_table: Target::TABLE_NAME,
+                target_key: target_relation.target_key,
+                filter: Some(Box::new(f(Target::Where::default()).into())),
+            },
+        )
+    }
+
+    pub fn filter<F>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+    {
+        RelationQuery::new(self).filter(f)
+    }
+
+    pub fn order_by<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        RelationQuery::new(self).order_by(f)
+    }
+
+    pub fn order_by_desc<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        RelationQuery::new(self).order_by_desc(f)
+    }
+
+    pub fn range<R>(self, range: R) -> RelationQuery<Owner, Target, Self>
+    where
+        R: Into<crate::query::builder::RangeBounds>,
+    {
+        RelationQuery::new(self).range(range)
+    }
+
+    pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Self, I>
+    where
+        F: FnOnce(Target::Where) -> I,
+    {
+        RelationQuery::new(self).include(f)
+    }
+}
+
+impl<Owner: Model, Via: Model + Clone + 'static, Target: Model> RelationHandle<Owner, Target>
+    for ThroughRelation<Owner, Via, Target>
+{
+    type Via = Via;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo> {
+        Ok(RelationPathInfo::Through {
+            relation: self.info()?,
+            via_relation: self.via_info()?,
+            target_relation: self.target_info()?,
+        })
+    }
+}
+
+impl<Owner: Model, Via: Model + Clone + 'static, Target: Model + Clone + 'static>
+    RelationSelection<Owner> for ThroughRelation<Owner, Via, Target>
+{
+    type Target = Target;
+    type Via = Via;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo> {
+        <Self as RelationHandle<Owner, Target>>::path_info(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoInclude;
+
+#[derive(Debug)]
+pub struct RelationQuery<Owner: Model, Target: Model, Handle, Nested = NoInclude> {
+    handle: Handle,
+    filters: Vec<crate::query::filter::FilterExpr>,
+    order_by: Vec<crate::query::filter::OrderBy>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    nested: Nested,
+    _marker: PhantomData<(Owner, Target)>,
+}
+
+impl<Owner, Target, Handle, Nested> Clone for RelationQuery<Owner, Target, Handle, Nested>
+where
+    Owner: Model,
+    Target: Model,
+    Handle: Clone,
+    Nested: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            nested: self.nested.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Owner: Model, Target: Model, Handle> RelationQuery<Owner, Target, Handle, NoInclude> {
+    pub fn new(handle: Handle) -> Self {
+        Self {
+            handle,
+            filters: Vec::new(),
+            order_by: Vec::new(),
+            range_start: None,
+            range_end: None,
+            nested: NoInclude,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<Owner: Model, Target: Model, Handle, Nested> RelationQuery<Owner, Target, Handle, Nested> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+    {
+        self.filters.push(f(Target::Where::default()).into());
+        self
+    }
+
+    pub fn order_by<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        self.order_by.push(f(Target::Where::default()).into());
+        self
+    }
+
+    pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(Target::Where) -> O,
+        O: Into<crate::query::filter::OrderBy>,
+    {
+        let mut order = f(Target::Where::default()).into();
+        order.direction = crate::query::filter::OrderDirection::Desc;
+        self.order_by.push(order);
+        self
+    }
+
+    pub fn range<R>(mut self, range: R) -> Self
+    where
+        R: Into<crate::query::builder::RangeBounds>,
+    {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
+        self
+    }
+
+    pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Handle, I>
+    where
+        F: FnOnce(Target::Where) -> I,
+    {
+        RelationQuery {
+            handle: self.handle,
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            nested: f(Target::Where::default()),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
+    pub fn nested(&self) -> &Nested {
+        &self.nested
+    }
+}
+
+impl<Owner, Target, Handle, Nested> RelationSelection<Owner>
+    for RelationQuery<Owner, Target, Handle, Nested>
+where
+    Owner: Model,
+    Target: Model + Clone + 'static,
+    Handle: RelationHandle<Owner, Target> + Clone,
+    Nested: Clone,
+{
+    type Target = Target;
+    type Via = Handle::Via;
+
+    fn path_info(&self) -> crate::Result<RelationPathInfo> {
+        self.handle.path_info()
+    }
+
+    fn filters(&self) -> &[crate::query::filter::FilterExpr] {
+        &self.filters
+    }
+
+    fn order_by(&self) -> &[crate::query::filter::OrderBy] {
+        &self.order_by
+    }
+
+    fn range_start(&self) -> Option<usize> {
+        self.range_start
+    }
+
+    fn range_end(&self) -> Option<usize> {
+        self.range_end
     }
 }
 
@@ -272,6 +716,39 @@ where
     }
 }
 
+/// 只读模型 trait，用于 view、DTO、raw SQL 结果和查询投影。
+pub trait ViewModel: Sized {
+    const TABLE_NAME: &'static str;
+    const COLUMNS: &'static [&'static str];
+    const COLUMN_SCHEMA: &'static [ColumnSchema];
+
+    /// 获取指定数据库后端实际使用的表名。
+    fn table_name_for_db(db_type: crate::abstract_layer::DbType) -> &'static str {
+        normalize_table_name_for_db(db_type, Self::TABLE_NAME)
+    }
+
+    /// 获取 hypertable 时间字段名和分片时长（如果有）
+    fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
+        for col in Self::COLUMN_SCHEMA {
+            if let Some(duration) = col.hypertable {
+                return Some((col.name, duration));
+            }
+        }
+        None
+    }
+
+    type QueryBuilder;
+    type Where: Default;
+
+    fn query() -> Self::QueryBuilder;
+    fn select() -> Self::QueryBuilder;
+    fn from_row(row: &Row) -> crate::Result<Self>;
+    fn from_row_values(values: &[Value]) -> crate::Result<Self>;
+}
+
+/// 可写模型 marker，用于表、迁移、写入相关 API。
+pub trait WritableModel: Model {}
+
 /// 模型 trait,所有 ORM 模型必须实现
 pub trait Model: Sized {
     const TABLE_NAME: &'static str;
@@ -308,20 +785,20 @@ pub trait Model: Sized {
     fn from_row(row: &Row) -> crate::Result<Self>;
     fn from_row_values(values: &[Value]) -> crate::Result<Self>;
 
-    /// 获取字段值 (用于 INSERT/UPDATE)
-    fn field_values(&self) -> Vec<Value>;
-
-    /// 获取指定列的值。
-    fn column_value(&self, _column: &str) -> Option<Value> {
-        None
-    }
-
     /// 通过 Rust 字段名查找实际 SQL 列名。
     fn column_name_for_field(field: &str) -> Option<&'static str> {
         Self::COLUMN_SCHEMA
             .iter()
             .find(|column| column.rust_name == field || column.name == field)
             .map(|column| column.name)
+    }
+
+    /// 获取字段值 (用于 INSERT/UPDATE)
+    fn field_values(&self) -> Vec<Value>;
+
+    /// 获取指定列的值。
+    fn column_value(&self, _column: &str) -> Option<Value> {
+        None
     }
 
     /// 获取关系本地键值。
@@ -674,7 +1151,7 @@ pub trait Insertable {
     }
 }
 
-impl<T: crate::model::Model> Insertable for &T {
+impl<T: crate::model::WritableModel> Insertable for &T {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         vec![*self]
@@ -689,7 +1166,11 @@ impl<T: crate::model::Model> Insertable for &T {
 #[async_trait::async_trait]
 impl<T> Insertable for &mut T
 where
-    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+    T: crate::model::WritableModel
+        + crate::hooks::BeforeInsert
+        + crate::hooks::AfterInsert
+        + Send
+        + Sync,
 {
     type Model = T;
 
@@ -715,7 +1196,7 @@ where
     }
 }
 
-impl<T: crate::model::Model> Insertable for Vec<T> {
+impl<T: crate::model::WritableModel> Insertable for Vec<T> {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
@@ -729,7 +1210,11 @@ impl<T: crate::model::Model> Insertable for Vec<T> {
 #[async_trait::async_trait]
 impl<T> Insertable for &mut Vec<T>
 where
-    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+    T: crate::model::WritableModel
+        + crate::hooks::BeforeInsert
+        + crate::hooks::AfterInsert
+        + Send
+        + Sync,
 {
     type Model = T;
 
@@ -761,7 +1246,7 @@ where
     }
 }
 
-impl<T: crate::model::Model> Insertable for &Vec<T> {
+impl<T: crate::model::WritableModel> Insertable for &Vec<T> {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
@@ -775,7 +1260,11 @@ impl<T: crate::model::Model> Insertable for &Vec<T> {
 #[async_trait::async_trait]
 impl<T> Insertable for &mut [T]
 where
-    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+    T: crate::model::WritableModel
+        + crate::hooks::BeforeInsert
+        + crate::hooks::AfterInsert
+        + Send
+        + Sync,
 {
     type Model = T;
 
@@ -807,7 +1296,7 @@ where
     }
 }
 
-impl<T: crate::model::Model> Insertable for &[T] {
+impl<T: crate::model::WritableModel> Insertable for &[T] {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
@@ -818,7 +1307,7 @@ impl<T: crate::model::Model> Insertable for &[T] {
     }
 }
 
-impl<T: crate::model::Model, const N: usize> Insertable for &[T; N] {
+impl<T: crate::model::WritableModel, const N: usize> Insertable for &[T; N] {
     type Model = T;
     fn as_refs(&self) -> Vec<&T> {
         self.iter().collect()
@@ -832,7 +1321,11 @@ impl<T: crate::model::Model, const N: usize> Insertable for &[T; N] {
 #[async_trait::async_trait]
 impl<T, const N: usize> Insertable for &mut [T; N]
 where
-    T: crate::model::Model + crate::hooks::BeforeInsert + crate::hooks::AfterInsert + Send + Sync,
+    T: crate::model::WritableModel
+        + crate::hooks::BeforeInsert
+        + crate::hooks::AfterInsert
+        + Send
+        + Sync,
 {
     type Model = T;
 
@@ -1004,14 +1497,14 @@ pub fn quote_column_reference(db_type: crate::abstract_layer::DbType, column: &s
 }
 
 /// 运行时动态生成 CREATE TABLE SQL
-pub fn generate_create_table_sql<T: Model>(
+pub fn generate_create_table_sql<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
 ) -> crate::Result<String> {
     generate_create_table_sql_with_name::<T>(db_type, None)
 }
 
 /// 生成 CREATE TABLE SQL 语句，支持自定义表名
-pub fn generate_create_table_sql_with_name<T: Model>(
+pub fn generate_create_table_sql_with_name<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
@@ -1143,7 +1636,9 @@ pub fn generate_create_table_sql_with_name<T: Model>(
 }
 
 /// 生成 UNIQUE 约束
-fn generate_unique_constraints<T: Model>(db_type: crate::abstract_layer::DbType) -> Vec<String> {
+fn generate_unique_constraints<T: WritableModel>(
+    db_type: crate::abstract_layer::DbType,
+) -> Vec<String> {
     let mut constraints = Vec::new();
 
     // 收集所有 unique_group
@@ -1179,7 +1674,7 @@ fn generate_unique_constraints<T: Model>(db_type: crate::abstract_layer::DbType)
 }
 
 /// 生成索引 SQL，支持自定义表名
-fn generate_indexes_with_name<T: Model>(
+fn generate_indexes_with_name<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
     table_name: &str,
 ) -> crate::Result<String> {
@@ -1286,7 +1781,7 @@ fn render_index_sql(
 }
 
 /// 生成外键约束 SQL
-fn generate_foreign_key_constraints<T: Model>(
+fn generate_foreign_key_constraints<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
 ) -> Vec<String> {
     let mut constraints = Vec::new();
@@ -1319,7 +1814,7 @@ fn generate_foreign_key_constraints<T: Model>(
 }
 
 /// 生成复合主键约束 SQL
-fn generate_composite_primary_key_constraint<T: Model>(
+fn generate_composite_primary_key_constraint<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
 ) -> String {
     let primary_keys: Vec<&str> = T::COLUMN_SCHEMA
@@ -1585,7 +2080,7 @@ where
         .ok_or_else(|| crate::ormer_error!("Type mismatch: expected {}", expected.as_ref()))
 }
 
-impl<T: Model> FromRowValues for T {
+impl<T: ViewModel> FromRowValues for T {
     fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         T::from_row_values(values)
     }

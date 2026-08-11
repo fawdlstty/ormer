@@ -3,7 +3,7 @@ use crate::abstract_layer::common::common_helpers;
 use crate::abstract_layer::common::{SqlExecutor, SqlStatement};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
-use crate::model::{DbBackendTypeMapper, Model, Value};
+use crate::model::{DbBackendTypeMapper, Model, Value, WritableModel};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
@@ -126,7 +126,7 @@ impl Database {
         Ok(result.total())
     }
 
-    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+    pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         CreateTableExecutor {
             pool: self.pool.clone(),
             table_name: None,
@@ -134,7 +134,7 @@ impl Database {
         }
     }
 
-    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+    pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
             pool: self.pool.clone(),
             _marker: PhantomData,
@@ -150,7 +150,7 @@ impl Database {
         }
     }
 
-    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+    pub fn insert_partial<T: WritableModel>(&self) -> InsertPartialExecutor<'_, T> {
         InsertPartialExecutor {
             pool: self.pool.clone(),
             assignments: Vec::new(),
@@ -164,7 +164,7 @@ impl Database {
         model: impl crate::model::InsertModel<T>,
     ) -> InsertPartialExecutor<'_, T>
     where
-        T: Model,
+        T: WritableModel,
     {
         self.insert_partial::<T>()
             .with_source_table(model.insert_table_name())
@@ -339,7 +339,7 @@ impl Database {
         }
     }
 
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             pool: self.pool.clone(),
@@ -347,7 +347,7 @@ impl Database {
         }
     }
 
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -361,12 +361,14 @@ impl Database {
         let _client = self.pool.lock().await;
         Ok(Transaction {
             pool: self.pool.clone(),
+            committed: false,
+            rolled_back: false,
             _marker: PhantomData,
         })
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let table_filter = if let Some((schema_name, table_name)) = T::TABLE_NAME.rsplit_once('.') {
             format!("TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'")
@@ -514,6 +516,8 @@ impl Database {
         query.execute(&mut *client).trace().await?;
         Ok(Transaction {
             pool: self.pool.clone(),
+            committed: false,
+            rolled_back: false,
             _marker: PhantomData,
         })
     }
@@ -649,13 +653,13 @@ impl Database {
 }
 
 /// 创建表执行器
-pub struct CreateTableExecutor<'a, T: Model> {
+pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
     pool: Pool,
     table_name: Option<String>,
     _marker: PhantomData<(T, &'a ())>,
 }
 
-impl<'a, T: Model> CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
     pub fn with_table_name(mut self, table_name: &str) -> Self {
         self.table_name = Some(table_name.to_string());
         self
@@ -674,7 +678,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -694,12 +698,12 @@ impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
 }
 
 /// 删除表执行器
-pub struct DropTableExecutor<'a, T: Model> {
+pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
     pool: Pool,
     _marker: PhantomData<(T, &'a ())>,
 }
 
-impl<'a, T: Model> DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::MSSQL,
@@ -716,7 +720,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -1171,7 +1175,26 @@ pub struct UpdateExecutor<'a, T: Model> {
 /// 事务
 pub struct Transaction<'a> {
     pool: Pool,
+    committed: bool,
+    rolled_back: bool,
     _marker: PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {
+        if self.committed || self.rolled_back {
+            return;
+        }
+
+        let pool = self.pool.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut client = pool.lock().await;
+                let query = Query::new("ROLLBACK");
+                let _ = query.execute(&mut *client).trace().await;
+            });
+        }
+    }
 }
 
 impl<'a> Transaction<'a> {
@@ -1207,17 +1230,19 @@ impl<'a> Transaction<'a> {
         Ok(results.into_iter().collect())
     }
 
-    pub async fn commit(self) -> crate::Result<()> {
+    pub async fn commit(mut self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("COMMIT");
         query.execute(&mut *client).trace().await?;
+        self.committed = true;
         Ok(())
     }
 
-    pub async fn rollback(self) -> crate::Result<()> {
+    pub async fn rollback(mut self) -> crate::Result<()> {
         let mut client = self.pool.lock().await;
         let query = Query::new("ROLLBACK");
         query.execute(&mut *client).trace().await?;
+        self.rolled_back = true;
         Ok(())
     }
 
@@ -1237,7 +1262,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             pool: self.pool.clone(),
@@ -1245,7 +1270,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),

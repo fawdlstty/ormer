@@ -55,6 +55,25 @@ pub enum FilterExpr {
         subquery_sql: String,
         subquery_params: Vec<crate::model::Value>,
     },
+    /// 关系存在性查询: EXISTS (SELECT 1 FROM target WHERE target.fk = owner.pk AND ...)
+    RelationExists {
+        owner_table: &'static str,
+        owner_key: &'static str,
+        target_table: &'static str,
+        target_key: &'static str,
+        filter: Option<Box<FilterExpr>>,
+    },
+    /// through 关系存在性查询。
+    ThroughRelationExists {
+        owner_table: &'static str,
+        owner_key: &'static str,
+        via_table: &'static str,
+        via_owner_key: &'static str,
+        via_target_key: &'static str,
+        target_table: &'static str,
+        target_key: &'static str,
+        filter: Option<Box<FilterExpr>>,
+    },
     /// 表达式比较:left operator right
     ExprComparison {
         left: SqlExpr,
@@ -127,7 +146,7 @@ impl FilterExpr {
 }
 
 /// 排序方向
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum OrderDirection {
     Asc,
     Desc,
@@ -172,6 +191,10 @@ impl OrderBy {
             direction: OrderDirection::Desc,
             expr: Some(expr),
         }
+    }
+
+    pub(crate) fn cloned_expr(&self) -> Option<SqlExpr> {
+        self.expr.clone()
     }
 
     /// 将 OrderBy 转换为 SQL 字符串

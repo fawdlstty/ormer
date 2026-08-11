@@ -331,7 +331,7 @@ Can be combined with outer conditions:
 
 ## Loading Model Relations
 
-After declaring `#[has_many]` or `#[belongs_to]` on a model, related objects can be loaded on demand:
+After declaring `#[has_many]`, `#[belongs_to]`, `#[has_one]`, or `#[through]` on a model, related objects can be loaded on demand:
 
 ```rust
 let user = db.find_by_id::<User>(1).await?.unwrap();
@@ -347,7 +347,7 @@ let mut users = db.select::<User>().collect::<Vec<_>>().await?;
 db.preload(&mut users, UserWhere::default().posts).await?;
 ```
 
-Use `include` to load a `belongs_to` relation as part of the query result:
+Use `include` to load relations as part of the query result. Relation-local ordering, pagination, and nested includes are supported:
 
 ```rust
 let posts: Vec<Post> = db
@@ -355,9 +355,17 @@ let posts: Vec<Post> = db
     .include(|post| post.user)
     .collect()
     .await?;
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|user| user.roles.any(|role| role.name.eq("admin")))
+    .include(|user| user.roles.order_by(|role| role.name.asc()).range(..20))
+    .include(|user| user.user_roles.include(|user_role| user_role.role))
+    .collect()
+    .await?;
 ```
 
-Relation fields are excluded from column mapping. A missing `has_many` relation is an empty `Vec`, while a missing `belongs_to` target is `None`.
+Relation fields are excluded from column mapping. Empty collection relations return an empty `Vec`, while missing single-object relations return `None`.
 
 ## Set Operations
 

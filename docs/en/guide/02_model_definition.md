@@ -260,7 +260,7 @@ struct Post {
 
 ## Model Relations
 
-Foreign-key fields describe the database constraint. To load related models, use `#[has_many]` and `#[belongs_to]`:
+Foreign-key fields describe the database constraint. To load related models, use `#[has_many]`, `#[belongs_to]`, `#[has_one]`, and `#[through]`:
 
 ```rust
 #[derive(Debug, Clone, Model)]
@@ -271,6 +271,12 @@ struct User {
     name: String,
     #[has_many(Post.user_id)]
     posts: Vec<Post>,
+    #[has_one(Profile.user_id)]
+    profile: Option<Profile>,
+    #[has_many(UserRole.user_id)]
+    user_roles: Vec<UserRole>,
+    #[through(user_roles.role)]
+    roles: Vec<Role>,
 }
 
 #[derive(Debug, Clone, Model)]
@@ -286,7 +292,7 @@ struct Post {
 }
 ```
 
-Relation fields are not database columns. A `#[belongs_to]` field must be `Option<T>`, and a `#[has_many]` field must be `Vec<T>`.
+Relation fields are not database columns. `#[belongs_to]` and `#[has_one]` fields must be `Option<T>`, while `#[has_many]` and `#[through]` fields use `Vec<T>`. `#[through(user_roles.role)]` follows this model's `user_roles` relation and then the intermediate model's `role` relation.
 
 ## Composite Primary Keys
 

@@ -260,7 +260,7 @@ struct Post {
 
 ## 模型关系
 
-外键字段只描述数据库约束；需要加载关联模型时，可使用 `#[has_many]` 和 `#[belongs_to]`：
+外键字段只描述数据库约束；需要加载关联模型时，可使用 `#[has_many]`、`#[belongs_to]`、`#[has_one]` 和 `#[through]`：
 
 ```rust
 #[derive(Debug, Clone, Model)]
@@ -271,6 +271,12 @@ struct User {
     name: String,
     #[has_many(Post.user_id)]
     posts: Vec<Post>,
+    #[has_one(Profile.user_id)]
+    profile: Option<Profile>,
+    #[has_many(UserRole.user_id)]
+    user_roles: Vec<UserRole>,
+    #[through(user_roles.role)]
+    roles: Vec<Role>,
 }
 
 #[derive(Debug, Clone, Model)]
@@ -286,7 +292,7 @@ struct Post {
 }
 ```
 
-关系字段不会成为数据库列；`#[belongs_to]` 字段必须是 `Option<T>`，`#[has_many]` 字段必须是 `Vec<T>`。
+关系字段不会成为数据库列；`#[belongs_to]` 和 `#[has_one]` 字段必须是 `Option<T>`，`#[has_many]` 和常见 `#[through]` 字段使用 `Vec<T>`。`#[through(user_roles.role)]` 会沿用本模型的 `user_roles` 关系和中间模型上的 `role` 关系。
 
 ## 复合主键
 

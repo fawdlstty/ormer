@@ -2,7 +2,7 @@
 
 /// 测试数据库配置模块
 /// 提供统一的数据库后端配置，支持在多个数据库上运行测试
-use ormer::{Database, DbType, Model, PooledConnection};
+use ormer::{Database, DbType, Model, PooledConnection, WritableModel};
 
 /// 数据库后端配置类型
 /// 每个配置包含 (DbType, 连接字符串)
@@ -58,25 +58,28 @@ pub async fn create_db_connection(
 }
 
 #[allow(dead_code)]
-pub async fn prepare_table<T: Model>(db: &Database) -> ormer::Result<()> {
+pub async fn prepare_table<T: Model + WritableModel>(db: &Database) -> ormer::Result<()> {
     let _ = db.drop_table::<T>().execute().await;
     db.create_table::<T>().execute().await
 }
 
 #[allow(dead_code)]
-pub async fn clean_table<T: Model>(db: &Database) -> ormer::Result<()> {
+pub async fn clean_table<T: Model + WritableModel>(db: &Database) -> ormer::Result<()> {
     db.drop_table::<T>().execute().await
 }
 
 #[allow(dead_code)]
-pub async fn seed_rows<T: Model + Send + Sync>(db: &Database, rows: Vec<T>) -> ormer::Result<()> {
+pub async fn seed_rows<T: Model + WritableModel + Send + Sync>(
+    db: &Database,
+    rows: Vec<T>,
+) -> ormer::Result<()> {
     db.insert(rows).execute().await.map(|_| ())
 }
 
 #[allow(dead_code)]
 pub async fn seed_score_users<T, F>(db: &Database, mut make_user: F) -> ormer::Result<()>
 where
-    T: Model + Send + Sync,
+    T: Model + WritableModel + Send + Sync,
     F: FnMut(i32, &str, i32, i32) -> T,
 {
     seed_rows(
@@ -91,13 +94,17 @@ where
 }
 
 #[allow(dead_code)]
-pub async fn prepare_pooled_table<T: Model>(conn: &PooledConnection<'_>) -> ormer::Result<()> {
+pub async fn prepare_pooled_table<T: Model + WritableModel>(
+    conn: &PooledConnection<'_>,
+) -> ormer::Result<()> {
     let _ = conn.drop_table::<T>().execute().await;
     conn.create_table::<T>().execute().await
 }
 
 #[allow(dead_code)]
-pub async fn clean_pooled_table<T: Model>(conn: &PooledConnection<'_>) -> ormer::Result<()> {
+pub async fn clean_pooled_table<T: Model + WritableModel>(
+    conn: &PooledConnection<'_>,
+) -> ormer::Result<()> {
     conn.drop_table::<T>().execute().await
 }
 

@@ -4,7 +4,8 @@ use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatemen
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{
-    DbBackendTypeMapper, DurationToInterval, Model, Row, Value, split_schema_table_name,
+    DbBackendTypeMapper, DurationToInterval, Model, Row, Value, WritableModel,
+    split_schema_table_name,
 };
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
@@ -811,6 +812,12 @@ fn pg_collect_filter_param_rust_types<T: Model>(
             pg_collect_filter_param_rust_types::<T>(left, rust_types);
             pg_collect_filter_param_rust_types::<T>(right, rust_types);
         }
+        FilterExpr::RelationExists { filter, .. }
+        | FilterExpr::ThroughRelationExists { filter, .. } => {
+            if let Some(filter) = filter {
+                pg_collect_filter_param_rust_types::<T>(filter, rust_types);
+            }
+        }
         FilterExpr::Between { column, min, max } => {
             let rust_type = pg_model_column_rust_type::<T>(column);
             rust_types.push(rust_type.unwrap_or_else(|| infer_filter_value_rust_type(min)));
@@ -1004,13 +1011,13 @@ pub struct Database {
 }
 
 /// 创建表执行器
-pub struct CreateTableExecutor<'a, T: Model> {
+pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
     table_name: Option<String>,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T: Model> CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
         let mut statements = Vec::new();
@@ -1067,7 +1074,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -1083,12 +1090,12 @@ impl<'a, T: Model> SqlExecutor for CreateTableExecutor<'a, T> {
 }
 
 /// 删除表执行器
-pub struct DropTableExecutor<'a, T: Model> {
+pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<'a, T: Model> DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             DbType::PostgreSQL,
@@ -1105,7 +1112,7 @@ impl<'a, T: Model> DropTableExecutor<'a, T> {
     }
 }
 
-impl<'a, T: Model> SqlExecutor for DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T> {
     type Output = ();
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
@@ -1553,7 +1560,7 @@ impl Database {
     }
 
     /// 创建表 - 返回执行器
-    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+    pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         CreateTableExecutor {
             client: &self.client,
             table_name: None,
@@ -1571,7 +1578,7 @@ impl Database {
         }
     }
 
-    pub fn insert_partial<T: Model>(&self) -> InsertPartialExecutor<'_, T> {
+    pub fn insert_partial<T: WritableModel>(&self) -> InsertPartialExecutor<'_, T> {
         InsertPartialExecutor {
             db: self,
             assignments: Vec::new(),
@@ -1585,7 +1592,7 @@ impl Database {
         model: impl crate::model::InsertModel<T>,
     ) -> InsertPartialExecutor<'_, T>
     where
-        T: Model,
+        T: WritableModel,
     {
         self.insert_partial::<T>()
             .with_source_table(model.insert_table_name())
@@ -1617,7 +1624,7 @@ impl Database {
     }
 
     /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().trace().await?;
 
@@ -2046,7 +2053,7 @@ impl Database {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             client: &self.client,
@@ -2055,7 +2062,7 @@ impl Database {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
@@ -2085,7 +2092,7 @@ impl Database {
     }
 
     /// 删除表 - 返回执行器
-    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+    pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
             client: &self.client,
             _marker: std::marker::PhantomData,
@@ -2464,7 +2471,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
             client: self.client,
@@ -2473,7 +2480,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),

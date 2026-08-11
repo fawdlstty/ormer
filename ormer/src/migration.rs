@@ -6,7 +6,7 @@
 
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{Database, Transaction};
-use crate::model::{ColumnSchema, Model};
+use crate::model::{ColumnSchema, WritableModel};
 use crate::raw_sql::IntoRawSql;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -306,12 +306,12 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
 }
 
 /// Builder returned by `Database::migrate_table`.
-pub struct TableMigration<'a, T: Model> {
+pub struct TableMigration<'a, T: WritableModel> {
     db: &'a Database,
     marker: PhantomData<T>,
 }
 
-impl<'a, T: Model> TableMigration<'a, T> {
+impl<'a, T: WritableModel> TableMigration<'a, T> {
     pub async fn plan(&self) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
         let table_name = T::table_name_for_db(db_type);
@@ -689,7 +689,7 @@ fn postgresql_using_expression(
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_rebuild_sql<T: Model>(
+fn sqlite_rebuild_sql<T: WritableModel>(
     table_name: &str,
     actual_by_name: &BTreeMap<&str, &SchemaColumn>,
 ) -> crate::Result<String> {
@@ -1052,7 +1052,7 @@ impl Database {
         }
     }
 
-    pub fn migrate_table<T: Model>(&self) -> TableMigration<'_, T> {
+    pub fn migrate_table<T: WritableModel>(&self) -> TableMigration<'_, T> {
         TableMigration {
             db: self,
             marker: PhantomData,

@@ -4,10 +4,16 @@
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::{SqlStatement, common_helpers};
-use crate::model::{Model, Relation, RelationInfo, Value, normalize_table_name_for_db};
+use crate::model::{
+    Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
+    RelationSelection, ThroughRelation, Value, WritableModel, normalize_table_name_for_db,
+};
 use crate::query::builder::WhereExpr;
+use crate::query::filter::FilterExpr;
 use crate::query::insert::{IntoInsertAssignment, IntoInsertDefaultColumn};
 use crate::raw_sql::{IntoRawSql, RawSql};
+use std::future::Future;
+use std::pin::Pin;
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
@@ -94,6 +100,172 @@ fn primary_key_filter<T: Model>(key: impl crate::model::PrimaryKey) -> crate::Re
     Ok(WhereExpr::from_filter(filter))
 }
 
+fn relation_owner_key(path: RelationPathInfo) -> &'static RelationInfo {
+    match path {
+        RelationPathInfo::Direct { relation } => relation,
+        RelationPathInfo::Through { via_relation, .. } => via_relation,
+    }
+}
+
+pub trait NestedInclude<'a, Owner: Model>: Clone {
+    fn load_nested_include<'b>(
+        self,
+        executor: &'b SelectExecutor<'a, Owner>,
+        owners: &'b mut [Owner],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        'a: 'b;
+}
+
+impl<'a, Owner: Model> NestedInclude<'a, Owner> for NoInclude {
+    fn load_nested_include<'b>(
+        self,
+        _executor: &'b SelectExecutor<'a, Owner>,
+        _owners: &'b mut [Owner],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<'a, Owner, Target> NestedInclude<'a, Owner> for Relation<Owner, Target>
+where
+    Owner: Model + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+{
+    fn load_nested_include<'b>(
+        self,
+        executor: &'b SelectExecutor<'a, Owner>,
+        owners: &'b mut [Owner],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async move { executor.preload_models_with_selection(owners, self).await })
+    }
+}
+
+impl<'a, Owner, Via, Target> NestedInclude<'a, Owner> for ThroughRelation<Owner, Via, Target>
+where
+    Owner: Model + 'static + Send + Sync,
+    Via: Model + Clone + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+{
+    fn load_nested_include<'b>(
+        self,
+        executor: &'b SelectExecutor<'a, Owner>,
+        owners: &'b mut [Owner],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async move { executor.preload_models_with_selection(owners, self).await })
+    }
+}
+
+impl<'a, Owner, Target, Handle, Nested> NestedInclude<'a, Owner>
+    for RelationQuery<Owner, Target, Handle, Nested>
+where
+    Owner: Model + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+    Handle: RelationHandle<Owner, Target> + Clone + Send + Sync + 'static,
+    Handle::Via: Send + Sync,
+    Nested: NestedInclude<'a, Target> + Clone + Send + Sync + 'static,
+{
+    fn load_nested_include<'b>(
+        self,
+        executor: &'b SelectExecutor<'a, Owner>,
+        owners: &'b mut [Owner],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async move { executor.preload_models_with_selection(owners, self).await })
+    }
+}
+
+pub trait RelationNestedLoader<'a, Owner: Model>: RelationSelection<Owner> {
+    fn load_nested<'b>(
+        &'b self,
+        executor: &'b SelectExecutor<'a, Self::Target>,
+        related: &'b mut [Self::Target],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        Self::Target: Send + Sync,
+        'a: 'b;
+}
+
+impl<'a, Owner, Target> RelationNestedLoader<'a, Owner> for Relation<Owner, Target>
+where
+    Owner: Model + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+{
+    fn load_nested<'b>(
+        &'b self,
+        _executor: &'b SelectExecutor<'a, Self::Target>,
+        _related: &'b mut [Self::Target],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        Self::Target: Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<'a, Owner, Via, Target> RelationNestedLoader<'a, Owner> for ThroughRelation<Owner, Via, Target>
+where
+    Owner: Model + 'static + Send + Sync,
+    Via: Model + Clone + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+{
+    fn load_nested<'b>(
+        &'b self,
+        _executor: &'b SelectExecutor<'a, Self::Target>,
+        _related: &'b mut [Self::Target],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        Self::Target: Send + Sync,
+        'a: 'b,
+    {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl<'a, Owner, Target, Handle, Nested> RelationNestedLoader<'a, Owner>
+    for RelationQuery<Owner, Target, Handle, Nested>
+where
+    Owner: Model + 'static + Send + Sync,
+    Target: Model + Clone + 'static + Send + Sync,
+    Handle: RelationHandle<Owner, Target> + Clone + Send + Sync + 'static,
+    Handle::Via: Send + Sync,
+    Nested: NestedInclude<'a, Target> + Clone + Send + Sync + 'static,
+{
+    fn load_nested<'b>(
+        &'b self,
+        executor: &'b SelectExecutor<'a, Self::Target>,
+        related: &'b mut [Self::Target],
+    ) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send + 'b>>
+    where
+        Owner: 'static + Send + Sync,
+        Self::Target: Send + Sync,
+        'a: 'b,
+    {
+        let nested = self.nested().clone();
+        Box::pin(async move { nested.load_nested_include(executor, related).await })
+    }
+}
+
 fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
     let normalized = normalize_table_name_for_db(db_type, table_name);
     match db_type {
@@ -143,7 +315,7 @@ pub enum Database {
 }
 
 /// 统一的 CreateTableExecutor 枚举
-pub enum CreateTableExecutor<'a, T: Model> {
+pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::CreateTableExecutor<'a, T>),
     #[cfg(feature = "postgresql")]
@@ -154,7 +326,7 @@ pub enum CreateTableExecutor<'a, T: Model> {
     MSSQL(mssql_backend::CreateTableExecutor<'a, T>),
 }
 
-impl<'a, T: Model> CreateTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -183,7 +355,7 @@ impl<'a, T: Model> CreateTableExecutor<'a, T> {
 }
 
 /// 统一的 DropTableExecutor 枚举
-pub enum DropTableExecutor<'a, T: Model> {
+pub enum DropTableExecutor<'a, T: crate::model::WritableModel> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::DropTableExecutor<'a, T>),
     #[cfg(feature = "postgresql")]
@@ -194,7 +366,7 @@ pub enum DropTableExecutor<'a, T: Model> {
     MSSQL(mssql_backend::DropTableExecutor<'a, T>),
 }
 
-impl<'a, T: Model> DropTableExecutor<'a, T> {
+impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -581,7 +753,7 @@ impl Database {
     }
 
     /// 创建表 - 返回执行器
-    pub fn create_table<T: Model>(&self) -> CreateTableExecutor<'_, T> {
+    pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => CreateTableExecutor::Sqlite(db.create_table::<T>()),
@@ -595,7 +767,7 @@ impl Database {
     }
 
     /// 验证表结构
-    pub async fn validate_table<T: Model>(&self) -> crate::Result<()> {
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.validate_table::<T>().await,
@@ -622,7 +794,7 @@ impl Database {
         }
     }
 
-    pub fn insert_partial<T: Model + Send + Sync>(&self) -> InsertPartialExecutor<'_, T> {
+    pub fn insert_partial<T: WritableModel + Send + Sync>(&self) -> InsertPartialExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => {
@@ -642,7 +814,7 @@ impl Database {
         model: impl crate::model::InsertModel<T>,
     ) -> InsertPartialExecutor<'_, T>
     where
-        T: Model + Send + Sync,
+        T: WritableModel + Send + Sync,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -734,71 +906,40 @@ impl Database {
     /// 查找单个模型的关联对象。
     pub async fn find_related<
         T: Model + 'static + std::marker::Send + std::marker::Sync,
-        R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+        S: RelationSelection<T>,
     >(
         &self,
         owner: &T,
-        relation: Relation<T, R>,
-    ) -> crate::Result<Vec<R>> {
-        let relation = relation.info()?;
-        let key = owner.relation_key_value(relation)?;
-        self.select_related::<R>(relation, vec![key]).await
+        relation: S,
+    ) -> crate::Result<Vec<S::Target>>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + std::marker::Send + std::marker::Sync,
+        S::Target: std::marker::Send + std::marker::Sync,
+        S::Via: std::marker::Send + std::marker::Sync,
+    {
+        let path = relation.path_info()?;
+        let key = owner.relation_key_value(relation_owner_key(path))?;
+        self.select::<T>()
+            .select_related_with_selection(vec![key], &relation)
+            .await
     }
 
     /// 批量预加载关联对象，避免循环查询产生 N+1。
     pub async fn preload<
         T: Model + 'static + std::marker::Send + std::marker::Sync,
-        R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+        S: RelationSelection<T>,
     >(
         &self,
         owners: &mut [T],
-        relation: Relation<T, R>,
-    ) -> crate::Result<()> {
-        let relation = relation.info()?;
-        let owner_keys = owners
-            .iter()
-            .map(|owner| owner.relation_key_value(relation))
-            .collect::<crate::Result<Vec<_>>>()?;
-        let related = self.select_related::<R>(relation, owner_keys).await?;
-
-        let mut grouped: std::collections::HashMap<String, Vec<R>> =
-            std::collections::HashMap::new();
-        for item in related {
-            if let Some(key) = item.column_value(relation.target_key) {
-                grouped.entry(model_value_key(&key)).or_default().push(item);
-            }
-        }
-
-        for owner in owners {
-            let key = owner.relation_key_value(relation)?;
-            let values = grouped
-                .get(&model_value_key(&key))
-                .cloned()
-                .unwrap_or_default();
-            owner.assign_relation(relation.name, values)?;
-        }
-
-        Ok(())
-    }
-
-    async fn select_related<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
-        &self,
-        relation: &RelationInfo,
-        keys: Vec<Value>,
-    ) -> crate::Result<Vec<R>> {
-        let values = relation_filter_values(keys);
-        if values.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        self.select::<R>()
-            .filter(|_| {
-                WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
-                    column: relation.target_key.to_string(),
-                    values,
-                })
-            })
-            .collect::<Vec<R>>()
+        relation: S,
+    ) -> crate::Result<()>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + std::marker::Send + std::marker::Sync,
+        S::Target: std::marker::Send + std::marker::Sync,
+        S::Via: std::marker::Send + std::marker::Sync,
+    {
+        self.select::<T>()
+            .preload_models_with_selection(owners, relation)
             .await
     }
 
@@ -833,7 +974,7 @@ impl Database {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => {
@@ -849,7 +990,7 @@ impl Database {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => {
@@ -907,7 +1048,7 @@ impl Database {
     }
 
     /// 删除表 - 返回执行器
-    pub fn drop_table<T: Model>(&self) -> DropTableExecutor<'_, T> {
+    pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => DropTableExecutor::Sqlite(db.drop_table::<T>()),
@@ -977,6 +1118,16 @@ impl Database {
         connection_string: &str,
     ) -> super::connection_pool::PoolBuilder {
         super::connection_pool::PoolBuilder::new(db_type, connection_string)
+    }
+}
+
+impl super::DbExecutor for Database {
+    fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
+        Database::select::<T>(self)
+    }
+
+    fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        Database::select_column::<T, V>(self)
     }
 }
 
@@ -1122,107 +1273,240 @@ pub enum SelectExecutor<'a, T: Model> {
 crate::impl_unified_select_executor_methods!(SelectExecutor);
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
-    pub fn include<R: Model, F>(self, f: F) -> IncludedSelectExecutor<'a, T, R>
+    fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.select_model::<R>()),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                SelectExecutor::PostgreSQL(exec.select_model::<R>())
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.select_model::<R>()),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.select_model::<R>()),
+        }
+    }
+
+    pub fn include<F, S>(self, f: F) -> IncludedSelectExecutor<'a, T, S>
     where
-        F: FnOnce(T::Where) -> Relation<T, R>,
+        F: FnOnce(T::Where) -> S,
+        S: RelationSelection<T>,
     {
         let where_obj = T::Where::default();
         IncludedSelectExecutor {
             select: self,
-            relation: f(where_obj),
+            selection: f(where_obj),
             _marker: std::marker::PhantomData,
         }
     }
 
-    async fn select_related<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
+    async fn select_related_with_selection<S>(
         &self,
-        relation: &RelationInfo,
         keys: Vec<Value>,
-    ) -> crate::Result<Vec<R>> {
+        selection: &S,
+    ) -> crate::Result<Vec<S::Target>>
+    where
+        S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+        T: 'static + Send + Sync,
+    {
+        match selection.path_info()? {
+            RelationPathInfo::Direct { relation } => {
+                self.select_target_models::<S>(relation.target_key, keys, selection)
+                    .await
+            }
+            RelationPathInfo::Through {
+                via_relation,
+                target_relation,
+                ..
+            } => {
+                let via_items = self.select_via_models::<S>(via_relation, keys).await?;
+                let target_keys = via_items
+                    .iter()
+                    .filter_map(|item| item.column_value(target_relation.local_key))
+                    .collect();
+                self.select_target_models::<S>(target_relation.target_key, target_keys, selection)
+                    .await
+            }
+        }
+    }
+
+    async fn select_target_models<S>(
+        &self,
+        target_key: &str,
+        keys: Vec<Value>,
+        selection: &S,
+    ) -> crate::Result<Vec<S::Target>>
+    where
+        S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+        T: 'static + Send + Sync,
+    {
         let values = relation_filter_values(keys);
         if values.is_empty() {
             return Ok(Vec::new());
         }
 
-        match self {
-            #[cfg(feature = "sqlite")]
-            SelectExecutor::Sqlite(exec) => {
-                exec.select_model::<R>()
-                    .filter(|_| {
-                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
-                            column: relation.target_key.to_string(),
-                            values,
-                        })
-                    })
-                    .collect::<Vec<R>>()
-                    .await
-            }
-            #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => {
-                exec.select_model::<R>()
-                    .filter(|_| {
-                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
-                            column: relation.target_key.to_string(),
-                            values,
-                        })
-                    })
-                    .collect::<Vec<R>>()
-                    .await
-            }
-            #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => {
-                exec.select_model::<R>()
-                    .filter(|_| {
-                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
-                            column: relation.target_key.to_string(),
-                            values,
-                        })
-                    })
-                    .collect::<Vec<R>>()
-                    .await
-            }
-            #[cfg(feature = "mssql")]
-            SelectExecutor::MSSQL(exec) => {
-                exec.select_model::<R>()
-                    .filter(|_| {
-                        WhereExpr::from_filter(crate::query::filter::FilterExpr::In {
-                            column: relation.target_key.to_string(),
-                            values,
-                        })
-                    })
-                    .collect::<Vec<R>>()
-                    .await
-            }
+        let mut exec = self.select_model::<S::Target>().filter(|_| {
+            WhereExpr::from_filter(FilterExpr::In {
+                column: target_key.to_string(),
+                values,
+            })
+        });
+
+        for filter in selection.filters().iter().cloned() {
+            exec = exec.filter(|_| WhereExpr::from_filter(filter));
         }
+
+        for order in selection.order_by().iter().cloned() {
+            exec = exec.order_by(|_| order);
+        }
+
+        if selection.range_start().is_some() || selection.range_end().is_some() {
+            exec = exec.range(crate::query::builder::RangeBounds {
+                start: selection.range_start(),
+                end: selection.range_end(),
+            });
+        }
+
+        let mut related = exec.collect::<Vec<S::Target>>().await?;
+        let target_select = self.select_model::<S::Target>();
+        selection.load_nested(&target_select, &mut related).await?;
+        Ok(related)
     }
 
-    async fn preload_models<R: Model + Clone + 'static + std::marker::Send + std::marker::Sync>(
+    async fn select_via_models<S>(
         &self,
-        owners: &mut [T],
-        relation: Relation<T, R>,
-    ) -> crate::Result<()> {
-        let relation = relation.info()?;
-        let owner_keys = owners
-            .iter()
-            .map(|owner| owner.relation_key_value(relation))
-            .collect::<crate::Result<Vec<_>>>()?;
-        let related = self.select_related::<R>(relation, owner_keys).await?;
-
-        let mut grouped: std::collections::HashMap<String, Vec<R>> =
-            std::collections::HashMap::new();
-        for item in related {
-            if let Some(key) = item.column_value(relation.target_key) {
-                grouped.entry(model_value_key(&key)).or_default().push(item);
-            }
+        via_relation: &RelationInfo,
+        keys: Vec<Value>,
+    ) -> crate::Result<Vec<S::Via>>
+    where
+        S: RelationSelection<T>,
+        S::Via: Send + Sync,
+    {
+        let values = relation_filter_values(keys);
+        if values.is_empty() {
+            return Ok(Vec::new());
         }
 
-        for owner in owners {
-            let key = owner.relation_key_value(relation)?;
-            let values = grouped
-                .get(&model_value_key(&key))
-                .cloned()
-                .unwrap_or_default();
-            owner.assign_relation(relation.name, values)?;
+        self.select_model::<S::Via>()
+            .filter(|_| {
+                WhereExpr::from_filter(FilterExpr::In {
+                    column: via_relation.target_key.to_string(),
+                    values,
+                })
+            })
+            .collect::<Vec<S::Via>>()
+            .await
+    }
+
+    async fn preload_models_with_selection<S>(
+        &self,
+        owners: &mut [T],
+        selection: S,
+    ) -> crate::Result<()>
+    where
+        S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+        T: 'static + Send + Sync,
+    {
+        let path = selection.path_info()?;
+        let owner_relation = relation_owner_key(path);
+        let owner_keys = owners
+            .iter()
+            .map(|owner| owner.relation_key_value(owner_relation))
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        match path {
+            RelationPathInfo::Direct { relation } => {
+                let related = self
+                    .select_target_models::<S>(relation.target_key, owner_keys, &selection)
+                    .await?;
+                let mut grouped: std::collections::HashMap<String, Vec<S::Target>> =
+                    std::collections::HashMap::new();
+                for item in related {
+                    if let Some(key) = item.column_value(relation.target_key) {
+                        grouped.entry(model_value_key(&key)).or_default().push(item);
+                    }
+                }
+
+                for owner in owners {
+                    let key = owner.relation_key_value(relation)?;
+                    let values = grouped
+                        .get(&model_value_key(&key))
+                        .cloned()
+                        .unwrap_or_default();
+                    owner.assign_relation(relation.name, values)?;
+                }
+            }
+            RelationPathInfo::Through {
+                relation,
+                via_relation,
+                target_relation,
+            } => {
+                let via_items = self
+                    .select_via_models::<S>(via_relation, owner_keys)
+                    .await?;
+                let mut target_keys_by_owner: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+
+                for item in &via_items {
+                    if let (Some(owner_key), Some(target_key)) = (
+                        item.column_value(via_relation.target_key),
+                        item.column_value(target_relation.local_key),
+                    ) {
+                        let target_key = model_value_key(&target_key);
+                        target_keys_by_owner
+                            .entry(model_value_key(&owner_key))
+                            .or_default()
+                            .push(target_key.clone());
+                    }
+                }
+
+                let target_key_values = via_items
+                    .iter()
+                    .filter_map(|item| item.column_value(target_relation.local_key))
+                    .collect();
+                let related = self
+                    .select_target_models::<S>(
+                        target_relation.target_key,
+                        target_key_values,
+                        &selection,
+                    )
+                    .await?;
+                let mut targets_by_key: std::collections::HashMap<String, Vec<S::Target>> =
+                    std::collections::HashMap::new();
+                for item in &related {
+                    if let Some(key) = item.column_value(target_relation.target_key) {
+                        targets_by_key
+                            .entry(model_value_key(&key))
+                            .or_default()
+                            .push(item.clone());
+                    }
+                }
+
+                for owner in owners {
+                    let key = owner.relation_key_value(via_relation)?;
+                    let key = model_value_key(&key);
+                    let values = target_keys_by_owner
+                        .get(&key)
+                        .map(|target_keys| {
+                            target_keys
+                                .iter()
+                                .flat_map(|target_key| {
+                                    targets_by_key.get(target_key).into_iter().flatten()
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    owner.assign_relation(relation.name, values)?;
+                }
+            }
         }
 
         Ok(())
@@ -2156,7 +2440,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Delete 执行器
-    pub fn delete<T: Model>(&self) -> DeleteExecutor<'_, T> {
+    pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => {
@@ -2173,7 +2457,7 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建 Update 执行器
-    pub fn update<T: Model>(&self) -> UpdateExecutor<'_, T> {
+    pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => {
@@ -2266,6 +2550,16 @@ impl<'a> Transaction<'a> {
             }
             Transaction::_Phantom(_) => unreachable!(),
         }
+    }
+}
+
+impl<'a> super::DbExecutor for Transaction<'a> {
+    fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
+        Transaction::select::<T>(self)
+    }
+
+    fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+        Transaction::select_column::<T, V>(self)
     }
 }
 
@@ -2618,39 +2912,105 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 }
 
-pub struct IncludedSelectExecutor<'a, T: Model, R: Model> {
+pub struct IncludedSelectExecutor<'a, T: Model, S: RelationSelection<T>> {
     select: SelectExecutor<'a, T>,
-    relation: Relation<T, R>,
-    _marker: std::marker::PhantomData<R>,
+    selection: S,
+    _marker: std::marker::PhantomData<S>,
 }
 
-impl<'a, T: Model, R: Model> IncludedSelectExecutor<'a, T, R> {
-    pub fn collect<C>(self) -> IncludedCollectFuture<'a, T, R, C>
+impl<'a, T: Model, S: RelationSelection<T>> IncludedSelectExecutor<'a, T, S> {
+    pub fn include<F, S2>(self, f: F) -> DoubleIncludedSelectExecutor<'a, T, S, S2>
+    where
+        F: FnOnce(T::Where) -> S2,
+        S2: RelationSelection<T>,
+    {
+        DoubleIncludedSelectExecutor {
+            select: self.select,
+            first: self.selection,
+            second: f(T::Where::default()),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn collect<C>(self) -> IncludedCollectFuture<'a, T, S, C>
     where
         T: 'static,
-        R: Clone + 'static,
+        S: 'static,
+        S::Target: Clone + 'static,
         C: FromIterator<T> + 'static,
     {
         IncludedCollectFuture {
             select: self.select,
-            relation: self.relation,
+            selection: self.selection,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
-pub struct IncludedCollectFuture<'a, T: Model, R: Model, C> {
+pub struct DoubleIncludedSelectExecutor<
+    'a,
+    T: Model,
+    S1: RelationSelection<T>,
+    S2: RelationSelection<T>,
+> {
     select: SelectExecutor<'a, T>,
-    relation: Relation<T, R>,
+    first: S1,
+    second: S2,
+    _marker: std::marker::PhantomData<(S1, S2)>,
+}
+
+impl<'a, T, S1, S2> DoubleIncludedSelectExecutor<'a, T, S1, S2>
+where
+    T: Model,
+    S1: RelationSelection<T>,
+    S2: RelationSelection<T>,
+{
+    pub fn collect<C>(self) -> DoubleIncludedCollectFuture<'a, T, S1, S2, C>
+    where
+        T: 'static,
+        S1: 'static,
+        S2: 'static,
+        S1::Target: Clone + 'static,
+        S2::Target: Clone + 'static,
+        C: FromIterator<T> + 'static,
+    {
+        DoubleIncludedCollectFuture {
+            select: self.select,
+            first: self.first,
+            second: self.second,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct IncludedCollectFuture<'a, T: Model, S: RelationSelection<T>, C> {
+    select: SelectExecutor<'a, T>,
+    selection: S,
+    _marker: std::marker::PhantomData<C>,
+}
+
+pub struct DoubleIncludedCollectFuture<
+    'a,
+    T: Model,
+    S1: RelationSelection<T>,
+    S2: RelationSelection<T>,
+    C,
+> {
+    select: SelectExecutor<'a, T>,
+    first: S1,
+    second: S2,
     _marker: std::marker::PhantomData<C>,
 }
 
 impl<
     'a,
     T: Model + 'static + std::marker::Send + std::marker::Sync,
-    R: Model + Clone + 'static + std::marker::Send + std::marker::Sync,
+    S: RelationSelection<T> + RelationNestedLoader<'a, T> + std::marker::Send + std::marker::Sync + 'a,
     C: FromIterator<T> + 'static,
-> std::future::IntoFuture for IncludedCollectFuture<'a, T, R, C>
+> std::future::IntoFuture for IncludedCollectFuture<'a, T, S, C>
+where
+    S::Target: std::marker::Send + std::marker::Sync,
+    S::Via: std::marker::Send + std::marker::Sync,
 {
     type Output = crate::Result<C>;
     type IntoFuture =
@@ -2660,7 +3020,38 @@ impl<
         Box::pin(async move {
             let mut owners = self.select.collect::<Vec<T>>().await?;
             self.select
-                .preload_models::<R>(&mut owners, self.relation)
+                .preload_models_with_selection(&mut owners, self.selection)
+                .await?;
+            Ok(owners.into_iter().collect())
+        })
+    }
+}
+
+impl<
+    'a,
+    T: Model + 'static + std::marker::Send + std::marker::Sync,
+    S1: RelationSelection<T> + RelationNestedLoader<'a, T> + std::marker::Send + std::marker::Sync + 'a,
+    S2: RelationSelection<T> + RelationNestedLoader<'a, T> + std::marker::Send + std::marker::Sync + 'a,
+    C: FromIterator<T> + 'static,
+> std::future::IntoFuture for DoubleIncludedCollectFuture<'a, T, S1, S2, C>
+where
+    S1::Target: std::marker::Send + std::marker::Sync,
+    S1::Via: std::marker::Send + std::marker::Sync,
+    S2::Target: std::marker::Send + std::marker::Sync,
+    S2::Via: std::marker::Send + std::marker::Sync,
+{
+    type Output = crate::Result<C>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let mut owners = self.select.collect::<Vec<T>>().await?;
+            self.select
+                .preload_models_with_selection(&mut owners, self.first)
+                .await?;
+            self.select
+                .preload_models_with_selection(&mut owners, self.second)
                 .await?;
             Ok(owners.into_iter().collect())
         })
