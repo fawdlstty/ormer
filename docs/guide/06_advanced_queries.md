@@ -251,6 +251,42 @@ let user_roles: Vec<(User, Option<Role>)> = db
 
 可与主查询的 `filter`、`range` 等方法组合使用。
 
+### 派生表 JOIN
+
+`Select`、`MappedSelect`、`GroupedSelect` 可通过 `as_model::<R>()` 提升为派生表。无主键的投影结果类型使用 `ViewModel`。
+
+```rust
+#[derive(Debug, ormer::ViewModel)]
+struct UserTotal {
+    user_id: i32,
+    total: i64,
+}
+
+let totals = db
+    .select::<Order>()
+    .select_column(|o| (o.user_id, o.amount.sum()))
+    .group_by(|o| o.user_id)
+    .as_model::<UserTotal>();
+
+let rows: Vec<(User, Option<UserTotal>)> = db
+    .select::<User>()
+    .left_join_derived(totals, |u, t| u.id.eq(t.user_id))
+    .collect()
+    .await?;
+```
+
+也可以把派生表作为主查询来源：
+
+```rust
+let hot_users: Vec<UserTotal> = db
+    .from_derived(totals)
+    .filter(|t| t.total.gt(1000_i64))
+    .order_by_desc(|t| t.total)
+    .range(..10)
+    .collect()
+    .await?;
+```
+
 ## 多表关联
 
 ### 两表 (from)

@@ -94,6 +94,34 @@ let users: Vec<User> = db
 .filter(|u| u.age.lt(18).or(u.age.gt(65)))
 ```
 
+### 模型级过滤器
+
+`#[filter]` 会为模型生成同名链式方法。使用前导入派生出的扩展 trait：
+
+```rust
+use OrderFilterExt;
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .filter_tenant(tenant_id)
+    .filter_valid()
+    .collect()
+    .await?;
+```
+
+### 运行时动态字段
+
+`field` 可把运行时字段名或列名转换为安全查询条件；字段不存在时，执行查询时返回错误：
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.field("email").ne("a@example.com"))
+    .order_by_dynamic(|u| u.field("age").desc())
+    .collect()
+    .await?;
+```
+
 ## 排序
 
 ```rust
@@ -146,6 +174,21 @@ let users: Vec<User> = db
 // 等价于 range(..1)，只取第一条
 let user: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
 ```
+
+## 递归 CTE
+
+自关联树可用 `descendants` / `ancestors` 生成递归 CTE。第一个字段是节点 id，第二个字段是父节点 id：
+
+```rust
+let nodes: Vec<Category> = db
+    .select::<Category>()
+    .descendants(|c| (c.id, c.parent_id), root_id)
+    .order_by(|c| c.id.asc())
+    .collect()
+    .await?;
+```
+
+SQLite 当前 turso 后端可能不支持执行递归 CTE，可使用 `to_sql()` 生成 SQL 后交给支持的后端执行。
 
 ## 流式查询 (stream)
 

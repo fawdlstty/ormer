@@ -94,6 +94,34 @@ This uses PostgreSQL's array-containment operator; other backends do not provide
 .filter(|u| u.age.lt(18).or(u.age.gt(65)))
 ```
 
+### Model Filters
+
+`#[filter]` generates same-named chain methods for the model. Import the generated extension trait before use:
+
+```rust
+use OrderFilterExt;
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .filter_tenant(tenant_id)
+    .filter_valid()
+    .collect()
+    .await?;
+```
+
+### Runtime Dynamic Fields
+
+`field` converts a runtime field name or column name into a safe query condition. Unknown fields return an error when the query executes:
+
+```rust
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.field("email").ne("a@example.com"))
+    .order_by_dynamic(|u| u.field("age").desc())
+    .collect()
+    .await?;
+```
+
 ## Sorting
 
 ```rust
@@ -146,6 +174,21 @@ For example, an integer primary key is read as `0` and a nullable field is read 
 // Equivalent to range(..1), returns only the first record
 let user: Option<User> = db.select::<User>().filter(|u| u.age.ge(18)).first().await?;
 ```
+
+## Recursive CTE
+
+Self-referencing trees can use `descendants` / `ancestors` to generate a recursive CTE. The first field is the node id, and the second field is the parent id:
+
+```rust
+let nodes: Vec<Category> = db
+    .select::<Category>()
+    .descendants(|c| (c.id, c.parent_id), root_id)
+    .order_by(|c| c.id.asc())
+    .collect()
+    .await?;
+```
+
+The current SQLite turso backend may not execute recursive CTEs. Use `to_sql()` to generate SQL for a backend that supports them.
 
 ## Streaming Queries (stream)
 

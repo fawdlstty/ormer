@@ -33,28 +33,32 @@ pub use migration::{
 ))]
 pub use abstract_layer::{
     ConnectionPool, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
-    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
-    InsertPartialExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    NestedInclude, PooledConnection, PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor,
-    RelationNestedLoader, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
-    SqlStatement, Transaction, TransactionInsertOrIgnoreExecutor, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor,
+    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
+    DoubleIncludedSelectExecutor, DropTableExecutor, InsertGraphExecutor, InsertPartialExecutor,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude, PooledConnection,
+    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelationNestedLoader,
+    ReplicatedConnectionPool, ReplicatedDatabase, ReplicatedDatabaseBuilder, ReplicatedPoolBuilder,
+    SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
+    TransactionInsertOrIgnoreExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    UpdateGraphExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
 pub use model::{
     ActiveValue, AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
-    FromRowValues, FromSingleValue, FromValue, InsertModel, Insertable, Model, ModelEnum,
-    ModelEnumProvider, NoInclude, PrimaryKey, Relation, RelationHandle, RelationInfo, RelationKind,
-    RelationPathInfo, RelationQuery, RelationSelection, Row, ThroughInfo, ThroughRelation, Value,
-    ViewModel, WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
+    Embed, EmbedWhere, FromRowValues, FromSingleValue, FromValue, GraphWritable, InsertModel,
+    Insertable, Model, ModelEnum, ModelEnumProvider, NoInclude, PrimaryKey, Relation,
+    RelationHandle, RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection,
+    Row, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, Value, ViewModel,
+    WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
 };
-pub use ormer_derive::{InsertModel, Model, ModelEnum, ViewModel};
+pub use ormer_derive::{Embed, InsertModel, Model, ModelEnum, ViewModel};
 pub use query::builder::{
-    AgeColumn, CursorPage, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoGroupingSets,
-    IsInValue, IsInValues, LeftJoinedSelect, MapToResult, MappedSelect, MultiTableSelect,
-    NumericColumn, PageCursor, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
-    SelectColumnResult, SetOp, SubqueryParam, UnionSelect, WhereColumn, WhereExpr,
+    AgeColumn, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
+    FilterQuery, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoGroupingSets, IsInValue,
+    IsInValues, LeftJoinedSelect, MapToResult, MappedSelect, MultiTableSelect, NumericColumn,
+    PageCursor, RecursiveColumns, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
+    SelectColumnResult, SetOp, SubqueryParam, UnionSelect, WhereColumn, WhereExpr, from_derived,
 };
 pub use query::expr::{
     CaseMatchBuilder, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, SqlExpr, TypedExpr,

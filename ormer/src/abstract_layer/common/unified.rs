@@ -6,14 +6,17 @@
 use super::{SqlStatement, common_helpers};
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
-    RelationSelection, ThroughRelation, Value, WritableModel, normalize_table_name_for_db,
+    RelationSelection, TableRouteValue, ThroughRelation, Value, WritableModel,
+    normalize_table_name_for_db,
 };
-use crate::query::builder::WhereExpr;
+use crate::query::builder::{DerivedSelect, DerivedTableSelect};
+use crate::query::builder::{FilterQuery, WhereExpr};
 use crate::query::filter::FilterExpr;
 use crate::query::insert::{IntoInsertAssignment, IntoInsertDefaultColumn};
 use crate::raw_sql::{IntoRawSql, RawSql};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
@@ -36,6 +39,8 @@ fn model_value_key(value: &Value) -> String {
         Value::Text(v) => format!("t:{v}"),
         Value::TextArray(v) => format!("ta:{v:?}"),
         Value::Real(v) => format!("r:{v}"),
+        Value::Decimal(v) => format!("de:{v}"),
+        Value::BigDecimal(v) => format!("bd:{v}"),
         Value::Boolean(v) => format!("o:{v}"),
         Value::Bytes(v) => format!("x:{v:?}"),
         Value::IntegerArray(v) => format!("ia:{v:?}"),
@@ -314,6 +319,83 @@ pub enum Database {
     MSSQL(mssql_backend::Database),
 }
 
+pub struct ReplicatedDatabaseBuilder {
+    db_type: super::super::DbType,
+    write_connection: Option<String>,
+    read_connections: Vec<String>,
+}
+
+pub struct ReplicatedDatabase {
+    db_type: super::super::DbType,
+    write: Database,
+    reads: Vec<Database>,
+    next_read: AtomicUsize,
+}
+
+impl ReplicatedDatabaseBuilder {
+    pub(crate) fn new(db_type: super::super::DbType) -> Self {
+        Self {
+            db_type,
+            write_connection: None,
+            read_connections: Vec::new(),
+        }
+    }
+
+    pub fn write(mut self, connection_string: impl Into<String>) -> Self {
+        self.write_connection = Some(connection_string.into());
+        self
+    }
+
+    pub fn read(mut self, connection_string: impl Into<String>) -> Self {
+        self.read_connections.push(connection_string.into());
+        self
+    }
+
+    pub async fn connect(self) -> crate::Result<ReplicatedDatabase> {
+        let Some(write_connection) = self.write_connection else {
+            return Err(crate::ormer_error!(
+                "replicated database requires a write connection"
+            ));
+        };
+
+        let write = Database::connect(self.db_type, &write_connection).await?;
+        let mut reads = Vec::with_capacity(self.read_connections.len());
+        for connection in self.read_connections {
+            reads.push(Database::connect(self.db_type, &connection).await?);
+        }
+
+        Ok(ReplicatedDatabase {
+            db_type: self.db_type,
+            write,
+            reads,
+            next_read: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl ReplicatedDatabase {
+    pub fn db_type(&self) -> super::super::DbType {
+        self.db_type
+    }
+
+    pub fn write(&self) -> &Database {
+        &self.write
+    }
+
+    pub fn read(&self) -> &Database {
+        if self.reads.is_empty() {
+            return &self.write;
+        }
+        let index = self.next_read.fetch_add(1, Ordering::Relaxed) % self.reads.len();
+        &self.reads[index]
+    }
+}
+
+pub struct DerivedTableSelectExecutor<'a, R: Model> {
+    db: &'a Database,
+    select: DerivedTableSelect<R>,
+}
+
 /// 统一的 CreateTableExecutor 枚举
 pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
     #[cfg(feature = "sqlite")]
@@ -327,6 +409,39 @@ pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
+    pub fn with_table_name(self, table_name: &str) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            CreateTableExecutor::Sqlite(exec) => {
+                CreateTableExecutor::Sqlite(exec.with_table_name(table_name))
+            }
+            #[cfg(feature = "postgresql")]
+            CreateTableExecutor::PostgreSQL(exec) => {
+                CreateTableExecutor::PostgreSQL(exec.with_table_name(table_name))
+            }
+            #[cfg(feature = "mysql")]
+            CreateTableExecutor::MySQL(exec) => {
+                CreateTableExecutor::MySQL(exec.with_table_name(table_name))
+            }
+            #[cfg(feature = "mssql")]
+            CreateTableExecutor::MSSQL(exec) => {
+                CreateTableExecutor::MSSQL(exec.with_table_name(table_name))
+            }
+        }
+    }
+
+    pub fn route_table(self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        let table_name = crate::model::render_table_name_template(T::TABLE_NAME, &route)
+            .unwrap_or_else(|err| panic!("Failed to render table route: {}", err));
+        self.with_table_name(&table_name)
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -654,6 +769,16 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertOrUpdateExecutor<'a, I>),
 }
 
+pub struct InsertGraphExecutor<'a, T: crate::model::GraphWritable> {
+    db: &'a Database,
+    model: &'a mut T,
+}
+
+pub struct UpdateGraphExecutor<'a, T: crate::model::GraphWritable> {
+    db: &'a Database,
+    model: &'a mut T,
+}
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
@@ -679,6 +804,55 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             #[cfg(feature = "mssql")]
             InsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
         }
+    }
+}
+
+impl<'a, T> InsertGraphExecutor<'a, T>
+where
+    T: crate::model::GraphWritable + Send + Sync + 'a,
+    <T as Model>::AutoIncrementKeyType: Into<crate::model::Value>,
+{
+    pub async fn execute(self) -> crate::Result<()> {
+        let mut tx = self.db.begin().await?;
+        if let Err(err) = async {
+            let key = tx.insert(&*self.model).execute().await?;
+            let key_value = crate::model::graph_auto_increment_key_value(key);
+            if !crate::model::graph_is_no_auto_increment_key(&key_value) {
+                self.model
+                    .assign_column_value(<T as Model>::primary_key_columns()[0], key_value)?;
+            }
+            <T as crate::model::GraphWritable>::insert_graph_relations(&mut tx, self.model).await
+        }
+        .await
+        {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+        tx.commit().await
+    }
+}
+
+impl<'a, T> UpdateGraphExecutor<'a, T>
+where
+    T: crate::model::GraphWritable + Send + Sync + 'a,
+{
+    pub async fn execute(self) -> crate::Result<u64> {
+        let mut tx = self.db.begin().await?;
+        let affected = match async {
+            let affected = tx.update::<T>().set_model(&*self.model).execute().await?;
+            <T as crate::model::GraphWritable>::update_graph_relations(&mut tx, self.model).await?;
+            Ok::<u64, crate::OrmerError>(affected)
+        }
+        .await
+        {
+            Ok(affected) => affected,
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+        };
+        tx.commit().await?;
+        Ok(affected)
     }
 }
 
@@ -723,6 +897,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 }
 
 impl Database {
+    pub fn replicated(db_type: super::super::DbType) -> ReplicatedDatabaseBuilder {
+        ReplicatedDatabaseBuilder::new(db_type)
+    }
+
     /// 连接到数据库,根据 DbType 选择后端
     pub async fn connect(
         db_type: super::super::DbType,
@@ -830,6 +1008,13 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_model::<T>(model)),
         }
+    }
+
+    pub fn insert_graph<'a, T>(&'a self, model: &'a mut T) -> InsertGraphExecutor<'a, T>
+    where
+        T: crate::model::GraphWritable,
+    {
+        InsertGraphExecutor { db: self, model }
     }
 
     /// 插入或更新记录 - 返回执行器
@@ -957,6 +1142,16 @@ impl Database {
         }
     }
 
+    pub fn from_derived<R: Model>(
+        &self,
+        derived: DerivedSelect<R>,
+    ) -> DerivedTableSelectExecutor<'_, R> {
+        DerivedTableSelectExecutor {
+            db: self,
+            select: crate::query::builder::from_derived(derived),
+        }
+    }
+
     /// 创建分组聚合查询执行器
     pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         match self {
@@ -1003,6 +1198,13 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => UpdateExecutor::MSSQL(db.update::<T>()),
         }
+    }
+
+    pub fn update_graph<'a, T>(&'a self, model: &'a mut T) -> UpdateGraphExecutor<'a, T>
+    where
+        T: crate::model::GraphWritable,
+    {
+        UpdateGraphExecutor { db: self, model }
     }
 
     /// 创建 Related 查询执行器（关联查询）
@@ -1128,6 +1330,113 @@ impl super::DbExecutor for Database {
 
     fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         Database::select_column::<T, V>(self)
+    }
+}
+
+impl<'a, R: Model> DerivedTableSelectExecutor<'a, R> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> WhereExpr,
+    {
+        self.select = self.select.filter(f);
+        self
+    }
+
+    pub fn order_by<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> O,
+        O: Into<crate::OrderBy>,
+    {
+        self.select = self.select.order_by(f);
+        self
+    }
+
+    pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> O,
+        O: Into<crate::OrderBy>,
+    {
+        self.select = self.select.order_by_desc(f);
+        self
+    }
+
+    pub fn range<RR: Into<crate::query::builder::RangeBounds>>(mut self, range: RR) -> Self {
+        self.select = self.select.range(range);
+        self
+    }
+
+    pub fn collect<C>(self) -> DerivedTableCollectFuture<'a, R, C>
+    where
+        R: crate::model::FromRowValues + 'static,
+        C: FromIterator<R> + 'static,
+    {
+        DerivedTableCollectFuture {
+            db: self.db,
+            select: self.select,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let db_type = self.db.db_type();
+        #[cfg(feature = "postgresql")]
+        if matches!(db_type, crate::DbType::PostgreSQL) {
+            let (sql, params, rust_types) = self.select.to_sql_with_params_and_types(db_type);
+            return Ok(SqlStatement::batch(
+                db_type,
+                vec![super::SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types)],
+            ));
+        }
+
+        let (sql, params) = self.select.to_sql_with_params(db_type);
+        Ok(SqlStatement::single(db_type, sql, params))
+    }
+}
+
+pub struct DerivedTableCollectFuture<'a, R: Model, C> {
+    db: &'a Database,
+    select: DerivedTableSelect<R>,
+    _marker: std::marker::PhantomData<C>,
+}
+
+impl<'a, R, C> std::future::IntoFuture for DerivedTableCollectFuture<'a, R, C>
+where
+    R: Model + crate::model::FromRowValues + 'static + std::marker::Send,
+    C: FromIterator<R> + 'static,
+{
+    type Output = crate::Result<C>;
+    type IntoFuture =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let db_type = self.db.db_type();
+            match self.db {
+                #[cfg(feature = "sqlite")]
+                Database::Sqlite(db) => {
+                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    db.select_raw::<R, C>(&sql, params).await
+                }
+                #[cfg(feature = "postgresql")]
+                Database::PostgreSQL(db) => {
+                    let (sql, params, rust_types) = self
+                        .select
+                        .to_sql_with_params_and_types(crate::DbType::PostgreSQL);
+                    db.select_raw_with_types::<R, C>(&sql, params, rust_types)
+                        .await
+                }
+                #[cfg(feature = "mysql")]
+                Database::MySQL(db) => {
+                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    db.select_raw::<R, C>(&sql, params).await
+                }
+                #[cfg(feature = "mssql")]
+                Database::MSSQL(db) => {
+                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    db.select_raw::<R, C>(&sql, params).await
+                }
+            }
+        })
     }
 }
 
@@ -1272,6 +1581,12 @@ pub enum SelectExecutor<'a, T: Model> {
 
 crate::impl_unified_select_executor_methods!(SelectExecutor);
 
+impl<'a, T: Model> FilterQuery<T> for SelectExecutor<'a, T> {
+    fn append_filter_expr(self, expr: WhereExpr) -> Self {
+        SelectExecutor::append_filter_expr(self, expr)
+    }
+}
+
 impl<'a, T: Model> SelectExecutor<'a, T> {
     fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         match self {
@@ -1285,6 +1600,19 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.select_model::<R>()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.select_model::<R>()),
+        }
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => exec.to_sql(),
         }
     }
 
@@ -1657,6 +1985,84 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => {
                 RightJoinedSelectExecutor::MSSQL(exec.right_join::<J>(f))
+            }
+        }
+    }
+
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelectExecutor<'a, T, J> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => LeftJoinedSelectExecutor::Sqlite(
+                exec.left_join_derived::<J>(derived, f),
+                std::marker::PhantomData,
+            ),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                LeftJoinedSelectExecutor::PostgreSQL(exec.left_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => {
+                LeftJoinedSelectExecutor::MySQL(exec.left_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => {
+                LeftJoinedSelectExecutor::MSSQL(exec.left_join_derived::<J>(derived, f))
+            }
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<'a, T, J> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => InnerJoinedSelectExecutor::Sqlite(
+                exec.inner_join_derived::<J>(derived, f),
+                std::marker::PhantomData,
+            ),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                InnerJoinedSelectExecutor::PostgreSQL(exec.inner_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => {
+                InnerJoinedSelectExecutor::MySQL(exec.inner_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => {
+                InnerJoinedSelectExecutor::MSSQL(exec.inner_join_derived::<J>(derived, f))
+            }
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<'a, T, J> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => RightJoinedSelectExecutor::Sqlite(
+                exec.right_join_derived::<J>(derived, f),
+                std::marker::PhantomData,
+            ),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                RightJoinedSelectExecutor::PostgreSQL(exec.right_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => {
+                RightJoinedSelectExecutor::MySQL(exec.right_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => {
+                RightJoinedSelectExecutor::MSSQL(exec.right_join_derived::<J>(derived, f))
             }
         }
     }
@@ -2348,6 +2754,20 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 }
 
 impl<'a> Transaction<'a> {
+    pub fn db_type(&self) -> super::super::DbType {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(_) => super::super::DbType::Sqlite,
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(_) => super::super::DbType::PostgreSQL,
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(_) => super::super::DbType::MySQL,
+            #[cfg(feature = "mssql")]
+            Transaction::MSSQL(_) => super::super::DbType::MSSQL,
+            Transaction::_Phantom(_) => unreachable!(),
+        }
+    }
+
     pub fn select_sql<T>(
         &mut self,
         sql: impl IntoRawSql,
@@ -2356,6 +2776,33 @@ impl<'a> Transaction<'a> {
             txn: self,
             sql: sql.into_raw_sql(),
             _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub async fn execute_sql(&mut self, sql: impl IntoRawSql) -> crate::Result<u64> {
+        let sql = sql.into_raw_sql();
+        match self {
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn) => {
+                let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
+                txn.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => {
+                let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
+                txn.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(txn) => {
+                let (sql, params) = sql.render(super::super::DbType::MySQL)?;
+                txn.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "mssql")]
+            Transaction::MSSQL(txn) => {
+                let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+                txn.exec_raw(&sql, params).await
+            }
+            Transaction::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -2771,6 +3218,23 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
         }
     }
+
+    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            GroupedSelectExecutor::Sqlite(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "postgresql")]
+            GroupedSelectExecutor::PostgreSQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "mysql")]
+            GroupedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "mssql")]
+            GroupedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+        }
+    }
 }
 
 impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
@@ -3059,6 +3523,23 @@ where
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            MappedSelectExecutor::Sqlite(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "postgresql")]
+            MappedSelectExecutor::PostgreSQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "mysql")]
+            MappedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "mssql")]
+            MappedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+        }
+    }
+
     pub fn collect<C>(self) -> MappedCollectFuture<'a, T, V, C>
     where
         T: 'static,

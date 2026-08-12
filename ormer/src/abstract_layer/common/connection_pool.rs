@@ -12,6 +12,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
 use tokio::sync::Mutex;
 
@@ -713,6 +714,106 @@ impl PoolBuilder {
     }
 }
 
+pub struct ReplicatedPoolBuilder {
+    db_type: DbType,
+    write_connection: Option<String>,
+    read_connections: Vec<String>,
+    config: PoolConfig,
+}
+
+pub struct ReplicatedConnectionPool {
+    db_type: DbType,
+    write: ConnectionPool,
+    reads: Vec<ConnectionPool>,
+    next_read: AtomicUsize,
+}
+
+impl ReplicatedPoolBuilder {
+    pub(crate) fn new(db_type: DbType) -> Self {
+        Self {
+            db_type,
+            write_connection: None,
+            read_connections: Vec::new(),
+            config: PoolConfig::default(),
+        }
+    }
+
+    pub fn write(mut self, connection_string: impl Into<String>) -> Self {
+        self.write_connection = Some(connection_string.into());
+        self
+    }
+
+    pub fn read(mut self, connection_string: impl Into<String>) -> Self {
+        self.read_connections.push(connection_string.into());
+        self
+    }
+
+    pub fn range(mut self, range: std::ops::Range<u32>) -> Self {
+        self.config.min_size = range.start;
+        self.config.max_size = range.end;
+        self
+    }
+
+    pub fn max_size(mut self, max_size: u32) -> Self {
+        self.config.max_size = max_size;
+        self
+    }
+
+    pub async fn connect(self) -> crate::Result<ReplicatedConnectionPool> {
+        let Some(write_connection) = self.write_connection else {
+            return Err(crate::ormer_error!(
+                "replicated connection pool requires a write connection"
+            ));
+        };
+
+        let write = PoolBuilder {
+            db_type: self.db_type,
+            connection_string: write_connection,
+            config: self.config.clone(),
+        }
+        .build()
+        .await?;
+
+        let mut reads = Vec::with_capacity(self.read_connections.len());
+        for connection_string in self.read_connections {
+            reads.push(
+                PoolBuilder {
+                    db_type: self.db_type,
+                    connection_string,
+                    config: self.config.clone(),
+                }
+                .build()
+                .await?,
+            );
+        }
+
+        Ok(ReplicatedConnectionPool {
+            db_type: self.db_type,
+            write,
+            reads,
+            next_read: AtomicUsize::new(0),
+        })
+    }
+}
+
+impl ReplicatedConnectionPool {
+    pub fn db_type(&self) -> DbType {
+        self.db_type
+    }
+
+    pub fn write(&self) -> &ConnectionPool {
+        &self.write
+    }
+
+    pub fn read(&self) -> &ConnectionPool {
+        if self.reads.is_empty() {
+            return &self.write;
+        }
+        let index = self.next_read.fetch_add(1, AtomicOrdering::Relaxed) % self.reads.len();
+        &self.reads[index]
+    }
+}
+
 /// 统一的连接池枚举
 pub enum ConnectionPool {
     #[cfg(feature = "sqlite")]
@@ -726,6 +827,23 @@ pub enum ConnectionPool {
 }
 
 impl ConnectionPool {
+    pub fn replicated(db_type: DbType) -> ReplicatedPoolBuilder {
+        ReplicatedPoolBuilder::new(db_type)
+    }
+
+    pub fn db_type(&self) -> DbType {
+        match self {
+            #[cfg(feature = "sqlite")]
+            ConnectionPool::Sqlite(_) => DbType::Sqlite,
+            #[cfg(feature = "postgresql")]
+            ConnectionPool::PostgreSQL(_) => DbType::PostgreSQL,
+            #[cfg(feature = "mysql")]
+            ConnectionPool::MySQL(_) => DbType::MySQL,
+            #[cfg(feature = "mssql")]
+            ConnectionPool::MSSQL(_) => DbType::MSSQL,
+        }
+    }
+
     /// 从连接池异步获取连接
     ///
     /// 此方法会等待直到有可用连接或创建新连接

@@ -3,6 +3,10 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
+pub type RustDecimal = rust_decimal::Decimal;
+
+pub type BigDecimal = bigdecimal::BigDecimal;
+
 /// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
 pub trait DurationToInterval {
     /// 将 Duration 转换为 PostgreSQL INTERVAL 字符串
@@ -115,6 +119,141 @@ impl ColumnDefault {
 pub struct CheckConstraint {
     pub name: Option<&'static str>,
     pub expr: &'static str,
+}
+
+/// Runtime values used to render table name templates such as `orders_{tenant_id}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableRoute {
+    values: HashMap<String, String>,
+}
+
+impl TableRoute {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with(mut self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+        self.insert(key, value);
+        self
+    }
+
+    pub fn insert(&mut self, key: impl Into<String>, value: impl TableRouteValue) {
+        self.values.insert(key.into(), value.to_table_route_value());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
+
+    pub fn merge_missing(&mut self, other: TableRoute) {
+        for (key, value) in other.values {
+            self.values.entry(key).or_insert(value);
+        }
+    }
+}
+
+/// Converts a value into an identifier segment for table routing.
+pub trait TableRouteValue {
+    fn to_table_route_value(&self) -> String;
+}
+
+macro_rules! impl_table_route_value_to_string {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl TableRouteValue for $t {
+                fn to_table_route_value(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )*
+    };
+}
+
+impl_table_route_value_to_string!(
+    i8,
+    i16,
+    i32,
+    i64,
+    isize,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    bool,
+    f32,
+    f64,
+    rust_decimal::Decimal,
+    bigdecimal::BigDecimal,
+);
+
+impl TableRouteValue for str {
+    fn to_table_route_value(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl TableRouteValue for String {
+    fn to_table_route_value(&self) -> String {
+        self.clone()
+    }
+}
+
+impl<T: TableRouteValue + ?Sized> TableRouteValue for &T {
+    fn to_table_route_value(&self) -> String {
+        (*self).to_table_route_value()
+    }
+}
+
+impl TableRouteValue for Value {
+    fn to_table_route_value(&self) -> String {
+        match self {
+            Value::Integer(value) => value.to_string(),
+            Value::BigInt(value) => value.to_string(),
+            Value::Duration(value) => value.as_micros().to_string(),
+            Value::Text(value) => value.clone(),
+            Value::TextArray(value) => value.join("_"),
+            Value::Real(value) => value.to_string().replace('.', "_"),
+            Value::Decimal(value) | Value::BigDecimal(value) => value.replace('.', "_"),
+            Value::Boolean(value) => {
+                if *value {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            Value::Bytes(value) => value.iter().map(|byte| format!("{byte:02x}")).collect(),
+            Value::IntegerArray(value) => value
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("_"),
+            Value::BigIntArray(value) => value
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("_"),
+            Value::NullableBigIntArray(value) => value
+                .iter()
+                .map(|value| {
+                    value
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join("_"),
+            Value::DateTime(value) => value.timestamp_millis().to_string(),
+            Value::Date(value) => value.format("%Y%m%d").to_string(),
+            Value::Time(value) => value.format("%H%M%S").to_string(),
+            Value::Json(value) => value.to_string(),
+            Value::Uuid(value) => value.to_string().replace('-', "_"),
+            Value::Null => "null".to_string(),
+        }
+    }
 }
 
 /// 外键信息
@@ -654,6 +793,32 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EmbedColumnSchema {
+    pub rust_name: &'static str,
+    pub name: &'static str,
+    pub rust_type: &'static str,
+    pub is_nullable: bool,
+    pub enum_variants: Option<&'static [&'static str]>,
+    pub data_type: Option<&'static str>,
+}
+
+pub trait Embed: Sized {
+    const COLUMNS: &'static [&'static str];
+    const COLUMN_SCHEMA: &'static [EmbedColumnSchema];
+    type Where: EmbedWhere + Default;
+
+    fn from_row(row: &Row, prefix: &str) -> crate::Result<Self>;
+    fn from_row_values(values: &[Value]) -> crate::Result<Self>;
+    fn field_values(&self) -> Vec<Value>;
+    fn column_value(&self, column: &str) -> Option<Value>;
+    fn assign_column_value(&mut self, column: &str, value: Value) -> crate::Result<()>;
+}
+
+pub trait EmbedWhere {
+    fn new_with_prefix(prefix: &str) -> Self;
+}
+
 /// 数据库后端 trait - 用于 SQL 类型映射
 pub trait DbBackendTypeMapper {
     /// 根据 Rust 类型获取 SQL 类型
@@ -729,7 +894,7 @@ pub trait ViewModel: Sized {
 
     /// 获取 hypertable 时间字段名和分片时长（如果有）
     fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
-        for col in Self::COLUMN_SCHEMA {
+        for col in Self::column_schema() {
             if let Some(duration) = col.hypertable {
                 return Some((col.name, duration));
             }
@@ -739,6 +904,14 @@ pub trait ViewModel: Sized {
 
     type QueryBuilder;
     type Where: Default;
+
+    fn columns() -> Vec<&'static str> {
+        Self::COLUMNS.to_vec()
+    }
+
+    fn column_schema() -> Vec<ColumnSchema> {
+        Self::COLUMN_SCHEMA.to_vec()
+    }
 
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
@@ -761,9 +934,26 @@ pub trait Model: Sized {
         normalize_table_name_for_db(db_type, Self::TABLE_NAME)
     }
 
+    /// 从模型实例中提取表路由变量。
+    fn table_route(&self) -> crate::Result<TableRoute> {
+        let variables = table_route_variables(Self::TABLE_NAME);
+        let mut route = TableRoute::new();
+        for variable in variables {
+            let value = self.column_value(&variable).ok_or_else(|| {
+                crate::ormer_error!(
+                    "Table route value {} not found on model {}",
+                    variable,
+                    Self::TABLE_NAME
+                )
+            })?;
+            route.insert(variable, value);
+        }
+        Ok(route)
+    }
+
     /// 获取 hypertable 时间字段名和分片时长（如果有）
     fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
-        for col in Self::COLUMN_SCHEMA {
+        for col in Self::column_schema() {
             if let Some(duration) = col.hypertable {
                 return Some((col.name, duration));
             }
@@ -780,6 +970,14 @@ pub trait Model: Sized {
     type Where: Default;
     type Update: Default + crate::query::update::UpdateFields;
 
+    fn columns() -> Vec<&'static str> {
+        Self::COLUMNS.to_vec()
+    }
+
+    fn column_schema() -> Vec<ColumnSchema> {
+        Self::COLUMN_SCHEMA.to_vec()
+    }
+
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
     fn from_row(row: &Row) -> crate::Result<Self>;
@@ -787,7 +985,7 @@ pub trait Model: Sized {
 
     /// 通过 Rust 字段名查找实际 SQL 列名。
     fn column_name_for_field(field: &str) -> Option<&'static str> {
-        Self::COLUMN_SCHEMA
+        Self::column_schema()
             .iter()
             .find(|column| column.rust_name == field || column.name == field)
             .map(|column| column.name)
@@ -799,6 +997,14 @@ pub trait Model: Sized {
     /// 获取指定列的值。
     fn column_value(&self, _column: &str) -> Option<Value> {
         None
+    }
+
+    /// 按列名写入字段值。派生模型会为普通字段和嵌入字段生成实现。
+    fn assign_column_value(&mut self, _column: &str, _value: Value) -> crate::Result<()> {
+        Err(crate::ormer_error!(
+            "Column assignment is not supported on {}",
+            Self::TABLE_NAME
+        ))
     }
 
     /// 获取关系本地键值。
@@ -827,6 +1033,10 @@ pub trait Model: Sized {
         ))
     }
 
+    fn graph_relations_mut(&mut self) -> Vec<GraphRelationMut<'_>> {
+        Vec::new()
+    }
+
     /// 获取主键字段名列表（支持单主键和复合主键）
     fn primary_key_columns() -> &'static [&'static str] {
         // 默认实现返回空，要求派生宏生成
@@ -851,13 +1061,13 @@ pub trait Model: Sized {
     /// 获取非主键字段的 (列名, 值) 对，用于 set_model
     fn non_pk_field_values(&self) -> Vec<(&'static str, Value)> {
         let all_values = self.field_values();
-        Self::COLUMN_SCHEMA
+        Self::column_schema()
             .iter()
             .filter(|col| !col.is_primary)
             .filter_map(|col| {
-                Self::COLUMNS
+                Self::columns()
                     .iter()
-                    .position(|&c| c == col.name)
+                    .position(|c| *c == col.name)
                     .and_then(|idx| {
                         if idx < all_values.len() {
                             Some((col.name, all_values[idx].clone()))
@@ -879,7 +1089,7 @@ pub trait Model: Sized {
 
     /// 获取需要插入的列名（排除自增主键）
     fn insert_columns() -> Vec<&'static str> {
-        Self::COLUMN_SCHEMA
+        Self::column_schema()
             .iter()
             .filter(|col| !col.is_auto_increment)
             .map(|col| col.name)
@@ -889,14 +1099,14 @@ pub trait Model: Sized {
     /// 获取需要插入的字段值（排除自增主键）
     fn insert_values(&self) -> Vec<Value> {
         let all_values = self.field_values();
-        Self::COLUMN_SCHEMA
+        Self::column_schema()
             .iter()
             .filter(|col| !col.is_auto_increment)
             .filter_map(|col| {
                 // 找到原始字段值中对应的索引
-                Self::COLUMNS
+                Self::columns()
                     .iter()
-                    .position(|&c| c == col.name)
+                    .position(|c| *c == col.name)
                     .and_then(|original_idx| {
                         if original_idx < all_values.len() {
                             Some(all_values[original_idx].clone())
@@ -907,6 +1117,287 @@ pub trait Model: Sized {
             })
             .collect()
     }
+}
+
+pub enum GraphRelationMut<'a> {
+    HasMany {
+        relation: &'static RelationInfo,
+        items: &'a mut dyn GraphModels,
+    },
+    HasOne {
+        relation: &'static RelationInfo,
+        item: Option<&'a mut dyn GraphModel>,
+    },
+    Through {
+        relation: &'static RelationInfo,
+        items: &'a mut dyn GraphModels,
+    },
+}
+
+pub trait GraphModel {
+    fn model(&self) -> &dyn Any;
+    fn model_mut(&mut self) -> &mut dyn Any;
+    fn primary_key_values(&self) -> Vec<Value>;
+    fn assign_column_value(&mut self, column: &str, value: Value) -> crate::Result<()>;
+}
+
+impl<T: Model + 'static> GraphModel for T {
+    fn model(&self) -> &dyn Any {
+        self
+    }
+
+    fn model_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn primary_key_values(&self) -> Vec<Value> {
+        <T as Model>::primary_key_values(self)
+    }
+
+    fn assign_column_value(&mut self, column: &str, value: Value) -> crate::Result<()> {
+        <T as Model>::assign_column_value(self, column, value)
+    }
+}
+
+pub trait GraphModels {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn with_each_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut dyn GraphModel) -> crate::Result<()>,
+    ) -> crate::Result<()>;
+}
+
+impl<T: Model + 'static> GraphModels for Vec<T> {
+    fn len(&self) -> usize {
+        self.len()
+    }
+
+    fn with_each_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut dyn GraphModel) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        for item in self {
+            f(item)?;
+        }
+        Ok(())
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait GraphWritable: WritableModel + Sized {
+    async fn insert_graph_relations<'tx>(
+        _tx: &mut crate::abstract_layer::Transaction<'tx>,
+        _owner: &mut Self,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn update_graph_relations<'tx>(
+        _tx: &mut crate::abstract_layer::Transaction<'tx>,
+        _owner: &mut Self,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn graph_assign_parent_key<Owner, Target>(
+    owner: &Owner,
+    relation: &RelationInfo,
+    target: &mut Target,
+) -> crate::Result<()>
+where
+    Owner: Model,
+    Target: Model,
+{
+    let value = owner.relation_key_value(relation)?;
+    target.assign_column_value(relation.target_key, value)
+}
+
+pub fn graph_auto_increment_key_value<K: Into<Value>>(key: K) -> Value {
+    key.into()
+}
+
+pub fn graph_is_no_auto_increment_key(value: &Value) -> bool {
+    matches!(value, Value::Null)
+}
+
+pub fn graph_relation_info<Owner, Target>(
+    relation_name: &'static str,
+) -> crate::Result<&'static RelationInfo>
+where
+    Owner: Model,
+    Target: Model,
+{
+    Owner::RELATIONS
+        .iter()
+        .find(|relation| {
+            relation.name == relation_name && relation.target_table == Target::TABLE_NAME
+        })
+        .ok_or_else(|| {
+            crate::ormer_error!(
+                "Relation {} -> {} not found on {}",
+                relation_name,
+                Target::TABLE_NAME,
+                Owner::TABLE_NAME
+            )
+        })
+}
+
+pub fn graph_through_infos<Owner, Via, Target>(
+    relation_name: &'static str,
+) -> crate::Result<(&'static RelationInfo, &'static RelationInfo, &'static RelationInfo)>
+where
+    Owner: Model,
+    Via: Model,
+    Target: Model,
+{
+    let relation = graph_relation_info::<Owner, Target>(relation_name)?;
+    let through = relation.through.as_ref().ok_or_else(|| {
+        crate::ormer_error!(
+            "Relation {} on {} is not a through relation",
+            relation_name,
+            Owner::TABLE_NAME
+        )
+    })?;
+    let via_relation = graph_relation_info::<Owner, Via>(through.via_relation)?;
+    let target_relation = graph_relation_info::<Via, Target>(through.target_relation)?;
+    Ok((relation, via_relation, target_relation))
+}
+
+pub fn graph_target_key_value<Target>(
+    target: &Target,
+    target_relation: &RelationInfo,
+) -> crate::Result<Value>
+where
+    Target: Model,
+{
+    target
+        .column_value(target_relation.target_key)
+        .ok_or_else(|| {
+            crate::ormer_error!(
+                "Column {} not found on {}",
+                target_relation.target_key,
+                Target::TABLE_NAME
+            )
+        })
+        .and_then(|value| {
+            if matches!(value, Value::Null) {
+                Err(crate::ormer_error!(
+                    "Through target {}.{} cannot be NULL",
+                    Target::TABLE_NAME,
+                    target_relation.target_key
+                ))
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+pub async fn graph_insert_through_link<'tx, Owner, Via>(
+    tx: &mut crate::abstract_layer::Transaction<'tx>,
+    owner: &Owner,
+    via_relation: &RelationInfo,
+    target_relation: &RelationInfo,
+    target_key: Value,
+) -> crate::Result<()>
+where
+    Owner: Model,
+    Via: Model,
+{
+    let owner_key = owner.relation_key_value(via_relation)?;
+    graph_insert_through_link_values::<Via>(
+        tx,
+        via_relation.target_key,
+        owner_key,
+        target_relation.local_key,
+        target_key,
+    )
+    .await
+}
+
+pub async fn graph_insert_through_link_values<'tx, Via>(
+    tx: &mut crate::abstract_layer::Transaction<'tx>,
+    owner_column: &'static str,
+    owner_value: Value,
+    target_column: &'static str,
+    target_value: Value,
+) -> crate::Result<()>
+where
+    Via: Model,
+{
+    let db_type = tx.db_type();
+    let table = quote_qualified_identifier(db_type, Via::table_name_for_db(db_type));
+    let owner_col = quote_identifier(db_type, owner_column);
+    let target_col = quote_identifier(db_type, target_column);
+    let sql = match db_type {
+        #[cfg(feature = "sqlite")]
+        crate::abstract_layer::DbType::Sqlite => {
+            format!("INSERT OR IGNORE INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
+        }
+        #[cfg(feature = "postgresql")]
+        crate::abstract_layer::DbType::PostgreSQL => {
+            format!(
+                "INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}}) ON CONFLICT DO NOTHING"
+            )
+        }
+        #[cfg(feature = "mysql")]
+        crate::abstract_layer::DbType::MySQL => {
+            format!("INSERT IGNORE INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
+        }
+        #[cfg(feature = "mssql")]
+        crate::abstract_layer::DbType::MSSQL => format!(
+            "IF NOT EXISTS (SELECT 1 FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}) \
+             INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})"
+        ),
+    };
+    let mut raw = crate::RawSql::new(sql).bind(owner_value.clone()).bind(target_value.clone());
+    #[cfg(feature = "mssql")]
+    if matches!(db_type, crate::abstract_layer::DbType::MSSQL) {
+        raw = raw.bind(owner_value).bind(target_value);
+    }
+    tx.execute_sql(raw).await?;
+    Ok(())
+}
+
+pub async fn graph_sync_through_links<'tx, Owner, Via>(
+    tx: &mut crate::abstract_layer::Transaction<'tx>,
+    owner: &Owner,
+    via_relation: &RelationInfo,
+    target_relation: &RelationInfo,
+    target_keys: &[Value],
+) -> crate::Result<()>
+where
+    Owner: Model,
+    Via: Model,
+{
+    let owner_key = owner.relation_key_value(via_relation)?;
+    let db_type = tx.db_type();
+    let table = quote_qualified_identifier(db_type, Via::table_name_for_db(db_type));
+    let owner_col = quote_identifier(db_type, via_relation.target_key);
+    let target_col = quote_identifier(db_type, target_relation.local_key);
+
+    if target_keys.is_empty() {
+        let sql = format!("DELETE FROM {table} WHERE {owner_col} = {{}}");
+        tx.execute_sql(crate::RawSql::new(sql).bind(owner_key)).await?;
+        return Ok(());
+    }
+
+    let placeholders = (0..target_keys.len())
+        .map(|_| "{}")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "DELETE FROM {table} WHERE {owner_col} = {{}} AND {target_col} NOT IN ({placeholders})"
+    );
+    let mut raw = crate::RawSql::new(sql).bind(owner_key);
+    for target_key in target_keys {
+        raw = raw.bind(target_key.clone());
+    }
+    tx.execute_sql(raw).await?;
+    Ok(())
 }
 
 /// 枚举类型提供者 trait (可选实现)
@@ -942,6 +1433,68 @@ pub fn normalize_table_name_for_db(
         crate::abstract_layer::DbType::PostgreSQL => table_name,
         #[cfg(feature = "mssql")]
         crate::abstract_layer::DbType::MSSQL => table_name,
+    }
+}
+
+pub fn table_route_variables(table_name: &str) -> Vec<String> {
+    let mut variables = Vec::new();
+    let mut rest = table_name;
+    while let Some(open_idx) = rest.find('{') {
+        rest = &rest[open_idx + 1..];
+        let Some(close_idx) = rest.find('}') else {
+            break;
+        };
+        let name = &rest[..close_idx];
+        if !name.is_empty() && !variables.iter().any(|existing| existing == name) {
+            variables.push(name.to_string());
+        }
+        rest = &rest[close_idx + 1..];
+    }
+    variables
+}
+
+fn validate_table_route_segment(key: &str, value: &str) -> crate::Result<()> {
+    if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(crate::ormer_error!(
+            "Invalid table route value for {}: {}",
+            key,
+            value
+        ));
+    }
+    Ok(())
+}
+
+pub fn render_table_name_template(table_name: &str, route: &TableRoute) -> crate::Result<String> {
+    let mut rendered = String::new();
+    let mut rest = table_name;
+    while let Some(open_idx) = rest.find('{') {
+        rendered.push_str(&rest[..open_idx]);
+        rest = &rest[open_idx + 1..];
+        let close_idx = rest.find('}').ok_or_else(|| {
+            crate::ormer_error!("Unclosed table route placeholder in {}", table_name)
+        })?;
+        let key = &rest[..close_idx];
+        let value = route.get(key).ok_or_else(|| {
+            crate::ormer_error!("Missing table route value {} for table {}", key, table_name)
+        })?;
+        validate_table_route_segment(key, value)?;
+        rendered.push_str(value);
+        rest = &rest[close_idx + 1..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
+}
+
+pub fn routed_table_name_for_db(
+    db_type: crate::abstract_layer::DbType,
+    table_name: &str,
+    route: &TableRoute,
+) -> crate::Result<String> {
+    if table_name.contains('{') {
+        let rendered = render_table_name_template(table_name, route)?;
+        Ok(normalize_table_name_for_db(db_type, &rendered).to_string())
+    } else {
+        Ok(normalize_table_name_for_db(db_type, table_name).to_string())
     }
 }
 
@@ -1053,6 +1606,8 @@ impl_enum_provider_for_non_enum!(
     usize,
     f32,
     f64,
+    rust_decimal::Decimal,
+    bigdecimal::BigDecimal,
     bool,
     String,
     &str,
@@ -1512,13 +2067,14 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
     let quoted_table_name = quote_qualified_identifier(db_type, table_name);
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", quoted_table_name);
 
-    for (i, column) in T::COLUMN_SCHEMA.iter().enumerate() {
+    let column_schema = T::column_schema();
+    for (i, column) in column_schema.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
 
         // 检查是否有复合主键（多个主键字段）
-        let primary_key_count = T::COLUMN_SCHEMA.iter().filter(|c| c.is_primary).count();
+        let primary_key_count = column_schema.iter().filter(|c| c.is_primary).count();
         let is_composite_primary = primary_key_count > 1;
 
         // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
@@ -1580,7 +2136,7 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
         // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
         if column.unique_group.is_some() {
             // 检查这个 group 中是否有多个字段
-            let group_count = T::COLUMN_SCHEMA
+            let group_count = column_schema
                 .iter()
                 .filter(|c| c.unique_group == column.unique_group)
                 .count();
@@ -1645,7 +2201,8 @@ fn generate_unique_constraints<T: WritableModel>(
     let mut group_map: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
         std::collections::BTreeMap::new();
 
-    for column in T::COLUMN_SCHEMA.iter() {
+    let column_schema = T::column_schema();
+    for column in column_schema.iter() {
         if let Some(group_id) = column.unique_group {
             group_map.entry(group_id).or_default().push(column);
         }
@@ -1686,7 +2243,8 @@ fn generate_indexes_with_name<T: WritableModel>(
     let mut grouped_indexes: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
         std::collections::BTreeMap::new();
 
-    for column in T::COLUMN_SCHEMA.iter() {
+    let column_schema = T::column_schema();
+    for column in column_schema.iter() {
         if !column.is_indexed {
             continue;
         }
@@ -1786,7 +2344,7 @@ fn generate_foreign_key_constraints<T: WritableModel>(
 ) -> Vec<String> {
     let mut constraints = Vec::new();
 
-    for column in T::COLUMN_SCHEMA.iter() {
+    for column in T::column_schema().iter() {
         if let Some(fk) = &column.foreign_key {
             let ref_column = fk.get_ref_column();
             let ref_table = normalize_table_name_for_db(db_type, fk.ref_table);
@@ -1817,7 +2375,7 @@ fn generate_foreign_key_constraints<T: WritableModel>(
 fn generate_composite_primary_key_constraint<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
 ) -> String {
-    let primary_keys: Vec<&str> = T::COLUMN_SCHEMA
+    let primary_keys: Vec<&str> = T::column_schema()
         .iter()
         .filter(|c| c.is_primary)
         .map(|c| c.name)
@@ -1921,6 +2479,8 @@ pub enum Value {
     Text(String),
     TextArray(Vec<String>),
     Real(f64),
+    Decimal(String),
+    BigDecimal(String),
     Boolean(bool),
     Bytes(Vec<u8>),
     IntegerArray(Vec<i32>),
@@ -2105,6 +2665,21 @@ where
     }
 }
 
+fn parse_integral_decimal_text<T>(raw: &str, expected: &str) -> crate::Result<T>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    let raw = raw.trim();
+    let integer = match raw.split_once('.') {
+        Some((integer, fraction)) if fraction.chars().all(|ch| ch == '0') => integer,
+        _ => raw,
+    };
+    integer
+        .parse::<T>()
+        .map_err(|err| crate::ormer_error!("Type mismatch: expected {}: {}", expected, err))
+}
+
 // 使用宏生成 FromValue 实现，减少重复代码
 macro_rules! impl_from_value_for {
     ($($type:ty => $variant:ident),* $(,)?) => {
@@ -2113,6 +2688,9 @@ macro_rules! impl_from_value_for {
                 fn from_value(value: &Value) -> crate::Result<Self> {
                     match value {
                         Value::$variant(v) => Ok(*v as $type),
+                        Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
+                            parse_integral_decimal_text::<$type>(v, stringify!($type))
+                        }
                         _ => Err(crate::ormer_error!("Type mismatch: expected {}", stringify!($type))),
                     }
                 }
@@ -2147,6 +2725,8 @@ impl_from_row_values_single!(
     usize => "usize",
     std::time::Duration => "Duration",
     f64 => "f64",
+    rust_decimal::Decimal => "rust_decimal::Decimal",
+    bigdecimal::BigDecimal => "bigdecimal::BigDecimal",
     String => "String",
     Vec<String> => "Vec<String>",
     bool => "bool",
@@ -2176,6 +2756,50 @@ impl FromValue for f64 {
             Value::Real(v) => Ok(*v),
             Value::Integer(v) => Ok(*v as f64),
             _ => Err(crate::ormer_error!("Type mismatch: expected f64")),
+        }
+    }
+}
+
+impl From<rust_decimal::Decimal> for Value {
+    fn from(v: rust_decimal::Decimal) -> Self {
+        Value::Decimal(v.to_string())
+    }
+}
+
+impl FromValue for rust_decimal::Decimal {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
+                v.parse::<rust_decimal::Decimal>().map_err(|err| {
+                    crate::ormer_error!("Type mismatch: expected rust_decimal::Decimal: {}", err)
+                })
+            }
+            Value::Integer(v) => Ok(rust_decimal::Decimal::from(*v)),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected rust_decimal::Decimal"
+            )),
+        }
+    }
+}
+
+impl From<bigdecimal::BigDecimal> for Value {
+    fn from(v: bigdecimal::BigDecimal) -> Self {
+        Value::BigDecimal(v.to_plain_string())
+    }
+}
+
+impl FromValue for bigdecimal::BigDecimal {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
+                v.parse::<bigdecimal::BigDecimal>().map_err(|err| {
+                    crate::ormer_error!("Type mismatch: expected bigdecimal::BigDecimal: {}", err)
+                })
+            }
+            Value::Integer(v) => Ok(bigdecimal::BigDecimal::from(*v)),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected bigdecimal::BigDecimal"
+            )),
         }
     }
 }
@@ -2334,6 +2958,24 @@ impl FromValue for Option<f64> {
     }
 }
 
+impl FromValue for Option<rust_decimal::Decimal> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            _ => rust_decimal::Decimal::from_value(value).map(Some),
+        }
+    }
+}
+
+impl FromValue for Option<bigdecimal::BigDecimal> {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            _ => bigdecimal::BigDecimal::from_value(value).map(Some),
+        }
+    }
+}
+
 // 为 Option 类型实现 FromRowValues
 impl<T: FromValue> FromRowValues for Option<T> {
     fn from_row_values(values: &[Value]) -> crate::Result<Self> {
@@ -2378,6 +3020,12 @@ impl From<f64> for Value {
 impl From<std::time::Duration> for Value {
     fn from(v: std::time::Duration) -> Self {
         Value::Duration(v)
+    }
+}
+
+impl From<()> for Value {
+    fn from(_: ()) -> Self {
+        Value::Null
     }
 }
 
@@ -2432,6 +3080,22 @@ impl_from_option_for_value!(
     serde_json::Value => |value| Value::Json(value),
     uuid::Uuid => |value| Value::Uuid(value),
 );
+
+impl From<Option<rust_decimal::Decimal>> for Value {
+    fn from(value: Option<rust_decimal::Decimal>) -> Self {
+        value
+            .map(|value| Value::Decimal(value.to_string()))
+            .unwrap_or(Value::Null)
+    }
+}
+
+impl From<Option<bigdecimal::BigDecimal>> for Value {
+    fn from(value: Option<bigdecimal::BigDecimal>) -> Self {
+        value
+            .map(|value| Value::BigDecimal(value.to_plain_string()))
+            .unwrap_or(Value::Null)
+    }
+}
 
 impl FromValue for Option<std::time::Duration> {
     fn from_value(value: &Value) -> crate::Result<Self> {

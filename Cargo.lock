@@ -186,6 +186,17 @@ dependencies = [
 
 [[package]]
 name = "bigdecimal"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6773ddc0eafc0e509fb60e48dff7f450f8e674a0686ae8605e8d9901bd5eefa"
+dependencies = [
+ "num-bigint",
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "bigdecimal"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d6867f1565b3aad85681f1015055b087fcfd840d6aeee6eee7f2da317603695"
@@ -1580,7 +1591,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "478b0ff3f7d67b79da2b96f56f334431aef65e15ba4b29dd74a4236e29582bdc"
 dependencies = [
  "base64 0.21.7",
- "bigdecimal",
+ "bigdecimal 0.4.10",
  "bindgen",
  "bitflags 2.11.1",
  "bitvec",
@@ -1754,6 +1765,7 @@ dependencies = [
  "async-trait",
  "bb8",
  "bb8-postgres",
+ "bigdecimal 0.4.10",
  "byteorder",
  "bytes",
  "chrono",
@@ -1762,6 +1774,7 @@ dependencies = [
  "ormer-derive",
  "paste",
  "postgres-types",
+ "rust_decimal",
  "serde_json",
  "tiberius",
  "tokio",
@@ -2662,6 +2675,7 @@ dependencies = [
  "async-native-tls",
  "async-trait",
  "asynchronous-codec",
+ "bigdecimal 0.3.1",
  "byteorder",
  "bytes",
  "chrono",
@@ -2673,6 +2687,7 @@ dependencies = [
  "once_cell",
  "pin-project-lite",
  "pretty-hex",
+ "rust_decimal",
  "thiserror 1.0.69",
  "tracing",
  "uuid",

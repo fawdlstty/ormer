@@ -69,6 +69,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "INTEGER",
             // 浮点类型
             "f32" | "f64" => "REAL",
+            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => "TEXT",
             // 时长类型
             "Duration" | "std::time::Duration" => "INTEGER",
             // 字符串类型
@@ -122,6 +123,11 @@ pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
+    pub fn with_table_name(mut self, table_name: &str) -> Self {
+        self.table_name = Some(table_name.to_string());
+        self
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::Sqlite,
@@ -279,7 +285,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let has_auto_increment = I::Model::column_schema()
+            .iter()
+            .any(|c| c.is_auto_increment);
         if has_auto_increment {
             if rows_affected == 0 {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
@@ -370,7 +378,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
         }
 
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.db.conn.last_insert_rowid();
             return common_helpers::convert_auto_increment_key::<Self::Output>(last_id);
@@ -400,7 +408,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             DbType::Sqlite,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            I::Model::COLUMNS,
+            &I::Model::columns(),
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
@@ -417,12 +425,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let columns = I::Model::COLUMNS;
+        let columns = I::Model::columns();
         let col_count = columns.len();
         let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, columns);
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
         let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
@@ -656,17 +664,19 @@ impl Database {
         }
 
         // 比较列数量
-        if actual_columns.len() != T::COLUMNS.len() {
+        let expected_columns = T::columns();
+        let expected_schema = T::column_schema();
+        if actual_columns.len() != expected_columns.len() {
             return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
-                T::COLUMNS.len(),
+                expected_columns.len(),
                 actual_columns.len()
             ));
         }
 
         // 比较每一列的定义
-        for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
+        for (i, expected_col) in expected_schema.iter().enumerate() {
             if i >= actual_columns.len() {
                 return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Missing column: {}",
@@ -700,8 +710,9 @@ impl Database {
             }
 
             // 检查列类型（只比较基础类型，不包含 NOT NULL 约束）
+            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
             let expected_type = crate::abstract_layer::DbType::Sqlite.sql_type(
-                expected_col.rust_type,
+                effective_rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
@@ -711,11 +722,15 @@ impl Database {
             // 对于类型比较，我们需要提取基础类型（不包含约束）
             let type_to_compare = if expected_col.is_primary {
                 // 主键的基础类型，不包含任何约束
-                match expected_col.rust_type {
+                match effective_rust_type {
                     "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
                         "INTEGER".to_string()
                     }
                     "f32" | "f64" => "REAL".to_string(),
+                    "Decimal"
+                    | "rust_decimal::Decimal"
+                    | "BigDecimal"
+                    | "bigdecimal::BigDecimal" => "TEXT".to_string(),
                     "String" => "TEXT".to_string(),
                     "bool" => "INTEGER".to_string(),
                     "Vec<u8>" | "&[u8]" => "BLOB".to_string(),
@@ -724,7 +739,7 @@ impl Database {
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
                 let full_type = crate::abstract_layer::DbType::Sqlite.sql_type(
-                    expected_col.rust_type,
+                    effective_rust_type,
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
@@ -843,13 +858,14 @@ impl Database {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
-        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
+        let (sql, all_values) =
+            common_helpers::build_routed_insert_statement::<T>(DbType::Sqlite, models)?;
         let all_params = values_into_params(all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
 
         // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.conn.last_insert_rowid();
             // 将 i64 转换为对应的主键类型
@@ -1206,7 +1222,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let has_auto_increment = I::Model::column_schema()
+            .iter()
+            .any(|c| c.is_auto_increment);
         if has_auto_increment {
             if rows_affected == 0 {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
@@ -1240,7 +1258,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             DbType::Sqlite,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            I::Model::COLUMNS,
+            &I::Model::columns(),
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
@@ -1257,12 +1275,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         self.models.run_before_insert(hook_ctx).await?;
 
         let refs = self.models.as_refs();
-        let columns = I::Model::COLUMNS;
+        let columns = I::Model::columns();
         let col_count = columns.len();
         let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, columns);
+        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
         let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
@@ -1512,13 +1530,14 @@ impl Transaction {
             return Ok(T::AutoIncrementKeyType::default());
         }
 
-        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::Sqlite, models);
+        let (sql, all_values) =
+            common_helpers::build_routed_insert_statement::<T>(DbType::Sqlite, models)?;
         let all_params = values_into_params(all_values)?;
 
         self.conn.execute(&sql, all_params).trace().await?;
 
         // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+        let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
             let last_id = self.conn.last_insert_rowid();
             let result =
@@ -1778,6 +1797,42 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     ) -> RightJoinedSelectExecutor<T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelectExecutor<T, J> {
+        LeftJoinedSelectExecutor {
+            select: self.select.left_join_derived::<J>(derived, f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<T, J> {
+        InnerJoinedSelectExecutor {
+            select: self.select.inner_join_derived::<J>(derived, f),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<T, J> {
+        RightJoinedSelectExecutor {
+            select: self.select.right_join_derived::<J>(derived, f),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2383,7 +2438,7 @@ impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::S
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
 
         let turso_params = values_into_params(params)?;
 
@@ -2404,6 +2459,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
 
         Ok(results.into_iter().collect())
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
+        Ok(SqlStatement::single(DbType::Sqlite, sql, params))
     }
 }
 
@@ -2770,6 +2830,7 @@ fn value_to_turso_value(value: Value) -> turso::Value {
         Value::Text(v) => turso::Value::Text(v),
         Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
         Value::Real(v) => turso::Value::Real(v),
+        Value::Decimal(v) | Value::BigDecimal(v) => turso::Value::Text(v),
         Value::Boolean(v) => turso::Value::Integer(if v { 1 } else { 0 }),
         Value::Bytes(v) => turso::Value::Blob(v),
         Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
@@ -2886,6 +2947,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         }
     }
 
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
+    }
+
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
@@ -2944,6 +3013,14 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             executor: self.clone(),
             _marker: PhantomData,
         }
+    }
+
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
     }
 
     /// 添加 GROUP BY 字段

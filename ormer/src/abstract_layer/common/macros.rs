@@ -114,6 +114,48 @@ macro_rules! __ormer_backend_select_methods {
             }
         }
 
+        pub fn append_filter_expr(self, expr: $crate::WhereExpr) -> Self {
+            Self {
+                select: $crate::query::builder::FilterQuery::<T>::append_filter_expr(
+                    self.select,
+                    expr,
+                ),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn filter_dynamic<F>(self, f: F) -> Self
+        where
+            F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::WhereExpr,
+        {
+            Self {
+                select: self.select.filter_dynamic(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn route_table(
+            self,
+            key: impl Into<String>,
+            value: impl $crate::model::TableRouteValue,
+        ) -> Self {
+            Self {
+                select: self.select.route_table(key, value),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
+            Self {
+                select: self.select.with_table_route(route),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn order_by<F, O>(self, f: F) -> Self
         where
             F: FnOnce(<T as $crate::Model>::Where) -> O,
@@ -133,6 +175,17 @@ macro_rules! __ormer_backend_select_methods {
         {
             Self {
                 select: self.select.order_by_desc(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn order_by_dynamic<F>(self, f: F) -> Self
+        where
+            F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::OrderBy,
+        {
+            Self {
+                select: self.select.order_by_dynamic(f),
                 $conn_field: self.$conn_field,
                 _marker: std::marker::PhantomData,
             }
@@ -183,6 +236,30 @@ macro_rules! __ormer_backend_select_methods {
         pub fn limit(self, limit: usize) -> Self {
             Self {
                 select: self.select.limit(limit),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn descendants<F, C>(self, f: F, root_id: impl Into<$crate::Value>) -> Self
+        where
+            F: FnOnce(T::Where) -> C,
+            C: $crate::query::builder::RecursiveColumns<T>,
+        {
+            Self {
+                select: self.select.descendants(f, root_id),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn ancestors<F, C>(self, f: F, leaf_id: impl Into<$crate::Value>) -> Self
+        where
+            F: FnOnce(T::Where) -> C,
+            C: $crate::query::builder::RecursiveColumns<T>,
+        {
+            Self {
+                select: self.select.ancestors(f, leaf_id),
                 $conn_field: self.$conn_field,
                 _marker: std::marker::PhantomData,
             }
@@ -397,6 +474,91 @@ macro_rules! impl_unified_select_executor_methods {
                 }
             }
 
+            pub fn append_filter_expr(self, expr: $crate::WhereExpr) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.append_filter_expr(expr))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.append_filter_expr(expr))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.append_filter_expr(expr))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.append_filter_expr(expr))
+                    }
+                }
+            }
+
+            pub fn filter_dynamic<F>(self, f: F) -> Self
+            where
+                F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::WhereExpr,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => $executor_name::Sqlite(exec.filter_dynamic(f)),
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.filter_dynamic(f))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter_dynamic(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter_dynamic(f)),
+                }
+            }
+
+            pub fn route_table(
+                self,
+                key: impl Into<String>,
+                value: impl $crate::model::TableRouteValue,
+            ) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.route_table(key, value))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.route_table(key, value))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.route_table(key, value))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.route_table(key, value))
+                    }
+                }
+            }
+
+            pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.with_table_route(route))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.with_table_route(route))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.with_table_route(route))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.with_table_route(route))
+                    }
+                }
+            }
+
             pub fn order_by<F, O>(self, f: F) -> Self
             where
                 F: FnOnce(T::Where) -> O,
@@ -432,6 +594,26 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_desc(f)),
+                }
+            }
+
+            pub fn order_by_dynamic<F>(self, f: F) -> Self
+            where
+                F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::OrderBy,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.order_by_dynamic(f))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.order_by_dynamic(f))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_dynamic(f)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_dynamic(f)),
                 }
             }
 
@@ -517,6 +699,56 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
+                }
+            }
+
+            pub fn descendants<F, C>(self, f: F, root_id: impl Into<$crate::Value>) -> Self
+            where
+                F: FnOnce(T::Where) -> C,
+                C: $crate::query::builder::RecursiveColumns<T>,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.descendants(f, root_id))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.descendants(f, root_id))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.descendants(f, root_id))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.descendants(f, root_id))
+                    }
+                }
+            }
+
+            pub fn ancestors<F, C>(self, f: F, leaf_id: impl Into<$crate::Value>) -> Self
+            where
+                F: FnOnce(T::Where) -> C,
+                C: $crate::query::builder::RecursiveColumns<T>,
+            {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.ancestors(f, leaf_id))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.ancestors(f, leaf_id))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.ancestors(f, leaf_id))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.ancestors(f, leaf_id))
+                    }
                 }
             }
 

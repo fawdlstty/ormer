@@ -282,6 +282,75 @@ impl ToSql for PgTextParam {
 }
 
 #[derive(Debug, Clone)]
+struct PgNumericTextParam(String);
+
+impl ToSql for PgNumericTextParam {
+    fn to_sql(
+        &self,
+        _: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        matches!(*ty, PgType::NUMERIC | PgType::UNKNOWN)
+    }
+
+    fn encode_format(&self, _ty: &PgType) -> postgres_types::Format {
+        postgres_types::Format::Text
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+#[derive(Debug, Clone)]
+struct PgMaybeNumericTextParam(Option<String>);
+
+impl ToSql for PgMaybeNumericTextParam {
+    fn to_sql(
+        &self,
+        ty: &PgType,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match &self.0 {
+            Some(value) => PgNumericTextParam(value.clone()).to_sql(ty, out),
+            None => Ok(IsNull::Yes),
+        }
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        PgNumericTextParam::accepts(ty)
+    }
+
+    fn encode_format(&self, _ty: &PgType) -> postgres_types::Format {
+        postgres_types::Format::Text
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+#[derive(Debug, Clone)]
+struct PgNumericText(String);
+
+impl<'a> FromSql<'a> for PgNumericText {
+    fn from_sql(
+        ty: &PgType,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if *ty != PgType::NUMERIC {
+            return Err("expected NUMERIC".into());
+        }
+        Ok(Self(postgres_numeric_to_string(raw)?))
+    }
+
+    fn accepts(ty: &PgType) -> bool {
+        *ty == PgType::NUMERIC
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PgMaybeTextParam(Option<String>);
 
 impl ToSql for PgMaybeTextParam {
@@ -393,6 +462,65 @@ fn from_postgres_interval(interval: PgInterval) -> std::time::Duration {
     } else {
         std::time::Duration::from_micros(total_micros.min(u64::MAX as i128) as u64)
     }
+}
+
+fn postgres_numeric_to_string(
+    raw: &[u8],
+) -> Result<String, Box<dyn std::error::Error + Sync + Send>> {
+    use byteorder::{BigEndian, ReadBytesExt};
+    const NUMERIC_NEG: u16 = 0x4000;
+    const NUMERIC_NAN: u16 = 0xC000;
+    const NUMERIC_PINF: u16 = 0xD000;
+    const NUMERIC_NINF: u16 = 0xF000;
+
+    let mut cursor = raw;
+    let digit_count = cursor.read_u16::<BigEndian>()? as usize;
+    let weight = cursor.read_i16::<BigEndian>()?;
+    let sign = cursor.read_u16::<BigEndian>()?;
+    let display_scale = cursor.read_u16::<BigEndian>()? as usize;
+
+    return match sign {
+        NUMERIC_NAN => Ok("NaN".to_string()),
+        NUMERIC_PINF => Ok("Infinity".to_string()),
+        NUMERIC_NINF => Ok("-Infinity".to_string()),
+        NUMERIC_NEG | 0 => {
+            let mut groups = Vec::with_capacity(digit_count);
+            for _ in 0..digit_count {
+                groups.push(cursor.read_u16::<BigEndian>()?);
+            }
+
+            let integer_groups = (weight + 1).max(0) as usize;
+            let mut digits = String::new();
+            if integer_groups == 0 {
+                digits.push('0');
+            } else {
+                for i in 0..integer_groups {
+                    let group = groups.get(i).copied().unwrap_or(0);
+                    if i == 0 {
+                        digits.push_str(&group.to_string());
+                    } else {
+                        digits.push_str(&format!("{group:04}"));
+                    }
+                }
+            }
+
+            if display_scale > 0 {
+                digits.push('.');
+                let fraction_groups = display_scale.div_ceil(4);
+                for i in integer_groups..integer_groups + fraction_groups {
+                    let group = groups.get(i).copied().unwrap_or(0);
+                    digits.push_str(&format!("{group:04}"));
+                }
+                digits.truncate(digits.len() - fraction_groups * 4 + display_scale);
+            }
+
+            if sign == NUMERIC_NEG && digits != "0" {
+                digits.insert(0, '-');
+            }
+            Ok(digits)
+        }
+        _ => Err("invalid NUMERIC sign".into()),
+    };
 }
 
 fn pg_datetime_value_from_row(
@@ -591,6 +719,18 @@ fn pg_value_from_row_cell(
                     .map(crate::model::Value::Real)
                     .unwrap_or(crate::model::Value::Null))
             }
+            "Decimal" | "rust_decimal::Decimal" => {
+                let value: Option<PgNumericText> = pg_try_get(row, idx, "Decimal")?;
+                Ok(value
+                    .map(|value| crate::model::Value::Decimal(value.0))
+                    .unwrap_or(crate::model::Value::Null))
+            }
+            "BigDecimal" | "bigdecimal::BigDecimal" => {
+                let value: Option<PgNumericText> = pg_try_get(row, idx, "BigDecimal")?;
+                Ok(value
+                    .map(|value| crate::model::Value::BigDecimal(value.0))
+                    .unwrap_or(crate::model::Value::Null))
+            }
             "bool" => {
                 let value: Option<bool> = pg_try_get(row, idx, "bool")?;
                 Ok(match value {
@@ -672,6 +812,28 @@ fn pg_value_from_row_cell(
                         idx
                     ))
                 })
+            }
+            "Decimal" | "rust_decimal::Decimal" => {
+                let value: Option<PgNumericText> = pg_try_get(row, idx, "Decimal")?;
+                value
+                    .map(|value| crate::model::Value::Decimal(value.0))
+                    .ok_or_else(|| {
+                        crate::ormer_error!(format!(
+                            "Failed to parse non-nullable column at index {} (expected Decimal type)",
+                            idx
+                        ))
+                    })
+            }
+            "BigDecimal" | "bigdecimal::BigDecimal" => {
+                let value: Option<PgNumericText> = pg_try_get(row, idx, "BigDecimal")?;
+                value
+                    .map(|value| crate::model::Value::BigDecimal(value.0))
+                    .ok_or_else(|| {
+                        crate::ormer_error!(format!(
+                            "Failed to parse non-nullable column at index {} (expected BigDecimal type)",
+                            idx
+                        ))
+                    })
             }
             "bool" => {
                 let value: Option<bool> = pg_try_get(row, idx, "bool")?;
@@ -833,7 +995,8 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         }
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
-        | FilterExpr::IsNotNull { .. } => {}
+        | FilterExpr::IsNotNull { .. }
+        | FilterExpr::InvalidDynamicField { .. } => {}
         FilterExpr::ExprComparison { left, right, .. } => {
             pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
             pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
@@ -942,6 +1105,9 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             // 浮点类型
             "f32" => "REAL",
             "f64" => "DOUBLE PRECISION",
+            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
+                "NUMERIC"
+            }
             // 字符串类型
             "String" => "TEXT",
             // 布尔类型
@@ -1018,6 +1184,11 @@ pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
+    pub fn with_table_name(mut self, table_name: &str) -> Self {
+        self.table_name = Some(table_name.to_string());
+        self
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
         let mut statements = Vec::new();
@@ -1925,7 +2096,7 @@ impl Database {
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
 
         let (sql, all_values) =
-            common_helpers::build_insert_statement::<T>(DbType::PostgreSQL, models);
+            common_helpers::build_routed_insert_statement::<T>(DbType::PostgreSQL, models)?;
 
         // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
@@ -2112,6 +2283,24 @@ impl Database {
         C: FromIterator<V>,
     {
         let rows = pg_query_untyped(&self.client, sql, &params).await?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(pg_decode_row_values_from_row(&row, row.columns().len())?);
+        }
+        Ok(results.into_iter().collect())
+    }
+
+    pub(crate) async fn select_raw_with_types<V, C>(
+        &self,
+        sql: &str,
+        params: Vec<Value>,
+        rust_types: Vec<&'static str>,
+    ) -> crate::Result<C>
+    where
+        V: crate::model::FromRowValues,
+        C: FromIterator<V>,
+    {
+        let rows = pg_query_for_query(&self.client, sql, &params, &rust_types).await?;
         let mut results = Vec::new();
         for row in rows {
             results.push(pg_decode_row_values_from_row(&row, row.columns().len())?);
@@ -2539,7 +2728,7 @@ impl<'a> Transaction<'a> {
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let (sql, all_values) =
-            common_helpers::build_insert_statement::<T>(DbType::PostgreSQL, models);
+            common_helpers::build_routed_insert_statement::<T>(DbType::PostgreSQL, models)?;
 
         // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
         let rust_types: Vec<&str> = T::COLUMN_SCHEMA
@@ -2675,6 +2864,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             client: self.client,
             _marker: PhantomData,
         }
+    }
+
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
     }
 
     /// 克隆executor（保持相同的client引用）
@@ -2869,6 +3066,42 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     ) -> RightJoinedSelectExecutor<'a, T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelectExecutor<'a, T, J> {
+        LeftJoinedSelectExecutor {
+            select: self.select.left_join_derived::<J>(derived, f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<'a, T, J> {
+        InnerJoinedSelectExecutor {
+            select: self.select.inner_join_derived::<J>(derived, f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<'a, T, J> {
+        RightJoinedSelectExecutor {
+            select: self.select.right_join_derived::<J>(derived, f),
             client: self.client,
             _marker: PhantomData,
         }
@@ -3102,6 +3335,10 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
+                    crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
+                        Box::new(PgNumericTextParam(v))
+                            as Box<dyn postgres_types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::Boolean(b) => {
                         Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
@@ -3190,11 +3427,9 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::NUMERIC => {
-                    // NUMERIC类型处理 - 由于tokio-postgres不直接支持NUMERIC到f64的转换
-                    // 我们尝试直接读取为f64
-                    let val_result: Result<Option<f64>, _> = row.try_get(0);
+                    let val_result: Result<Option<PgNumericText>, _> = row.try_get(0);
                     match val_result {
-                        Ok(Some(v)) => crate::model::Value::Real(v),
+                        Ok(Some(v)) => crate::model::Value::BigDecimal(v.0),
                         Ok(None) => crate::model::Value::Null,
                         Err(_) => crate::model::Value::Null,
                     }
@@ -3243,8 +3478,8 @@ impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
         let param_rust_types = self.select.param_rust_types();
-        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
 
         let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
@@ -3256,6 +3491,15 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
 
         Ok(results.into_iter().collect())
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
+        let rust_types = self.select.param_rust_types();
+        Ok(SqlStatement::batch(
+            DbType::PostgreSQL,
+            vec![SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types)],
+        ))
     }
 }
 
@@ -3667,6 +3911,9 @@ fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam 
             _ => Box::new(value.clone()),
         },
         Value::Real(value) => Box::new(*value),
+        Value::Decimal(value) | Value::BigDecimal(value) => {
+            Box::new(PgNumericTextParam(value.clone()))
+        }
         Value::Boolean(value) => Box::new(*value),
         Value::Bytes(value) => Box::new(value.clone()),
         Value::IntegerArray(value) => Box::new(value.clone()),
@@ -3694,6 +3941,9 @@ fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam 
             Some("i32" | "i16" | "i8" | "u16" | "u32" | "u8") => Box::new(None::<i32>),
             Some("String" | "&str") => Box::new(PgMaybeTextParam(None)),
             Some("f32" | "f64") => Box::new(None::<f64>),
+            Some("Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal") => {
+                Box::new(PgMaybeNumericTextParam(None))
+            }
             Some("Duration" | "std::time::Duration") => Box::new(None::<PgInterval>),
             Some("bool") => Box::new(None::<bool>),
             Some("Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]") => {
@@ -4324,6 +4574,14 @@ fn convert_postgres_value(
                 });
             }
         }
+        Type::NUMERIC => {
+            if let Ok(v) = row.try_get::<_, Option<PgNumericText>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::BigDecimal(val.0),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         // 布尔类型
         Type::BOOL => {
             if let Ok(v) = row.try_get::<_, Option<bool>>(index) {
@@ -4405,6 +4663,14 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         }
     }
 
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
+    }
+
     /// 添加 GROUP BY 字段
     pub fn group_by<F, G>(self, f: F) -> Self
     where
@@ -4482,6 +4748,10 @@ impl<
                     }
                     crate::model::Value::Real(r) => {
                         Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
+                    crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
+                        Box::new(PgNumericTextParam(v))
+                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Boolean(b) => {
                         Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>

@@ -96,6 +96,8 @@ pub enum FilterExpr {
     ExprIsNotNull { expr: SqlExpr },
     /// Full text search
     TextSearch { expr: SqlExpr, query: String },
+    /// Runtime dynamic field that could not be resolved against the model.
+    InvalidDynamicField { model: &'static str, field: String },
 }
 
 /// 值类型（用于过滤）
@@ -110,6 +112,8 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
         Value::Text(_) => "String",
         Value::TextArray(_) => "Vec<String>",
         Value::Real(_) => "f64",
+        Value::Decimal(_) => "rust_decimal::Decimal",
+        Value::BigDecimal(_) => "bigdecimal::BigDecimal",
         Value::Boolean(_) => "bool",
         Value::Bytes(_) => "Vec<u8>",
         Value::IntegerArray(_) => "Vec<i32>",
@@ -127,6 +131,86 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
 #[cfg(feature = "postgresql")]
 pub(crate) fn infer_model_value_rust_type(value: &crate::model::Value) -> &'static str {
     infer_filter_value_rust_type(value)
+}
+
+impl crate::query::builder::AggregateResultType for rust_decimal::Decimal {
+    type Output = Option<rust_decimal::Decimal>;
+}
+
+impl crate::query::builder::AggregateResultType for bigdecimal::BigDecimal {
+    type Output = Option<bigdecimal::BigDecimal>;
+}
+
+impl crate::query::builder::ColumnValueType for rust_decimal::Decimal {
+    fn to_filter_value(value: Self) -> Value {
+        Value::from(value)
+    }
+
+    fn supports_comparison() -> bool {
+        true
+    }
+}
+
+impl crate::query::builder::ColumnValueType for bigdecimal::BigDecimal {
+    fn to_filter_value(value: Self) -> Value {
+        Value::from(value)
+    }
+
+    fn supports_comparison() -> bool {
+        true
+    }
+}
+
+impl crate::query::builder::IsInValue<rust_decimal::Decimal> for &rust_decimal::Decimal {
+    fn to_in_value(self) -> rust_decimal::Decimal {
+        *self
+    }
+}
+
+impl crate::query::builder::IsInValue<rust_decimal::Decimal> for &&rust_decimal::Decimal {
+    fn to_in_value(self) -> rust_decimal::Decimal {
+        **self
+    }
+}
+
+impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &bigdecimal::BigDecimal {
+    fn to_in_value(self) -> bigdecimal::BigDecimal {
+        self.clone()
+    }
+}
+
+impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &&bigdecimal::BigDecimal {
+    fn to_in_value(self) -> bigdecimal::BigDecimal {
+        (*self).clone()
+    }
+}
+
+impl crate::query::expr::IntoSqlExpr for rust_decimal::Decimal {
+    fn into_sql_expr(self) -> SqlExpr {
+        SqlExpr::Value(Value::from(self))
+    }
+}
+
+impl crate::query::expr::IntoTypedExpr for rust_decimal::Decimal {
+    type Output = rust_decimal::Decimal;
+
+    fn into_typed_expr(self) -> crate::query::expr::TypedExpr<Self::Output> {
+        crate::query::expr::TypedExpr::new(SqlExpr::Value(Value::from(self)))
+    }
+}
+
+impl crate::query::expr::IntoSqlExpr for bigdecimal::BigDecimal {
+    fn into_sql_expr(self) -> SqlExpr {
+        SqlExpr::Value(Value::from(self))
+    }
+}
+
+impl crate::query::expr::IntoTypedExpr for bigdecimal::BigDecimal {
+    type Output = bigdecimal::BigDecimal;
+
+    fn into_typed_expr(self) -> crate::query::expr::TypedExpr<Self::Output> {
+        crate::query::expr::TypedExpr::new(SqlExpr::Value(Value::from(self)))
+    }
 }
 
 /// 子查询 trait - 用于 is_in 方法
@@ -158,6 +242,7 @@ pub struct OrderBy {
     pub column: String,
     pub direction: OrderDirection,
     expr: Option<SqlExpr>,
+    error: Option<String>,
 }
 
 impl OrderBy {
@@ -166,6 +251,7 @@ impl OrderBy {
             column,
             direction: OrderDirection::Asc,
             expr: None,
+            error: None,
         }
     }
 
@@ -174,6 +260,7 @@ impl OrderBy {
             column,
             direction: OrderDirection::Desc,
             expr: None,
+            error: None,
         }
     }
 
@@ -182,6 +269,7 @@ impl OrderBy {
             column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
             direction: OrderDirection::Asc,
             expr: Some(expr),
+            error: None,
         }
     }
 
@@ -190,11 +278,25 @@ impl OrderBy {
             column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
             direction: OrderDirection::Desc,
             expr: Some(expr),
+            error: None,
+        }
+    }
+
+    pub fn invalid(column: String, error: String) -> Self {
+        Self {
+            column,
+            direction: OrderDirection::Asc,
+            expr: None,
+            error: Some(error),
         }
     }
 
     pub(crate) fn cloned_expr(&self) -> Option<SqlExpr> {
         self.expr.clone()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 
     /// 将 OrderBy 转换为 SQL 字符串

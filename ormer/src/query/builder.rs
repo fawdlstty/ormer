@@ -1,7 +1,7 @@
 use crate::abstract_layer::DbType;
 use crate::model::{
-    ColumnSchema, Model, normalize_table_name_for_db, quote_column_reference,
-    quote_qualified_identifier,
+    ColumnSchema, Model, TableRoute, TableRouteValue, normalize_table_name_for_db,
+    quote_column_reference, quote_qualified_identifier, routed_table_name_for_db,
 };
 use crate::query::expr::{AliasedExpr, IntoSqlExpr, SqlExpr, TypedExpr, WindowSpecBuilder};
 use crate::query::filter::{FilterExpr, OrderBy, OrderDirection};
@@ -11,9 +11,28 @@ use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Sub};
+use std::sync::Arc;
 
 fn table_name_for<T: Model>(db_type: DbType) -> String {
     quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
+}
+
+fn table_name_for_route<T: Model>(db_type: DbType, route: &TableRoute) -> crate::Result<String> {
+    if route.is_empty() {
+        return Ok(table_name_for::<T>(db_type));
+    }
+    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, route)?;
+    Ok(quote_qualified_identifier(db_type, &table_name))
+}
+
+fn table_name_for_route_or_panic<T: Model>(db_type: DbType, route: &TableRoute) -> String {
+    table_name_for_route::<T>(db_type, route)
+        .unwrap_or_else(|err| panic!("Failed to render table route: {}", err))
+}
+
+/// Query builders and executors that can receive a prebuilt typed filter.
+pub trait FilterQuery<T: Model>: Sized {
+    fn append_filter_expr(self, expr: WhereExpr) -> Self;
 }
 
 fn quote_sql_string(value: &str) -> String {
@@ -253,13 +272,14 @@ fn select_expr_for_column<T: Model>(
     table_prefix: Option<&str>,
 ) -> String {
     if ignored_columns.iter().any(|ignored| ignored == column) {
-        let schema = T::COLUMN_SCHEMA
+        let schema = T::column_schema()
             .iter()
             .find(|schema| schema.name == column)
+            .cloned()
             .unwrap_or_else(|| panic!("Column schema not found: {}", column));
         return format!(
             "{} AS {}",
-            ignored_column_default_expr(schema, db_type),
+            ignored_column_default_expr(&schema, db_type),
             quote_column_reference(db_type, column)
         );
     }
@@ -276,9 +296,29 @@ fn select_exprs_for_model<T: Model>(
     ignored_columns: &[String],
     table_prefix: Option<&str>,
 ) -> String {
-    T::COLUMNS
-        .iter()
+    T::columns()
+        .into_iter()
         .map(|column| select_expr_for_column::<T>(column, db_type, ignored_columns, table_prefix))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn select_exprs_for_model_as<R: Model>(
+    db_type: DbType,
+    source_columns: &[&'static str],
+    table_prefix: Option<&str>,
+) -> String {
+    source_columns
+        .iter()
+        .zip(R::columns().iter())
+        .map(|(source, alias)| {
+            let source = if let Some(prefix) = table_prefix {
+                quote_column_reference(db_type, &format!("{}.{}", prefix, source))
+            } else {
+                quote_column_reference(db_type, source)
+            };
+            format!("{} AS {}", source, quote_column_reference(db_type, alias))
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -396,6 +436,57 @@ enum RelationJoin {
         via_target_key: &'static str,
         target_key: &'static str,
     },
+}
+
+fn invalid_dynamic_field_error(model: &'static str, field: &str) -> String {
+    format!("Field '{}' does not exist on model {}", field, model)
+}
+
+fn invalid_dynamic_field(model: &'static str, field: impl Into<String>) -> FilterExpr {
+    let field = field.into();
+    FilterExpr::InvalidDynamicField { model, field }
+}
+
+fn validate_filter_expr(filter: &FilterExpr) -> crate::Result<()> {
+    match filter {
+        FilterExpr::InvalidDynamicField { model, field } => Err(crate::ormer_error!(
+            "{}",
+            invalid_dynamic_field_error(model, field)
+        )),
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            validate_filter_expr(left)?;
+            validate_filter_expr(right)
+        }
+        FilterExpr::RelationExists { filter, .. }
+        | FilterExpr::ThroughRelationExists { filter, .. } => {
+            if let Some(filter) = filter {
+                validate_filter_expr(filter)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_filters(filters: &[FilterExpr]) -> crate::Result<()> {
+    for filter in filters {
+        validate_filter_expr(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_order_by(order_by: &[OrderBy]) -> crate::Result<()> {
+    for order in order_by {
+        if let Some(error) = order.error() {
+            return Err(crate::ormer_error!("{}", error));
+        }
+    }
+    Ok(())
+}
+
+fn validate_select_parts(filters: &[FilterExpr], order_by: &[OrderBy]) -> crate::Result<()> {
+    validate_filters(filters)?;
+    validate_order_by(order_by)
 }
 
 fn filter_has_relation(filter: &FilterExpr) -> bool {
@@ -531,6 +622,21 @@ enum GroupingClause {
     Cube(Vec<SqlExpr>),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum RecursiveDirection {
+    Descendants,
+    Ancestors,
+}
+
+#[derive(Debug, Clone)]
+struct RecursiveCte {
+    name: &'static str,
+    id_column: &'static str,
+    parent_column: &'static str,
+    start_value: crate::model::Value,
+    direction: RecursiveDirection,
+}
+
 impl RowLock {
     fn for_update() -> Self {
         Self {
@@ -618,6 +724,24 @@ fn format_projection_list(
         .join(", ")
 }
 
+fn derived_model_aliases<R: Model>() -> Vec<Option<String>> {
+    R::columns()
+        .into_iter()
+        .map(|column| Some(column.to_string()))
+        .collect()
+}
+
+fn assert_derived_model_column_count<R: Model>(actual: usize) {
+    let expected = R::columns().len();
+    assert!(
+        actual == expected,
+        "Derived query projects {} columns, but {} expects {} columns",
+        actual,
+        R::TABLE_NAME,
+        expected
+    );
+}
+
 fn range_limit(start: Option<usize>, end: usize) -> usize {
     if let Some(start) = start {
         end - start
@@ -674,22 +798,18 @@ fn format_from_table_list(tables: &[String]) -> String {
         .join(", ")
 }
 
-fn append_join_condition(db_type: DbType, filter: &FilterExpr, sql: &mut String) {
-    if let FilterExpr::ColumnComparison {
-        left_column,
-        operator,
-        right_column,
-    } = filter
-    {
-        write!(
-            sql,
-            "{} {} {}",
-            quote_column_reference(db_type, &format!("t0.{}", left_column)),
-            operator,
-            quote_column_reference(db_type, &format!("t1.{}", right_column))
-        )
-        .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
-    }
+fn append_join_condition(
+    db_type: DbType,
+    filter: &FilterExpr,
+    sql: &mut String,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
+    let condition = FilterFormatter::new(db_type)
+        .with_table_prefix("t0")
+        .with_right_table_prefix("t1")
+        .format(filter, param_idx, params);
+    sql.push_str(&condition);
 }
 
 #[derive(Clone, Copy)]
@@ -714,7 +834,7 @@ struct JoinSqlParts<'a> {
     range_start: Option<usize>,
     range_end: Option<usize>,
     ignored_columns: &'a [String],
-    join_table: &'a str,
+    join_source: &'a JoinSource,
     join_alias: &'a str,
     on_condition: &'a FilterExpr,
     join_order_by: &'a [OrderBy],
@@ -722,20 +842,60 @@ struct JoinSqlParts<'a> {
     join_range_end: Option<usize>,
 }
 
+impl std::fmt::Debug for JoinSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table(table) => f.debug_tuple("Table").field(table).finish(),
+            Self::Derived(_) => f.write_str("Derived"),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum JoinSource {
+    Table(String),
+    Derived(DerivedSelectSql),
+}
+
+impl JoinSource {
+    fn to_sql_with_params(
+        &self,
+        db_type: DbType,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) -> String {
+        match self {
+            Self::Table(table) => {
+                quote_qualified_identifier(db_type, normalize_table_name_for_db(db_type, table))
+            }
+            Self::Derived(derived) => {
+                let (sql, derived_params) = derived.to_sql_with_params(db_type);
+                let count = derived_params.len() as i32;
+                params.extend(derived_params);
+                *param_idx += count;
+                format!("({sql})")
+            }
+        }
+    }
+}
+
 fn joined_select_header<T: Model, J: Model>(
     sql: &mut String,
     db_type: DbType,
     join_kind: JoinKind,
     ignored_columns: &[String],
-    join_table: &str,
+    join_source: &JoinSource,
     join_alias: &str,
     lateral: bool,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
 ) {
     let lateral_sql = if lateral {
         " LATERAL (SELECT * FROM "
     } else {
         " "
     };
+    let join_source_sql = join_source.to_sql_with_params(db_type, param_idx, params);
     write!(
         sql,
         "SELECT {}, {} FROM {} AS t0 {}{}{}",
@@ -744,7 +904,7 @@ fn joined_select_header<T: Model, J: Model>(
         table_name_for::<T>(db_type),
         join_kind.keyword(),
         lateral_sql,
-        quote_qualified_identifier(db_type, normalize_table_name_for_db(db_type, join_table)),
+        join_source_sql,
     )
     .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -767,13 +927,21 @@ fn plain_join_sql_with_params<T: Model, J: Model>(
         db_type,
         join_kind,
         parts.ignored_columns,
-        parts.join_table,
+        parts.join_source,
         parts.join_alias,
         false,
+        &mut param_idx,
+        &mut params,
     );
 
     sql.push_str(" ON ");
-    append_join_condition(db_type, parts.on_condition, &mut sql);
+    append_join_condition(
+        db_type,
+        parts.on_condition,
+        &mut sql,
+        &mut param_idx,
+        &mut params,
+    );
 
     append_filter_clause(
         &mut sql,
@@ -804,9 +972,11 @@ fn lateral_join_sql_with_params<T: Model, J: Model>(
         db_type,
         join_kind,
         parts.ignored_columns,
-        parts.join_table,
+        parts.join_source,
         parts.join_alias,
         true,
+        &mut param_idx,
+        &mut params,
     );
 
     let formatter = FilterFormatter::new(db_type).with_table_prefix("t0");
@@ -891,15 +1061,20 @@ fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Ve
 }
 
 #[cfg(feature = "postgresql")]
-fn collect_join_filter_param_rust_types<T: Model>(
-    lateral: bool,
+fn collect_join_param_rust_types<T: Model>(
+    join_source: &JoinSource,
     on_condition: &FilterExpr,
     filters: &[FilterExpr],
 ) -> Vec<&'static str> {
-    let mut rust_types = Vec::new();
-    if lateral {
-        collect_filter_param_rust_types::<T>(on_condition, &mut rust_types);
-    }
+    let mut rust_types = match join_source {
+        JoinSource::Table(_) => Vec::new(),
+        JoinSource::Derived(derived) => {
+            let (_, _, rust_types) =
+                derived.to_sql_with_params_and_types(crate::DbType::PostgreSQL);
+            rust_types
+        }
+    };
+    collect_filter_param_rust_types::<T>(on_condition, &mut rust_types);
     for filter in filters {
         collect_filter_param_rust_types::<T>(filter, &mut rust_types);
     }
@@ -969,7 +1144,8 @@ fn collect_filter_param_rust_types<T: Model>(
         }
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
-        | FilterExpr::IsNotNull { .. } => {}
+        | FilterExpr::IsNotNull { .. }
+        | FilterExpr::InvalidDynamicField { .. } => {}
         FilterExpr::Exists {
             subquery_params, ..
         }
@@ -1057,7 +1233,7 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
 #[cfg(feature = "postgresql")]
 fn model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
     let column = normalize_filter_column_name(column);
-    T::COLUMN_SCHEMA
+    T::column_schema()
         .iter()
         .find(|schema| schema.name == column)
         .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
@@ -1133,6 +1309,8 @@ pub struct Select<T: Model> {
     distinct_on: Vec<SqlExpr>,
     lock: Option<RowLock>,
     ignored_columns: Vec<String>,
+    table_route: TableRoute,
+    recursive_cte: Option<RecursiveCte>,
     _marker: PhantomData<T>,
 }
 
@@ -1150,6 +1328,8 @@ impl<T: Model> Clone for Select<T> {
             distinct_on: self.distinct_on.clone(),
             lock: self.lock,
             ignored_columns: self.ignored_columns.clone(),
+            table_route: self.table_route.clone(),
+            recursive_cte: self.recursive_cte.clone(),
             _marker: PhantomData,
         }
     }
@@ -1190,6 +1370,7 @@ pub struct AggregateSelect<T: Model, R = crate::model::Value> {
     aggregate_func: String, // COUNT, SUM, AVG, MAX, MIN
     column_name: String,
     filters: Vec<FilterExpr>,
+    table_route: TableRoute,
     _marker: PhantomData<(T, R)>,
 }
 
@@ -1205,6 +1386,7 @@ pub struct MappedSelect<T: Model, V> {
     distinct: bool,
     distinct_on: Vec<SqlExpr>,
     lock: Option<RowLock>,
+    table_route: TableRoute,
     _marker: PhantomData<(T, V)>,
 }
 
@@ -1222,7 +1404,94 @@ pub struct GroupedSelect<T: Model, V> {
     order_by: Vec<OrderBy>,          // ORDER BY
     range_start: Option<usize>,
     range_end: Option<usize>,
+    table_route: TableRoute,
     _marker: PhantomData<(T, V)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DerivedSelectSql {
+    render:
+        Arc<dyn Fn(DbType) -> (String, Vec<crate::model::Value>, Vec<&'static str>) + Send + Sync>,
+}
+
+impl DerivedSelectSql {
+    fn new(
+        render: impl Fn(DbType) -> (String, Vec<crate::model::Value>, Vec<&'static str>)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            render: Arc::new(render),
+        }
+    }
+
+    fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let (sql, params, _) = (self.render)(db_type);
+        (sql, params)
+    }
+
+    #[cfg(feature = "postgresql")]
+    fn to_sql_with_params_and_types(
+        &self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>, Vec<&'static str>) {
+        (self.render)(db_type)
+    }
+}
+
+pub struct DerivedSelect<R: Model> {
+    inner: DerivedSelectSql,
+    _marker: PhantomData<R>,
+}
+
+impl<R: Model> Clone for DerivedSelect<R> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<R: Model> DerivedSelect<R> {
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        self.inner.to_sql_with_params(db_type)
+    }
+
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn to_sql_with_params_and_types(
+        &self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>, Vec<&'static str>) {
+        self.inner.to_sql_with_params_and_types(db_type)
+    }
+
+    pub fn to_sql(&self) -> String {
+        self.to_sql_with_params(default_db_type()).0
+    }
+}
+
+pub struct DerivedTableSelect<R: Model> {
+    derived: DerivedSelect<R>,
+    filters: Vec<FilterExpr>,
+    order_by: Vec<OrderBy>,
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    _marker: PhantomData<R>,
+}
+
+impl<R: Model> Clone for DerivedTableSelect<R> {
+    fn clone(&self) -> Self {
+        Self {
+            derived: self.derived.clone(),
+            filters: self.filters.clone(),
+            order_by: self.order_by.clone(),
+            range_start: self.range_start,
+            range_end: self.range_end,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T: Model, V> Clone for MappedSelect<T, V> {
@@ -1238,6 +1507,7 @@ impl<T: Model, V> Clone for MappedSelect<T, V> {
             distinct: self.distinct,
             distinct_on: self.distinct_on.clone(),
             lock: self.lock,
+            table_route: self.table_route.clone(),
             _marker: PhantomData,
         }
     }
@@ -1258,6 +1528,7 @@ impl<T: Model, V> Clone for GroupedSelect<T, V> {
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
+            table_route: self.table_route.clone(),
             _marker: PhantomData,
         }
     }
@@ -1278,6 +1549,7 @@ impl<T: Model, V> Default for GroupedSelect<T, V> {
             order_by: Vec::new(),
             range_start: None,
             range_end: None,
+            table_route: TableRoute::new(),
             _marker: PhantomData,
         }
     }
@@ -1295,7 +1567,7 @@ impl<T: Model, R> AggregateSelect<T, R> {
             "SELECT {}({}) FROM {}",
             self.aggregate_func,
             quote_column_reference(db_type, &self.column_name),
-            table_name_for::<T>(db_type)
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
         )
         .expect("Failed to write aggregate SELECT clause");
 
@@ -1337,6 +1609,28 @@ impl<T: Model, V> MappedSelect<T, V> {
         self
     }
 
+    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        assert_derived_model_column_count::<R>(self.column_exprs.len());
+        let aliases = derived_model_aliases::<R>();
+        DerivedSelect {
+            inner: DerivedSelectSql::new(move |db_type| {
+                let mut select = self.clone();
+                select.alias_names = aliases.clone();
+                let (sql, params) = select.to_sql_with_params(db_type);
+                #[cfg(feature = "postgresql")]
+                let rust_types = select.param_rust_types();
+                #[cfg(not(feature = "postgresql"))]
+                let rust_types = Vec::new();
+                (sql, params, rust_types)
+            }),
+            _marker: PhantomData,
+        }
+    }
+
     pub fn distinct_on<F, G>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> G,
@@ -1367,6 +1661,16 @@ impl<T: Model, V> MappedSelect<T, V> {
         let mut lock = self.lock.unwrap_or_else(RowLock::for_update);
         lock.no_wait = true;
         self.lock = Some(lock);
+        self
+    }
+
+    pub fn route_table(mut self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    pub fn with_table_route(mut self, route: TableRoute) -> Self {
+        self.table_route.merge_missing(route);
         self
     }
 
@@ -1441,7 +1745,7 @@ impl<T: Model, V> MappedSelect<T, V> {
             "SELECT {}{} FROM {}",
             distinct_str,
             columns,
-            table_name_for::<T>(db_type)
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
         )
         .expect("Failed to write SELECT clause");
 
@@ -1469,10 +1773,39 @@ impl<T: Model, V> MappedSelect<T, V> {
     }
 }
 
+impl<T: Model, V> FilterQuery<T> for MappedSelect<T, V> {
+    fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
+        self.filters.push(expr.into());
+        self
+    }
+}
+
 impl<T: Model, V> GroupedSelect<T, V> {
     /// 创建新的 GroupedSelect 实例
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        assert_derived_model_column_count::<R>(self.column_exprs.len());
+        let aliases = derived_model_aliases::<R>();
+        DerivedSelect {
+            inner: DerivedSelectSql::new(move |db_type| {
+                let mut select = self.clone();
+                select.alias_names = aliases.clone();
+                let (sql, params) = select.to_sql_with_params(db_type);
+                #[cfg(feature = "postgresql")]
+                let rust_types = select.param_rust_types();
+                #[cfg(not(feature = "postgresql"))]
+                let rust_types = Vec::new();
+                (sql, params, rust_types)
+            }),
+            _marker: PhantomData,
+        }
     }
 
     /// 添加选择的列（支持聚合函数，链式调用）
@@ -1514,6 +1847,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -1567,6 +1901,16 @@ impl<T: Model, V> GroupedSelect<T, V> {
         self.grouping_clause = Some(GroupingClause::Cube(f(where_obj).sql_exprs()));
         self.group_by_columns.clear();
         self.group_by_exprs.clear();
+        self
+    }
+
+    pub fn route_table(mut self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    pub fn with_table_route(mut self, route: TableRoute) -> Self {
+        self.table_route.merge_missing(route);
         self
     }
 
@@ -1662,7 +2006,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
             &mut sql,
             "SELECT {} FROM {}",
             columns,
-            table_name_for::<T>(db_type)
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
         )
         .expect("Failed to write SELECT clause");
 
@@ -1774,9 +2118,34 @@ impl<T: Model, V> GroupedSelect<T, V> {
         self.to_sql_with_params(db_type)
     }
 
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+        let mut rust_types = Vec::new();
+        for expr in &self.column_exprs {
+            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
+        }
+        for expr in &self.group_by_exprs {
+            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
+        }
+        for filter in &self.filters {
+            collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+        }
+        for filter in &self.having_filters {
+            collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+        }
+        rust_types
+    }
+
     /// 获取列数（供执行器使用）
     pub fn column_count(&self) -> usize {
         self.column_names.len()
+    }
+}
+
+impl<T: Model, V> FilterQuery<T> for GroupedSelect<T, V> {
+    fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
+        self.filters.push(expr.into());
+        self
     }
 }
 
@@ -1794,6 +2163,8 @@ impl<T: Model> Select<T> {
             distinct_on: Vec::new(),
             lock: None,
             ignored_columns: Vec::new(),
+            table_route: TableRoute::new(),
+            recursive_cte: None,
             _marker: PhantomData,
         }
     }
@@ -1855,6 +2226,7 @@ impl<T: Model> Select<T> {
             aggregate_func: func.to_string(),
             column_name: column.to_string(),
             filters: self.filters,
+            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -1865,6 +2237,7 @@ impl<T: Model> Select<T> {
             aggregate_func: func.to_string(),
             column_name: column.to_string(),
             filters: self.filters,
+            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -1945,6 +2318,7 @@ impl<T: Model> Select<T> {
             distinct: self.distinct,
             distinct_on: self.distinct_on,
             lock: self.lock,
+            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -1993,6 +2367,7 @@ impl<T: Model> Select<T> {
             distinct: self.distinct,
             distinct_on: self.distinct_on,
             lock: self.lock,
+            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -2019,12 +2394,45 @@ impl<T: Model> Select<T> {
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
+            table_route: self.table_route,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+    {
+        let source_columns = T::columns();
+        assert_derived_model_column_count::<R>(source_columns.len());
+        DerivedSelect {
+            inner: DerivedSelectSql::new(move |db_type| {
+                let (base_sql, params) = self.to_sql_with_params(db_type);
+                let outer_columns =
+                    select_exprs_for_model_as::<R>(db_type, &source_columns, Some("t0"));
+                let sql = format!("SELECT {outer_columns} FROM ({base_sql}) AS t0");
+                #[cfg(feature = "postgresql")]
+                let rust_types = self.param_rust_types();
+                #[cfg(not(feature = "postgresql"))]
+                let rust_types = Vec::new();
+                (sql, params, rust_types)
+            }),
             _marker: PhantomData,
         }
     }
 }
 
 impl<T: Model> Select<T> {
+    pub fn route_table(mut self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    pub fn with_table_route(mut self, route: TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn filter<F>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> WhereExpr,
@@ -2054,6 +2462,14 @@ impl<T: Model> Select<T> {
         self.filter(f)
     }
 
+    pub fn filter_dynamic<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(DynamicColumnSet<T>) -> WhereExpr,
+    {
+        self.filters.push(f(DynamicColumnSet::new()).into());
+        self
+    }
+
     /// 添加排序
     pub fn order_by<F, O>(mut self, f: F) -> Self
     where
@@ -2076,6 +2492,14 @@ impl<T: Model> Select<T> {
         let mut order = f(where_obj).into();
         order.direction = crate::query::filter::OrderDirection::Desc;
         self.order_by.push(order);
+        self
+    }
+
+    pub fn order_by_dynamic<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(DynamicColumnSet<T>) -> OrderBy,
+    {
+        self.order_by.push(f(DynamicColumnSet::new()));
         self
     }
 
@@ -2111,6 +2535,38 @@ impl<T: Model> Select<T> {
         let bounds = range.into();
         self.range_start = bounds.start;
         self.range_end = bounds.end;
+        self
+    }
+
+    pub fn descendants<F, C>(mut self, f: F, root_id: impl Into<crate::model::Value>) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: RecursiveColumns<T>,
+    {
+        let (id_column, parent_column) = f(T::Where::default()).recursive_columns();
+        self.recursive_cte = Some(RecursiveCte {
+            name: "__ormer_tree",
+            id_column,
+            parent_column,
+            start_value: root_id.into(),
+            direction: RecursiveDirection::Descendants,
+        });
+        self
+    }
+
+    pub fn ancestors<F, C>(mut self, f: F, leaf_id: impl Into<crate::model::Value>) -> Self
+    where
+        F: FnOnce(T::Where) -> C,
+        C: RecursiveColumns<T>,
+    {
+        let (id_column, parent_column) = f(T::Where::default()).recursive_columns();
+        self.recursive_cte = Some(RecursiveCte {
+            name: "__ormer_tree",
+            id_column,
+            parent_column,
+            start_value: leaf_id.into(),
+            direction: RecursiveDirection::Ancestors,
+        });
         self
     }
 
@@ -2210,8 +2666,12 @@ impl<T: Model> Select<T> {
         let mut sql = String::new();
         let mut params = Vec::new();
 
-        write!(&mut sql, "SELECT 1 FROM {}", table_name_for::<T>(db_type))
-            .unwrap_or_else(|e| panic!("Failed to write EXISTS subquery SQL: {}", e));
+        write!(
+            &mut sql,
+            "SELECT 1 FROM {}",
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
+        )
+        .unwrap_or_else(|e| panic!("Failed to write EXISTS subquery SQL: {}", e));
 
         let mut param_idx = 1;
         append_filter_clause(
@@ -2232,8 +2692,20 @@ impl<T: Model> Select<T> {
         sql
     }
 
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        validate_select_parts(&self.filters, &self.order_by)?;
+        Ok(self.to_sql_with_params(db_type))
+    }
+
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        if self.recursive_cte.is_some() {
+            return self.to_sql_with_recursive_cte(db_type);
+        }
+
         if self.filters.iter().any(filter_has_relation) {
             let mut base_filters = Vec::new();
             let mut relation_filters = Vec::new();
@@ -2274,7 +2746,7 @@ impl<T: Model> Select<T> {
             "SELECT {}{} FROM {}",
             distinct_str,
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, None),
-            table_name_for::<T>(db_type)
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -2293,6 +2765,91 @@ impl<T: Model> Select<T> {
         );
 
         // 返回参数
+        (sql, params)
+    }
+
+    fn to_sql_with_recursive_cte(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let cte = self.recursive_cte.as_ref().expect("recursive CTE missing");
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+        let cte_name = crate::model::quote_identifier(db_type, cte.name);
+        let table_name = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
+        let id_column = crate::model::quote_identifier(db_type, cte.id_column);
+        let parent_column = crate::model::quote_identifier(db_type, cte.parent_column);
+        let id_ref = quote_column_reference(db_type, cte.id_column);
+
+        params.push(cte.start_value.clone());
+        let start_placeholder =
+            crate::abstract_layer::common::common_helpers::placeholder(db_type, param_idx as usize);
+        param_idx += 1;
+
+        let with_recursive = match db_type {
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => "WITH",
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => "WITH RECURSIVE",
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => "WITH RECURSIVE",
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => "WITH RECURSIVE",
+        };
+
+        write!(
+            &mut sql,
+            "{} {} AS (SELECT * FROM {} WHERE {} = {} UNION ALL ",
+            with_recursive, cte_name, table_name, id_ref, start_placeholder
+        )
+        .unwrap_or_else(|e| panic!("Failed to write recursive CTE anchor: {}", e));
+
+        match cte.direction {
+            RecursiveDirection::Descendants => {
+                write!(
+                    &mut sql,
+                    "SELECT child.* FROM {} AS child JOIN {} AS parent ON child.{} = parent.{})",
+                    table_name, cte_name, parent_column, id_column
+                )
+            }
+            RecursiveDirection::Ancestors => {
+                write!(
+                    &mut sql,
+                    "SELECT parent.* FROM {} AS parent JOIN {} AS child ON parent.{} = child.{})",
+                    table_name, cte_name, id_column, parent_column
+                )
+            }
+        }
+        .unwrap_or_else(|e| panic!("Failed to write recursive CTE step: {}", e));
+
+        let distinct_str = select_modifier_sql(
+            self.distinct,
+            &self.distinct_on,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+        write!(
+            &mut sql,
+            " SELECT {}{} FROM {}",
+            distinct_str,
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, None),
+            cte_name
+        )
+        .unwrap_or_else(|e| panic!("Failed to write recursive CTE SELECT: {}", e));
+
+        append_select_tail(
+            &mut sql,
+            &self.filters,
+            " WHERE ",
+            FilterFormatter::new(db_type),
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            self.lock,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+
         (sql, params)
     }
 
@@ -2318,7 +2875,7 @@ impl<T: Model> Select<T> {
             "SELECT {}{} FROM {} AS t0",
             distinct_str,
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            table_name_for::<T>(db_type)
+            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
         )
         .unwrap_or_else(|e| panic!("Failed to write relation SELECT clause: {}", e));
 
@@ -2369,7 +2926,17 @@ impl<T: Model> Select<T> {
 
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_model_filter_param_rust_types::<T>(&self.filters)
+        let mut rust_types = Vec::new();
+        if let Some(cte) = &self.recursive_cte {
+            rust_types.push(infer_model_value_rust_type(&cte.start_value));
+        }
+        for expr in &self.distinct_on {
+            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
+        }
+        for filter in &self.filters {
+            collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+        }
+        rust_types
     }
 
     pub(crate) fn prepare_cursor_page(&self) -> crate::Result<(Self, Vec<String>)> {
@@ -2466,6 +3033,134 @@ impl<T: Model> Select<T> {
             values.push(value);
         }
         Ok(PageCursor::new(values))
+    }
+}
+
+impl<T: Model> FilterQuery<T> for Select<T> {
+    fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
+        self.filters.push(expr.into());
+        self
+    }
+}
+
+pub fn from_derived<R: Model>(derived: DerivedSelect<R>) -> DerivedTableSelect<R> {
+    DerivedTableSelect {
+        derived,
+        filters: Vec::new(),
+        order_by: Vec::new(),
+        range_start: None,
+        range_end: None,
+        _marker: PhantomData,
+    }
+}
+
+impl<R: Model> DerivedTableSelect<R> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> WhereExpr,
+    {
+        let expr = f(R::Where::default());
+        self.filters.push(expr.into());
+        self
+    }
+
+    pub fn order_by<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> O,
+        O: Into<OrderBy>,
+    {
+        self.order_by.push(f(R::Where::default()).into());
+        self
+    }
+
+    pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+    where
+        F: FnOnce(R::Where) -> O,
+        O: Into<OrderBy>,
+    {
+        let mut order = f(R::Where::default()).into();
+        order.direction = crate::query::filter::OrderDirection::Desc;
+        self.order_by.push(order);
+        self
+    }
+
+    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+        let bounds = range.into();
+        self.range_start = bounds.start;
+        self.range_end = bounds.end;
+        self
+    }
+
+    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let (derived_sql, mut params) = self.derived.to_sql_with_params(db_type);
+        let mut param_idx = params.len() as i32 + 1;
+        let mut sql = format!(
+            "SELECT {} FROM ({}) AS t0",
+            select_exprs_for_model::<R>(db_type, &[], Some("t0")),
+            derived_sql
+        );
+
+        append_select_tail(
+            &mut sql,
+            &self.filters,
+            " WHERE ",
+            FilterFormatter::new(db_type).with_table_prefix("t0"),
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            None,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+
+        (sql, params)
+    }
+
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn to_sql_with_params_and_types(
+        &self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>, Vec<&'static str>) {
+        let (derived_sql, mut params, mut rust_types) =
+            self.derived.to_sql_with_params_and_types(db_type);
+        let mut param_idx = params.len() as i32 + 1;
+        let mut sql = format!(
+            "SELECT {} FROM ({}) AS t0",
+            select_exprs_for_model::<R>(db_type, &[], Some("t0")),
+            derived_sql
+        );
+
+        append_select_tail(
+            &mut sql,
+            &self.filters,
+            " WHERE ",
+            FilterFormatter::new(db_type).with_table_prefix("t0"),
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            None,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+
+        for filter in &self.filters {
+            collect_filter_param_rust_types::<R>(filter, &mut rust_types);
+        }
+
+        (sql, params, rust_types)
+    }
+
+    pub fn to_sql(&self) -> String {
+        self.to_sql_with_params(default_db_type()).0
+    }
+}
+
+impl<R: Model> FilterQuery<R> for DerivedTableSelect<R> {
+    fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
+        self.filters.push(expr.into());
+        self
     }
 }
 
@@ -2890,6 +3585,176 @@ impl<T: Model> WhereColumn<T> {
     fn new() -> Self {
         Self {
             _marker: PhantomData,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DynamicColumn<T: Model> {
+    model: &'static str,
+    requested_field: String,
+    column_name: Option<&'static str>,
+    _marker: PhantomData<T>,
+}
+
+pub struct DynamicColumnSet<T: Model> {
+    _marker: PhantomData<T>,
+}
+
+impl<T: Model> DynamicColumnSet<T> {
+    fn new() -> Self {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn field(&self, field: impl Into<String>) -> DynamicColumn<T> {
+        DynamicColumn::new(field)
+    }
+}
+
+impl<T: Model> DynamicColumn<T> {
+    pub fn new(field: impl Into<String>) -> Self {
+        let requested_field = field.into();
+        let column_name = T::column_name_for_field(&requested_field);
+        Self {
+            model: T::TABLE_NAME,
+            requested_field,
+            column_name,
+            _marker: PhantomData,
+        }
+    }
+
+    fn column_or_invalid(&self) -> Result<&'static str, FilterExpr> {
+        self.column_name
+            .ok_or_else(|| invalid_dynamic_field(self.model, self.requested_field.clone()))
+    }
+
+    fn comparison(self, operator: &str, value: impl Into<ColumnValue>) -> WhereExpr {
+        let inner = match self.column_or_invalid() {
+            Ok(column) => match value.into() {
+                ColumnValue::Literal(value) => FilterExpr::Comparison {
+                    column: column.to_string(),
+                    operator: operator.to_string(),
+                    value,
+                },
+                ColumnValue::ColumnRef(other_column) => FilterExpr::ColumnComparison {
+                    left_column: column.to_string(),
+                    operator: operator.to_string(),
+                    right_column: other_column,
+                },
+            },
+            Err(error) => error,
+        };
+        WhereExpr {
+            inner,
+            ..WhereExpr::defaults()
+        }
+    }
+
+    pub fn eq(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison("=", value)
+    }
+
+    pub fn ne(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison("!=", value)
+    }
+
+    pub fn ge(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison(">=", value)
+    }
+
+    pub fn gt(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison(">", value)
+    }
+
+    pub fn le(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison("<=", value)
+    }
+
+    pub fn lt(self, value: impl Into<ColumnValue>) -> WhereExpr {
+        self.comparison("<", value)
+    }
+
+    pub fn like(self, pattern: &str) -> WhereExpr {
+        self.comparison("LIKE", pattern)
+    }
+
+    pub fn contains(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("%{}%", pattern))
+    }
+
+    pub fn starts_with(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("{}%", pattern))
+    }
+
+    pub fn ends_with(self, pattern: &str) -> WhereExpr {
+        self.like(&format!("%{}", pattern))
+    }
+
+    pub fn is_null(self) -> WhereExpr {
+        WhereExpr {
+            inner: match self.column_or_invalid() {
+                Ok(column) => FilterExpr::IsNull {
+                    column: column.to_string(),
+                },
+                Err(error) => error,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    pub fn is_not_null(self) -> WhereExpr {
+        WhereExpr {
+            inner: match self.column_or_invalid() {
+                Ok(column) => FilterExpr::IsNotNull {
+                    column: column.to_string(),
+                },
+                Err(error) => error,
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    pub fn between(self, min: impl Into<ColumnValue>, max: impl Into<ColumnValue>) -> WhereExpr {
+        let inner = match self.column_or_invalid() {
+            Ok(column) => match (min.into(), max.into()) {
+                (ColumnValue::Literal(min), ColumnValue::Literal(max)) => FilterExpr::Between {
+                    column: column.to_string(),
+                    min,
+                    max,
+                },
+                (min, max) => FilterExpr::ExprBetween {
+                    expr: SqlExpr::Column(column.to_string()),
+                    min: min.into_sql_expr(),
+                    max: max.into_sql_expr(),
+                },
+            },
+            Err(error) => error,
+        };
+        WhereExpr {
+            inner,
+            ..WhereExpr::defaults()
+        }
+    }
+
+    pub fn asc(self) -> OrderBy {
+        match self.column_name {
+            Some(column) => OrderBy::asc(column.to_string()),
+            None => OrderBy::invalid(
+                self.requested_field.clone(),
+                invalid_dynamic_field_error(self.model, &self.requested_field),
+            ),
+        }
+    }
+
+    pub fn desc(self) -> OrderBy {
+        match self.column_name {
+            Some(column) => OrderBy::desc(column.to_string()),
+            None => OrderBy::invalid(
+                self.requested_field.clone(),
+                invalid_dynamic_field_error(self.model, &self.requested_field),
+            ),
         }
     }
 }
@@ -3866,6 +4731,16 @@ impl<T, S> From<TypedColumn<T, S>> for OrderBy {
     }
 }
 
+pub trait RecursiveColumns<T: Model> {
+    fn recursive_columns(self) -> (&'static str, &'static str);
+}
+
+impl<T: Model, Id, Parent> RecursiveColumns<T> for (TypedColumn<Id, T>, TypedColumn<Parent, T>) {
+    fn recursive_columns(self) -> (&'static str, &'static str) {
+        (self.0.column_name(), self.1.column_name())
+    }
+}
+
 impl<T: crate::model::FromValue, S> crate::model::FromRowValues for TypedColumn<T, S> {
     fn from_row_values(values: &[crate::model::Value]) -> crate::Result<Self> {
         if values.is_empty() {
@@ -3902,9 +4777,24 @@ impl<T: ColumnValueType> From<T> for ColumnValue {
     }
 }
 
+impl From<crate::model::Value> for ColumnValue {
+    fn from(v: crate::model::Value) -> Self {
+        ColumnValue::Literal(v)
+    }
+}
+
 impl<T, S> From<TypedColumn<T, S>> for ColumnValue {
     fn from(col: TypedColumn<T, S>) -> Self {
         ColumnValue::ColumnRef(col.column_name.to_string())
+    }
+}
+
+impl ColumnValue {
+    fn into_sql_expr(self) -> SqlExpr {
+        match self {
+            ColumnValue::Literal(value) => SqlExpr::Value(value),
+            ColumnValue::ColumnRef(column) => SqlExpr::Column(column),
+        }
     }
 }
 
@@ -4726,7 +5616,7 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     range_start: Option<usize>,
     range_end: Option<usize>,
     ignored_columns: Vec<String>,
-    join_table: String,
+    join_source: JoinSource,
     join_alias: String,
     on_condition: FilterExpr,
     /// 是否为 LATERAL JOIN
@@ -4748,7 +5638,7 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns.clone(),
-            join_table: self.join_table.clone(),
+            join_source: self.join_source.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
             lateral: self.lateral,
@@ -4768,7 +5658,7 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     range_start: Option<usize>,
     range_end: Option<usize>,
     ignored_columns: Vec<String>,
-    join_table: String,
+    join_source: JoinSource,
     join_alias: String,
     on_condition: FilterExpr,
     /// 是否为 LATERAL JOIN
@@ -4790,7 +5680,7 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns.clone(),
-            join_table: self.join_table.clone(),
+            join_source: self.join_source.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
             lateral: self.lateral,
@@ -4810,7 +5700,7 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     range_start: Option<usize>,
     range_end: Option<usize>,
     ignored_columns: Vec<String>,
-    join_table: String,
+    join_source: JoinSource,
     join_alias: String,
     on_condition: FilterExpr,
     /// 是否为 LATERAL JOIN
@@ -4832,7 +5722,7 @@ impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns.clone(),
-            join_table: self.join_table.clone(),
+            join_source: self.join_source.clone(),
             join_alias: self.join_alias.clone(),
             on_condition: self.on_condition.clone(),
             lateral: self.lateral,
@@ -4865,7 +5755,7 @@ impl<T: Model> Select<T> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns,
-            join_table: J::TABLE_NAME.to_string(),
+            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
             lateral,
@@ -4896,7 +5786,7 @@ impl<T: Model> Select<T> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns,
-            join_table: J::TABLE_NAME.to_string(),
+            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
             lateral,
@@ -4927,7 +5817,100 @@ impl<T: Model> Select<T> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns,
-            join_table: J::TABLE_NAME.to_string(),
+            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
+        LeftJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
+            join_source: JoinSource::Derived(derived.inner),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
+        InnerJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
+            join_source: JoinSource::Derived(derived.inner),
+            join_alias: "t1".to_string(),
+            on_condition: expr.into(),
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelect<T, J> {
+        let t_where = T::Where::default();
+        let j_where = J::Where::default();
+        let expr = f(t_where, j_where);
+
+        let lateral = expr.is_lateral();
+        let join_order_by = expr.join_order_by.clone();
+        let join_range_start = expr.join_range_start;
+        let join_range_end = expr.join_range_end;
+
+        RightJoinedSelect {
+            filters: self.filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            ignored_columns: self.ignored_columns,
+            join_source: JoinSource::Derived(derived.inner),
             join_alias: "t1".to_string(),
             on_condition: expr.into(),
             lateral,
@@ -4942,7 +5925,7 @@ impl<T: Model> Select<T> {
 impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -4973,7 +5956,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
-                join_table: &self.join_table,
+                join_source: &self.join_source,
                 join_alias: &self.join_alias,
                 on_condition: &self.on_condition,
                 join_order_by: &self.join_order_by,
@@ -4987,7 +5970,7 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
 impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -5017,7 +6000,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
-                join_table: &self.join_table,
+                join_source: &self.join_source,
                 join_alias: &self.join_alias,
                 on_condition: &self.on_condition,
                 join_order_by: &self.join_order_by,
@@ -5031,7 +6014,7 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
 impl<T: Model, J: Model> RightJoinedSelect<T, J> {
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_filter_param_rust_types::<T>(self.lateral, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -5061,7 +6044,7 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
-                join_table: &self.join_table,
+                join_source: &self.join_source,
                 join_alias: &self.join_alias,
                 on_condition: &self.on_condition,
                 join_order_by: &self.join_order_by,

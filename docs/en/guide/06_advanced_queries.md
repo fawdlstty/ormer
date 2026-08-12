@@ -251,6 +251,42 @@ Supported JOIN types: `left_join`, `inner_join`, `right_join`.
 
 Can be combined with `filter`, `range`, and other methods on the main query.
 
+### Derived Table JOIN
+
+`Select`, `MappedSelect`, and `GroupedSelect` can be promoted to a derived table with `as_model::<R>()`. Use `ViewModel` for projection result types without a primary key.
+
+```rust
+#[derive(Debug, ormer::ViewModel)]
+struct UserTotal {
+    user_id: i32,
+    total: i64,
+}
+
+let totals = db
+    .select::<Order>()
+    .select_column(|o| (o.user_id, o.amount.sum()))
+    .group_by(|o| o.user_id)
+    .as_model::<UserTotal>();
+
+let rows: Vec<(User, Option<UserTotal>)> = db
+    .select::<User>()
+    .left_join_derived(totals, |u, t| u.id.eq(t.user_id))
+    .collect()
+    .await?;
+```
+
+The same derived table can be used as the main query source:
+
+```rust
+let hot_users: Vec<UserTotal> = db
+    .from_derived(totals)
+    .filter(|t| t.total.gt(1000_i64))
+    .order_by_desc(|t| t.total)
+    .range(..10)
+    .collect()
+    .await?;
+```
+
 ## Multi-Table Joins
 
 ### Two Tables (from)

@@ -41,6 +41,9 @@ fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Val
             mysql_async::Value::Bytes(crate::model::stringify_string_vec(v).into_bytes())
         }
         crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
+        crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
+            mysql_async::Value::Bytes(v.clone().into_bytes())
+        }
         crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
         crate::model::Value::Duration(v) => {
             mysql_async::Value::Int(v.as_micros().min(i64::MAX as u128) as i64)
@@ -132,6 +135,9 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
             // 浮点类型
             "f32" => "FLOAT",
             "f64" => "DOUBLE",
+            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
+                "DECIMAL(65,30)"
+            }
             // 时长类型
             "Duration" | "std::time::Duration" => "BIGINT",
             // 字符串类型
@@ -171,6 +177,11 @@ pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
+    pub fn with_table_name(mut self, table_name: &str) -> Self {
+        self.table_name = Some(table_name.to_string());
+        self
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
             crate::abstract_layer::DbType::MySQL,
@@ -283,7 +294,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MySQL, models);
+        let (sql, all_values) =
+            common_helpers::build_routed_insert_statement::<T>(DbType::MySQL, models)?;
         let params = values_to_params(&all_values)?;
 
         conn.exec_drop(&sql, params).trace().await?;
@@ -896,7 +908,8 @@ impl Database {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MySQL, models);
+        let (sql, all_values) =
+            common_helpers::build_routed_insert_statement::<T>(DbType::MySQL, models)?;
         let params = values_to_params(&all_values)?;
 
         conn.exec_drop(&sql, params).trace().await?;
@@ -1635,6 +1648,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         }
     }
 
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
+    }
+
     /// 克隆executor（保持相同的pool引用）
     pub fn clone_with_pool(&self) -> Self {
         Self {
@@ -1748,6 +1769,42 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     ) -> RightJoinedSelectExecutor<'a, T, J> {
         RightJoinedSelectExecutor {
             select: self.select.right_join::<J>(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelectExecutor<'a, T, J> {
+        LeftJoinedSelectExecutor {
+            select: self.select.left_join_derived::<J>(derived, f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<'a, T, J> {
+        InnerJoinedSelectExecutor {
+            select: self.select.inner_join_derived::<J>(derived, f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<'a, T, J> {
+        RightJoinedSelectExecutor {
+            select: self.select.right_join_derived::<J>(derived, f),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2039,7 +2096,7 @@ impl<'a, T: Model + 'static + Send + std::marker::Sync> std::future::IntoFuture
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
 
         let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2057,6 +2114,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
 
         Ok(results.into_iter().collect())
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
+        Ok(SqlStatement::single(DbType::MySQL, sql, params))
     }
 }
 
@@ -3345,6 +3407,12 @@ fn convert_mysql_value(row: &mysql_async::Row, index: usize) -> crate::Result<cr
                 | ColumnType::MYSQL_TYPE_VAR_STRING
         ) && col.character_set() == 63 // 63 = binary charset
     });
+    let is_decimal_col = row.columns().get(index).is_some_and(|col| {
+        matches!(
+            col.column_type(),
+            ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL
+        )
+    });
 
     match value {
         Some(Value::NULL) | None => Ok(crate::model::Value::Null),
@@ -3401,6 +3469,10 @@ fn convert_mysql_value(row: &mysql_async::Row, index: usize) -> crate::Result<cr
             // 二进制列（BLOB/BINARY）直接作为 Bytes 返回
             Ok(crate::model::Value::Bytes(b))
         }
+        Some(Value::Bytes(b)) if is_decimal_col => match String::from_utf8(b.clone()) {
+            Ok(s) => Ok(crate::model::Value::BigDecimal(s)),
+            Err(_) => Ok(crate::model::Value::Bytes(b)),
+        },
         Some(Value::Bytes(b)) => {
             // 文本列：尝试将字节解析为数值（MySQL聚合函数可能返回字符串形式的数值）
             if let Ok(s) = String::from_utf8(b.clone()) {
@@ -3434,6 +3506,14 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             },
             _marker: PhantomData,
         }
+    }
+
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
     }
 
     /// 添加 GROUP BY 字段

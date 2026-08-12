@@ -18,19 +18,24 @@ pub use stream_connection::StreamConnection;
 mod unified;
 pub use unified::{
     AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
-    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
-    InsertExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor,
-    LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
-    ModelCollectWithFuture, NestedInclude, RawCollectFuture, RawSelectExecutor,
-    RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, SelectExecutor,
+    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
+    DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
+    IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,
+    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
+    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
+    RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder, SelectExecutor,
     SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
     TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor, UpdateGraphExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
-pub use connection_pool::{ConnectionPool, PooledConnection, PooledRawSelectExecutor};
+pub use connection_pool::{
+    ConnectionPool, PooledConnection, PooledRawSelectExecutor, ReplicatedConnectionPool,
+    ReplicatedPoolBuilder,
+};
 
 #[derive(Debug, Clone)]
 pub struct SingleSqlStatement {

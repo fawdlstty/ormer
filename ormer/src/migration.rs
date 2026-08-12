@@ -7,7 +7,6 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{Database, Transaction};
 use crate::model::{ColumnSchema, WritableModel};
-use crate::raw_sql::IntoRawSql;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
@@ -1214,35 +1213,6 @@ impl Database {
             Database::MySQL(db) => db.schema_columns(table_name).await,
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.schema_columns(table_name).await,
-        }
-    }
-}
-
-impl Transaction<'_> {
-    pub async fn execute_sql(&mut self, sql: impl IntoRawSql) -> crate::Result<u64> {
-        let sql = sql.into_raw_sql();
-        match self {
-            #[cfg(feature = "sqlite")]
-            Transaction::Sqlite(transaction) => {
-                let (sql, params) = sql.render(DbType::Sqlite)?;
-                transaction.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "postgresql")]
-            Transaction::PostgreSQL(transaction) => {
-                let (sql, params) = sql.render(DbType::PostgreSQL)?;
-                transaction.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mysql")]
-            Transaction::MySQL(transaction) => {
-                let (sql, params) = sql.render(DbType::MySQL)?;
-                transaction.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mssql")]
-            Transaction::MSSQL(transaction) => {
-                let (sql, params) = sql.render(DbType::MSSQL)?;
-                transaction.exec_raw(&sql, params).await
-            }
-            Transaction::_Phantom(_) => Err(crate::ormer_error!("No database backend is enabled")),
         }
     }
 }

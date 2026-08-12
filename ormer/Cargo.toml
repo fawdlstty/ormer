@@ -29,6 +29,8 @@ tokio = { version = "1.52.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde"] }
 serde_json = "1.0"
+rust_decimal = "1"
+bigdecimal = "0.4"
 # sqlite
 turso = { version = "0.1", optional = true }
 # postgres
@@ -37,9 +39,9 @@ bb8-postgres = { version = "0.8", optional = true }
 postgres-types = { version = "0.2", optional = true }
 tokio-postgres = { version = "0.7", features = ["array-impls", "with-chrono-0_4"], optional = true }
 # mysql
-mysql_async = { version = "0.34", optional = true }
+mysql_async = { version = "0.34", features = ["rust_decimal", "bigdecimal"], optional = true }
 # mssql
-tiberius = { version = "0.12", optional = true, features = ["tds73", "chrono"] }
+tiberius = { version = "0.12", optional = true, features = ["tds73", "chrono", "rust_decimal", "bigdecimal"] }
 tokio-util = { version = "0.7", features = ["compat"], optional = true }
 
 [dev-dependencies]
@@ -59,7 +61,6 @@ sqlite = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types", "dep:bb8", "dep:bb8-postgres"]
 mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
-
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

@@ -22,7 +22,9 @@ use crate::{
     impl_backend_related_executor_methods_with_lifetime, impl_insert_conflict_methods,
 };
 use std::marker::PhantomData;
+use std::str::FromStr;
 use std::sync::Arc;
+use tiberius::numeric::Numeric;
 use tiberius::{Client, Config, Query};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -72,6 +74,9 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             "u64" => "BIGINT",
             "f32" => "REAL",
             "f64" => "FLOAT",
+            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
+                "DECIMAL(38,18)"
+            }
             "Duration" | "std::time::Duration" => "BIGINT",
             "String" => "NVARCHAR(255)",
             "bool" => "BIT",
@@ -770,7 +775,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
                 DbType::MSSQL,
                 &refs,
-            );
+            )?;
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -792,7 +797,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
 
         let has_auto_increment = common_helpers::auto_increment_column::<T>().is_some();
-        let (sql, all_values) = common_helpers::build_insert_statement::<T>(DbType::MSSQL, models);
+        let (sql, all_values) =
+            common_helpers::build_routed_insert_statement::<T>(DbType::MSSQL, models)?;
 
         let mut client = self.pool.lock().await;
 
@@ -1346,7 +1352,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
                 DbType::MSSQL,
                 &refs,
-            );
+            )?;
 
         Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
     }
@@ -1581,6 +1587,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let (sql, params) = self
+            .select
+            .try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
+        Ok(SqlStatement::single(
+            crate::abstract_layer::DbType::MSSQL,
+            sql,
+            params,
+        ))
+    }
+
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
         F: FnOnce(T::Where) -> crate::query::builder::TypedColumn<C, T>,
@@ -1745,6 +1762,42 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    pub fn left_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> LeftJoinedSelectExecutor<'a, T, J> {
+        LeftJoinedSelectExecutor {
+            select: self.select.left_join_derived::<J>(derived, f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn inner_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> InnerJoinedSelectExecutor<'a, T, J> {
+        InnerJoinedSelectExecutor {
+            select: self.select.inner_join_derived::<J>(derived, f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn right_join_derived<J: Model>(
+        self,
+        derived: crate::query::builder::DerivedSelect<J>,
+        f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
+    ) -> RightJoinedSelectExecutor<'a, T, J> {
+        RightJoinedSelectExecutor {
+            select: self.select.right_join_derived::<J>(derived, f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     pub fn stream(self) -> SelectStream<'a, T> {
         SelectStream {
             executor: self,
@@ -1804,6 +1857,14 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             pool: self.pool,
             _marker: PhantomData,
         }
+    }
+
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
     }
 }
 
@@ -2198,6 +2259,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         }
     }
 
+    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
+    where
+        T: Send + Sync + 'static,
+        V: Send + Sync + 'static,
+    {
+        self.select.as_model::<R>()
+    }
+
     /// 克隆executor（保持相同的pool引用）
     pub fn clone_with_pool(&self) -> Self {
         Self {
@@ -2258,7 +2327,8 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
             _marker: _,
         } = self.executor;
         Box::pin(async move {
-            let (sql, params) = select.to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
+            let (sql, params) =
+                select.try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = pool.lock().await;
             let mut query = Query::new(&sql);
             for param in &params {
@@ -2599,6 +2669,10 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Valu
     if let Ok(Some(v)) = row.try_get::<i16, _>(idx) {
         return Ok(Value::Integer(v as i64));
     }
+    // 尝试 Numeric/Decimal
+    if let Ok(Some(v)) = row.try_get::<Numeric, _>(idx) {
+        return Ok(Value::BigDecimal(v.to_string()));
+    }
     // 尝试 &str (NVARCHAR, VARCHAR, CHAR)
     if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
         return Ok(Value::Text(v.to_string()));
@@ -2639,6 +2713,26 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Valu
     }
     // 值为 NULL 或无法识别的类型
     Ok(Value::Null)
+}
+
+fn decimal_text_to_mssql_numeric(value: &str) -> Numeric {
+    let normalized = value.trim();
+    let negative = normalized.starts_with('-');
+    let unsigned = normalized.strip_prefix(['-', '+']).unwrap_or(normalized);
+    let scale = unsigned
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0)
+        .min(37);
+    let mut digits = unsigned.replace('.', "");
+    if scale == 0 && digits.is_empty() {
+        digits.push('0');
+    }
+    let mut integer = i128::from_str(&digits).unwrap_or(0);
+    if negative {
+        integer = -integer;
+    }
+    Numeric::new_with_scale(integer, scale as u8)
 }
 
 // 辅助函数：从 tiberius Row 中提取 i64 值（用于聚合查询）
@@ -2682,6 +2776,7 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
         Value::Integer(v) => query.bind(*v),
         Value::BigInt(v) => query.bind(*v as i64),
         Value::Real(v) => query.bind(*v),
+        Value::Decimal(v) | Value::BigDecimal(v) => query.bind(decimal_text_to_mssql_numeric(v)),
         Value::Duration(v) => {
             let micros = v.as_micros().min(i64::MAX as u128) as i64;
             query.bind(micros)

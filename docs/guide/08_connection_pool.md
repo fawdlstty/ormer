@@ -19,6 +19,25 @@ let conn = pool.get().await?;
 let users: Vec<User> = conn.select::<User>().collect().await?;
 ```
 
+## 读写分离
+
+同一种数据库类型下可以显式配置主库和只读库。查询通过 `.read()` 获取读库，写入和强一致读取通过 `.write()` 获取主库：
+
+```rust
+let pool = ConnectionPool::replicated(DbType::PostgreSQL)
+    .write(primary_url)
+    .read(replica_url)
+    .max_size(16)
+    .connect()
+    .await?;
+
+let writer = pool.write().get().await?;
+writer.insert(&user).execute().await?;
+
+let reader = pool.read().get().await?;
+let users: Vec<User> = reader.select::<User>().collect().await?;
+```
+
 ### 自动管理
 
 ```rust

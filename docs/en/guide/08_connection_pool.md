@@ -19,6 +19,25 @@ let conn = pool.get().await?;
 let users: Vec<User> = conn.select::<User>().collect().await?;
 ```
 
+## Read/Write Splitting
+
+For one database type, configure a primary connection and one or more read replicas. Use `.read()` for replica queries and `.write()` for writes or strongly consistent reads:
+
+```rust
+let pool = ConnectionPool::replicated(DbType::PostgreSQL)
+    .write(primary_url)
+    .read(replica_url)
+    .max_size(16)
+    .connect()
+    .await?;
+
+let writer = pool.write().get().await?;
+writer.insert(&user).execute().await?;
+
+let reader = pool.read().get().await?;
+let users: Vec<User> = reader.select::<User>().collect().await?;
+```
+
 ### Auto Management
 
 ```rust

@@ -1,7 +1,7 @@
 use super::super::DbType;
 use crate::model::{
-    FromRowValues, Model, Row, Value, quote_column_reference, quote_identifier,
-    quote_qualified_identifier,
+    FromRowValues, Model, Row, TableRoute, Value, quote_column_reference, quote_identifier,
+    quote_qualified_identifier, routed_table_name_for_db,
 };
 use crate::query::filter::FilterExpr;
 use crate::query::filter_formatter::FilterFormatter;
@@ -33,6 +33,14 @@ pub fn placeholder_list(db_type: DbType, start_idx: usize, count: usize) -> Stri
 
 pub fn quote_table_name<T: Model>(db_type: DbType) -> String {
     quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
+}
+
+pub fn quote_routed_table_name<T: Model>(
+    db_type: DbType,
+    route: &TableRoute,
+) -> crate::Result<String> {
+    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, route)?;
+    Ok(quote_qualified_identifier(db_type, &table_name))
 }
 
 pub fn quote_column_list(db_type: DbType, columns: &[&str]) -> String {
@@ -202,7 +210,7 @@ where
     F: FnMut(usize) -> crate::Result<Value>,
 {
     let mut data = HashMap::new();
-    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+    for (i, col_name) in T::columns().iter().enumerate() {
         data.insert(col_name.to_string(), value_at(offset + i)?);
     }
 
@@ -219,7 +227,7 @@ where
 {
     let mut data = HashMap::new();
     let mut is_null = true;
-    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+    for (i, col_name) in T::columns().iter().enumerate() {
         let value = value_at(offset + i)?;
         if !matches!(value, Value::Null) {
             is_null = false;
@@ -269,6 +277,16 @@ fn parse_column_value_options(
     datetime: Option<chrono::DateTime<chrono::Utc>>,
     mode: ColumnValueMode<'_>,
 ) -> crate::Result<Value> {
+    fn decimal_string(
+        string: Option<String>,
+        int: Option<i64>,
+        real: Option<f64>,
+    ) -> Option<String> {
+        string
+            .or_else(|| int.map(|value| value.to_string()))
+            .or_else(|| real.map(|value| value.to_string()))
+    }
+
     if is_nullable {
         match rust_type {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match int {
@@ -281,6 +299,14 @@ fn parse_column_value_options(
             },
             "f32" | "f64" => match real {
                 Some(val) => Ok(Value::Real(val)),
+                None => Ok(Value::Null),
+            },
+            "Decimal" | "rust_decimal::Decimal" => match decimal_string(string, int, real) {
+                Some(val) => Ok(Value::Decimal(val)),
+                None => Ok(Value::Null),
+            },
+            "BigDecimal" | "bigdecimal::BigDecimal" => match decimal_string(string, int, real) {
+                Some(val) => Ok(Value::BigDecimal(val)),
                 None => Ok(Value::Null),
             },
             "bool" => match boolean {
@@ -349,6 +375,34 @@ fn parse_column_value_options(
                         column_name
                     )
                 })
+            }
+            ("Decimal" | "rust_decimal::Decimal", ColumnValueMode::Default) => Ok(Value::Decimal(
+                decimal_string(string, int, real).unwrap_or_else(|| "0".to_string()),
+            )),
+            ("Decimal" | "rust_decimal::Decimal", ColumnValueMode::Strict { column_name }) => {
+                decimal_string(string, int, real)
+                    .map(Value::Decimal)
+                    .ok_or_else(|| {
+                        crate::ormer_error!(
+                            "Failed to parse non-nullable column '{}' (expected Decimal type)",
+                            column_name
+                        )
+                    })
+            }
+            ("BigDecimal" | "bigdecimal::BigDecimal", ColumnValueMode::Default) => {
+                Ok(Value::BigDecimal(
+                    decimal_string(string, int, real).unwrap_or_else(|| "0".to_string()),
+                ))
+            }
+            ("BigDecimal" | "bigdecimal::BigDecimal", ColumnValueMode::Strict { column_name }) => {
+                decimal_string(string, int, real)
+                    .map(Value::BigDecimal)
+                    .ok_or_else(|| {
+                        crate::ormer_error!(
+                            "Failed to parse non-nullable column '{}' (expected BigDecimal type)",
+                            column_name
+                        )
+                    })
             }
             ("bool", ColumnValueMode::Default) => Ok(Value::Boolean(boolean.unwrap_or(0) == 1)),
             ("bool", ColumnValueMode::Strict { column_name }) => boolean
@@ -571,7 +625,7 @@ pub fn build_batch_insert_statement<T: Model>(
 }
 
 pub fn auto_increment_column<T: Model>() -> Option<&'static str> {
-    T::COLUMN_SCHEMA
+    T::column_schema()
         .iter()
         .find(|column| column.is_auto_increment)
         .map(|column| column.name)
@@ -625,6 +679,44 @@ pub fn build_insert_statement<T: Model>(db_type: DbType, models: &[&T]) -> (Stri
     )
 }
 
+fn routed_table_name_for_models<T: Model>(db_type: DbType, models: &[&T]) -> crate::Result<String> {
+    let Some(first) = models.first() else {
+        return Ok(T::table_name_for_db(db_type).to_string());
+    };
+    let first_route = first.table_route()?;
+    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, &first_route)?;
+
+    for model in models.iter().skip(1) {
+        let route = model.table_route()?;
+        let model_table = routed_table_name_for_db(db_type, T::TABLE_NAME, &route)?;
+        if model_table != table_name {
+            return Err(crate::ormer_error!(
+                "Batch insert cannot target multiple routed tables: {} and {}",
+                table_name,
+                model_table
+            ));
+        }
+    }
+
+    Ok(table_name)
+}
+
+pub fn build_routed_insert_statement<T: Model>(
+    db_type: DbType,
+    models: &[&T],
+) -> crate::Result<(String, Vec<Value>)> {
+    let columns = T::insert_columns();
+    let table_name = routed_table_name_for_models(db_type, models)?;
+    Ok(build_batch_insert_statement::<T>(
+        db_type,
+        "INSERT INTO",
+        &table_name,
+        &columns,
+        models,
+        BatchInsertValuesMode::WithoutAutoIncrement,
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct PartialInsertStatement {
     pub sql: String,
@@ -635,6 +727,18 @@ pub struct PartialInsertStatement {
 pub fn build_partial_insert_statement<T: Model>(
     db_type: DbType,
     assignments: &[InsertAssignment],
+) -> crate::Result<PartialInsertStatement> {
+    build_partial_insert_statement_for_table::<T>(
+        db_type,
+        assignments,
+        T::table_name_for_db(db_type),
+    )
+}
+
+pub fn build_partial_insert_statement_for_table<T: Model>(
+    db_type: DbType,
+    assignments: &[InsertAssignment],
+    table_name: &str,
 ) -> crate::Result<PartialInsertStatement> {
     let mut values_by_column = HashMap::<&'static str, InsertValue>::new();
     for assignment in assignments {
@@ -651,7 +755,7 @@ pub fn build_partial_insert_statement<T: Model>(
     let mut columns = Vec::new();
     let mut params = Vec::new();
     let mut param_rust_types = Vec::new();
-    for schema in T::COLUMN_SCHEMA {
+    for schema in T::column_schema() {
         match values_by_column.get(schema.name) {
             Some(InsertValue::Literal(value)) => {
                 columns.push(schema.name);
@@ -662,7 +766,7 @@ pub fn build_partial_insert_statement<T: Model>(
         }
     }
 
-    let table_name = quote_qualified_identifier(db_type, T::table_name_for_db(db_type));
+    let table_name = quote_qualified_identifier(db_type, table_name);
     let sql = if columns.is_empty() {
         match db_type {
             #[cfg(feature = "mysql")]
@@ -687,6 +791,17 @@ pub fn build_partial_insert_statement_with_auto_increment_returning<T: Model>(
     assignments: &[InsertAssignment],
 ) -> crate::Result<PartialInsertStatement> {
     let mut statement = build_partial_insert_statement::<T>(db_type, assignments)?;
+    statement.sql = append_auto_increment_returning::<T>(db_type, statement.sql);
+    Ok(statement)
+}
+
+pub fn build_partial_insert_statement_with_auto_increment_returning_for_table<T: Model>(
+    db_type: DbType,
+    assignments: &[InsertAssignment],
+    table_name: &str,
+) -> crate::Result<PartialInsertStatement> {
+    let mut statement =
+        build_partial_insert_statement_for_table::<T>(db_type, assignments, table_name)?;
     statement.sql = append_auto_increment_returning::<T>(db_type, statement.sql);
     Ok(statement)
 }
@@ -731,10 +846,11 @@ pub fn build_insert_statement_with_conflict<T: Model>(
     conflict: Option<&InsertConflict>,
 ) -> crate::Result<(String, Vec<Value>)> {
     let columns = T::insert_columns();
+    let table_name = routed_table_name_for_models(db_type, models)?;
     let (mut sql, mut values) = build_batch_insert_statement::<T>(
         db_type,
         insert_prefix_for_conflict(db_type, conflict),
-        T::table_name_for_db(db_type),
+        &table_name,
         &columns,
         models,
         BatchInsertValuesMode::WithoutAutoIncrement,
@@ -939,9 +1055,9 @@ fn append_mysql_insert_conflict_clause(
 pub fn build_insert_statement_with_auto_increment_returning<T: Model>(
     db_type: DbType,
     models: &[&T],
-) -> (String, Vec<Value>) {
-    let (sql, values) = build_insert_statement::<T>(db_type, models);
-    (append_auto_increment_returning::<T>(db_type, sql), values)
+) -> crate::Result<(String, Vec<Value>)> {
+    let (sql, values) = build_routed_insert_statement::<T>(db_type, models)?;
+    Ok((append_auto_increment_returning::<T>(db_type, sql), values))
 }
 
 pub fn build_insert_statement_with_conflict_and_auto_increment_returning<T: Model>(

@@ -6,13 +6,35 @@ use proc_macro::TokenStream;
 #[proc_macro_derive(
     Model,
     attributes(
-        table, column, primary, unique, index, foreign, data_type, default, check, hypertable,
-        compress, has_many, belongs_to, has_one, through
+        table,
+        column,
+        primary,
+        unique,
+        index,
+        foreign,
+        data_type,
+        default,
+        check,
+        hypertable,
+        compress,
+        has_many,
+        belongs_to,
+        has_one,
+        through,
+        embed,
+        filter,
+        ormer_ignore
     )
 )]
 pub fn derive_model(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model::derive_model(input).into()
+}
+
+#[proc_macro_derive(Embed, attributes(column, data_type))]
+pub fn derive_embed(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    model::derive_embed(input).into()
 }
 
 #[proc_macro_derive(ViewModel, attributes(table, column, data_type))]

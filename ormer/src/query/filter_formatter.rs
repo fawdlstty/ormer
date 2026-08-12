@@ -90,7 +90,8 @@ impl FilterFormatter {
                     self.comparison_sql(
                         &quote_column_reference(self.db_type, &full_col_name),
                         operator,
-                        param_idx
+                        param_idx,
+                        value,
                     )
                 )
                 .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
@@ -361,6 +362,9 @@ impl FilterFormatter {
                 write!(sql, "{sql_fragment}")
                     .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));
             }
+            FilterExpr::InvalidDynamicField { .. } => {
+                sql.push_str("1 = 0");
+            }
         }
     }
 
@@ -541,7 +545,13 @@ impl FilterFormatter {
     }
 
     /// 格式化单个比较表达式的 SQL 片段
-    fn comparison_sql(&self, full_col_name: &str, operator: &str, param_idx: &i32) -> String {
+    fn comparison_sql(
+        &self,
+        full_col_name: &str,
+        operator: &str,
+        param_idx: &i32,
+        _value: &Value,
+    ) -> String {
         let param_placeholder = placeholder(self.db_type, *param_idx as usize);
         #[cfg(feature = "postgresql")]
         let param_placeholder =
@@ -554,6 +564,17 @@ impl FilterFormatter {
         #[cfg(feature = "postgresql")]
         if matches!(self.db_type, DbType::PostgreSQL) && operator == "@>" {
             return format!("{} @> ARRAY[{}]", full_col_name, param_placeholder);
+        }
+
+        #[cfg(feature = "sqlite")]
+        if matches!(self.db_type, DbType::Sqlite)
+            && matches!(_value, Value::Decimal(_) | Value::BigDecimal(_))
+            && matches!(operator, ">" | ">=" | "<" | "<=")
+        {
+            return format!(
+                "CAST({} AS NUMERIC) {} CAST({} AS NUMERIC)",
+                full_col_name, operator, param_placeholder
+            );
         }
 
         format!("{} {} {}", full_col_name, operator, param_placeholder)

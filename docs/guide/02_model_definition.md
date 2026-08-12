@@ -30,8 +30,68 @@ struct User {
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
 - `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
+- `#[filter(filter_name, |m, ...| ...)]` - 模型级可复用过滤器，名称必须以 `filter_` 开头
+- `#[ormer_ignore]` - 字段不映射为数据库列，可用于动态表路由值
 
 PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite 和 MySQL 会使用最后一段表名。
+
+## 模型级过滤器
+
+```rust
+#[derive(Debug, Model)]
+#[table = "orders"]
+#[filter(filter_valid, |o| o.deleted_at.is_null())]
+#[filter(filter_tenant, |o, tenant_id: i64| o.tenant_id.eq(tenant_id))]
+struct Order {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+    deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+use OrderFilterExt;
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .filter_tenant(tenant_id)
+    .filter_valid()
+    .collect()
+    .await?;
+```
+
+## 动态表路由
+
+表名可以包含 `{变量}` 占位符，查询时用 `route_table` 指定值；写入模型时会从同名字段自动取值。
+
+```rust
+#[derive(Debug, Model)]
+#[table = "orders_{tenant_id}"]
+struct Order {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+}
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .route_table("tenant_id", tenant_id)
+    .collect()
+    .await?;
+```
+
+如果路由值不需要数据库列，使用 `#[ormer_ignore]`：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events_{tenant_id}"]
+struct Event {
+    #[primary]
+    id: i64,
+    name: String,
+    #[ormer_ignore]
+    tenant_id: i64,
+}
+```
 
 ## 字段属性
 

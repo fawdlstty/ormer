@@ -30,8 +30,68 @@ struct User {
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
 - `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
+- `#[filter(filter_name, |m, ...| ...)]` - Model-level reusable filter; the name must start with `filter_`
+- `#[ormer_ignore]` - Excludes a field from database columns; useful for dynamic table route values
 
 PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite and MySQL use the final table-name component.
+
+## Model Filters
+
+```rust
+#[derive(Debug, Model)]
+#[table = "orders"]
+#[filter(filter_valid, |o| o.deleted_at.is_null())]
+#[filter(filter_tenant, |o, tenant_id: i64| o.tenant_id.eq(tenant_id))]
+struct Order {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+    deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+use OrderFilterExt;
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .filter_tenant(tenant_id)
+    .filter_valid()
+    .collect()
+    .await?;
+```
+
+## Dynamic Table Routing
+
+Table names may contain `{variable}` placeholders. Use `route_table` for queries; inserts read matching values from model fields.
+
+```rust
+#[derive(Debug, Model)]
+#[table = "orders_{tenant_id}"]
+struct Order {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+}
+
+let orders: Vec<Order> = db
+    .select::<Order>()
+    .route_table("tenant_id", tenant_id)
+    .collect()
+    .await?;
+```
+
+If a route value should not be a database column, mark it with `#[ormer_ignore]`:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events_{tenant_id}"]
+struct Event {
+    #[primary]
+    id: i64,
+    name: String,
+    #[ormer_ignore]
+    tenant_id: i64,
+}
+```
 
 ## Field Attributes
 
