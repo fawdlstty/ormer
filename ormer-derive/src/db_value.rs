@@ -67,7 +67,7 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
             }
         }
 
-        impl ::ormer::model::ModelEnumProvider for #name {
+        impl ::ormer::model::FieldTypeProvider for #name {
             const ENUM_VARIANTS: Option<&'static [&'static str]> = None;
             const DB_VALUE_TYPE: Option<fn(::ormer::DbType) -> &'static str> =
                 Some(<#name as ::ormer::model::DbValue>::db_type);

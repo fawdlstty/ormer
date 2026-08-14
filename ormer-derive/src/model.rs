@@ -180,7 +180,17 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             let enum_variants = if has_data_type {
                 quote! { None }
             } else {
-                quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
+                quote! { <#field_type as ::ormer::model::FieldTypeProvider>::ENUM_VARIANTS }
+            };
+            let rust_type = if has_data_type {
+                quote! { #rust_type }
+            } else {
+                quote! {
+                    match <#field_type as ::ormer::model::FieldTypeProvider>::RUST_TYPE {
+                        Some(rust_type) => rust_type,
+                        None => #rust_type,
+                    }
+                }
             };
             let db_value_type = info
                 .db_value_type_expr
@@ -272,6 +282,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 quote! {
                     #field_name: <#field_type as ::ormer::model::Embed>::from_row(row, #prefix)?
                 }
+            } else if info.has_data_type_newtype_fallback {
+                let column_name = &info.column_name;
+                let db_type = info.data_type_db_type();
+                field_from_data_type_newtype_expr(
+                    info,
+                    quote! { row.get::<#db_type>(#column_name)? },
+                    quote! { row.get::<Option<#db_type>>(#column_name)? },
+                )
             } else if info.has_i32_data_type {
                 let column_name = &info.column_name;
                 field_from_i32_expr(
@@ -330,7 +348,30 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     }
                 }
             } else {
-                if info.has_i32_data_type {
+                if info.has_data_type_newtype_fallback {
+                    let db_type = info.data_type_db_type();
+                    field_from_data_type_newtype_expr(
+                        info,
+                        quote! {
+                            {
+                                let i = __ormer_value_index;
+                                __ormer_value_index += 1;
+                                <#db_type as ::ormer::FromRowValues>::from_row_values(
+                                    &values[i..i+1]
+                                )?
+                            }
+                        },
+                        quote! {
+                            {
+                                let i = __ormer_value_index;
+                                __ormer_value_index += 1;
+                                <Option<#db_type> as ::ormer::FromRowValues>::from_row_values(
+                                    &values[i..i+1]
+                                )?
+                            }
+                        },
+                    )
+                } else if info.has_i32_data_type {
                     field_from_i32_expr(
                         info.field,
                         quote! {
@@ -1412,7 +1453,17 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         let enum_variants = if info.has_data_type {
             quote! { None }
         } else {
-            quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
+            quote! { <#field_type as ::ormer::model::FieldTypeProvider>::ENUM_VARIANTS }
+        };
+        let rust_type = if info.has_data_type {
+            quote! { #rust_type }
+        } else {
+            quote! {
+                match <#field_type as ::ormer::model::FieldTypeProvider>::RUST_TYPE {
+                    Some(rust_type) => rust_type,
+                    None => #rust_type,
+                }
+            }
         };
         let db_value_type = info
             .db_value_type_expr
@@ -1467,6 +1518,14 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
             quote! {
                 #field_name: ::std::default::Default::default()
             }
+        } else if info.has_data_type_newtype_fallback {
+            let column_name = &info.column_name;
+            let db_type = info.data_type_db_type();
+            field_from_data_type_newtype_expr(
+                info,
+                quote! { row.get::<#db_type>(&format!("{}{}", prefix, #column_name))? },
+                quote! { row.get::<Option<#db_type>>(&format!("{}{}", prefix, #column_name))? },
+            )
         } else if info.has_i32_data_type {
             let column_name = &info.column_name;
             field_from_i32_expr(
@@ -1495,6 +1554,21 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
             quote! {
                 #field_name: ::std::default::Default::default()
             }
+        } else if info.has_data_type_newtype_fallback {
+            let i = syn::Index::from(value_index);
+            value_index += 1;
+            let db_type = info.data_type_db_type();
+            field_from_data_type_newtype_expr(
+                info,
+                quote! {
+                    <#db_type as ::ormer::FromRowValues>::from_row_values(&values[#i..#i+1])?
+                },
+                quote! {
+                    <Option<#db_type> as ::ormer::FromRowValues>::from_row_values(
+                        &values[#i..#i+1]
+                    )?
+                },
+            )
         } else if info.has_i32_data_type {
             let i = syn::Index::from(value_index);
             value_index += 1;
@@ -1695,7 +1769,17 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
             let enum_variants = if info.has_data_type {
                 quote! { None }
             } else {
-                quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
+                quote! { <#field_type as ::ormer::model::FieldTypeProvider>::ENUM_VARIANTS }
+            };
+            let rust_type = if info.has_data_type {
+                quote! { #rust_type }
+            } else {
+                quote! {
+                    match <#field_type as ::ormer::model::FieldTypeProvider>::RUST_TYPE {
+                        Some(rust_type) => rust_type,
+                        None => #rust_type,
+                    }
+                }
             };
             let db_value_type = info
                 .db_value_type_expr
@@ -1738,6 +1822,14 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                 quote! {
                     #field_name: ::std::default::Default::default()
                 }
+            } else if info.has_data_type_newtype_fallback {
+                let column_name = &info.column_name;
+                let db_type = info.data_type_db_type();
+                field_from_data_type_newtype_expr(
+                    info,
+                    quote! { row.get::<#db_type>(#column_name)? },
+                    quote! { row.get::<Option<#db_type>>(#column_name)? },
+                )
             } else if info.has_i32_data_type {
                 let column_name = &info.column_name;
                 field_from_i32_expr(
@@ -1766,6 +1858,23 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                 quote! {
                     #field_name: ::std::default::Default::default()
                 }
+            } else if info.has_data_type_newtype_fallback {
+                let i = syn::Index::from(value_index);
+                value_index += 1;
+                let db_type = info.data_type_db_type();
+                field_from_data_type_newtype_expr(
+                    info,
+                    quote! {
+                        <#db_type as ::ormer::FromRowValues>::from_row_values(
+                            &values[#i..#i+1]
+                        )?
+                    },
+                    quote! {
+                        <Option<#db_type> as ::ormer::FromRowValues>::from_row_values(
+                            &values[#i..#i+1]
+                        )?
+                    },
+                )
             } else if info.has_i32_data_type {
                 let i = syn::Index::from(value_index);
                 value_index += 1;
@@ -2053,6 +2162,7 @@ struct FieldInfo<'a> {
     db_value_type_expr: Option<proc_macro2::TokenStream>,
     effective_data_type_type: Option<syn::Type>,
     has_data_type: bool,
+    has_data_type_newtype_fallback: bool,
     has_i32_data_type: bool,
     has_vec_i32_data_type: bool,
     default: proc_macro2::TokenStream,
@@ -2103,6 +2213,12 @@ impl<'a> FieldInfo<'a> {
             .as_ref()
             .map(is_vec_i32_type)
             .unwrap_or(false);
+        let has_data_type_newtype_fallback = effective_data_type_type
+            .as_ref()
+            .map(|db_type| {
+                is_numeric_scalar_type(db_type) && should_use_data_type_newtype_fallback(field_type)
+            })
+            .unwrap_or(false);
         let data_type = data_type_tokens(effective_data_type_type.as_ref());
         let (is_primary, primary_auto) = extract_primary_attr(field);
         let relation = extract_relation_field(field);
@@ -2139,6 +2255,7 @@ impl<'a> FieldInfo<'a> {
             db_value_type_expr,
             effective_data_type_type,
             has_data_type,
+            has_data_type_newtype_fallback,
             has_i32_data_type,
             has_vec_i32_data_type,
             default: extract_default(field),
@@ -2158,6 +2275,12 @@ impl<'a> FieldInfo<'a> {
 
     fn is_relation(&self) -> bool {
         self.relation.is_some()
+    }
+
+    fn data_type_db_type(&self) -> &syn::Type {
+        self.effective_data_type_type
+            .as_ref()
+            .expect("#[data_type(...)] is required for data type newtype fallback")
     }
 }
 
@@ -2774,7 +2897,7 @@ fn db_value_type_expr(ty: &syn::Type) -> Option<proc_macro2::TokenStream> {
     }
     let inner = option_inner_type(ty).unwrap_or(ty);
     Some(quote! {
-        <#inner as ::ormer::model::ModelEnumProvider>::DB_VALUE_TYPE
+        <#inner as ::ormer::model::FieldTypeProvider>::DB_VALUE_TYPE
     })
 }
 
@@ -2876,6 +2999,42 @@ fn is_vec_i32_type(ty: &syn::Type) -> bool {
     vec_inner_type(ty).map(is_i32_type).unwrap_or(false)
 }
 
+fn is_numeric_scalar_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "i8" | "i16"
+                        | "i32"
+                        | "i64"
+                        | "u8"
+                        | "u16"
+                        | "u32"
+                        | "u64"
+                        | "isize"
+                        | "usize"
+                        | "f64"
+                )
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn should_use_data_type_newtype_fallback(ty: &syn::Type) -> bool {
+    let ty = option_inner_type(ty).unwrap_or(ty);
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            type_path.path.segments.len() > 1 && !is_builtin_non_db_value_type(ty)
+        }
+        _ => false,
+    }
+}
+
 fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
     match ty {
         syn::Type::Path(type_path) if type_path.qself.is_none() => {
@@ -2951,7 +3110,21 @@ fn field_to_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
     let value_type = option_inner_type(field_type).unwrap_or(field_type);
 
     if info.has_i32_data_type {
-        if option_inner_type(field_type).is_some() {
+        if info.has_data_type_newtype_fallback {
+            let db_type = info.data_type_db_type();
+            if option_inner_type(field_type).is_some() {
+                quote! {
+                    match self.#field_name.clone() {
+                        Some(value) => ::ormer::Value::from(value.0 as #db_type),
+                        None => ::ormer::Value::Null,
+                    }
+                }
+            } else {
+                quote! {
+                    ::ormer::Value::from(self.#field_name.clone().0 as #db_type)
+                }
+            }
+        } else if option_inner_type(field_type).is_some() {
             quote! {
                 match self.#field_name.clone() {
                     Some(value) => {
@@ -2981,6 +3154,20 @@ fn field_to_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
                 }
             }
         }
+    } else if info.has_data_type_newtype_fallback {
+        let db_type = info.data_type_db_type();
+        if option_inner_type(field_type).is_some() {
+            quote! {
+                match self.#field_name.clone() {
+                    Some(value) => ::ormer::Value::from(value.0 as #db_type),
+                    None => ::ormer::Value::Null,
+                }
+            }
+        } else {
+            quote! {
+                ::ormer::Value::from(self.#field_name.clone().0 as #db_type)
+            }
+        }
     } else if info.has_vec_i32_data_type {
         let Some(_) = vec_inner_type(field_type) else {
             panic!("#[data_type(Vec<i32>)] requires a Vec<T> field");
@@ -3006,7 +3193,25 @@ fn field_assign_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
     let field_type = info.field_type;
     let value_type = option_inner_type(field_type).unwrap_or(field_type);
 
-    if info.has_i32_data_type {
+    if info.has_data_type_newtype_fallback {
+        let db_type = info.data_type_db_type();
+        if option_inner_type(field_type).is_some() {
+            quote! {
+                self.#field_name = match value {
+                    ::ormer::Value::Null => None,
+                    value => {
+                        let raw = <#db_type as ::ormer::FromValue>::from_value(&value)?;
+                        Some(#value_type(raw as _))
+                    }
+                };
+            }
+        } else {
+            quote! {
+                let raw = <#db_type as ::ormer::FromValue>::from_value(&value)?;
+                self.#field_name = #value_type(raw as _);
+            }
+        }
+    } else if info.has_i32_data_type {
         if option_inner_type(field_type).is_some() {
             quote! {
                 self.#field_name = match value {
@@ -3053,6 +3258,35 @@ fn field_assign_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
     } else {
         quote! {
             self.#field_name = <#field_type as ::ormer::FromValue>::from_value(&value)?;
+        }
+    }
+}
+
+fn field_from_data_type_newtype_expr(
+    info: &FieldInfo<'_>,
+    value_expr: proc_macro2::TokenStream,
+    optional_value_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let field_name = info.field_name;
+    let field_type = info.field_type;
+    let db_type = info.data_type_db_type();
+
+    if let Some(inner_type) = option_inner_type(field_type) {
+        quote! {
+            #field_name: {
+                let value = #optional_value_expr;
+                match value {
+                    Some(value) => Some(#inner_type(value as _)),
+                    None => None,
+                }
+            }
+        }
+    } else {
+        quote! {
+            #field_name: {
+                let value: #db_type = #value_expr;
+                #field_type(value as _)
+            }
         }
     }
 }

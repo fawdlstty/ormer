@@ -65,7 +65,18 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
     },
     Row(Vec<SqlExpr>),
-    Raw(String),
+    Raw(RawSqlExpr),
+}
+
+#[derive(Debug, Clone)]
+pub struct RawSqlExpr {
+    segments: Vec<RawExprSegment>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RawExprSegment {
+    Text(String),
+    Expr(SqlExpr),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +134,85 @@ pub struct AliasedExpr<E> {
     pub(crate) alias: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct RawExpr<T = ()> {
+    expr: RawSqlExpr,
+    _marker: PhantomData<T>,
+}
+
+impl RawSqlExpr {
+    pub fn new(segments: Vec<RawExprSegment>) -> Self {
+        Self { segments }
+    }
+
+    pub fn plain(sql: impl Into<String>) -> Self {
+        Self {
+            segments: vec![RawExprSegment::Text(sql.into())],
+        }
+    }
+
+    #[cfg(feature = "postgresql")]
+    pub(crate) fn segments(&self) -> &[RawExprSegment] {
+        &self.segments
+    }
+
+    fn to_sql(
+        &self,
+        db_type: DbType,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+        table_prefix: Option<&str>,
+    ) -> String {
+        let mut sql = String::new();
+        for segment in &self.segments {
+            match segment {
+                RawExprSegment::Text(text) => sql.push_str(text),
+                RawExprSegment::Expr(expr) => {
+                    sql.push_str(&expr.to_sql(db_type, param_idx, params, table_prefix));
+                }
+            }
+        }
+        sql
+    }
+}
+
+impl RawExprSegment {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+
+    pub fn expr(expr: impl IntoSqlExpr) -> Self {
+        Self::Expr(expr.into_sql_expr())
+    }
+}
+
+impl<T> RawExpr<T> {
+    pub fn new(expr: RawSqlExpr) -> Self {
+        Self {
+            expr,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn sql_expr(&self) -> SqlExpr {
+        SqlExpr::Raw(self.expr.clone())
+    }
+
+    pub fn typed<U>(self) -> RawExpr<U> {
+        RawExpr {
+            expr: self.expr,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn alias(self, alias: impl Into<String>) -> AliasedExpr<Self> {
+        AliasedExpr {
+            expr: self,
+            alias: alias.into(),
+        }
+    }
+}
+
 impl<T, S> TypedExpr<T, S> {
     pub fn new(expr: SqlExpr) -> Self {
         Self {
@@ -171,11 +261,40 @@ impl<T, S> IntoSqlExpr for TypedExpr<T, S> {
     }
 }
 
+impl IntoSqlExpr for SqlExpr {
+    fn into_sql_expr(self) -> SqlExpr {
+        self
+    }
+}
+
+impl<T> IntoSqlExpr for &T
+where
+    T: IntoSqlExpr + Clone,
+{
+    fn into_sql_expr(self) -> SqlExpr {
+        self.clone().into_sql_expr()
+    }
+}
+
+impl<T> IntoSqlExpr for RawExpr<T> {
+    fn into_sql_expr(self) -> SqlExpr {
+        SqlExpr::Raw(self.expr)
+    }
+}
+
 impl<T, S> IntoTypedExpr for TypedExpr<T, S> {
     type Output = T;
 
     fn into_typed_expr(self) -> TypedExpr<Self::Output> {
         TypedExpr::new(self.expr)
+    }
+}
+
+impl<T> IntoTypedExpr for RawExpr<T> {
+    type Output = T;
+
+    fn into_typed_expr(self) -> TypedExpr<Self::Output> {
+        TypedExpr::new(self.into_sql_expr())
     }
 }
 
@@ -266,7 +385,7 @@ where
 }
 
 pub fn raw<T>(sql: impl Into<String>) -> TypedExpr<T> {
-    TypedExpr::new(SqlExpr::Raw(sql.into()))
+    TypedExpr::new(SqlExpr::Raw(RawSqlExpr::plain(sql)))
 }
 
 pub fn row<E>(exprs: E) -> SqlExpr
@@ -445,7 +564,9 @@ impl SqlExpr {
                     sql.push_str(
                         &order_by
                             .iter()
-                            .map(|order| order.to_sql_for(db_type))
+                            .map(|order| {
+                                order.to_sql_with_params(db_type, param_idx, params, table_prefix)
+                            })
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
@@ -476,7 +597,14 @@ impl SqlExpr {
                             "ORDER BY {}",
                             over.order_by
                                 .iter()
-                                .map(|order| order.to_sql_for(db_type))
+                                .map(|order| {
+                                    order.to_sql_with_params(
+                                        db_type,
+                                        param_idx,
+                                        params,
+                                        table_prefix,
+                                    )
+                                })
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ));
@@ -680,7 +808,7 @@ impl SqlExpr {
                     .join(", ");
                 format!("({values})")
             }
-            SqlExpr::Raw(sql) => sql.clone(),
+            SqlExpr::Raw(expr) => expr.to_sql(db_type, param_idx, params, table_prefix),
         }
     }
 

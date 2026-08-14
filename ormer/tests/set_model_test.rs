@@ -4,6 +4,7 @@ mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user!(SetModelUser, "set_model_users_1");
+define_test_user!(BatchSetModelUser, "set_model_users_batch_1");
 
 async fn test_set_model_impl(
     config: &_test_common::DbConfig,
@@ -133,3 +134,122 @@ async fn test_set_model_impl(
 }
 
 test_on_all_dbs_result!(test_set_model_impl);
+
+async fn test_batch_set_model_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+    let _ = db.drop_table::<BatchSetModelUser>().execute().await;
+    db.create_table::<BatchSetModelUser>().execute().await?;
+
+    db.insert(&vec![
+        BatchSetModelUser {
+            id: 1,
+            name: "Batch Alice".to_string(),
+            age: 18,
+            email: None,
+        },
+        BatchSetModelUser {
+            id: 2,
+            name: "Batch Bob".to_string(),
+            age: 20,
+            email: None,
+        },
+        BatchSetModelUser {
+            id: 3,
+            name: "Batch Carol".to_string(),
+            age: 22,
+            email: None,
+        },
+    ])
+    .execute()
+    .await?;
+
+    let updates = vec![
+        BatchSetModelUser {
+            id: 1,
+            name: "Batch Alice Updated".to_string(),
+            age: 31,
+            email: Some("alice-batch@test.com".to_string()),
+        },
+        BatchSetModelUser {
+            id: 2,
+            name: "Batch Bob Updated".to_string(),
+            age: 32,
+            email: Some("bob-batch@test.com".to_string()),
+        },
+    ];
+    let sql = db
+        .update::<BatchSetModelUser>()
+        .set_model(&updates)
+        .to_sql()?;
+    assert_eq!(sql.statements.len(), 1);
+
+    let affected = db
+        .update::<BatchSetModelUser>()
+        .set_model(&updates)
+        .execute()
+        .await?;
+    assert!(affected > 0);
+
+    let user1 = db
+        .select::<BatchSetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .first()
+        .await?
+        .unwrap();
+    assert_eq!(user1.name, "Batch Alice Updated");
+    assert_eq!(user1.age, 31);
+    assert_eq!(user1.email, Some("alice-batch@test.com".to_string()));
+
+    let partial_updates = vec![
+        BatchSetModelUser {
+            id: 1,
+            name: "Batch Alice Partial".to_string(),
+            age: 99,
+            email: Some("alice-partial@test.com".to_string()),
+        },
+        BatchSetModelUser {
+            id: 2,
+            name: "Batch Bob Partial".to_string(),
+            age: 98,
+            email: Some("bob-partial@test.com".to_string()),
+        },
+    ];
+    let partial_sql = db
+        .update::<BatchSetModelUser>()
+        .set_model_fields(&partial_updates, |p| (p.name, p.email))
+        .to_sql()?;
+    assert_eq!(partial_sql.statements.len(), 1);
+
+    let affected = db
+        .update::<BatchSetModelUser>()
+        .set_model_fields(&partial_updates, |p| (p.name, p.email))
+        .execute()
+        .await?;
+    assert!(affected > 0);
+
+    let user1 = db
+        .select::<BatchSetModelUser>()
+        .filter(|p| p.id.eq(1))
+        .first()
+        .await?
+        .unwrap();
+    assert_eq!(user1.name, "Batch Alice Partial");
+    assert_eq!(user1.age, 31);
+    assert_eq!(user1.email, Some("alice-partial@test.com".to_string()));
+
+    let untouched = db
+        .select::<BatchSetModelUser>()
+        .filter(|p| p.id.eq(3))
+        .first()
+        .await?
+        .unwrap();
+    assert_eq!(untouched.name, "Batch Carol");
+    assert_eq!(untouched.age, 22);
+
+    db.drop_table::<BatchSetModelUser>().execute().await?;
+    Ok(())
+}
+
+test_on_all_dbs_result!(test_batch_set_model_impl);

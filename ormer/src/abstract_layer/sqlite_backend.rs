@@ -211,13 +211,19 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
             DbType::Sqlite,
             &refs,
             self.conflict.as_ref(),
         )?;
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::batch(
+            DbType::Sqlite,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
@@ -233,29 +239,26 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
 
-        let refs = self.models.as_refs();
-        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
-            DbType::Sqlite,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-        let all_params = values_into_params(all_values)?;
-
-        let sql_with_returning = format!("{} RETURNING *", sql);
-        let mut rows = self
-            .db
-            .conn
-            .query(&sql_with_returning, all_params)
-            .trace()
-            .await?;
-
+        let sql = self.to_sql()?;
         let mut results = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
-            let model = common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
-                let value = row.get_value(i)?;
-                convert_turso_value(&value)
-            })?;
-            results.push(model);
+        for statement in &sql.statements {
+            let all_params = values_into_params(statement.params.clone())?;
+            let sql_with_returning = format!("{} RETURNING *", statement.sql);
+            let mut rows = self
+                .db
+                .conn
+                .query(&sql_with_returning, all_params)
+                .trace()
+                .await?;
+
+            while let Some(row) = rows.next().trace().await? {
+                let model =
+                    common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
+                        let value = row.get_value(i)?;
+                        convert_turso_value(&value)
+                    })?;
+                results.push(model);
+            }
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -278,10 +281,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
 
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-
-        let rows_affected = self.db.conn.execute(&statement.sql, params).trace().await?;
+        let mut rows_affected = 0;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            rows_affected += self.db.conn.execute(&statement.sql, params).trace().await?;
+        }
         self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
@@ -850,6 +854,7 @@ impl Database {
 
     /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
     /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
+    #[allow(dead_code)]
     pub(crate) async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
@@ -1193,13 +1198,19 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
             DbType::Sqlite,
             &refs,
             self.conflict.as_ref(),
         )?;
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::batch(
+            DbType::Sqlite,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
@@ -1211,15 +1222,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
 
-        let statement = &sql.statements[0];
-        let all_params = values_to_params(&statement.params)?;
-
-        let rows_affected = self
-            .txn
-            .conn
-            .execute(&statement.sql, all_params)
-            .trace()
-            .await?;
+        let mut rows_affected = 0;
+        for statement in &sql.statements {
+            let all_params = values_to_params(&statement.params)?;
+            rows_affected += self
+                .txn
+                .conn
+                .execute(&statement.sql, all_params)
+                .trace()
+                .await?;
+        }
         self.models.run_after_insert(hook_ctx).await?;
 
         // 获取自增ID（如果有自增主键）
@@ -2479,13 +2491,14 @@ pub struct DeleteExecutor<T: Model> {
 
 impl<T: Model> DeleteExecutor<T> {
     /// 添加 WHERE 条件
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -2589,13 +2602,14 @@ pub struct UpdateExecutor<T: Model> {
 
 impl<T: Model> UpdateExecutor<T> {
     /// 添加 WHERE 条件
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -2685,14 +2699,22 @@ impl<T: Model> UpdateExecutor<T> {
                 params,
                 versioned: false,
                 version_update: None,
+                param_columns: None,
             });
         }
 
-        for plan in &self.model_updates {
-            statements.push(common_helpers::build_model_update_sql::<T>(
-                DbType::Sqlite,
-                plan,
-            )?);
+        if let Some(batch_statements) = common_helpers::build_bulk_model_update_statements::<T>(
+            DbType::Sqlite,
+            &self.model_updates,
+        )? {
+            statements.extend(batch_statements);
+        } else {
+            for plan in &self.model_updates {
+                statements.push(common_helpers::build_model_update_sql::<T>(
+                    DbType::Sqlite,
+                    plan,
+                )?);
+            }
         }
 
         Ok(statements)
@@ -2956,9 +2978,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 HAVING 条件
-    pub fn having<F>(self, f: F) -> Self
+    pub fn having<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.having(f),
@@ -2968,9 +2991,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn filter<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.filter(f),

@@ -538,9 +538,10 @@ impl<Owner: Model, Target: Model> Relation<Owner, Target> {
             })
     }
 
-    pub fn any<F>(self, f: F) -> crate::query::builder::WhereExpr
+    pub fn any<F, W>(self, f: F) -> crate::query::builder::WhereExpr
     where
-        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(Target::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         let relation = self.info().expect("relation metadata not found");
         crate::query::builder::WhereExpr::from_filter(
@@ -549,14 +550,17 @@ impl<Owner: Model, Target: Model> Relation<Owner, Target> {
                 owner_key: relation.local_key,
                 target_table: Target::TABLE_NAME,
                 target_key: relation.target_key,
-                filter: Some(Box::new(f(Target::Where::default()).into())),
+                filter: Some(Box::new(crate::query::filter::FilterExpr::from(
+                    f(Target::Where::default()).into(),
+                ))),
             },
         )
     }
 
-    pub fn filter<F>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    pub fn filter<F, W>(self, f: F) -> RelationQuery<Owner, Target, Self>
     where
-        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(Target::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         RelationQuery::new(self).filter(f)
     }
@@ -694,9 +698,10 @@ impl<Owner: Model, Via: Model, Target: Model> ThroughRelation<Owner, Via, Target
             })
     }
 
-    pub fn any<F>(self, f: F) -> crate::query::builder::WhereExpr
+    pub fn any<F, W>(self, f: F) -> crate::query::builder::WhereExpr
     where
-        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(Target::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         let via_relation = self
             .via_info()
@@ -713,14 +718,17 @@ impl<Owner: Model, Via: Model, Target: Model> ThroughRelation<Owner, Via, Target
                 via_target_key: target_relation.local_key,
                 target_table: Target::TABLE_NAME,
                 target_key: target_relation.target_key,
-                filter: Some(Box::new(f(Target::Where::default()).into())),
+                filter: Some(Box::new(crate::query::filter::FilterExpr::from(
+                    f(Target::Where::default()).into(),
+                ))),
             },
         )
     }
 
-    pub fn filter<F>(self, f: F) -> RelationQuery<Owner, Target, Self>
+    pub fn filter<F, W>(self, f: F) -> RelationQuery<Owner, Target, Self>
     where
-        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(Target::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         RelationQuery::new(self).filter(f)
     }
@@ -830,11 +838,14 @@ impl<Owner: Model, Target: Model, Handle> RelationQuery<Owner, Target, Handle, N
 }
 
 impl<Owner: Model, Target: Model, Handle, Nested> RelationQuery<Owner, Target, Handle, Nested> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(Target::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(Target::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
-        self.filters.push(f(Target::Where::default()).into());
+        self.filters.push(crate::query::filter::FilterExpr::from(
+            f(Target::Where::default()).into(),
+        ));
         self
     }
 
@@ -1584,11 +1595,14 @@ where
     Ok(())
 }
 
-/// 枚举类型提供者 trait (可选实现)
-/// 如果类型实现了此 trait,则会被识别为枚举类型并生成 ENUM SQL
-pub trait ModelEnumProvider {
+/// 字段类型元数据提供者 trait (可选实现)。
+///
+/// 枚举类型可提供变体列表以生成 ENUM SQL；包装字段类型可提供内部 Rust 类型，
+/// 让后端按内部类型生成 SQL 并解析数据库值。
+pub trait FieldTypeProvider {
     const ENUM_VARIANTS: Option<&'static [&'static str]>;
     const DB_VALUE_TYPE: Option<fn(crate::abstract_layer::DbType) -> &'static str> = None;
+    const RUST_TYPE: Option<&'static str> = None;
 
     /// 获取枚举的所有变体名称
     fn enum_variants() -> Option<&'static [&'static str]> {
@@ -1597,6 +1611,10 @@ pub trait ModelEnumProvider {
 
     fn db_value_type() -> Option<fn(crate::abstract_layer::DbType) -> &'static str> {
         Self::DB_VALUE_TYPE
+    }
+
+    fn rust_type() -> Option<&'static str> {
+        Self::RUST_TYPE
     }
 }
 
@@ -1697,8 +1715,8 @@ pub fn split_schema_table_name<'a>(
         .unwrap_or((default_schema, table_name))
 }
 
-/// ModelEnum trait - 用于标记枚举类型 (由派生宏自动实现)
-pub trait ModelEnum: ModelEnumProvider {
+/// FieldType trait - 用于标记可直接作为模型字段的自定义字段类型 (由派生宏自动实现)
+pub trait FieldType: FieldTypeProvider + Into<Value> + FromValue {
     /// 获取枚举的所有变体名称  
     const VARIANTS: &'static [&'static str];
 
@@ -1732,59 +1750,64 @@ pub trait ModelEnum: ModelEnumProvider {
     fn is_numeric_enum() -> bool {
         false
     }
+
+    /// 将字段类型转换为查询参数值。
+    fn to_filter_value(value: Self) -> Value {
+        value.into()
+    }
+
+    /// 判断是否支持数值比较操作。
+    fn supports_comparison() -> bool {
+        false
+    }
 }
 
-/// 为 `Option<T>` 实现 ModelEnumProvider，透传内部类型的枚举信息
-impl<T: ModelEnumProvider> ModelEnumProvider for Option<T> {
+#[deprecated(note = "renamed to FieldTypeProvider")]
+pub use FieldTypeProvider as ModelEnumProvider;
+
+#[deprecated(note = "renamed to FieldType")]
+pub use FieldType as ModelEnum;
+
+/// 为 `Option<T>` 实现 FieldTypeProvider，透传内部类型的字段类型信息
+impl<T: FieldTypeProvider> FieldTypeProvider for Option<T> {
     const ENUM_VARIANTS: Option<&'static [&'static str]> = T::ENUM_VARIANTS;
     const DB_VALUE_TYPE: Option<fn(crate::abstract_layer::DbType) -> &'static str> =
         T::DB_VALUE_TYPE;
+    const RUST_TYPE: Option<&'static str> = T::RUST_TYPE;
 }
 
-// 为 Option<T> where T: ModelEnum 实现 From<Option<T>> for Value
-impl<T: ModelEnum> From<Option<T>> for Value {
+// 为 Option<T> where T: FieldType 实现 From<Option<T>> for Value
+impl<T: FieldType> From<Option<T>> for Value {
     fn from(v: Option<T>) -> Self {
         match v {
-            Some(enum_val) if T::is_numeric_enum() => Value::Integer(enum_val.as_i64()),
-            Some(enum_val) => Value::Text(enum_val.name().to_string()),
+            Some(value) => value.into(),
             None => Value::Null,
         }
     }
 }
 
-// 为 Option<T> where T: ModelEnum 实现 FromValue
-impl<T: ModelEnum> FromValue for Option<T> {
+// 为 Option<T> where T: FieldType 实现 FromValue
+impl<T: FieldType> FromValue for Option<T> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
-            Value::Integer(v) if T::is_numeric_enum() => T::from_i64(*v).map(Some),
-            Value::Text(s) => {
-                // 使用 ModelEnum::from_name 构造枚举值
-                match T::from_name(s) {
-                    Ok(enum_val) => Ok(Some(enum_val)),
-                    Err(_) => Err(crate::ormer_error!("Unknown enum variant: {}", s)),
-                }
-            }
-            _ => Err(crate::ormer_error!(
-                "Expected Text value for Option<{}>",
-                std::any::type_name::<T>()
-            )),
+            value => T::from_value(value).map(Some),
         }
     }
 }
 
-// 为常见非枚举类型实现 ModelEnumProvider，返回 None
-macro_rules! impl_enum_provider_for_non_enum {
+// 为常见非自定义字段类型实现 FieldTypeProvider，返回 None
+macro_rules! impl_field_type_provider_for_plain_type {
     ($($t:ty),* $(,)?) => {
         $(
-            impl ModelEnumProvider for $t {
+            impl FieldTypeProvider for $t {
                 const ENUM_VARIANTS: Option<&'static [&'static str]> = None;
             }
         )*
     };
 }
 
-impl_enum_provider_for_non_enum!(
+impl_field_type_provider_for_plain_type!(
     i8,
     i16,
     i32,
@@ -2905,9 +2928,15 @@ macro_rules! impl_from_value_for {
 
 // 为基本类型生成 FromValue 实现
 impl_from_value_for!(
+    i8 => Integer,
+    i16 => Integer,
     i32 => Integer,
     i64 => Integer,
+    u8 => Integer,
+    u16 => Integer,
+    u32 => Integer,
     u64 => Integer,
+    isize => Integer,
     usize => Integer,
 );
 
@@ -2925,9 +2954,15 @@ macro_rules! impl_from_row_values_single {
 
 // 为单列类型实现 FromRowValues。
 impl_from_row_values_single!(
+    i8 => "i8",
+    i16 => "i16",
     i32 => "i32",
     i64 => "i64",
+    u8 => "u8",
+    u16 => "u16",
+    u32 => "u32",
     u64 => "u64",
+    isize => "isize",
     usize => "usize",
     std::time::Duration => "Duration",
     f64 => "f64",
@@ -3213,9 +3248,16 @@ macro_rules! impl_from_for_value {
 
 // 为整数类型生成 From 实现
 impl_from_for_value!(
+    i8 => Integer,
+    i16 => Integer,
     i32 => Integer,
     i64 => Integer,
+    u8 => Integer,
+    u16 => Integer,
+    u32 => Integer,
     u64 => Integer,
+    isize => Integer,
+    usize => Integer,
 );
 
 // f64 特殊处理
@@ -3274,9 +3316,16 @@ macro_rules! impl_from_option_for_value {
 }
 
 impl_from_option_for_value!(
+    i8 => |value| Value::Integer(value as i64),
+    i16 => |value| Value::Integer(value as i64),
     i32 => |value| Value::Integer(value as i64),
     i64 => |value| Value::Integer(value as i64),
+    u8 => |value| Value::Integer(value as i64),
+    u16 => |value| Value::Integer(value as i64),
+    u32 => |value| Value::Integer(value as i64),
     u64 => |value| Value::Integer(value as i64),
+    isize => |value| Value::Integer(value as i64),
+    usize => |value| Value::Integer(value as i64),
     String => |value| Value::Text(value),
     bool => |value| Value::Boolean(value),
     std::time::Duration => |value| Value::Duration(value),

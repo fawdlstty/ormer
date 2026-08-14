@@ -1,15 +1,18 @@
 #[allow(unused_imports)]
-use ormer::{Model, ModelEnum};
+use ormer::{FieldType, Model};
 
 #[cfg(feature = "postgresql")]
 mod _test_common;
 
-#[derive(Debug, Clone, ModelEnum, PartialEq)]
+#[derive(Debug, Clone, FieldType, PartialEq)]
 enum UserStatus {
     Active,
     Inactive,
     Banned,
 }
+
+#[derive(Debug, Clone, FieldType, PartialEq)]
+pub struct ExceptionType(pub u16);
 
 // 注意: 枚举类型需要实现 ColumnValueType 才能用于 filter
 // 这需要额外的实现,暂时跳过 filter 测试
@@ -42,6 +45,21 @@ struct TestEnumUserOptional {
     id: i32,
     status: Option<UserStatus>,
     name: String,
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+#[derive(Debug, Model, PartialEq)]
+#[table = "test_field_type_exceptions"]
+struct TestException {
+    #[primary]
+    id: i32,
+    exception_type: ExceptionType,
+    optional_exception_type: Option<ExceptionType>,
 }
 
 #[tokio::test]
@@ -179,6 +197,66 @@ fn test_enum_column_schema_metadata() {
         optional_status_col.enum_variants,
         Some(UserStatus::VARIANTS)
     );
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+#[test]
+fn test_tuple_struct_field_type() -> ormer::Result<()> {
+    let exception_col = TestException::COLUMN_SCHEMA
+        .iter()
+        .find(|col| col.name == "exception_type")
+        .unwrap();
+    assert_eq!(exception_col.rust_type, "u16");
+    assert_eq!(exception_col.enum_variants, None);
+    assert_eq!(exception_col.data_type, None);
+
+    let model = TestException {
+        id: 1,
+        exception_type: ExceptionType(42),
+        optional_exception_type: Some(ExceptionType(7)),
+    };
+    let values = model.field_values();
+    assert_eq!(values.len(), 3);
+    assert_integer_value(&values[1], 42);
+    assert_integer_value(&values[2], 7);
+
+    let from_values = <TestException as Model>::from_row_values(&[
+        ormer::Value::Integer(2),
+        ormer::Value::Integer(9),
+        ormer::Value::Null,
+    ])?;
+    assert_eq!(from_values.exception_type, ExceptionType(9));
+    assert_eq!(from_values.optional_exception_type, None);
+
+    #[cfg(feature = "sqlite")]
+    {
+        let (sql, params) = ormer::Select::<TestException>::new()
+            .filter(|e| e.exception_type.eq(ExceptionType(12)))
+            .to_sql_with_params(ormer::DbType::Sqlite);
+        assert!(sql.contains("exception_type = ?"), "SQL: {sql}");
+        assert_eq!(params.len(), 1);
+        assert_integer_value(&params[0], 12);
+
+        let create_sql = ormer::generate_create_table_sql::<TestException>(ormer::DbType::Sqlite)?;
+        assert!(
+            create_sql.contains("exception_type INTEGER NOT NULL"),
+            "SQL: {create_sql}"
+        );
+    }
+
+    Ok(())
+}
+
+fn assert_integer_value(value: &ormer::Value, expected: i64) {
+    match value {
+        ormer::Value::Integer(value) => assert_eq!(*value, expected),
+        other => panic!("expected integer value {expected}, got {other:?}"),
+    }
 }
 
 #[cfg(feature = "postgresql")]

@@ -791,9 +791,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
     }
 
-    pub fn conflict_where<F>(self, f: F) -> Self
+    pub fn conflict_where<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+        F: FnOnce(<I::Model as Model>::Where) -> W,
+        W: Into<WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -833,9 +834,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
     }
 
-    pub fn do_update_if<F>(self, f: F) -> Self
+    pub fn do_update_if<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+        F: FnOnce(<I::Model as Model>::Where) -> W,
+        W: Into<WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1521,9 +1523,10 @@ impl super::DbExecutor for Database {
 }
 
 impl<'a, R: Model> DerivedTableSelectExecutor<'a, R> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(R::Where) -> WhereExpr,
+        F: FnOnce(R::Where) -> W,
+        W: Into<WhereExpr>,
     {
         self.select = self.select.filter(f);
         self
@@ -2551,9 +2554,10 @@ fn append_scoped_filters<T: Model>(
 }
 
 impl<'a, T: Model> ScopedDeleteExecutor<'a, T> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         self.inner = self.inner.filter(f);
         self
@@ -2611,9 +2615,10 @@ impl<'a, T: Model> super::SqlExecutor for ScopedDeleteExecutor<'a, T> {
 }
 
 impl<'a, T: Model> ScopedUpdateExecutor<'a, T> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         self.inner = self.inner.filter(f);
         self
@@ -2978,9 +2983,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         }
     }
 
-    pub fn conflict_where<F>(self, f: F) -> Self
+    pub fn conflict_where<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+        F: FnOnce(<I::Model as Model>::Where) -> W,
+        W: Into<WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -3044,9 +3050,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         }
     }
 
-    pub fn do_update_if<F>(self, f: F) -> Self
+    pub fn do_update_if<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<I::Model as Model>::Where) -> WhereExpr,
+        F: FnOnce(<I::Model as Model>::Where) -> W,
+        W: Into<WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -3707,9 +3714,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 
     /// 添加 HAVING 条件
     #[allow(unused_variables)]
-    pub fn having<F>(self, f: F) -> Self
+    pub fn having<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]
@@ -3727,9 +3735,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 
     /// 添加 WHERE 条件（分组前过滤）
     #[allow(unused_variables)]
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn filter<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         match self {
             #[cfg(feature = "sqlite")]

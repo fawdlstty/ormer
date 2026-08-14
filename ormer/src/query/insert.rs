@@ -174,6 +174,9 @@ impl<M: Model> IntoInsertConflictTarget<M> for String {
     }
 }
 
-pub fn where_expr_to_filter(expr: WhereExpr) -> FilterExpr {
-    expr.into()
+pub fn where_expr_to_filter<W>(expr: W) -> FilterExpr
+where
+    W: Into<WhereExpr>,
+{
+    expr.into().into()
 }

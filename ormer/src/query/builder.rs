@@ -3,7 +3,9 @@ use crate::model::{
     ColumnSchema, Model, TableRoute, TableRouteValue, normalize_table_name_for_db,
     quote_column_reference, quote_qualified_identifier, routed_table_name_for_db,
 };
-use crate::query::expr::{AliasedExpr, IntoSqlExpr, SqlExpr, TypedExpr, WindowSpecBuilder};
+use crate::query::expr::{
+    AliasedExpr, IntoSqlExpr, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
+};
 use crate::query::filter::{FilterExpr, OrderBy, OrderDirection};
 #[cfg(feature = "postgresql")]
 use crate::query::filter::{infer_filter_value_rust_type, infer_model_value_rust_type};
@@ -479,18 +481,27 @@ fn append_select_tail(
     params: &mut Vec<crate::model::Value>,
 ) {
     append_filter_clause(sql, filter_keyword, filters, formatter, param_idx, params);
-    append_order_by_clause(sql, order_by, db_type);
+    append_order_by_clause(sql, order_by, db_type, param_idx, params);
     append_range_clause(sql, range_start, range_end, !order_by.is_empty(), db_type);
     append_lock_clause(sql, lock);
 }
 
-fn append_order_by_clause(sql: &mut String, order_by: &[OrderBy], db_type: DbType) {
+fn append_order_by_clause(
+    sql: &mut String,
+    order_by: &[OrderBy],
+    db_type: DbType,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
     if order_by.is_empty() {
         return;
     }
 
     sql.push_str(" ORDER BY ");
-    let order_strs: Vec<String> = order_by.iter().map(|o| o.to_sql_for(db_type)).collect();
+    let order_strs: Vec<String> = order_by
+        .iter()
+        .map(|o| o.to_sql_with_params(db_type, param_idx, params, None))
+        .collect();
     sql.push_str(&order_strs.join(", "));
 }
 
@@ -1064,7 +1075,13 @@ fn lateral_join_sql_with_params<T: Model, J: Model>(
     write!(&mut sql, " WHERE {}", condition_sql)
         .unwrap_or_else(|e| panic!("Failed to write lateral WHERE clause: {}", e));
 
-    append_order_by_clause(&mut sql, parts.join_order_by, db_type);
+    append_order_by_clause(
+        &mut sql,
+        parts.join_order_by,
+        db_type,
+        &mut param_idx,
+        &mut params,
+    );
     append_limit_offset_clause(&mut sql, parts.join_range_start, parts.join_range_end);
 
     write!(&mut sql, ") AS {} ON true", parts.join_alias)
@@ -1144,6 +1161,7 @@ fn collect_model_filter_param_rust_types<T: Model>(filters: &[FilterExpr]) -> Ve
 fn collect_join_param_rust_types<T: Model>(
     join_source: &JoinSource,
     on_condition: &FilterExpr,
+    join_order_by: &[OrderBy],
     filters: &[FilterExpr],
 ) -> Vec<&'static str> {
     let mut rust_types = match join_source {
@@ -1155,6 +1173,7 @@ fn collect_join_param_rust_types<T: Model>(
         }
     };
     collect_filter_param_rust_types::<T>(on_condition, &mut rust_types);
+    collect_order_by_param_rust_types::<T>(join_order_by, &mut rust_types);
     for filter in filters {
         collect_filter_param_rust_types::<T>(filter, &mut rust_types);
     }
@@ -1265,7 +1284,14 @@ fn collect_filter_param_rust_types<T: Model>(
 #[cfg(feature = "postgresql")]
 fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut Vec<&'static str>) {
     match expr {
-        SqlExpr::Column(_) | SqlExpr::Raw(_) => {}
+        SqlExpr::Column(_) => {}
+        SqlExpr::Raw(raw) => {
+            for segment in raw.segments() {
+                if let crate::query::expr::RawExprSegment::Expr(expr) = segment {
+                    collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+                }
+            }
+        }
         SqlExpr::Value(value) => rust_types.push(infer_model_value_rust_type(value)),
         SqlExpr::Binary { left, right, .. } => {
             collect_sql_expr_param_rust_types::<T>(left, rust_types);
@@ -1296,7 +1322,7 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
         SqlExpr::Aggregate {
             expr,
             filter,
-            order_by: _,
+            order_by,
             over,
             ..
         } => {
@@ -1304,10 +1330,12 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
             if let Some(filter) = filter {
                 collect_filter_param_rust_types::<T>(filter, rust_types);
             }
+            collect_order_by_param_rust_types::<T>(order_by, rust_types);
             if let Some(over) = over {
                 for expr in &over.partition_by {
                     collect_sql_expr_param_rust_types::<T>(expr, rust_types);
                 }
+                collect_order_by_param_rust_types::<T>(&over.order_by, rust_types);
             }
         }
         SqlExpr::CaseMatch {
@@ -1321,6 +1349,18 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
                 collect_sql_expr_param_rust_types::<T>(then, rust_types);
             }
             collect_sql_expr_param_rust_types::<T>(else_expr, rust_types);
+        }
+    }
+}
+
+#[cfg(feature = "postgresql")]
+fn collect_order_by_param_rust_types<T: Model>(
+    order_by: &[OrderBy],
+    rust_types: &mut Vec<&'static str>,
+) {
+    for order in order_by {
+        if let Some(expr) = order.cloned_expr() {
+            collect_sql_expr_param_rust_types::<T>(&expr, rust_types);
         }
     }
 }
@@ -1731,6 +1771,7 @@ impl<T: Model, V> MappedSelect<T, V> {
         for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
+        collect_order_by_param_rust_types::<T>(&self.order_by, &mut rust_types);
         rust_types
     }
 
@@ -1805,12 +1846,13 @@ impl<T: Model, V> MappedSelect<T, V> {
         self
     }
 
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
-        let expr = f(T::Where::default());
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(T::Where::default()).into());
+        self.filters.push(expr);
         self
     }
 
@@ -1913,7 +1955,7 @@ impl<T: Model, V> MappedSelect<T, V> {
 
 impl<T: Model, V> FilterQuery<T> for MappedSelect<T, V> {
     fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
-        self.filters.push(expr.into());
+        self.filters.push(FilterExpr::from(expr));
         self
     }
 }
@@ -2074,24 +2116,26 @@ impl<T: Model, V> GroupedSelect<T, V> {
     }
 
     /// 添加 HAVING 条件
-    pub fn having<F>(mut self, f: F) -> Self
+    pub fn having<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(<T as Model>::Where) -> WhereExpr,
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = <T as Model>::Where::default();
-        let expr = f(where_obj);
-        self.having_filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.having_filters.push(expr);
         self
     }
 
     /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -2291,15 +2335,16 @@ impl<T: Model, V> GroupedSelect<T, V> {
         for expr in &self.column_exprs {
             collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
         }
-        for expr in &self.group_by_exprs {
-            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
-        }
         for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+        }
+        for expr in &self.group_by_exprs {
+            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
         }
         for filter in &self.having_filters {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
+        collect_order_by_param_rust_types::<T>(&self.order_by, &mut rust_types);
         rust_types
     }
 
@@ -2311,7 +2356,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
 
 impl<T: Model, V> FilterQuery<T> for GroupedSelect<T, V> {
     fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
-        self.filters.push(expr.into());
+        self.filters.push(FilterExpr::from(expr));
         self
     }
 }
@@ -2647,13 +2692,14 @@ impl<T: Model> Select<T> {
         self
     }
 
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -2669,18 +2715,21 @@ impl<T: Model> Select<T> {
 
     /// 添加 WHERE 条件 (使用宏支持 >= 和 > 运算符语法)
     #[doc(hidden)]
-    pub fn filter_cmp<F>(self, f: F) -> Self
+    pub fn filter_cmp<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         self.filter(f)
     }
 
-    pub fn filter_dynamic<F>(mut self, f: F) -> Self
+    pub fn filter_dynamic<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(DynamicColumnSet<T>) -> WhereExpr,
+        F: FnOnce(DynamicColumnSet<T>) -> W,
+        W: Into<WhereExpr>,
     {
-        self.filters.push(f(DynamicColumnSet::new()).into());
+        self.filters
+            .push(FilterExpr::from(f(DynamicColumnSet::new()).into()));
         self
     }
 
@@ -3127,7 +3176,13 @@ impl<T: Model> Select<T> {
             );
         }
 
-        append_order_by_clause(&mut sql, &self.order_by, db_type);
+        append_order_by_clause(
+            &mut sql,
+            &self.order_by,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
         append_range_clause(
             &mut sql,
             self.range_start,
@@ -3152,6 +3207,7 @@ impl<T: Model> Select<T> {
         for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
+        collect_order_by_param_rust_types::<T>(&self.order_by, &mut rust_types);
         rust_types
     }
 
@@ -3225,7 +3281,7 @@ impl<T: Model> Select<T> {
                 ));
             }
             let filter = build_cursor_seek_filter(&order_by, cursor.values(), kind)?;
-            select.filters.push(filter.into());
+            select.filters.push(FilterExpr::from(filter));
             select.range_start = None;
         }
 
@@ -3254,7 +3310,7 @@ impl<T: Model> Select<T> {
 
 impl<T: Model> FilterQuery<T> for Select<T> {
     fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
-        self.filters.push(expr.into());
+        self.filters.push(FilterExpr::from(expr));
         self
     }
 }
@@ -3284,12 +3340,13 @@ pub fn from_derived<R: Model>(derived: DerivedSelect<R>) -> DerivedTableSelect<R
 }
 
 impl<R: Model> DerivedTableSelect<R> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(R::Where) -> WhereExpr,
+        F: FnOnce(R::Where) -> W,
+        W: Into<WhereExpr>,
     {
-        let expr = f(R::Where::default());
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(R::Where::default()).into());
+        self.filters.push(expr);
         self
     }
 
@@ -3377,6 +3434,7 @@ impl<R: Model> DerivedTableSelect<R> {
         for filter in &self.filters {
             collect_filter_param_rust_types::<R>(filter, &mut rust_types);
         }
+        collect_order_by_param_rust_types::<R>(&self.order_by, &mut rust_types);
 
         (sql, params, rust_types)
     }
@@ -3388,7 +3446,7 @@ impl<R: Model> DerivedTableSelect<R> {
 
 impl<R: Model> FilterQuery<R> for DerivedTableSelect<R> {
     fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
-        self.filters.push(expr.into());
+        self.filters.push(FilterExpr::from(expr));
         self
     }
 }
@@ -3585,14 +3643,15 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
     }
 
     /// 添加 WHERE 条件（支持两个表的字段比较）
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where, R::Where) -> WhereExpr,
+        F: FnOnce(T::Where, R::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let t_where = T::Where::default();
         let r_where = R::Where::default();
-        let expr = f(t_where, r_where);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(t_where, r_where).into());
+        self.filters.push(expr);
         self
     }
 
@@ -3667,15 +3726,16 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
     }
 
     /// 添加 WHERE 条件（支持三个表的字段比较）
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where, R1::Where, R2::Where) -> WhereExpr,
+        F: FnOnce(T::Where, R1::Where, R2::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let t_where = T::Where::default();
         let r1_where = R1::Where::default();
         let r2_where = R2::Where::default();
-        let expr = f(t_where, r1_where, r2_where);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(t_where, r1_where, r2_where).into());
+        self.filters.push(expr);
         self
     }
 
@@ -3753,16 +3813,17 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
     }
 
     /// 添加 WHERE 条件（支持四个表的字段比较）
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> WhereExpr,
+        F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let t_where = T::Where::default();
         let r1_where = R1::Where::default();
         let r2_where = R2::Where::default();
         let r3_where = R3::Where::default();
-        let expr = f(t_where, r1_where, r2_where, r3_where);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(t_where, r1_where, r2_where, r3_where).into());
+        self.filters.push(expr);
         self
     }
 
@@ -4101,6 +4162,20 @@ impl WhereExpr {
     }
 }
 
+impl<T> From<RawExpr<T>> for WhereExpr {
+    fn from(expr: RawExpr<T>) -> Self {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: expr.into_sql_expr(),
+        })
+    }
+}
+
+impl<T> From<RawExpr<T>> for OrderBy {
+    fn from(expr: RawExpr<T>) -> Self {
+        OrderBy::asc_expr(expr.into_sql_expr())
+    }
+}
+
 /// 整数列代理(示例:针对 i32 类型的字段)
 /// 注意:完整实现需要通过过程宏为每个模型的每个字段生成对应的代理类型
 pub struct AgeColumn {
@@ -4296,6 +4371,18 @@ impl<T, S> ProjectionExpr for TypedColumn<T, S> {
 }
 
 impl<T, S> ProjectionExpr for TypedExpr<T, S> {
+    type Output = T;
+
+    fn column_name(&self) -> String {
+        self.sql_expr().to_sql_no_params(default_db_type())
+    }
+
+    fn sql_expr(&self) -> SqlExpr {
+        self.sql_expr()
+    }
+}
+
+impl<T> ProjectionExpr for RawExpr<T> {
     type Output = T;
 
     fn column_name(&self) -> String {
@@ -4673,17 +4760,13 @@ impl ColumnValueType for std::time::Duration {
     }
 }
 
-impl<T: crate::model::ModelEnum> ColumnValueType for T {
+impl<T: crate::model::FieldType> ColumnValueType for T {
     fn to_filter_value(value: Self) -> crate::query::filter::Value {
-        if T::is_numeric_enum() {
-            crate::query::filter::Value::Integer(value.as_i64())
-        } else {
-            crate::query::filter::Value::Text(value.name().to_string())
-        }
+        T::to_filter_value(value)
     }
 
     fn supports_comparison() -> bool {
-        false
+        T::supports_comparison()
     }
 }
 
@@ -4738,7 +4821,7 @@ impl_is_in_value_for_numeric!(i8, i16, i32, i64, u8, u16, u32, u64, isize, usize
 
 impl<T> IsInValue<T> for T
 where
-    T: crate::model::ModelEnum,
+    T: crate::model::FieldType,
 {
     fn to_in_value(self) -> T {
         self
@@ -4747,7 +4830,7 @@ where
 
 impl<T> IsInValue<T> for &T
 where
-    T: crate::model::ModelEnum + Clone,
+    T: crate::model::FieldType + Clone,
 {
     fn to_in_value(self) -> T {
         self.clone()
@@ -4756,7 +4839,7 @@ where
 
 impl<T> IsInValue<T> for &&T
 where
-    T: crate::model::ModelEnum + Clone,
+    T: crate::model::FieldType + Clone,
 {
     fn to_in_value(self) -> T {
         (*self).clone()
@@ -5195,9 +5278,10 @@ impl<T, S> TypedColumn<T, S>
 where
     S: Model,
 {
-    pub fn filter<F>(self, f: F) -> TypedExpr<T, S>
+    pub fn filter<F, W>(self, f: F) -> TypedExpr<T, S>
     where
-        F: FnOnce(S::Where) -> WhereExpr,
+        F: FnOnce(S::Where) -> W,
+        W: Into<WhereExpr>,
     {
         TypedExpr::new(self.sql_expr()).filter(f)
     }
@@ -5318,10 +5402,10 @@ impl<T, S> TypedExpr<T, S> {
                 order_by,
                 over: Some(f(WindowSpecBuilder::default()).build()),
             }),
-            expr => Self::new(SqlExpr::Raw(format!(
-                "{} OVER ()",
-                expr.to_sql_no_params(default_db_type())
-            ))),
+            expr => Self::new(SqlExpr::Raw(crate::query::expr::RawSqlExpr::new(vec![
+                crate::query::expr::RawExprSegment::Expr(expr),
+                crate::query::expr::RawExprSegment::Text(" OVER ()".to_string()),
+            ]))),
         }
     }
 }
@@ -5330,11 +5414,12 @@ impl<T, S> TypedExpr<T, S>
 where
     S: Model,
 {
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn filter<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(S::Where) -> WhereExpr,
+        F: FnOnce(S::Where) -> W,
+        W: Into<WhereExpr>,
     {
-        let filter_expr = f(S::Where::default()).into();
+        let filter_expr = FilterExpr::from(f(S::Where::default()).into());
         match self.expr {
             SqlExpr::Aggregate {
                 name,
@@ -6424,17 +6509,19 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
         collect_join_param_rust_types::<T>(
             &self.join_source,
             &self.on_condition,
+            &self.join_order_by,
             &self.effective_filters(),
         )
     }
 
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -6494,17 +6581,19 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
         collect_join_param_rust_types::<T>(
             &self.join_source,
             &self.on_condition,
+            &self.join_order_by,
             &self.effective_filters(),
         )
     }
 
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -6563,17 +6652,19 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
         collect_join_param_rust_types::<T>(
             &self.join_source,
             &self.on_condition,
+            &self.join_order_by,
             &self.effective_filters(),
         )
     }
 
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 

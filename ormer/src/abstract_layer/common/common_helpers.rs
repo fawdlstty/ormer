@@ -9,7 +9,7 @@ use crate::query::insert::{
     InsertAssignment, InsertConflict, InsertConflictAction, InsertConflictTarget, InsertValue,
 };
 use crate::query::update::{UpdateAssignment, UpdateExpr, UpdateValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
     match db_type {
@@ -74,6 +74,14 @@ pub struct ModelSqlStatement {
     pub params: Vec<Value>,
     pub versioned: bool,
     pub version_update: Option<VersionSnapshotUpdate>,
+    pub param_columns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertSqlStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+    pub row_count: usize,
 }
 
 pub fn model_primary_key_filters<T: Model>(model: &T) -> Vec<FilterExpr> {
@@ -219,7 +227,529 @@ pub fn build_model_update_sql<T: Model>(
         params,
         versioned: plan.version_update.is_some(),
         version_update: plan.version_update.clone(),
+        param_columns: None,
     })
+}
+
+pub fn bind_param_limit(db_type: DbType) -> usize {
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => 999,
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => 65_535,
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => 65_535,
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => 2_100,
+    }
+}
+
+fn value_key(value: &Value) -> String {
+    match value {
+        Value::Integer(v) => format!("i:{v}"),
+        Value::BigInt(v) => format!("b:{v}"),
+        Value::Duration(v) => format!("du:{v:?}"),
+        Value::Text(v) => format!("t:{v}"),
+        Value::TextArray(v) => format!("ta:{v:?}"),
+        Value::Real(v) => format!("r:{v}"),
+        Value::Decimal(v) => format!("de:{v}"),
+        Value::BigDecimal(v) => format!("bd:{v}"),
+        Value::Boolean(v) => format!("bo:{v}"),
+        Value::Bytes(v) => format!("x:{v:?}"),
+        Value::IntegerArray(v) => format!("ia:{v:?}"),
+        Value::BigIntArray(v) => format!("ba:{v:?}"),
+        Value::NullableBigIntArray(v) => format!("nba:{v:?}"),
+        Value::DateTime(v) => format!("dt:{v}"),
+        Value::Date(v) => format!("d:{v}"),
+        Value::Time(v) => format!("ti:{v}"),
+        Value::Json(v) => format!("j:{v}"),
+        Value::Uuid(v) => format!("u:{v}"),
+        Value::Null => "n:".to_string(),
+    }
+}
+
+fn extract_model_update_pk_values<T: Model>(plan: &ModelUpdatePlan) -> Option<Vec<Value>> {
+    let pk_columns = T::primary_key_columns();
+    if pk_columns.is_empty() || plan.filters.len() != pk_columns.len() {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(pk_columns.len());
+    for pk in pk_columns {
+        let value = plan.filters.iter().find_map(|filter| match filter {
+            FilterExpr::Comparison {
+                column,
+                operator,
+                value,
+            } if column == pk && operator == "=" => Some(value.clone()),
+            _ => None,
+        })?;
+        values.push(value);
+    }
+    Some(values)
+}
+
+fn model_update_set_columns(plans: &[ModelUpdatePlan]) -> Option<Vec<String>> {
+    let first = plans.first()?;
+    let columns = first
+        .sets
+        .iter()
+        .map(|(column, _)| column.clone())
+        .collect::<Vec<_>>();
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    plans
+        .iter()
+        .all(|plan| {
+            plan.version_update.is_none()
+                && plan.sets.len() == columns.len()
+                && plan
+                    .sets
+                    .iter()
+                    .zip(&columns)
+                    .all(|((column, _), expected)| column == expected)
+        })
+        .then_some(columns)
+}
+
+fn model_update_pk_values<T: Model>(plans: &[ModelUpdatePlan]) -> Option<Vec<Vec<Value>>> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let pk_values = extract_model_update_pk_values::<T>(plan)?;
+        let key = pk_values
+            .iter()
+            .map(value_key)
+            .collect::<Vec<_>>()
+            .join("|");
+        if !seen.insert(key) {
+            return None;
+        }
+        values.push(pk_values);
+    }
+    Some(values)
+}
+
+fn bulk_update_params_per_row(db_type: DbType, pk_count: usize, set_count: usize) -> usize {
+    #[allow(unreachable_patterns)]
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => set_count * (pk_count + 1) + pk_count,
+        _ => pk_count + set_count,
+    }
+}
+
+fn bulk_update_rows_per_statement(db_type: DbType, pk_count: usize, set_count: usize) -> usize {
+    let params_per_row = bulk_update_params_per_row(db_type, pk_count, set_count).max(1);
+    (bind_param_limit(db_type) / params_per_row).max(1)
+}
+
+fn push_pk_match_sql(
+    db_type: DbType,
+    sql: &mut String,
+    pk_columns: &[&'static str],
+    pk_values: &[Value],
+    params: &mut Vec<Value>,
+) {
+    if pk_columns.len() > 1 {
+        sql.push('(');
+    }
+    for (index, pk) in pk_columns.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str(&format!(
+            "{} = {}",
+            quote_identifier(db_type, pk),
+            placeholder(db_type, params.len() + 1)
+        ));
+        params.push(pk_values[index].clone());
+    }
+    if pk_columns.len() > 1 {
+        sql.push(')');
+    }
+}
+
+fn plan_set_value<'a>(plan: &'a ModelUpdatePlan, column: &str) -> Option<&'a Value> {
+    plan.sets
+        .iter()
+        .find_map(|(set_column, value)| (set_column == column).then_some(value))
+}
+
+#[cfg(feature = "sqlite")]
+fn build_sqlite_bulk_model_update_sql<T: Model>(
+    plans: &[ModelUpdatePlan],
+    pk_values: &[Vec<Value>],
+    set_columns: &[String],
+) -> crate::Result<ModelSqlStatement> {
+    let db_type = DbType::Sqlite;
+    let pk_columns = T::primary_key_columns();
+    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    let mut params = Vec::new();
+    let mut param_columns = Vec::new();
+
+    for (set_index, column) in set_columns.iter().enumerate() {
+        if set_index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format!("{} = CASE ", quote_identifier(db_type, column)));
+        for (plan, pk_values) in plans.iter().zip(pk_values) {
+            sql.push_str("WHEN ");
+            push_pk_match_sql(db_type, &mut sql, pk_columns, pk_values, &mut params);
+            param_columns.extend(pk_columns.iter().map(|column| (*column).to_string()));
+            sql.push_str(" THEN ");
+            sql.push_str(&placeholder(db_type, params.len() + 1));
+            let value = plan_set_value(plan, column).ok_or_else(|| {
+                crate::ormer_error!("Missing bulk update value for column {column}")
+            })?;
+            params.push(value.clone());
+            param_columns.push(column.clone());
+            sql.push(' ');
+        }
+        sql.push_str(&format!("ELSE {} END", quote_identifier(db_type, column)));
+    }
+
+    sql.push_str(" WHERE ");
+    for (index, pk_values) in pk_values.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" OR ");
+        }
+        push_pk_match_sql(db_type, &mut sql, pk_columns, pk_values, &mut params);
+        param_columns.extend(pk_columns.iter().map(|column| (*column).to_string()));
+    }
+
+    Ok(ModelSqlStatement {
+        sql,
+        params,
+        versioned: false,
+        version_update: None,
+        param_columns: Some(param_columns),
+    })
+}
+
+#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+fn bulk_source_columns<'a>(
+    pk_columns: &'a [&'static str],
+    set_columns: &'a [String],
+) -> Vec<&'a str> {
+    pk_columns
+        .iter()
+        .map(|column| *column)
+        .chain(set_columns.iter().map(String::as_str))
+        .collect()
+}
+
+#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+fn push_bulk_source_row_values<T: Model>(
+    params: &mut Vec<Value>,
+    param_columns: &mut Vec<String>,
+    plan: &ModelUpdatePlan,
+    pk_values: &[Value],
+    set_columns: &[String],
+) -> crate::Result<()> {
+    for (pk, value) in T::primary_key_columns().iter().zip(pk_values) {
+        params.push(value.clone());
+        param_columns.push((*pk).to_string());
+    }
+    for column in set_columns {
+        let value = plan_set_value(plan, column)
+            .ok_or_else(|| crate::ormer_error!("Missing bulk update value for column {column}"))?;
+        params.push(value.clone());
+        param_columns.push(column.clone());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "postgresql")]
+fn postgres_bulk_source_cast_type<T: Model>(column: &str) -> crate::Result<String> {
+    let schema = T::COLUMN_SCHEMA
+        .iter()
+        .find(|schema| schema.name == column)
+        .ok_or_else(|| crate::ormer_error!("Unknown bulk update column {column}"))?;
+
+    if let Some(db_value_type) = schema.db_value_type {
+        return Ok(db_value_type(DbType::PostgreSQL).to_string());
+    }
+
+    Ok(DbType::PostgreSQL.sql_type(
+        schema.data_type.unwrap_or(schema.rust_type),
+        false,
+        false,
+        true,
+        schema.enum_variants,
+    ))
+}
+
+#[cfg(feature = "postgresql")]
+fn postgres_casted_placeholder_list<T: Model>(
+    start_idx: usize,
+    source_columns: &[&str],
+) -> crate::Result<String> {
+    source_columns
+        .iter()
+        .enumerate()
+        .map(|(offset, column)| {
+            let cast_type = postgres_bulk_source_cast_type::<T>(column)?;
+            Ok(format!(
+                "CAST({} AS {cast_type})",
+                placeholder(DbType::PostgreSQL, start_idx + offset)
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()
+        .map(|parts| parts.join(", "))
+}
+
+#[cfg(any(feature = "postgresql", feature = "mssql"))]
+fn build_values_source_bulk_model_update_sql<T: Model>(
+    db_type: DbType,
+    plans: &[ModelUpdatePlan],
+    pk_values: &[Vec<Value>],
+    set_columns: &[String],
+) -> crate::Result<ModelSqlStatement> {
+    let pk_columns = T::primary_key_columns();
+    let source_columns = bulk_source_columns(pk_columns, set_columns);
+    let source_column_list = quote_column_list(db_type, &source_columns);
+    let source_width = source_columns.len();
+    let mut params = Vec::new();
+    let mut param_columns = Vec::new();
+
+    let mut values_sql = String::new();
+    for (index, (plan, pk_values)) in plans.iter().zip(pk_values).enumerate() {
+        if index > 0 {
+            values_sql.push_str(", ");
+        }
+        values_sql.push('(');
+        #[cfg(feature = "postgresql")]
+        if matches!(db_type, DbType::PostgreSQL) {
+            values_sql.push_str(&postgres_casted_placeholder_list::<T>(
+                params.len() + 1,
+                &source_columns,
+            )?);
+        } else {
+            values_sql.push_str(&placeholder_list(db_type, params.len() + 1, source_width));
+        }
+        #[cfg(not(feature = "postgresql"))]
+        values_sql.push_str(&placeholder_list(db_type, params.len() + 1, source_width));
+        values_sql.push(')');
+        push_bulk_source_row_values::<T>(
+            &mut params,
+            &mut param_columns,
+            plan,
+            pk_values,
+            set_columns,
+        )?;
+    }
+
+    let table = quote_table_name::<T>(db_type);
+    let sql = match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => {
+            let assignments = set_columns
+                .iter()
+                .map(|column| {
+                    quote_assignment(
+                        db_type,
+                        column,
+                        &quote_column_with_prefix(db_type, "source", column),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let predicates = pk_columns
+                .iter()
+                .map(|pk| {
+                    format!(
+                        "{} = {}",
+                        quote_column_with_prefix(db_type, "target", pk),
+                        quote_column_with_prefix(db_type, "source", pk)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE {table} AS target SET {assignments} FROM (VALUES {values_sql}) AS source ({source_column_list}) WHERE {predicates}"
+            )
+        }
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => {
+            let assignments = set_columns
+                .iter()
+                .map(|column| {
+                    format!(
+                        "{} = {}",
+                        quote_column_with_prefix(db_type, "target", column),
+                        quote_column_with_prefix(db_type, "source", column)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let predicates = pk_columns
+                .iter()
+                .map(|pk| {
+                    format!(
+                        "{} = {}",
+                        quote_column_with_prefix(db_type, "target", pk),
+                        quote_column_with_prefix(db_type, "source", pk)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            format!(
+                "UPDATE target SET {assignments} FROM {table} AS target JOIN (VALUES {values_sql}) AS source ({source_column_list}) ON {predicates}"
+            )
+        }
+        _ => {
+            return Err(crate::ormer_error!(
+                "VALUES source bulk update is not supported for this database"
+            ));
+        }
+    };
+
+    Ok(ModelSqlStatement {
+        sql,
+        params,
+        versioned: false,
+        version_update: None,
+        param_columns: Some(param_columns),
+    })
+}
+
+#[cfg(feature = "mysql")]
+fn build_mysql_bulk_model_update_sql<T: Model>(
+    plans: &[ModelUpdatePlan],
+    pk_values: &[Vec<Value>],
+    set_columns: &[String],
+) -> crate::Result<ModelSqlStatement> {
+    let db_type = DbType::MySQL;
+    let pk_columns = T::primary_key_columns();
+    let source_columns = bulk_source_columns(pk_columns, set_columns);
+    let source_width = source_columns.len();
+    let mut params = Vec::new();
+    let mut param_columns = Vec::new();
+    let mut source_sql = String::new();
+
+    for (index, (plan, pk_values)) in plans.iter().zip(pk_values).enumerate() {
+        if index > 0 {
+            source_sql.push_str(" UNION ALL ");
+        }
+        source_sql.push_str("SELECT ");
+        for (column_index, column) in source_columns.iter().enumerate() {
+            if column_index > 0 {
+                source_sql.push_str(", ");
+            }
+            source_sql.push_str(&placeholder(db_type, params.len() + column_index + 1));
+            if index == 0 {
+                source_sql.push_str(" AS ");
+                source_sql.push_str(&quote_identifier(db_type, column));
+            }
+        }
+        push_bulk_source_row_values::<T>(
+            &mut params,
+            &mut param_columns,
+            plan,
+            pk_values,
+            set_columns,
+        )?;
+        debug_assert_eq!(params.len(), (index + 1) * source_width);
+    }
+
+    let assignments = set_columns
+        .iter()
+        .map(|column| {
+            format!(
+                "{} = {}",
+                quote_column_with_prefix(db_type, "target", column),
+                quote_column_with_prefix(db_type, "source", column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicates = pk_columns
+        .iter()
+        .map(|pk| {
+            format!(
+                "{} = {}",
+                quote_column_with_prefix(db_type, "target", pk),
+                quote_column_with_prefix(db_type, "source", pk)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ");
+
+    Ok(ModelSqlStatement {
+        sql: format!(
+            "UPDATE {} AS target JOIN ({source_sql}) AS source ON {predicates} SET {assignments}",
+            quote_table_name::<T>(db_type)
+        ),
+        params,
+        versioned: false,
+        version_update: None,
+        param_columns: Some(param_columns),
+    })
+}
+
+fn build_bulk_model_update_sql<T: Model>(
+    db_type: DbType,
+    plans: &[ModelUpdatePlan],
+    pk_values: &[Vec<Value>],
+    set_columns: &[String],
+) -> crate::Result<ModelSqlStatement> {
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => build_sqlite_bulk_model_update_sql::<T>(plans, pk_values, set_columns),
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => {
+            build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
+        }
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => build_mysql_bulk_model_update_sql::<T>(plans, pk_values, set_columns),
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => {
+            build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
+        }
+    }
+}
+
+pub fn build_bulk_model_update_statements<T: Model>(
+    db_type: DbType,
+    plans: &[ModelUpdatePlan],
+) -> crate::Result<Option<Vec<ModelSqlStatement>>> {
+    if plans.len() <= 1 {
+        return Ok(None);
+    }
+
+    let set_columns = match model_update_set_columns(plans) {
+        Some(columns) => columns,
+        None => return Ok(None),
+    };
+    let pk_values = match model_update_pk_values::<T>(plans) {
+        Some(values) => values,
+        None => return Ok(None),
+    };
+    let pk_count = T::primary_key_columns().len();
+    let rows_per_statement =
+        bulk_update_rows_per_statement(db_type, pk_count, set_columns.len()).max(1);
+    if rows_per_statement <= 1 {
+        return Ok(None);
+    }
+
+    let mut statements = Vec::new();
+    let mut start = 0;
+    while start < plans.len() {
+        let end = (start + rows_per_statement).min(plans.len());
+        statements.push(build_bulk_model_update_sql::<T>(
+            db_type,
+            &plans[start..end],
+            &pk_values[start..end],
+            &set_columns,
+        )?);
+        start = end;
+    }
+
+    Ok(Some(statements))
 }
 
 pub fn optimistic_lock_conflict<T: Model>() -> crate::OrmerError {
@@ -880,6 +1410,10 @@ fn routed_table_name_for_models<T: Model>(db_type: DbType, models: &[&T]) -> cra
     Ok(table_name)
 }
 
+pub fn routed_insert_table_name<T: Model>(db_type: DbType, models: &[&T]) -> crate::Result<String> {
+    routed_table_name_for_models(db_type, models)
+}
+
 pub fn build_routed_insert_statement<T: Model>(
     db_type: DbType,
     models: &[&T],
@@ -1042,6 +1576,55 @@ pub fn build_insert_statement_with_conflict<T: Model>(
     }
 
     Ok((sql, values))
+}
+
+fn insert_rows_per_statement<T: Model>(db_type: DbType) -> usize {
+    let column_count = T::insert_columns().len().max(1);
+    (bind_param_limit(db_type) / column_count).max(1)
+}
+
+pub fn build_insert_statements_with_conflict<T: Model>(
+    db_type: DbType,
+    models: &[&T],
+    conflict: Option<&InsertConflict>,
+) -> crate::Result<Vec<InsertSqlStatement>> {
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if conflict.is_some_and(InsertConflict::is_configured) || auto_increment_column::<T>().is_some()
+    {
+        let (sql, params) = build_insert_statement_with_conflict::<T>(db_type, models, conflict)?;
+        return Ok(vec![InsertSqlStatement {
+            sql,
+            params,
+            row_count: models.len(),
+        }]);
+    }
+
+    let rows_per_statement = insert_rows_per_statement::<T>(db_type);
+    if models.len() <= rows_per_statement {
+        let (sql, params) = build_insert_statement_with_conflict::<T>(db_type, models, conflict)?;
+        return Ok(vec![InsertSqlStatement {
+            sql,
+            params,
+            row_count: models.len(),
+        }]);
+    }
+
+    routed_table_name_for_models(db_type, models)?;
+    models
+        .chunks(rows_per_statement)
+        .map(|chunk| {
+            let (sql, params) =
+                build_insert_statement_with_conflict::<T>(db_type, chunk, conflict)?;
+            Ok(InsertSqlStatement {
+                sql,
+                params,
+                row_count: chunk.len(),
+            })
+        })
+        .collect()
 }
 
 fn append_insert_conflict_clause<T: Model>(

@@ -37,6 +37,8 @@ db.insert(&[user1, user2])
     .await?;
 ```
 
+大批量插入会按后端参数上限自动拆批；PostgreSQL 在无冲突处理、无自增键返回且值类型可安全序列化时会自动使用 `COPY FROM STDIN`。
+
 ### 部分插入和表单模型
 
 `insert_partial::<User>()` 只写入通过 `set` 指定的列；`default` 表示 INSERT 时省略该列以使用数据库默认值：
@@ -246,6 +248,8 @@ db.update::<User>()
     .await?;
 ```
 
+`set_model(&users)` 和 `set_model_fields(&users, ...)` 接收模型集合时，会在无乐观锁冲突定位需求且主键不重复的场景下自动生成单 SQL 差异更新；不满足条件时保持逐条更新语义。
+
 ## 删除 (Delete)
 
 ```rust
@@ -270,6 +274,31 @@ db.delete::<User>()
 db.create_table::<User>().execute().await?;
 
 db.drop_table::<User>().execute().await?;
+```
+
+## Typed DSL raw 表达式
+
+`filter`、`order_by` / `order_by_desc`、`map_to` 中可以用 `ormer::raw!` 写数据库函数或方言表达式。`{...}` 内的字段会渲染为列引用，普通变量和字面量会走参数绑定；字面量花括号用 `{{` / `}}` 转义。
+
+```rust
+let term = "%alice%";
+
+let names: Vec<String> = db
+    .select::<User>()
+    .filter(|u| ormer::raw!("LOWER({u.name}) LIKE LOWER({term})"))
+    .order_by_desc(|u| ormer::raw!("LENGTH({u.name})"))
+    .map_to(|u| {
+        ormer::raw!("LOWER({u.name})")
+            .typed::<String>()
+            .alias("name_lower")
+    })
+    .collect()
+    .await?;
+
+db.update::<User>()
+    .set(|u| u.name = u.name.set_expr(ormer::raw!("LOWER({u.name})")))
+    .execute()
+    .await?;
 ```
 
 ## 原生 SQL

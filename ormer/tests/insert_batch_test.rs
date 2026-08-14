@@ -5,6 +5,7 @@ mod _test_common;
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_simple!(TestUser1, "test_insert_batch_users_1");
 define_test_user_simple!(TestUser2, "test_insert_batch_users_2");
+define_test_user_simple!(TestUser3, "test_insert_batch_users_3");
 
 async fn test_insert_single_and_batch_impl(
     config: &_test_common::DbConfig,
@@ -168,3 +169,30 @@ async fn test_insert_or_update_single_and_batch_impl(
 
 test_on_all_dbs_result!(test_insert_single_and_batch_impl);
 test_on_all_dbs_result!(test_insert_or_update_single_and_batch_impl);
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_insert_batch_auto_chunks_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    let config = _test_common::sqlite_config();
+    let db = _test_common::create_db_connection(&config).await?;
+    let _ = db.drop_table::<TestUser3>().execute().await;
+    db.create_table::<TestUser3>().execute().await?;
+
+    let users = (1..=350)
+        .map(|id| TestUser3 {
+            id,
+            name: format!("User {id}"),
+            age: 20 + id % 30,
+        })
+        .collect::<Vec<_>>();
+
+    let sql = db.insert(&users).to_sql()?;
+    assert!(sql.statements.len() > 1);
+
+    db.insert(&users).execute().await?;
+    let inserted = db.select::<TestUser3>().collect::<Vec<_>>().await?;
+    assert_eq!(inserted.len(), users.len());
+
+    db.drop_table::<TestUser3>().execute().await?;
+    Ok(())
+}

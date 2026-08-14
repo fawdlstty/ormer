@@ -1,10 +1,10 @@
 #![cfg(feature = "postgresql")]
 
 use ormer::model::DbBackendTypeMapper;
-use ormer::{Model, ModelEnum};
+use ormer::{FieldType, Model};
 use postgres_types::{Format, ToSql, Type};
 
-#[derive(Debug, Clone, ModelEnum, PartialEq)]
+#[derive(Debug, Clone, FieldType, PartialEq)]
 enum TestPgStatus {
     Active,
     Disabled,
@@ -20,7 +20,7 @@ struct TestPgEnumUser {
 }
 
 #[test]
-fn model_enum_metadata_is_embedded_into_column_schema() {
+fn field_type_metadata_is_embedded_into_column_schema() {
     let status = TestPgEnumUser::COLUMN_SCHEMA
         .iter()
         .find(|column| column.name == "status")

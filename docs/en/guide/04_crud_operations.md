@@ -37,6 +37,8 @@ db.insert(&[user1, user2])
     .await?;
 ```
 
+Large inserts are automatically split by backend parameter limits; PostgreSQL uses `COPY FROM STDIN` when there is no conflict handling, no auto-increment key return, and all values can be serialized safely.
+
 ### Partial Insert and Form Models
 
 `insert_partial::<User>()` writes only columns selected with `set`; `default` omits the column from the INSERT so the database default is used:
@@ -245,6 +247,8 @@ db.update::<User>()
     .await?;
 ```
 
+When `set_model(&users)` or `set_model_fields(&users, ...)` receives a model collection, Ormer emits a single differential UPDATE when there is no optimistic-lock row attribution requirement and primary keys are unique; otherwise it keeps the per-row update semantics.
+
 ## Delete
 
 ```rust
@@ -269,6 +273,31 @@ db.delete::<User>()
 db.create_table::<User>().execute().await?;
 
 db.drop_table::<User>().execute().await?;
+```
+
+## Typed DSL Raw Expressions
+
+Use `ormer::raw!` inside `filter`, `order_by` / `order_by_desc`, and `map_to` for database functions or dialect expressions. Fields inside `{...}` render as column references, while variables and literals are bound as parameters; escape literal braces with `{{` / `}}`.
+
+```rust
+let term = "%alice%";
+
+let names: Vec<String> = db
+    .select::<User>()
+    .filter(|u| ormer::raw!("LOWER({u.name}) LIKE LOWER({term})"))
+    .order_by_desc(|u| ormer::raw!("LENGTH({u.name})"))
+    .map_to(|u| {
+        ormer::raw!("LOWER({u.name})")
+            .typed::<String>()
+            .alias("name_lower")
+    })
+    .collect()
+    .await?;
+
+db.update::<User>()
+    .set(|u| u.name = u.name.set_expr(ormer::raw!("LOWER({u.name})")))
+    .execute()
+    .await?;
 ```
 
 ## Raw SQL

@@ -5,14 +5,16 @@ use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{
     DbBackendTypeMapper, DurationToInterval, Model, Row, Value, WritableModel,
-    split_schema_table_name,
+    quote_qualified_identifier, split_schema_table_name,
 };
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::expr::SqlExpr;
-use crate::query::filter::{FilterExpr, infer_filter_value_rust_type, infer_model_value_rust_type};
+use crate::query::filter::{
+    FilterExpr, OrderBy, infer_filter_value_rust_type, infer_model_value_rust_type,
+};
 use crate::query::insert::{
     InsertAssignment, InsertConflict, IntoInsertAssignment, IntoInsertDefaultColumn,
 };
@@ -26,7 +28,8 @@ use crate::{
     impl_backend_multi_table_executor_methods_with_lifetime,
     impl_backend_related_executor_methods_with_lifetime, impl_insert_conflict_methods,
 };
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::SinkExt;
 use postgres_types::{FromSql, FromSqlOwned, IsNull, ToSql, Type as PgType};
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -206,6 +209,92 @@ pub(crate) fn pg_insert_param_rust_types<T: Model>(
         pg_collect_conflict_rust_types::<T>(conflict, &mut rust_types);
     }
     rust_types
+}
+
+const POSTGRES_COPY_MIN_ROWS: usize = 1024;
+
+fn pg_copy_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn pg_copy_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Integer(value) => Some(value.to_string()),
+        Value::BigInt(value) => Some(value.to_string()),
+        Value::Duration(value) => Some(value.to_interval_string()),
+        Value::Text(value) => Some(pg_copy_escape(value)),
+        Value::Real(value) => Some(value.to_string()),
+        Value::Decimal(value) => Some(value.to_string()),
+        Value::BigDecimal(value) => Some(value.to_string()),
+        Value::Boolean(value) => Some(value.to_string()),
+        Value::DateTime(value) => Some(value.to_string()),
+        Value::Date(value) => Some(value.to_string()),
+        Value::Time(value) => Some(value.to_string()),
+        Value::Json(value) => Some(pg_copy_escape(&value.to_string())),
+        Value::Uuid(value) => Some(value.to_string()),
+        Value::Null => Some("\\N".to_string()),
+        Value::Bytes(_)
+        | Value::TextArray(_)
+        | Value::IntegerArray(_)
+        | Value::BigIntArray(_)
+        | Value::NullableBigIntArray(_) => None,
+    }
+}
+
+fn pg_copy_insert_payload<T: Model>(models: &[&T]) -> Option<String> {
+    let mut payload = String::new();
+    for model in models {
+        for (index, value) in model.insert_values().iter().enumerate() {
+            if index > 0 {
+                payload.push('\t');
+            }
+            payload.push_str(&pg_copy_value(value)?);
+        }
+        payload.push('\n');
+    }
+    Some(payload)
+}
+
+fn pg_copy_insert_statement<T: Model>(models: &[&T]) -> crate::Result<String> {
+    let columns = T::insert_columns();
+    let table_name = common_helpers::routed_insert_table_name::<T>(DbType::PostgreSQL, models)?;
+    Ok(format!(
+        "COPY {} ({}) FROM STDIN",
+        quote_qualified_identifier(DbType::PostgreSQL, &table_name),
+        common_helpers::quote_column_list(DbType::PostgreSQL, &columns)
+    ))
+}
+
+fn pg_should_use_copy_insert<T: Model>(models: &[&T], conflict: Option<&InsertConflict>) -> bool {
+    models.len() >= POSTGRES_COPY_MIN_ROWS
+        && common_helpers::auto_increment_column::<T>().is_none()
+        && !conflict.is_some_and(InsertConflict::is_configured)
+        && !T::insert_columns().is_empty()
+}
+
+async fn pg_try_copy_insert<T: Model>(
+    client: &tokio_postgres::Client,
+    models: &[&T],
+) -> crate::Result<bool> {
+    let Some(payload) = pg_copy_insert_payload(models) else {
+        return Ok(false);
+    };
+    let copy_sql = pg_copy_insert_statement::<T>(models)?;
+    let sink = client.copy_in(&copy_sql).await?;
+    let mut sink = std::pin::pin!(sink);
+    sink.send(Bytes::from(payload)).await?;
+    sink.finish().await?;
+    Ok(true)
 }
 
 /// PostgreSQL 类型映射器
@@ -624,6 +713,21 @@ fn pg_collect_update_assignment_param_rust_types<T: Model>(
             pg_collect_update_expr_param_rust_types::<T>(expr, &assignment.column, rust_types);
         }
     }
+}
+
+fn pg_model_statement_param_rust_types<T: Model>(
+    statement: &common_helpers::ModelSqlStatement,
+) -> Option<Vec<&'static str>> {
+    statement.param_columns.as_ref().map(|columns| {
+        columns
+            .iter()
+            .zip(&statement.params)
+            .map(|(column, value)| {
+                pg_model_column_rust_type::<T>(column)
+                    .unwrap_or_else(|| infer_model_value_rust_type(value))
+            })
+            .collect()
+    })
 }
 
 fn is_vec_i32_type(rust_type: &str) -> bool {
@@ -1069,7 +1173,14 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
     rust_types: &mut Vec<&'static str>,
 ) {
     match expr {
-        SqlExpr::Column(_) | SqlExpr::Raw(_) => {}
+        SqlExpr::Column(_) => {}
+        SqlExpr::Raw(raw) => {
+            for segment in raw.segments() {
+                if let crate::query::expr::RawExprSegment::Expr(expr) = segment {
+                    pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+                }
+            }
+        }
         SqlExpr::Value(value) => rust_types.push(infer_model_value_rust_type(value)),
         SqlExpr::Binary { left, right, .. } => {
             pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
@@ -1100,7 +1211,7 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
         SqlExpr::Aggregate {
             expr,
             filter,
-            order_by: _,
+            order_by,
             over,
             ..
         } => {
@@ -1108,10 +1219,12 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
             if let Some(filter) = filter {
                 pg_collect_filter_param_rust_types::<T>(filter, rust_types);
             }
+            pg_collect_order_by_param_rust_types::<T>(order_by, rust_types);
             if let Some(over) = over {
                 for expr in &over.partition_by {
                     pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
                 }
+                pg_collect_order_by_param_rust_types::<T>(&over.order_by, rust_types);
             }
         }
         SqlExpr::CaseMatch {
@@ -1125,6 +1238,17 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
                 pg_collect_sql_expr_param_rust_types::<T>(then, rust_types);
             }
             pg_collect_sql_expr_param_rust_types::<T>(else_expr, rust_types);
+        }
+    }
+}
+
+fn pg_collect_order_by_param_rust_types<T: Model>(
+    order_by: &[OrderBy],
+    rust_types: &mut Vec<&'static str>,
+) {
+    for order in order_by {
+        if let Some(expr) = order.cloned_expr() {
+            pg_collect_sql_expr_param_rust_types::<T>(&expr, rust_types);
         }
     }
 }
@@ -1369,27 +1493,47 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
-        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
-            DbType::PostgreSQL,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-        let rust_types = pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
-        let sql = if has_auto_increment {
+        if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+                DbType::PostgreSQL,
+                &refs,
+                self.conflict.as_ref(),
+            )?;
+            let rust_types =
+                pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
             let pk_col = I::Model::COLUMN_SCHEMA
                 .iter()
                 .find(|c| c.is_auto_increment)
                 .map(|c| c.name)
                 .unwrap_or("id");
-            format!("{sql} RETURNING {pk_col}")
-        } else {
-            sql
-        };
+            return Ok(SqlStatement::batch(
+                DbType::PostgreSQL,
+                vec![
+                    SingleSqlStatement::new(format!("{sql} RETURNING {pk_col}"), all_values)
+                        .with_param_rust_types(rust_types),
+                ],
+            ));
+        }
+
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
-            vec![SingleSqlStatement::new(sql, all_values).with_param_rust_types(rust_types)],
+            statements
+                .into_iter()
+                .map(|statement| {
+                    let rust_types = pg_insert_param_rust_types::<I::Model>(
+                        statement.row_count,
+                        self.conflict.as_ref(),
+                    );
+                    SingleSqlStatement::new(statement.sql, statement.params)
+                        .with_param_rust_types(rust_types)
+                })
+                .collect(),
         ))
     }
 
@@ -1401,33 +1545,61 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         if sql.statements.is_empty() {
             return Ok(Vec::new());
         }
-        let statement = &mut sql.statements[0];
-        if let Some((prefix, _)) = statement.sql.split_once(" RETURNING ") {
-            statement.sql = format!("{prefix} RETURNING *");
-        } else {
-            statement.sql = format!("{} RETURNING *", statement.sql);
-        }
-
-        let statement = &sql.statements[0];
-        let params = values_to_params_with_types(
-            &statement.params,
-            statement.param_rust_types.as_deref().unwrap_or(&[]),
-        )?;
-        let param_refs = pg_param_refs(&params);
-        let rows = self.db.client.query(&statement.sql, &param_refs).await?;
-
         let mut results = Vec::new();
-        for row in rows {
-            let model = pg_decode_returning_model_from_row::<I::Model>(&row)?;
-            results.push(model);
+        for statement in &mut sql.statements {
+            if let Some((prefix, _)) = statement.sql.split_once(" RETURNING ") {
+                statement.sql = format!("{prefix} RETURNING *");
+            } else {
+                statement.sql = format!("{} RETURNING *", statement.sql);
+            }
+
+            let params = values_to_params_with_types(
+                &statement.params,
+                statement.param_rust_types.as_deref().unwrap_or(&[]),
+            )?;
+            let param_refs = pg_param_refs(&params);
+            let rows = self.db.client.query(&statement.sql, &param_refs).await?;
+            for row in rows {
+                let model = pg_decode_returning_model_from_row::<I::Model>(&row)?;
+                results.push(model);
+            }
         }
 
         self.models.run_after_insert(hook_ctx).await?;
         Ok(results)
     }
 
-    pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        <Self as SqlExecutor>::execute(self).await
+    pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        let use_copy = {
+            let refs = self.models.as_refs();
+            pg_should_use_copy_insert::<I::Model>(&refs, self.conflict.as_ref())
+        };
+        if !use_copy {
+            return <Self as SqlExecutor>::execute(self).await;
+        }
+
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+        let refs = self.models.as_refs();
+
+        if pg_try_copy_insert::<I::Model>(&self.db.client, &refs).await? {
+            self.models.run_after_insert(hook_ctx).await?;
+            return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+        }
+
+        let sql = self.to_sql()?;
+        for statement in &sql.statements {
+            let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+            pg_execute_with_types(
+                &self.db.client,
+                &statement.sql,
+                &statement.params,
+                rust_types,
+            )
+            .await?;
+        }
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
     }
 }
 
@@ -1447,9 +1619,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         self.models.run_before_insert(hook_ctx).await?;
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let statement = &sql.statements[0];
-        let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
         let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
             let rows = pg_query_with_types(
                 &self.db.client,
                 &statement.sql,
@@ -1474,13 +1646,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             };
             common_helpers::convert_auto_increment_key::<Self::Output>(id)
         } else {
-            pg_execute_with_types(
-                &self.db.client,
-                &statement.sql,
-                &statement.params,
-                rust_types,
-            )
-            .await?;
+            for statement in &sql.statements {
+                let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+                pg_execute_with_types(
+                    &self.db.client,
+                    &statement.sql,
+                    &statement.params,
+                    rust_types,
+                )
+                .await?;
+            }
             Ok(Self::Output::default())
         }?;
 
@@ -2139,6 +2314,7 @@ impl Database {
 
     /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
     /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
+    #[allow(dead_code)]
     pub(crate) async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
@@ -2483,31 +2659,74 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let has_auto_increment = common_helpers::auto_increment_column::<I::Model>().is_some();
-        let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
-            DbType::PostgreSQL,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-        let rust_types = pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
-        let sql = if has_auto_increment {
+        if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
+                DbType::PostgreSQL,
+                &refs,
+                self.conflict.as_ref(),
+            )?;
+            let rust_types =
+                pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
             let pk_col = I::Model::COLUMN_SCHEMA
                 .iter()
                 .find(|c| c.is_auto_increment)
                 .map(|c| c.name)
                 .unwrap_or("id");
-            format!("{sql} RETURNING {pk_col}")
-        } else {
-            sql
-        };
+            return Ok(SqlStatement::batch(
+                DbType::PostgreSQL,
+                vec![
+                    SingleSqlStatement::new(format!("{sql} RETURNING {pk_col}"), all_values)
+                        .with_param_rust_types(rust_types),
+                ],
+            ));
+        }
+
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
-            vec![SingleSqlStatement::new(sql, all_values).with_param_rust_types(rust_types)],
+            statements
+                .into_iter()
+                .map(|statement| {
+                    let rust_types = pg_insert_param_rust_types::<I::Model>(
+                        statement.row_count,
+                        self.conflict.as_ref(),
+                    );
+                    SingleSqlStatement::new(statement.sql, statement.params)
+                        .with_param_rust_types(rust_types)
+                })
+                .collect(),
         ))
     }
 
     pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
+        let use_copy = {
+            let refs = self.models.as_refs();
+            pg_should_use_copy_insert::<I::Model>(&refs, self.conflict.as_ref())
+        };
+        if use_copy {
+            let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+            self.models.run_before_insert(hook_ctx).await?;
+            let refs = self.models.as_refs();
+            if pg_try_copy_insert::<I::Model>(self.client, &refs).await? {
+                self.models.run_after_insert(hook_ctx).await?;
+                return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+            }
+
+            let sql = self.to_sql()?;
+            for statement in &sql.statements {
+                let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+                pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                    .await?;
+            }
+            self.models.run_after_insert(hook_ctx).await?;
+            return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
+        }
+
         let sql = self.to_sql()?;
         if sql.statements.is_empty() {
             return Ok(<<I::Model as Model>::AutoIncrementKeyType>::default());
@@ -2515,9 +2734,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let statement = &sql.statements[0];
-        let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
         let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
             let rows =
                 pg_query_with_types(self.client, &statement.sql, &statement.params, rust_types)
                     .await?;
@@ -2541,8 +2760,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
                 id,
             )
         } else {
-            pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
-                .await?;
+            for statement in &sql.statements {
+                let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+                pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                    .await?;
+            }
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }?;
 
@@ -3569,13 +3791,14 @@ pub struct DeleteExecutor<'a, T: Model> {
 
 impl<'a, T: Model> DeleteExecutor<'a, T> {
     /// 添加 WHERE 条件
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -3692,13 +3915,14 @@ pub struct UpdateExecutor<'a, T: Model> {
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
     /// 添加 WHERE 条件
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -3793,27 +4017,38 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                     params,
                     versioned: false,
                     version_update: None,
+                    param_columns: None,
                 },
                 rust_types,
             ));
         }
 
-        // Model UPDATE statements
-        for plan in &self.model_updates {
-            let mut rust_types = Vec::new();
-            for (col_name, value) in &plan.sets {
-                rust_types.push(
-                    pg_model_column_rust_type::<T>(col_name)
-                        .unwrap_or_else(|| infer_model_value_rust_type(value)),
-                );
+        if let Some(batch_statements) = common_helpers::build_bulk_model_update_statements::<T>(
+            DbType::PostgreSQL,
+            &self.model_updates,
+        )? {
+            for statement in batch_statements {
+                let rust_types =
+                    pg_model_statement_param_rust_types::<T>(&statement).unwrap_or_default();
+                statements.push((statement, rust_types));
             }
-            for filter in &plan.filters {
-                pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+        } else {
+            for plan in &self.model_updates {
+                let mut rust_types = Vec::new();
+                for (col_name, value) in &plan.sets {
+                    rust_types.push(
+                        pg_model_column_rust_type::<T>(col_name)
+                            .unwrap_or_else(|| infer_model_value_rust_type(value)),
+                    );
+                }
+                for filter in &plan.filters {
+                    pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+                }
+                statements.push((
+                    common_helpers::build_model_update_sql::<T>(DbType::PostgreSQL, plan)?,
+                    rust_types,
+                ));
             }
-            statements.push((
-                common_helpers::build_model_update_sql::<T>(DbType::PostgreSQL, plan)?,
-                rust_types,
-            ));
         }
 
         Ok(statements)
@@ -4664,9 +4899,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 HAVING 条件
-    pub fn having<F>(self, f: F) -> Self
+    pub fn having<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.having(f),
@@ -4676,9 +4912,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn filter<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.filter(f),

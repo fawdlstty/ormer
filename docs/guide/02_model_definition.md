@@ -255,17 +255,20 @@ let users: Vec<User> = db
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
 
-## 枚举类型
+## 字段类型
 
 ```rust
-use ormer::{Model, ModelEnum};
+use ormer::{FieldType, Model};
 
-#[derive(Debug, Clone, ModelEnum, PartialEq)]
+#[derive(Debug, Clone, FieldType, PartialEq)]
 enum UserStatus {
     Active,
     Inactive,
     Banned,
 }
+
+#[derive(Debug, Clone, FieldType, PartialEq)]
+pub struct ExceptionType(pub u16);
 
 #[derive(Debug, Model)]
 #[table = "users"]
@@ -273,13 +276,14 @@ struct User {
     #[primary(auto)]
     id: i32,
     status: UserStatus,
+    exception_type: ExceptionType,
     name: String,
 }
 ```
 
-支持 `Option<EnumType>` 表示可空枚举字段。
+`FieldType` 可用于枚举，也可用于单字段 tuple struct 包装类型。包装类型使用内部字段类型映射数据库列，例如 `ExceptionType(pub u16)` 按 `u16` 存储。支持 `Option<FieldType>` 表示可空字段。
 
-`ModelEnum` 枚举也可以用于 `IN`、比较和排序条件：
+`FieldType` 值也可以用于 `IN`、比较和排序条件：
 
 ```rust
 let active: Vec<User> = db
@@ -289,7 +293,7 @@ let active: Vec<User> = db
     .await?;
 ```
 
-如果已有数值枚举或包装类型，不需要派生 `ModelEnum`，可以用 `#[data_type(i32)]` 指定数据库类型。可空字段必须同时使用 `#[data_type(Option<i32>)]`：
+如果已有数值枚举或包装类型且不想派生 `FieldType`，可以用 `#[data_type(i32)]` 指定数据库类型。可空字段必须同时使用 `#[data_type(Option<i32>)]`：
 
 ```rust
 #[repr(i32)]

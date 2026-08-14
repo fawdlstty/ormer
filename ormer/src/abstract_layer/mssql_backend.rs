@@ -772,13 +772,29 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             ));
         }
 
-        let (sql, all_values) =
-            common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
-                DbType::MSSQL,
-                &refs,
-            )?;
+        if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, all_values) =
+                common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    DbType::MSSQL,
+                    &refs,
+                )?;
 
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+            return Ok(SqlStatement::single(DbType::MSSQL, sql, all_values));
+        }
+
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+            DbType::MSSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
+
+        Ok(SqlStatement::batch(
+            DbType::MSSQL,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
@@ -852,20 +868,26 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         self.models.run_before_insert(hook_ctx).await?;
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param);
-        }
 
         let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param);
+            }
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
             common_helpers::convert_auto_increment_key::<Self::Output>(id)
         } else {
-            query.execute(&mut *client).trace().await?;
+            for statement in &sql.statements {
+                let mut query = Query::new(&statement.sql);
+                for param in &statement.params {
+                    bind_value(&mut query, param);
+                }
+                query.execute(&mut *client).trace().await?;
+            }
             Ok(<I::Model as Model>::AutoIncrementKeyType::default())
         }?;
 
@@ -1351,13 +1373,29 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             ));
         }
 
-        let (sql, all_values) =
-            common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
-                DbType::MSSQL,
-                &refs,
-            )?;
+        if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, all_values) =
+                common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
+                    DbType::MSSQL,
+                    &refs,
+                )?;
 
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+            return Ok(SqlStatement::single(DbType::MSSQL, sql, all_values));
+        }
+
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+            DbType::MSSQL,
+            &refs,
+            self.conflict.as_ref(),
+        )?;
+
+        Ok(SqlStatement::batch(
+            DbType::MSSQL,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
@@ -1383,14 +1421,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         self.models.run_before_insert(hook_ctx).await?;
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param);
-        }
 
         let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param);
+            }
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
             let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
@@ -1398,7 +1436,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
                 id,
             )
         } else {
-            query.execute(&mut *client).trace().await?;
+            for statement in &sql.statements {
+                let mut query = Query::new(&statement.sql);
+                for param in &statement.params {
+                    bind_value(&mut query, param);
+                }
+                query.execute(&mut *client).trace().await?;
+            }
             Ok(<<I::Model as Model>::AutoIncrementKeyType>::default())
         }?;
 
@@ -1839,9 +1883,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 HAVING 条件
-    pub fn having<F>(self, f: F) -> Self
+    pub fn having<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(<T as Model>::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.having(f),
@@ -1851,9 +1896,10 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F>(self, f: F) -> Self
+    pub fn filter<F, W>(self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> crate::query::builder::WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
     {
         Self {
             select: self.select.filter(f),
@@ -1889,13 +1935,14 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static>
 
 // DeleteExecutor 实现
 impl<'a, T: Model> DeleteExecutor<'a, T> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -1958,13 +2005,14 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
 
 // UpdateExecutor 实现
 impl<'a, T: Model> UpdateExecutor<'a, T> {
-    pub fn filter<F>(mut self, f: F) -> Self
+    pub fn filter<F, W>(mut self, f: F) -> Self
     where
-        F: FnOnce(T::Where) -> WhereExpr,
+        F: FnOnce(T::Where) -> W,
+        W: Into<WhereExpr>,
     {
         let where_obj = T::Where::default();
-        let expr = f(where_obj);
-        self.filters.push(expr.into());
+        let expr = crate::query::filter::FilterExpr::from(f(where_obj).into());
+        self.filters.push(expr);
         self
     }
 
@@ -2035,15 +2083,22 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
                 params,
                 versioned: false,
                 version_update: None,
+                param_columns: None,
             });
         }
 
-        // Model UPDATE statements
-        for plan in &self.model_updates {
-            statements.push(common_helpers::build_model_update_sql::<T>(
-                DbType::MSSQL,
-                plan,
-            )?);
+        if let Some(batch_statements) = common_helpers::build_bulk_model_update_statements::<T>(
+            DbType::MSSQL,
+            &self.model_updates,
+        )? {
+            statements.extend(batch_statements);
+        } else {
+            for plan in &self.model_updates {
+                statements.push(common_helpers::build_model_update_sql::<T>(
+                    DbType::MSSQL,
+                    plan,
+                )?);
+            }
         }
 
         Ok(statements)

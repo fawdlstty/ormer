@@ -1,6 +1,7 @@
 mod db_value;
 mod model;
 mod model_enum;
+mod raw;
 
 use proc_macro::TokenStream;
 
@@ -51,6 +52,12 @@ pub fn derive_model_enum(input: TokenStream) -> TokenStream {
     model_enum::derive_model_enum(input).into()
 }
 
+#[proc_macro_derive(FieldType)]
+pub fn derive_field_type(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    model_enum::derive_field_type(input).into()
+}
+
 #[proc_macro_derive(DbValue, attributes(db_type))]
 pub fn derive_db_value(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
@@ -61,4 +68,9 @@ pub fn derive_db_value(input: TokenStream) -> TokenStream {
 pub fn derive_insert_model(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model::derive_insert_model(input).into()
+}
+
+#[proc_macro]
+pub fn raw(input: TokenStream) -> TokenStream {
+    raw::expand(input.into()).into()
 }

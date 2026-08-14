@@ -328,4 +328,23 @@ impl OrderBy {
             .unwrap_or_else(|| crate::model::quote_column_reference(db_type, &self.column));
         format!("{} {}", expr_sql, dir)
     }
+
+    pub(crate) fn to_sql_with_params(
+        &self,
+        db_type: crate::abstract_layer::DbType,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+        table_prefix: Option<&str>,
+    ) -> String {
+        let dir = match self.direction {
+            OrderDirection::Asc => "ASC",
+            OrderDirection::Desc => "DESC",
+        };
+        let expr_sql = self
+            .expr
+            .as_ref()
+            .map(|expr| expr.to_sql(db_type, param_idx, params, table_prefix))
+            .unwrap_or_else(|| crate::model::quote_column_reference(db_type, &self.column));
+        format!("{} {}", expr_sql, dir)
+    }
 }

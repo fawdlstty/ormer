@@ -48,13 +48,14 @@ pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
 pub use model::{
     ActiveValue, AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
-    DbValue, Embed, EmbedWhere, FromRowValues, FromSingleValue, FromValue, GraphWritable,
-    InsertModel, Insertable, Model, ModelEnum, ModelEnumProvider, NoInclude, PrimaryKey, Relation,
-    RelationHandle, RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection,
-    Row, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, Value, ViewModel,
-    WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
+    DbValue, Embed, EmbedWhere, FieldType, FieldTypeProvider, FromRowValues, FromSingleValue,
+    FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum, ModelEnumProvider,
+    NoInclude, PrimaryKey, Relation, RelationHandle, RelationInfo, RelationKind, RelationPathInfo,
+    RelationQuery, RelationSelection, Row, TableRoute, TableRouteValue, ThroughInfo,
+    ThroughRelation, Value, ViewModel, WritableModel, generate_create_table_sql,
+    generate_create_table_sql_with_name,
 };
-pub use ormer_derive::{DbValue, Embed, InsertModel, Model, ModelEnum, ViewModel};
+pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum, ViewModel, raw};
 pub use query::builder::{
     AgeColumn, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
     FilterQuery, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoArrayValue,
@@ -64,8 +65,8 @@ pub use query::builder::{
     SubqueryParam, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery, from_derived,
 };
 pub use query::expr::{
-    CaseMatchBuilder, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, SqlExpr, TypedExpr,
-    WindowSpecBuilder, case_match, raw, row, value,
+    CaseMatchBuilder, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, RawExpr, RawExprSegment, RawSqlExpr,
+    SqlExpr, TypedExpr, WindowSpecBuilder, case_match, raw, row, value,
 };
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};
 pub use query::insert::{

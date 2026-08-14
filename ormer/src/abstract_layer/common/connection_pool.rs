@@ -57,53 +57,123 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(_) => {
-                let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
-                        DbType::Sqlite,
-                        &refs,
-                        self.conflict.as_ref(),
-                    )?;
-                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+                if common_helpers::auto_increment_column::<I::Model>().is_some() {
+                    let (sql, all_values) =
+                        common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
+                            DbType::Sqlite,
+                            &refs,
+                            self.conflict.as_ref(),
+                        )?;
+                    return Ok(SqlStatement::single(DbType::Sqlite, sql, all_values));
+                }
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    DbType::Sqlite,
+                    &refs,
+                    self.conflict.as_ref(),
+                )?;
+                Ok(SqlStatement::batch(
+                    DbType::Sqlite,
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(_) => {
-                let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
-                        DbType::PostgreSQL,
-                        &refs,
+                if common_helpers::auto_increment_column::<I::Model>().is_some() {
+                    let (sql, all_values) =
+                        common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
+                            DbType::PostgreSQL,
+                            &refs,
+                            self.conflict.as_ref(),
+                        )?;
+                    let rust_types = postgresql_backend::pg_insert_param_rust_types::<I::Model>(
+                        refs.len(),
                         self.conflict.as_ref(),
-                    )?;
-                let rust_types = postgresql_backend::pg_insert_param_rust_types::<I::Model>(
-                    refs.len(),
+                    );
+                    return Ok(SqlStatement::batch(
+                        DbType::PostgreSQL,
+                        vec![
+                            super::SingleSqlStatement::new(sql, all_values)
+                                .with_param_rust_types(rust_types),
+                        ],
+                    ));
+                }
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    DbType::PostgreSQL,
+                    &refs,
                     self.conflict.as_ref(),
-                );
+                )?;
                 Ok(SqlStatement::batch(
                     DbType::PostgreSQL,
-                    vec![
-                        super::SingleSqlStatement::new(sql, all_values)
-                            .with_param_rust_types(rust_types),
-                    ],
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            let rust_types = postgresql_backend::pg_insert_param_rust_types::<
+                                I::Model,
+                            >(
+                                statement.row_count, self.conflict.as_ref()
+                            );
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                                .with_param_rust_types(rust_types)
+                        })
+                        .collect(),
                 ))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(_) => {
-                let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
-                        DbType::MySQL,
-                        &refs,
-                        self.conflict.as_ref(),
-                    )?;
-                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+                if common_helpers::auto_increment_column::<I::Model>().is_some() {
+                    let (sql, all_values) =
+                        common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
+                            DbType::MySQL,
+                            &refs,
+                            self.conflict.as_ref(),
+                        )?;
+                    return Ok(SqlStatement::single(DbType::MySQL, sql, all_values));
+                }
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    DbType::MySQL,
+                    &refs,
+                    self.conflict.as_ref(),
+                )?;
+                Ok(SqlStatement::batch(
+                    DbType::MySQL,
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(_) => {
-                let (sql, all_values) =
-                    common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
-                        DbType::MSSQL,
-                        &refs,
-                        self.conflict.as_ref(),
-                    )?;
-                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+                if common_helpers::auto_increment_column::<I::Model>().is_some() {
+                    let (sql, all_values) =
+                        common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
+                            DbType::MSSQL,
+                            &refs,
+                            self.conflict.as_ref(),
+                        )?;
+                    return Ok(SqlStatement::single(DbType::MSSQL, sql, all_values));
+                }
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    DbType::MSSQL,
+                    &refs,
+                    self.conflict.as_ref(),
+                )?;
+                Ok(SqlStatement::batch(
+                    DbType::MSSQL,
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
             }
         }
     }
@@ -126,53 +196,35 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsert
     }
 
     async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
-        if self
-            .conflict
-            .as_ref()
-            .is_some_and(|conflict| conflict.is_configured())
-        {
-            return match self.pooled_conn.get_connection() {
-                #[cfg(feature = "sqlite")]
-                ConnectionWrapper::Sqlite(db) => {
-                    db.insert(self.models)
-                        .with_conflict(self.conflict)
-                        .execute()
-                        .await
-                }
-                #[cfg(feature = "postgresql")]
-                ConnectionWrapper::PostgreSQL(db) => {
-                    db.insert(self.models)
-                        .with_conflict(self.conflict)
-                        .execute()
-                        .await
-                }
-                #[cfg(feature = "mysql")]
-                ConnectionWrapper::MySQL(db) => {
-                    db.insert(self.models)
-                        .with_conflict(self.conflict)
-                        .execute()
-                        .await
-                }
-                #[cfg(feature = "mssql")]
-                ConnectionWrapper::MSSQL(db) => {
-                    db.insert(self.models)
-                        .with_conflict(self.conflict)
-                        .execute()
-                        .await
-                }
-            };
-        }
-
-        let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::Sqlite(db) => {
+                db.insert(self.models)
+                    .with_conflict(self.conflict)
+                    .execute()
+                    .await
+            }
             #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::PostgreSQL(db) => {
+                db.insert(self.models)
+                    .with_conflict(self.conflict)
+                    .execute()
+                    .await
+            }
             #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::MySQL(db) => {
+                db.insert(self.models)
+                    .with_conflict(self.conflict)
+                    .execute()
+                    .await
+            }
             #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => db.insert_impl::<I::Model>(&refs).await,
+            ConnectionWrapper::MSSQL(db) => {
+                db.insert(self.models)
+                    .with_conflict(self.conflict)
+                    .execute()
+                    .await
+            }
         }
     }
 }

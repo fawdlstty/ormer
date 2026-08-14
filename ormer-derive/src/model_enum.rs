@@ -1,50 +1,29 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Ident};
+use syn::{Data, DeriveInput, Fields, Ident};
 
 pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
+    derive_field_type(input)
+}
+
+pub fn derive_field_type(input: DeriveInput) -> TokenStream {
+    match &input.data {
+        Data::Enum(data_enum) => derive_enum_field_type(&input, data_enum),
+        Data::Struct(data_struct) => derive_tuple_struct_field_type(&input, data_struct),
+        _ => panic!("FieldType can only be derived for enums or single-field tuple structs"),
+    }
+}
+
+fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> TokenStream {
     let name = &input.ident;
-
-    // 确保是枚举类型
-    let variants = match &input.data {
-        Data::Enum(data_enum) => &data_enum.variants,
-        _ => panic!("ModelEnum can only be derived for enums"),
-    };
-
-    // 提取所有变体名称
+    let variants = &data_enum.variants;
     let variant_names: Vec<&Ident> = variants.iter().map(|v| &v.ident).collect();
-
     let variant_names_str: Vec<String> = variant_names.iter().map(|v| v.to_string()).collect();
 
-    // 检测是否为数值枚举（检查 #[repr(i*)] 属性）
-    let is_numeric_enum = input.attrs.iter().any(|attr| {
-        if attr.path().is_ident("repr") {
-            if let syn::Meta::List(list) = &attr.meta {
-                let tokens_str = list.tokens.to_string();
-                tokens_str.starts_with("i") || tokens_str.starts_with("u")
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
+    let repr_integer_type = repr_integer_type(input);
+    let is_numeric_enum = repr_integer_type.is_some();
 
-    let is_i32_repr = input.attrs.iter().any(|attr| {
-        if attr.path().is_ident("repr") {
-            if let syn::Meta::List(list) = &attr.meta {
-                list.tokens.to_string().replace(' ', "") == "i32"
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
-
-    // 生成 From<EnumType> for Value 实现 (用于插入)
     let from_value_impl = if is_numeric_enum {
-        // 数值枚举：转为 Integer
         quote! {
             impl From<#name> for ::ormer::model::Value {
                 fn from(v: #name) -> Self {
@@ -59,7 +38,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
             }
         }
     } else {
-        // 字符串枚举：转为 Text
         let match_arms = variant_names.iter().map(|v| {
             quote! {
                 #name::#v => ::ormer::model::Value::Text(stringify!(#v).to_string()),
@@ -77,9 +55,7 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         }
     };
 
-    // 生成 FromValue for EnumType 实现 (用于读取)
     let from_impl = if is_numeric_enum {
-        // 数值枚举：从 Integer 读取
         let match_arms = variant_names.iter().map(|v| {
             quote! {
                 val if val == #name::#v as i64 => Ok(#name::#v),
@@ -106,7 +82,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
             }
         }
     } else {
-        // 字符串枚举：从 Text 读取
         let match_arms = variant_names.iter().map(|v| {
             let v_str = v.to_string();
             quote! {
@@ -135,10 +110,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         }
     };
 
-    // 为枚举类型本身实现 FromValue (非 Option)
-    // 这已经由上面的 from_impl 实现了
-
-    // 生成 FromRowValues for EnumType 实现
     let from_row_values_impl = quote! {
         impl ::ormer::model::FromRowValues for #name {
             fn from_row_values(values: &[::ormer::model::Value]) -> ::ormer::Result<Self> {
@@ -152,10 +123,10 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         }
     };
 
-    let try_from_i32_impl = if is_i32_repr {
+    let try_from_i32_impl = if let Some(repr_type) = &repr_integer_type {
         let match_arms = variant_names.iter().map(|v| {
             quote! {
-                val if val == #name::#v as i32 => Ok(#name::#v),
+                val if val == #name::#v as #repr_type => Ok(#name::#v),
             }
         });
 
@@ -164,7 +135,16 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                 type Error = ::ormer::OrmerError;
 
                 fn try_from(value: i32) -> ::ormer::Result<Self> {
-                    match value {
+                    let repr_value = <#repr_type as ::core::convert::TryFrom<i32>>::try_from(value)
+                        .map_err(|err| {
+                            ::ormer::ormer_error!(
+                                "Failed to convert numeric value '{}' to {}: {}",
+                                value,
+                                stringify!(#name),
+                                err
+                            )
+                        })?;
+                    match repr_value {
                         #(#match_arms)*
                         _ => Err(::ormer::ormer_error!(
                             "Unknown numeric value '{}' for {}", value, stringify!(#name)
@@ -177,7 +157,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         quote! {}
     };
 
-    // 生成 inherent 方法和 trait 实现
     let name_method = {
         let match_arms_1 = variant_names.iter().map(|v| {
             let v_str = v.to_string();
@@ -200,7 +179,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
             }
         });
 
-        // 为数值枚举生成 from_i64_arms
         let from_i64_arms = if is_numeric_enum {
             variant_names
                 .iter()
@@ -214,7 +192,6 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
             vec![]
         };
 
-        // 生成数值枚举特有方法
         let numeric_enum_methods = if is_numeric_enum {
             quote! {
                 fn as_i64(&self) -> i64 {
@@ -249,7 +226,7 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                 pub const VARIANTS: &'static [&'static str] = &[#(#variant_names_str),*];
             }
 
-            impl ::ormer::model::ModelEnum for #name {
+            impl ::ormer::model::FieldType for #name {
                 const VARIANTS: &'static [&'static str] = &[#(#variant_names_str),*];
 
                 fn name(&self) -> &'static str {
@@ -270,16 +247,12 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
                 #numeric_enum_methods
             }
 
-            impl ::ormer::model::ModelEnumProvider for #name {
+            impl ::ormer::model::FieldTypeProvider for #name {
                 const ENUM_VARIANTS: Option<&'static [&'static str]> = Some(#name::VARIANTS);
                 const DB_VALUE_TYPE: Option<fn(::ormer::DbType) -> &'static str> = None;
             }
         }
     };
-
-    // 注意: 不能生成 From<Option<EnumType>> for Value,
-    // 因为这会违反 orphan rule (Option 和 Value 都不是本地类型)
-    // Option<EnumType> 的转换由通用的 Option<T> 实现处理
 
     quote! {
         #try_from_i32_impl
@@ -288,4 +261,88 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
         #from_row_values_impl
         #name_method
     }
+}
+
+fn repr_integer_type(input: &DeriveInput) -> Option<syn::Type> {
+    for attr in &input.attrs {
+        if !attr.path().is_ident("repr") {
+            continue;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        let tokens = list.tokens.to_string().replace(' ', "");
+        for repr in tokens.split(',') {
+            if matches!(
+                repr,
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+            ) {
+                return syn::parse_str::<syn::Type>(repr).ok();
+            }
+        }
+    }
+    None
+}
+
+fn derive_tuple_struct_field_type(
+    input: &DeriveInput,
+    data_struct: &syn::DataStruct,
+) -> TokenStream {
+    let name = &input.ident;
+    let inner_type = match &data_struct.fields {
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0].ty,
+        _ => panic!("FieldType can only be derived for enums or single-field tuple structs"),
+    };
+    let inner_type_str = normalize_type_string(quote! { #inner_type }.to_string());
+
+    quote! {
+        impl From<#name> for ::ormer::model::Value {
+            fn from(value: #name) -> Self {
+                ::ormer::model::Value::from(value.0)
+            }
+        }
+
+        impl ::ormer::model::FromValue for #name {
+            fn from_value(value: &::ormer::model::Value) -> ::ormer::Result<Self> {
+                <#inner_type as ::ormer::model::FromValue>::from_value(value).map(#name)
+            }
+        }
+
+        impl ::ormer::model::FromRowValues for #name {
+            fn from_row_values(values: &[::ormer::model::Value]) -> ::ormer::Result<Self> {
+                let value = values.first().ok_or_else(|| {
+                    ::ormer::ormer_error!("Expected at least one value for {}", stringify!(#name))
+                })?;
+                <#name as ::ormer::model::FromValue>::from_value(value)
+            }
+        }
+
+        impl ::ormer::model::FieldTypeProvider for #name {
+            const ENUM_VARIANTS: Option<&'static [&'static str]> = None;
+            const DB_VALUE_TYPE: Option<fn(::ormer::DbType) -> &'static str> = None;
+            const RUST_TYPE: Option<&'static str> = Some(#inner_type_str);
+        }
+
+        impl ::ormer::model::FieldType for #name {
+            const VARIANTS: &'static [&'static str] = &[];
+
+            fn name(&self) -> &'static str {
+                stringify!(#name)
+            }
+
+            fn from_name(_name: &str) -> ::ormer::Result<Self> {
+                Err(::ormer::ormer_error!(
+                    "{} is not an enum field type", stringify!(#name)
+                ))
+            }
+        }
+    }
+}
+
+fn normalize_type_string(type_str: String) -> String {
+    type_str
+        .replace(" :: ", "::")
+        .replace(" < ", "<")
+        .replace(" >", ">")
+        .replace(" , ", ",")
 }

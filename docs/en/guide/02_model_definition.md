@@ -257,17 +257,20 @@ let users: Vec<User> = db
 
 All basic types can be wrapped with `Option<T>` for nullable fields.
 
-## Enum Types
+## Field Types
 
 ```rust
-use ormer::{Model, ModelEnum};
+use ormer::{FieldType, Model};
 
-#[derive(Debug, Clone, ModelEnum, PartialEq)]
+#[derive(Debug, Clone, FieldType, PartialEq)]
 enum UserStatus {
     Active,
     Inactive,
     Banned,
 }
+
+#[derive(Debug, Clone, FieldType, PartialEq)]
+pub struct ExceptionType(pub u16);
 
 #[derive(Debug, Model)]
 #[table = "users"]
@@ -275,13 +278,14 @@ struct User {
     #[primary(auto)]
     id: i32,
     status: UserStatus,
+    exception_type: ExceptionType,
     name: String,
 }
 ```
 
-Supports `Option<EnumType>` for nullable enum fields.
+`FieldType` works for enums and single-field tuple struct wrappers. Wrapper types use their inner field type for database columns, so `ExceptionType(pub u16)` is stored as `u16`. Use `Option<FieldType>` for nullable fields.
 
-`ModelEnum` values can also be used with `IN`, comparison, and ordering conditions:
+`FieldType` values can also be used with `IN`, comparison, and ordering conditions:
 
 ```rust
 let active: Vec<User> = db
@@ -291,7 +295,7 @@ let active: Vec<User> = db
     .await?;
 ```
 
-For an existing numeric enum or wrapper type, use `#[data_type(i32)]` instead of deriving `ModelEnum`. A nullable field must use `#[data_type(Option<i32>)]`:
+For an existing numeric enum or wrapper type where you do not want to derive `FieldType`, use `#[data_type(i32)]`. A nullable field must use `#[data_type(Option<i32>)]`:
 
 ```rust
 #[repr(i32)]

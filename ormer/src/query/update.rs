@@ -86,6 +86,18 @@ impl<T> UpdateField<T> {
         }
     }
 
+    pub fn set_expr<E>(&self, expr: E) -> Self
+    where
+        E: crate::query::expr::IntoSqlExpr,
+    {
+        Self {
+            column_name: self.column_name,
+            assigned: true,
+            value: UpdateValue::Expr(UpdateExpr::Sql(expr.into_sql_expr())),
+            _marker: PhantomData,
+        }
+    }
+
     pub fn incoming(&self) -> Self {
         Self {
             column_name: self.column_name,
@@ -170,6 +182,12 @@ impl<T> UpdateField<T> {
             op,
             right: Box::new(UpdateExpr::Value(value.into())),
         });
+    }
+}
+
+impl<T> crate::query::expr::IntoSqlExpr for UpdateField<T> {
+    fn into_sql_expr(self) -> crate::query::expr::SqlExpr {
+        crate::query::expr::SqlExpr::Column(self.column_name.to_string())
     }
 }
 

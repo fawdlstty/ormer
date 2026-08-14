@@ -42,9 +42,10 @@ macro_rules! impl_insert_conflict_methods {
                 self
             }
 
-            pub fn conflict_where<F>(mut self, f: F) -> Self
+            pub fn conflict_where<F, W>(mut self, f: F) -> Self
             where
-                F: FnOnce(<I::Model as $crate::Model>::Where) -> $crate::WhereExpr,
+                F: FnOnce(<I::Model as $crate::Model>::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 self.conflict_mut().target_filter =
                     Some($crate::query::insert::where_expr_to_filter(f(
@@ -65,9 +66,10 @@ macro_rules! impl_insert_conflict_methods {
                 self
             }
 
-            pub fn do_update_if<F>(mut self, f: F) -> Self
+            pub fn do_update_if<F, W>(mut self, f: F) -> Self
             where
-                F: FnOnce(<I::Model as $crate::Model>::Where) -> $crate::WhereExpr,
+                F: FnOnce(<I::Model as $crate::Model>::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 let conflict = self.conflict_mut();
                 conflict.action = Some($crate::query::insert::InsertConflictAction::DoUpdate);
@@ -103,9 +105,10 @@ macro_rules! impl_insert_conflict_methods {
 #[macro_export]
 macro_rules! __ormer_backend_select_methods {
     ($conn_field:ident) => {
-        pub fn filter<F>(self, f: F) -> Self
+        pub fn filter<F, W>(self, f: F) -> Self
         where
-            F: FnOnce(T::Where) -> $crate::WhereExpr,
+            F: FnOnce(T::Where) -> W,
+            W: Into<$crate::WhereExpr>,
         {
             Self {
                 select: self.select.filter(f),
@@ -305,9 +308,10 @@ macro_rules! __ormer_backend_select_methods {
 #[macro_export]
 macro_rules! __ormer_backend_join_methods {
     ($conn_field:ident) => {
-        pub fn filter<F>(self, f: F) -> Self
+        pub fn filter<F, W>(self, f: F) -> Self
         where
-            F: FnOnce(T::Where) -> $crate::WhereExpr,
+            F: FnOnce(T::Where) -> W,
+            W: Into<$crate::WhereExpr>,
         {
             Self {
                 select: self.select.filter(f),
@@ -330,9 +334,10 @@ macro_rules! __ormer_backend_join_methods {
 #[macro_export]
 macro_rules! __ormer_backend_related_methods {
     ($conn_field:ident) => {
-        pub fn filter<F>(self, f: F) -> Self
+        pub fn filter<F, W>(self, f: F) -> Self
         where
-            F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
+            F: FnOnce(T::Where, R::Where) -> W,
+            W: Into<$crate::WhereExpr>,
         {
             Self {
                 select: self.select.filter(f),
@@ -355,9 +360,10 @@ macro_rules! __ormer_backend_related_methods {
 #[macro_export]
 macro_rules! __ormer_backend_multi_table_methods {
     ($conn_field:ident) => {
-        pub fn filter<F>(self, f: F) -> Self
+        pub fn filter<F, W>(self, f: F) -> Self
         where
-            F: FnOnce(T::Where, R1::Where, R2::Where) -> $crate::WhereExpr,
+            F: FnOnce(T::Where, R1::Where, R2::Where) -> W,
+            W: Into<$crate::WhereExpr>,
         {
             Self {
                 select: self.select.filter(f),
@@ -380,9 +386,10 @@ macro_rules! __ormer_backend_multi_table_methods {
 #[macro_export]
 macro_rules! __ormer_backend_four_table_methods {
     ($conn_field:ident) => {
-        pub fn filter<F>(self, f: F) -> Self
+        pub fn filter<F, W>(self, f: F) -> Self
         where
-            F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> $crate::WhereExpr,
+            F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> W,
+            W: Into<$crate::WhereExpr>,
         {
             Self {
                 select: self.select.filter(f),
@@ -480,9 +487,10 @@ macro_rules! impl_executor_methods {
 macro_rules! impl_unified_select_executor_methods {
     ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
+            pub fn filter<F, W>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
+                F: FnOnce(T::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -870,9 +878,10 @@ macro_rules! impl_unified_select_executor_methods {
 macro_rules! impl_unified_delete_executor {
     ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
+            pub fn filter<F, W>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
+                F: FnOnce(T::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -1002,9 +1011,10 @@ macro_rules! impl_unified_delete_executor {
 macro_rules! impl_unified_update_executor {
     ($executor_name:ident) => {
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
-            pub fn filter<F>(self, f: F) -> Self
+            pub fn filter<F, W>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
+                F: FnOnce(T::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -1274,9 +1284,10 @@ macro_rules! impl_unified_aggregate_future {
 macro_rules! impl_unified_join_executor {
     ($executor_name:ident) => {
         impl<'a, T: $crate::Model, J: $crate::Model> $executor_name<'a, T, J> {
-            pub fn filter<F>(self, f: F) -> Self
+            pub fn filter<F, W>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where) -> $crate::WhereExpr,
+                F: FnOnce(T::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -1347,9 +1358,10 @@ macro_rules! impl_unified_join_collect_future {
 macro_rules! impl_unified_related_select_executor {
     ($executor_name:ident) => {
         impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> $executor_name<'a, T, R> {
-            pub fn filter<F>(self, f: F) -> Self
+            pub fn filter<F, W>(self, f: F) -> Self
             where
-                F: FnOnce(T::Where, R::Where) -> $crate::WhereExpr,
+                F: FnOnce(T::Where, R::Where) -> W,
+                W: Into<$crate::WhereExpr>,
             {
                 match self {
                     #[cfg(feature = "sqlite")]
