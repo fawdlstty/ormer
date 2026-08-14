@@ -7,7 +7,7 @@ English | [简体中文](README.zh.md)
 
 A minimalist ORM framework that supports SQLite, PostgreSQL, MySQL, and SqlServer.
 
-It also includes raw SQL parameter binding, relation loading, typed derived tables, model filters, dynamic table routing, hooks, and versioned migration support.
+It also includes raw SQL parameter binding, relation loading, object graph writes, embedded value objects, decimal types, typed derived tables, model filters, dynamic table routing, hooks, and versioned migration support.
 
 [Online Documentation](https://ormer.fawdlstty.com/en/)
 

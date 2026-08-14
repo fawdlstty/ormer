@@ -125,6 +125,28 @@ macro_rules! __ormer_backend_select_methods {
             }
         }
 
+        pub(crate) fn with_context_filters(
+            self,
+            filters: Vec<$crate::query::builder::ContextFilter>,
+        ) -> Self {
+            Self {
+                select: self.select.with_context_filters(filters),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn without_filter(self, name: &'static str) -> Self {
+            Self {
+                select: $crate::query::builder::WithoutFilterQuery::<T>::without_filter(
+                    self.select,
+                    name,
+                ),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn filter_dynamic<F>(self, f: F) -> Self
         where
             F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::WhereExpr,
@@ -495,6 +517,47 @@ macro_rules! impl_unified_select_executor_methods {
                 }
             }
 
+            pub(crate) fn with_context_filters(
+                self,
+                filters: Vec<$crate::query::builder::ContextFilter>,
+            ) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.with_context_filters(filters))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.with_context_filters(filters))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => {
+                        $executor_name::MySQL(exec.with_context_filters(filters))
+                    }
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => {
+                        $executor_name::MSSQL(exec.with_context_filters(filters))
+                    }
+                }
+            }
+
+            pub fn without_filter(self, name: &'static str) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec) => {
+                        $executor_name::Sqlite(exec.without_filter(name))
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.without_filter(name))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.without_filter(name)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.without_filter(name)),
+                }
+            }
+
             pub fn filter_dynamic<F>(self, f: F) -> Self
             where
                 F: FnOnce($crate::query::builder::DynamicColumnSet<T>) -> $crate::WhereExpr,
@@ -825,6 +888,23 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
+            pub fn model(self, model: &T) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(exec, phantom) => {
+                        $executor_name::Sqlite(exec.model(model), phantom)
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => {
+                        $executor_name::PostgreSQL(exec.model(model))
+                    }
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(exec) => $executor_name::MySQL(exec.model(model)),
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.model(model)),
+                }
+            }
+
             pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -862,7 +942,7 @@ macro_rules! impl_unified_delete_executor {
             {
                 let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete);
                 $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
-                let affected = self.execute().await?;
+                let affected = self.model(model).execute().await?;
                 if affected > 0 {
                     $crate::AfterDelete::after_delete(model, &mut ctx).await?;
                 }

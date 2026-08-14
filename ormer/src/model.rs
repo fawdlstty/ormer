@@ -2,10 +2,140 @@ use crate::time::{naive_local_to_utc, utc_to_naive_local};
 use std::any::Any;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::{Mutex, OnceLock};
 
 pub type RustDecimal = rust_decimal::Decimal;
 
 pub type BigDecimal = bigdecimal::BigDecimal;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionInfo {
+    pub column: &'static str,
+    pub rust_type: &'static str,
+    pub initial: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VersionSnapshotKey {
+    table: &'static str,
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct VersionObjectKey {
+    table: &'static str,
+    address: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct VersionSnapshotUpdate {
+    key: VersionSnapshotKey,
+    object_key: VersionObjectKey,
+    version: u64,
+}
+
+impl VersionSnapshotUpdate {
+    pub fn apply(&self) {
+        if let Ok(mut snapshots) = version_snapshots().lock() {
+            snapshots.insert(self.key.clone(), self.version);
+        }
+        if let Ok(mut snapshots) = version_object_snapshots().lock() {
+            snapshots.insert(self.object_key, self.version);
+        }
+    }
+}
+
+fn version_snapshots() -> &'static Mutex<HashMap<VersionSnapshotKey, u64>> {
+    static SNAPSHOTS: OnceLock<Mutex<HashMap<VersionSnapshotKey, u64>>> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn version_object_snapshots() -> &'static Mutex<HashMap<VersionObjectKey, u64>> {
+    static SNAPSHOTS: OnceLock<Mutex<HashMap<VersionObjectKey, u64>>> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn version_snapshot_key<T: Model>(model: &T) -> VersionSnapshotKey {
+    let version_column = T::version_info().map(|info| info.column);
+    VersionSnapshotKey {
+        table: T::TABLE_NAME,
+        values: T::columns()
+            .iter()
+            .filter(|column| Some(**column) != version_column)
+            .filter_map(|column| model.column_value(column))
+            .map(|value| value.to_table_route_value())
+            .collect(),
+    }
+}
+
+fn version_object_key<T: Model>(model: &T) -> VersionObjectKey {
+    VersionObjectKey {
+        table: T::TABLE_NAME,
+        address: model as *const T as usize,
+    }
+}
+
+pub fn clear_version_snapshots<T: Model>() {
+    if let Ok(mut snapshots) = version_snapshots().lock() {
+        snapshots.retain(|key, _| key.table != T::TABLE_NAME);
+    }
+    if let Ok(mut snapshots) = version_object_snapshots().lock() {
+        snapshots.retain(|key, _| key.table != T::TABLE_NAME);
+    }
+}
+
+pub fn record_version_snapshot<T: Model>(model: &T, version: u64) {
+    if T::version_info().is_none() {
+        return;
+    }
+    let key = version_snapshot_key(model);
+    if let Ok(mut snapshots) = version_snapshots().lock() {
+        snapshots.insert(key, version);
+    }
+    let object_key = version_object_key(model);
+    if let Ok(mut snapshots) = version_object_snapshots().lock() {
+        snapshots.insert(object_key, version);
+    }
+}
+
+pub fn model_version<T: Model>(model: &T) -> u64 {
+    let Some(info) = T::version_info() else {
+        return 0;
+    };
+    let object_key = version_object_key(model);
+    if let Some(version) = version_object_snapshots()
+        .lock()
+        .ok()
+        .and_then(|snapshots| snapshots.get(&object_key).copied())
+    {
+        return version;
+    }
+
+    let key = version_snapshot_key(model);
+    let version = version_snapshots()
+        .lock()
+        .ok()
+        .and_then(|snapshots| snapshots.get(&key).copied())
+        .unwrap_or(info.initial);
+    if let Ok(mut snapshots) = version_object_snapshots().lock() {
+        snapshots.insert(object_key, version);
+    }
+    version
+}
+
+pub fn version_snapshot_update<T: Model>(
+    model: &T,
+    old_version: u64,
+) -> Option<VersionSnapshotUpdate> {
+    if T::version_info().is_none() {
+        return None;
+    }
+    Some(VersionSnapshotUpdate {
+        key: version_snapshot_key(model),
+        object_key: version_object_key(model),
+        version: old_version.saturating_add(1),
+    })
+}
 
 /// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
 pub trait DurationToInterval {
@@ -75,10 +205,11 @@ pub struct ColumnSchema {
     pub foreign_key: Option<ForeignKeyInfo>, // 外键信息
     pub enum_variants: Option<&'static [&'static str]>, // 枚举类型的变体列表
     pub data_type: Option<&'static str>,     // 数据库类型覆盖
-    pub default: Option<ColumnDefault>,      // 数据库端默认值
-    pub check: Option<CheckConstraint>,      // CHECK 约束
+    pub db_value_type: Option<fn(crate::abstract_layer::DbType) -> &'static str>, // 自定义数据库类型
+    pub default: Option<ColumnDefault>,                                           // 数据库端默认值
+    pub check: Option<CheckConstraint>,                                           // CHECK 约束
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
-    pub compress: bool,                      // 是否启用数据库级压缩（PostgreSQL: COMPRESSION pglz）
+    pub compress: bool, // 是否启用数据库级压缩（PostgreSQL: COMPRESSION pglz）
 }
 
 /// 字段默认值。
@@ -801,6 +932,7 @@ pub struct EmbedColumnSchema {
     pub is_nullable: bool,
     pub enum_variants: Option<&'static [&'static str]>,
     pub data_type: Option<&'static str>,
+    pub db_value_type: Option<fn(crate::abstract_layer::DbType) -> &'static str>,
 }
 
 pub trait Embed: Sized {
@@ -829,6 +961,16 @@ pub trait DbBackendTypeMapper {
         is_nullable: bool,
         enum_variants: Option<&[&str]>,
     ) -> String;
+}
+
+/// 自定义数据库值类型。
+///
+/// 自定义类型的运行时绑定和解码仍通过已有 `Value` 分支完成；`db_type`
+/// 只用于建表 SQL 的后端类型名。
+pub trait DbValue: Sized {
+    fn to_value(&self) -> Value;
+    fn from_value(value: &Value) -> crate::Result<Self>;
+    fn db_type(db_type: crate::abstract_layer::DbType) -> &'static str;
 }
 
 /// 主键 trait - 用于 find_by_id 方法
@@ -976,6 +1118,10 @@ pub trait Model: Sized {
 
     fn column_schema() -> Vec<ColumnSchema> {
         Self::COLUMN_SCHEMA.to_vec()
+    }
+
+    fn version_info() -> Option<VersionInfo> {
+        None
     }
 
     fn query() -> Self::QueryBuilder;
@@ -1248,7 +1394,11 @@ where
 
 pub fn graph_through_infos<Owner, Via, Target>(
     relation_name: &'static str,
-) -> crate::Result<(&'static RelationInfo, &'static RelationInfo, &'static RelationInfo)>
+) -> crate::Result<(
+    &'static RelationInfo,
+    &'static RelationInfo,
+    &'static RelationInfo,
+)>
 where
     Owner: Model,
     Via: Model,
@@ -1332,10 +1482,29 @@ where
     let table = quote_qualified_identifier(db_type, Via::table_name_for_db(db_type));
     let owner_col = quote_identifier(db_type, owner_column);
     let target_col = quote_identifier(db_type, target_column);
+
+    #[cfg(feature = "sqlite")]
+    if matches!(db_type, crate::abstract_layer::DbType::Sqlite) {
+        let exists_sql = format!(
+            "SELECT COUNT(*) FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}"
+        );
+        let exists: Vec<i64> = tx
+            .select_sql(
+                crate::RawSql::new(exists_sql)
+                    .bind(owner_value.clone())
+                    .bind(target_value.clone()),
+            )
+            .collect()
+            .await?;
+        if exists.first().copied().unwrap_or(0) > 0 {
+            return Ok(());
+        }
+    }
+
     let sql = match db_type {
         #[cfg(feature = "sqlite")]
         crate::abstract_layer::DbType::Sqlite => {
-            format!("INSERT OR IGNORE INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
+            format!("INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
         }
         #[cfg(feature = "postgresql")]
         crate::abstract_layer::DbType::PostgreSQL => {
@@ -1353,11 +1522,25 @@ where
              INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})"
         ),
     };
-    let mut raw = crate::RawSql::new(sql).bind(owner_value.clone()).bind(target_value.clone());
-    #[cfg(feature = "mssql")]
-    if matches!(db_type, crate::abstract_layer::DbType::MSSQL) {
-        raw = raw.bind(owner_value).bind(target_value);
-    }
+    let raw = crate::RawSql::new(sql)
+        .bind(owner_value.clone())
+        .bind(target_value.clone());
+    let needs_probe_binds = {
+        #[cfg(feature = "mssql")]
+        {
+            matches!(db_type, crate::abstract_layer::DbType::MSSQL)
+        }
+        #[cfg(not(feature = "mssql"))]
+        {
+            let _ = db_type;
+            false
+        }
+    };
+    let raw = if needs_probe_binds {
+        raw.bind(owner_value).bind(target_value)
+    } else {
+        raw
+    };
     tx.execute_sql(raw).await?;
     Ok(())
 }
@@ -1381,7 +1564,8 @@ where
 
     if target_keys.is_empty() {
         let sql = format!("DELETE FROM {table} WHERE {owner_col} = {{}}");
-        tx.execute_sql(crate::RawSql::new(sql).bind(owner_key)).await?;
+        tx.execute_sql(crate::RawSql::new(sql).bind(owner_key))
+            .await?;
         return Ok(());
     }
 
@@ -1404,10 +1588,15 @@ where
 /// 如果类型实现了此 trait,则会被识别为枚举类型并生成 ENUM SQL
 pub trait ModelEnumProvider {
     const ENUM_VARIANTS: Option<&'static [&'static str]>;
+    const DB_VALUE_TYPE: Option<fn(crate::abstract_layer::DbType) -> &'static str> = None;
 
     /// 获取枚举的所有变体名称
     fn enum_variants() -> Option<&'static [&'static str]> {
         Self::ENUM_VARIANTS
+    }
+
+    fn db_value_type() -> Option<fn(crate::abstract_layer::DbType) -> &'static str> {
+        Self::DB_VALUE_TYPE
     }
 }
 
@@ -1548,6 +1737,8 @@ pub trait ModelEnum: ModelEnumProvider {
 /// 为 `Option<T>` 实现 ModelEnumProvider，透传内部类型的枚举信息
 impl<T: ModelEnumProvider> ModelEnumProvider for Option<T> {
     const ENUM_VARIANTS: Option<&'static [&'static str]> = T::ENUM_VARIANTS;
+    const DB_VALUE_TYPE: Option<fn(crate::abstract_layer::DbType) -> &'static str> =
+        T::DB_VALUE_TYPE;
 }
 
 // 为 Option<T> where T: ModelEnum 实现 From<Option<T>> for Value
@@ -2078,23 +2269,30 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
         let is_composite_primary = primary_key_count > 1;
 
         // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
-        let effective_rust_type = column.data_type.unwrap_or(column.rust_type);
-        let sql_type = if is_composite_primary && column.is_primary {
-            db_type.sql_type(
-                effective_rust_type,
-                false, // 不在列级别标记为主键
-                column.is_auto_increment,
+        let sql_type = if let Some(db_value_type) = column.db_value_type {
+            crate::abstract_layer::common::common_helpers::sql_type_with_nullability(
+                db_value_type(db_type),
                 column.is_nullable,
-                column.enum_variants,
             )
         } else {
-            db_type.sql_type(
-                effective_rust_type,
-                column.is_primary,
-                column.is_auto_increment,
-                column.is_nullable,
-                column.enum_variants,
-            )
+            let effective_rust_type = column.data_type.unwrap_or(column.rust_type);
+            if is_composite_primary && column.is_primary {
+                db_type.sql_type(
+                    effective_rust_type,
+                    false, // 不在列级别标记为主键
+                    column.is_auto_increment,
+                    column.is_nullable,
+                    column.enum_variants,
+                )
+            } else {
+                db_type.sql_type(
+                    effective_rust_type,
+                    column.is_primary,
+                    column.is_auto_increment,
+                    column.is_nullable,
+                    column.enum_variants,
+                )
+            }
         };
 
         // 添加压缩属性（仅 PostgreSQL 支持，且必须在 NOT NULL 之前）
@@ -2498,6 +2696,12 @@ pub trait FromValue: Sized {
     fn from_value(value: &Value) -> crate::Result<Self>;
 }
 
+impl FromValue for Value {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        Ok(value.clone())
+    }
+}
+
 pub fn downcast_relation_vec_as<Concrete: Model + 'static, Target: Model + 'static>(
     values: Vec<Target>,
 ) -> crate::Result<Vec<Concrete>> {
@@ -2703,6 +2907,7 @@ macro_rules! impl_from_value_for {
 impl_from_value_for!(
     i32 => Integer,
     i64 => Integer,
+    u64 => Integer,
     usize => Integer,
 );
 
@@ -2722,6 +2927,7 @@ macro_rules! impl_from_row_values_single {
 impl_from_row_values_single!(
     i32 => "i32",
     i64 => "i64",
+    u64 => "u64",
     usize => "usize",
     std::time::Duration => "Duration",
     f64 => "f64",
@@ -2738,6 +2944,7 @@ impl_from_row_values_single!(
     chrono::NaiveDateTime => "NaiveDateTime",
     chrono::NaiveDate => "NaiveDate",
     chrono::NaiveTime => "NaiveTime",
+    serde_json::Value => "serde_json::Value",
 );
 
 impl FromValue for std::time::Duration {
@@ -3008,6 +3215,7 @@ macro_rules! impl_from_for_value {
 impl_from_for_value!(
     i32 => Integer,
     i64 => Integer,
+    u64 => Integer,
 );
 
 // f64 特殊处理
@@ -3068,6 +3276,7 @@ macro_rules! impl_from_option_for_value {
 impl_from_option_for_value!(
     i32 => |value| Value::Integer(value as i64),
     i64 => |value| Value::Integer(value as i64),
+    u64 => |value| Value::Integer(value as i64),
     String => |value| Value::Text(value),
     bool => |value| Value::Boolean(value),
     std::time::Duration => |value| Value::Duration(value),

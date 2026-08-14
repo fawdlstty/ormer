@@ -329,6 +329,15 @@ impl FilterFormatter {
                 sql.push_str(&expr_sql);
                 sql.push_str(" IS NOT NULL");
             }
+            FilterExpr::ExprPredicate { expr } => {
+                let expr_sql = expr.to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    self.table_prefix.as_deref(),
+                );
+                sql.push_str(&expr_sql);
+            }
             FilterExpr::TextSearch { expr, query } => {
                 use std::fmt::Write;
                 let expr_sql = expr.to_sql(

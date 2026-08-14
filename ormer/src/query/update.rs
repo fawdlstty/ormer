@@ -18,6 +18,7 @@ pub enum UpdateExpr {
         op: UpdateBinaryOp,
         right: Box<UpdateExpr>,
     },
+    Sql(crate::query::expr::SqlExpr),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +91,60 @@ impl<T> UpdateField<T> {
             column_name: self.column_name,
             assigned: true,
             value: UpdateValue::Expr(UpdateExpr::IncomingColumn(self.column_name.to_string())),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn json_set<V>(&self, path: impl crate::query::builder::IntoJsonPath, value: V) -> Self
+    where
+        V: Into<Value>,
+    {
+        Self {
+            column_name: self.column_name,
+            assigned: true,
+            value: UpdateValue::Expr(UpdateExpr::Sql(crate::query::expr::SqlExpr::JsonSet {
+                expr: Box::new(crate::query::expr::SqlExpr::Column(
+                    self.column_name.to_string(),
+                )),
+                path: path.into_json_path(),
+                value: Box::new(crate::query::expr::SqlExpr::Value(value.into())),
+            })),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn array_append<V>(&self, value: V) -> Self
+    where
+        V: Into<Value>,
+    {
+        Self {
+            column_name: self.column_name,
+            assigned: true,
+            value: UpdateValue::Expr(UpdateExpr::Sql(crate::query::expr::SqlExpr::Function {
+                name: "array_append",
+                args: vec![
+                    crate::query::expr::SqlExpr::Column(self.column_name.to_string()),
+                    crate::query::expr::SqlExpr::Value(value.into()),
+                ],
+            })),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn array_remove<V>(&self, value: V) -> Self
+    where
+        V: Into<Value>,
+    {
+        Self {
+            column_name: self.column_name,
+            assigned: true,
+            value: UpdateValue::Expr(UpdateExpr::Sql(crate::query::expr::SqlExpr::Function {
+                name: "array_remove",
+                args: vec![
+                    crate::query::expr::SqlExpr::Column(self.column_name.to_string()),
+                    crate::query::expr::SqlExpr::Value(value.into()),
+                ],
+            })),
             _marker: PhantomData,
         }
     }

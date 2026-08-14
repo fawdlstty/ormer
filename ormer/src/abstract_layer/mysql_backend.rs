@@ -27,7 +27,7 @@ use mysql_async::prelude::*;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
+type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
 
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::MySQL)
@@ -1012,6 +1012,7 @@ impl Database {
     pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
+            versioned: false,
             pool: &self.pool,
             _marker: PhantomData,
         }
@@ -1437,6 +1438,7 @@ impl<'a> Transaction<'a> {
     pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
+            versioned: false,
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -1723,7 +1725,7 @@ impl_backend_executor_methods!(SelectExecutor, pool, &'a Pool, Select);
 impl<'a, T: Model> SelectExecutor<'a, T> {
     pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         SelectExecutor {
-            select: Select::new(),
+            select: Select::new().with_context_filters(self.select.context_filters()),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2125,6 +2127,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 /// Delete 执行器
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
+    versioned: bool,
     pool: &'a Pool,
     _marker: PhantomData<T>,
 }
@@ -2143,7 +2146,17 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let (sql, params) = self.build_sql_with_params();
-        Ok(SqlStatement::single(DbType::MySQL, sql, params))
+        Ok(SqlStatement::batch(
+            DbType::MySQL,
+            vec![SingleSqlStatement::new(sql, params).with_optimistic_lock(self.versioned, None)],
+        ))
+    }
+
+    pub fn model(mut self, model: &T) -> Self {
+        self.filters
+            .extend(common_helpers::model_delete_filters(model));
+        self.versioned = T::version_info().is_some();
+        self
     }
 
     /// 执行删除操作并返回影响的行数
@@ -2158,30 +2171,8 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!(
-            "DELETE FROM {}",
-            common_helpers::quote_table_name::<T>(DbType::MySQL)
-        );
-        let mut params = Vec::new();
-
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx: usize = 1;
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let _ = common_helpers::format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    DbType::MySQL,
-                );
-            }
-        }
-
-        (sql, params)
+        common_helpers::build_delete_sql::<T>(DbType::MySQL, &self.filters)
+            .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 }
 
@@ -2201,7 +2192,11 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
         let mysql_params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
         conn.exec_drop(&statement.sql, mysql_params).trace().await?;
-        Ok(conn.affected_rows())
+        let affected = conn.affected_rows();
+        if statement.versioned && affected == 0 {
+            return Err(common_helpers::optimistic_lock_conflict::<T>());
+        }
+        Ok(affected)
     }
 }
 
@@ -2255,46 +2250,15 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     /// db.update::<User>().set_model(&user).execute().await?;
     /// ```
     pub fn set_model(mut self, model: &T) -> Self {
-        let mut model_sets = Vec::new();
-        for (col_name, value) in model.non_pk_field_values() {
-            model_sets.push((col_name.to_string(), value));
+        if let Some(plan) = common_helpers::model_update_plan(model, None) {
+            self.model_updates.push(plan);
         }
-        let pk_columns = T::primary_key_columns();
-        let pk_values = model.primary_key_values();
-        let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values) {
-            let filter_val =
-                crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
-            model_filters.push(crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: filter_val,
-            });
-        }
-        self.model_updates.push((model_sets, model_filters));
         self
     }
 
     pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
-        let model_sets = model
-            .non_pk_field_values_for_columns(fields)
-            .into_iter()
-            .map(|(col_name, value)| (col_name.to_string(), value))
-            .collect::<Vec<_>>();
-        let pk_columns = T::primary_key_columns();
-        let pk_values = model.primary_key_values();
-        let model_filters = pk_columns
-            .iter()
-            .zip(pk_values)
-            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: crate::abstract_layer::common::common_helpers::value_to_filter_value(&val),
-            })
-            .collect();
-
-        if !model_sets.is_empty() {
-            self.model_updates.push((model_sets, model_filters));
+        if let Some(plan) = common_helpers::model_update_plan(model, Some(fields)) {
+            self.model_updates.push(plan);
         }
         self
     }
@@ -2305,7 +2269,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             DbType::MySQL,
             statements
                 .into_iter()
-                .map(|(sql, params)| SingleSqlStatement::new(sql, params))
+                .map(|statement| {
+                    SingleSqlStatement::new(statement.sql, statement.params)
+                        .with_optimistic_lock(statement.versioned, statement.version_update)
+                })
                 .collect(),
         ))
     }
@@ -2321,84 +2288,27 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
         ))
     }
 
-    fn build_all_sql(&self) -> crate::Result<Vec<(String, Vec<crate::model::Value>)>> {
+    fn build_all_sql(&self) -> crate::Result<Vec<common_helpers::ModelSqlStatement>> {
         let mut statements = Vec::new();
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!(
-                "UPDATE {} SET ",
-                common_helpers::quote_table_name::<T>(DbType::MySQL)
-            );
-            let mut params = Vec::new();
-            let mut first = true;
-            for assignment in &self.sets {
-                if !first {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&common_helpers::format_update_assignment(
-                    DbType::MySQL,
-                    assignment,
-                    &mut params,
-                ));
-                first = false;
-            }
-            if !self.filters.is_empty() {
-                sql.push_str(" WHERE ");
-                let mut param_idx = params.len() + 1;
-                for (i, filter) in self.filters.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(" AND ");
-                    }
-                    let _ = common_helpers::format_filter_with_params(
-                        filter,
-                        &mut sql,
-                        &mut param_idx,
-                        &mut params,
-                        DbType::MySQL,
-                    );
-                }
-            }
-            statements.push((sql, params));
+            let (sql, params) =
+                common_helpers::build_update_sql::<T>(DbType::MySQL, &self.sets, &self.filters)?;
+            statements.push(common_helpers::ModelSqlStatement {
+                sql,
+                params,
+                versioned: false,
+                version_update: None,
+            });
         }
 
         // Model UPDATE statements
-        for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!(
-                "UPDATE {} SET ",
-                common_helpers::quote_table_name::<T>(DbType::MySQL)
-            );
-            let mut params = Vec::new();
-            let mut first = true;
-            for (col_name, value) in model_sets {
-                if !first {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&common_helpers::quote_assignment(
-                    DbType::MySQL,
-                    col_name,
-                    "?",
-                ));
-                params.push(value.clone());
-                first = false;
-            }
-            if !model_filters.is_empty() {
-                sql.push_str(" WHERE ");
-                let mut param_idx = params.len() + 1;
-                for (i, filter) in model_filters.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(" AND ");
-                    }
-                    let _ = common_helpers::format_filter_with_params(
-                        filter,
-                        &mut sql,
-                        &mut param_idx,
-                        &mut params,
-                        DbType::MySQL,
-                    );
-                }
-            }
-            statements.push((sql, params));
+        for plan in &self.model_updates {
+            statements.push(common_helpers::build_model_update_sql::<T>(
+                DbType::MySQL,
+                plan,
+            )?);
         }
 
         Ok(statements)
@@ -2418,7 +2328,16 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
         for statement in &sql.statements {
             let mysql_params = values_to_params(&statement.params)?;
             let result = conn.exec_iter(&statement.sql, mysql_params).trace().await?;
-            total += result.affected_rows();
+            let affected = result.affected_rows();
+            if statement.versioned && affected == 0 {
+                return Err(common_helpers::optimistic_lock_conflict::<T>());
+            }
+            if affected > 0 {
+                if let Some(update) = &statement.version_update {
+                    update.apply();
+                }
+            }
+            total += affected;
         }
         Ok(total)
     }

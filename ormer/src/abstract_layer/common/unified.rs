@@ -9,14 +9,52 @@ use crate::model::{
     RelationSelection, TableRouteValue, ThroughRelation, Value, WritableModel,
     normalize_table_name_for_db,
 };
-use crate::query::builder::{DerivedSelect, DerivedTableSelect};
-use crate::query::builder::{FilterQuery, WhereExpr};
+use crate::query::builder::{ContextFilter, DerivedSelect, DerivedTableSelect};
+use crate::query::builder::{FilterQuery, NamedFilterQuery, WhereExpr, WithoutFilterQuery};
 use crate::query::filter::FilterExpr;
 use crate::query::insert::{IntoInsertAssignment, IntoInsertDefaultColumn};
 use crate::raw_sql::{IntoRawSql, RawSql};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub type TransactionFuture<'a, R> = Pin<Box<dyn Future<Output = crate::Result<R>> + Send + 'a>>;
+
+static SAVEPOINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransactionOptions {
+    pub isolation: Option<IsolationLevel>,
+    pub read_only: bool,
+}
+
+impl TransactionOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn isolation(mut self, isolation: IsolationLevel) -> Self {
+        self.isolation = Some(isolation);
+        self
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
+    }
+
+    pub fn serializable() -> Self {
+        Self::new().isolation(IsolationLevel::Serializable)
+    }
+}
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
@@ -65,7 +103,9 @@ fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value
         .collect()
 }
 
-fn primary_key_filter<T: Model>(key: impl crate::model::PrimaryKey) -> crate::Result<WhereExpr> {
+pub(crate) fn primary_key_filter<T: Model>(
+    key: impl crate::model::PrimaryKey,
+) -> crate::Result<WhereExpr> {
     let pk_columns = T::primary_key_columns();
     let pk_values = key.into_values();
 
@@ -105,7 +145,7 @@ fn primary_key_filter<T: Model>(key: impl crate::model::PrimaryKey) -> crate::Re
     Ok(WhereExpr::from_filter(filter))
 }
 
-fn relation_owner_key(path: RelationPathInfo) -> &'static RelationInfo {
+pub(crate) fn relation_owner_key(path: RelationPathInfo) -> &'static RelationInfo {
     match path {
         RelationPathInfo::Direct { relation } => relation,
         RelationPathInfo::Through { via_relation, .. } => via_relation,
@@ -389,11 +429,117 @@ impl ReplicatedDatabase {
         let index = self.next_read.fetch_add(1, Ordering::Relaxed) % self.reads.len();
         &self.reads[index]
     }
+
+    pub fn scope(&self) -> DatabaseScope<'_> {
+        self.write().scope()
+    }
+
+    pub async fn transaction<R, F>(&self, f: F) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
+    {
+        self.write.transaction(f).await
+    }
+
+    pub async fn transaction_opts<R, F>(
+        &self,
+        options: TransactionOptions,
+        f: F,
+    ) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
+    {
+        self.write.transaction_opts(options, f).await
+    }
 }
 
 pub struct DerivedTableSelectExecutor<'a, R: Model> {
     db: &'a Database,
     select: DerivedTableSelect<R>,
+}
+
+#[derive(Clone)]
+pub struct DatabaseScope<'a> {
+    db: &'a Database,
+    context_filters: Vec<ContextFilter>,
+}
+
+impl<'a> DatabaseScope<'a> {
+    pub fn select<T: Model>(&self) -> SelectExecutor<'a, T> {
+        self.db
+            .select::<T>()
+            .with_context_filters(self.context_filters.clone())
+    }
+
+    pub async fn find_by_id<T: Model + 'static + Send + Sync>(
+        &self,
+        key: impl crate::model::PrimaryKey,
+    ) -> crate::Result<Option<T>> {
+        let where_expr = primary_key_filter::<T>(key)?;
+        let results = self
+            .select::<T>()
+            .filter(|_| where_expr)
+            .range(..1)
+            .collect::<Vec<T>>()
+            .await?;
+        Ok(results.into_iter().next())
+    }
+
+    pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+        &self,
+        owner: &T,
+        relation: S,
+    ) -> crate::Result<Vec<S::Target>>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+    {
+        let path = relation.path_info()?;
+        let key = owner.relation_key_value(relation_owner_key(path))?;
+        self.select::<T>()
+            .select_related_with_selection(vec![key], &relation)
+            .await
+    }
+
+    pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+        &self,
+        owners: &mut [T],
+        relation: S,
+    ) -> crate::Result<()>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+    {
+        self.select::<T>()
+            .preload_models_with_selection(owners, relation)
+            .await
+    }
+
+    pub fn delete<T: WritableModel>(&self) -> ScopedDeleteExecutor<'a, T> {
+        ScopedDeleteExecutor {
+            inner: self.db.delete::<T>(),
+            context_filters: self.context_filters.clone(),
+            disabled_filters: Vec::new(),
+        }
+    }
+
+    pub fn update<T: WritableModel>(&self) -> ScopedUpdateExecutor<'a, T> {
+        ScopedUpdateExecutor {
+            inner: self.db.update::<T>(),
+            context_filters: self.context_filters.clone(),
+            disabled_filters: Vec::new(),
+        }
+    }
+}
+
+impl<'a, T: Model> NamedFilterQuery<T> for DatabaseScope<'a> {
+    fn apply_named_filter(mut self, name: &'static str, expr: WhereExpr) -> Self {
+        self.context_filters
+            .push(ContextFilter::new::<T>(name, expr));
+        self
+    }
 }
 
 /// 统一的 CreateTableExecutor 枚举
@@ -465,7 +611,9 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             CreateTableExecutor::MSSQL(exec) => exec.execute().await,
-        }
+        }?;
+        crate::model::clear_version_snapshots::<T>();
+        Ok(())
     }
 }
 
@@ -505,7 +653,9 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
             DropTableExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             DropTableExecutor::MSSQL(exec) => exec.execute().await,
-        }
+        }?;
+        crate::model::clear_version_snapshots::<T>();
+        Ok(())
     }
 }
 
@@ -1142,6 +1292,13 @@ impl Database {
         }
     }
 
+    pub fn scope(&self) -> DatabaseScope<'_> {
+        DatabaseScope {
+            db: self,
+            context_filters: Vec::new(),
+        }
+    }
+
     pub fn from_derived<R: Model>(
         &self,
         derived: DerivedSelect<R>,
@@ -1245,6 +1402,36 @@ impl Database {
             Database::MSSQL(db) => {
                 let txn = db.begin().await?;
                 Ok(Transaction::MSSQL(txn))
+            }
+        }
+    }
+
+    pub async fn transaction<R, F>(&self, f: F) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
+    {
+        self.transaction_opts(TransactionOptions::new(), f).await
+    }
+
+    pub async fn transaction_opts<R, F>(
+        &self,
+        options: TransactionOptions,
+        f: F,
+    ) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
+    {
+        let mut txn = self.begin().await?;
+        apply_transaction_options(&mut txn, options).await?;
+
+        match f(&mut txn).await {
+            Ok(value) => {
+                txn.commit().await?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
             }
         }
     }
@@ -1587,6 +1774,18 @@ impl<'a, T: Model> FilterQuery<T> for SelectExecutor<'a, T> {
     }
 }
 
+impl<'a, T: Model> NamedFilterQuery<T> for SelectExecutor<'a, T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.append_filter_expr(expr)
+    }
+}
+
+impl<'a, T: Model> WithoutFilterQuery<T> for SelectExecutor<'a, T> {
+    fn without_filter(self, name: &'static str) -> Self {
+        SelectExecutor::without_filter(self, name)
+    }
+}
+
 impl<'a, T: Model> SelectExecutor<'a, T> {
     fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         match self {
@@ -1629,7 +1828,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    async fn select_related_with_selection<S>(
+    pub(crate) async fn select_related_with_selection<S>(
         &self,
         keys: Vec<Value>,
         selection: &S,
@@ -1731,7 +1930,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             .await
     }
 
-    async fn preload_models_with_selection<S>(
+    pub(crate) async fn preload_models_with_selection<S>(
         &self,
         owners: &mut [T],
         selection: S,
@@ -2223,6 +2422,33 @@ pub enum DeleteExecutor<'a, T: Model> {
 
 crate::impl_unified_delete_executor!(DeleteExecutor);
 
+impl<'a, T: Model> NamedFilterQuery<T> for DeleteExecutor<'a, T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<'a, T: Model> super::SqlExecutor for DeleteExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        DeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            DeleteExecutor::Sqlite(exec, _) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "postgresql")]
+            DeleteExecutor::PostgreSQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "mysql")]
+            DeleteExecutor::MySQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "mssql")]
+            DeleteExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
+        }
+    }
+}
+
 /// 统一的 UpdateExecutor 枚举
 pub enum UpdateExecutor<'a, T: Model> {
     #[cfg(feature = "sqlite")]
@@ -2239,6 +2465,224 @@ pub enum UpdateExecutor<'a, T: Model> {
 }
 
 crate::impl_unified_update_executor!(UpdateExecutor);
+
+impl<'a, T: Model> NamedFilterQuery<T> for UpdateExecutor<'a, T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<'a, T: Model> super::SqlExecutor for UpdateExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        UpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            UpdateExecutor::Sqlite(exec, _) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "postgresql")]
+            UpdateExecutor::PostgreSQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "mysql")]
+            UpdateExecutor::MySQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "mssql")]
+            UpdateExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
+        }
+    }
+}
+
+pub struct ScopedDeleteExecutor<'a, T: Model> {
+    pub(crate) inner: DeleteExecutor<'a, T>,
+    pub(crate) context_filters: Vec<ContextFilter>,
+    pub(crate) disabled_filters: Vec<&'static str>,
+}
+
+pub struct ScopedUpdateExecutor<'a, T: Model> {
+    pub(crate) inner: UpdateExecutor<'a, T>,
+    pub(crate) context_filters: Vec<ContextFilter>,
+    pub(crate) disabled_filters: Vec<&'static str>,
+}
+
+fn scoped_filter_exprs<T: Model>(
+    context_filters: &[ContextFilter],
+    disabled_filters: &[&'static str],
+) -> Vec<FilterExpr> {
+    context_filters
+        .iter()
+        .filter(|filter| !disabled_filters.iter().any(|name| *name == filter.name()))
+        .filter_map(ContextFilter::filter_for::<T>)
+        .collect()
+}
+
+fn append_scoped_filters<T: Model>(
+    statement: &mut SqlStatement,
+    context_filters: &[ContextFilter],
+    disabled_filters: &[&'static str],
+) -> crate::Result<()> {
+    let filters = scoped_filter_exprs::<T>(context_filters, disabled_filters);
+    if filters.is_empty() {
+        return Ok(());
+    }
+
+    for single in &mut statement.statements {
+        if single.sql.contains(" WHERE ") {
+            single.sql.push_str(" AND ");
+        } else {
+            single.sql.push_str(" WHERE ");
+        }
+        let mut param_idx = single.params.len() + 1;
+        for (index, filter) in filters.iter().enumerate() {
+            if index > 0 {
+                single.sql.push_str(" AND ");
+            }
+            common_helpers::format_filter_with_params(
+                filter,
+                &mut single.sql,
+                &mut param_idx,
+                &mut single.params,
+                statement.db_type,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+impl<'a, T: Model> ScopedDeleteExecutor<'a, T> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        self.inner = self.inner.filter(f);
+        self
+    }
+
+    pub fn model(mut self, model: &T) -> Self {
+        self.inner = self.inner.model(model);
+        self
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let mut statement = self.inner.to_sql()?;
+        append_scoped_filters::<T>(
+            &mut statement,
+            &self.context_filters,
+            &self.disabled_filters,
+        )?;
+        Ok(statement)
+    }
+
+    pub async fn execute(self) -> crate::Result<u64> {
+        <Self as super::SqlExecutor>::execute(self).await
+    }
+
+    pub async fn exec(self) -> crate::Result<u64> {
+        self.execute().await
+    }
+}
+
+impl<'a, T: Model> NamedFilterQuery<T> for ScopedDeleteExecutor<'a, T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<'a, T: Model> WithoutFilterQuery<T> for ScopedDeleteExecutor<'a, T> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        if !self.disabled_filters.iter().any(|item| *item == name) {
+            self.disabled_filters.push(name);
+        }
+        self
+    }
+}
+
+impl<'a, T: Model> super::SqlExecutor for ScopedDeleteExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        ScopedDeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        self.inner.execute_with_sql(sql).await
+    }
+}
+
+impl<'a, T: Model> ScopedUpdateExecutor<'a, T> {
+    pub fn filter<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> WhereExpr,
+    {
+        self.inner = self.inner.filter(f);
+        self
+    }
+
+    pub fn set<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(&mut T::Update),
+    {
+        self.inner = self.inner.set(f);
+        self
+    }
+
+    pub fn set_model<I: crate::model::Insertable<Model = T>>(mut self, models: I) -> Self {
+        self.inner = self.inner.set_model(models);
+        self
+    }
+
+    pub fn set_model_fields<I, F, M>(mut self, models: I, fields_fn: F) -> Self
+    where
+        I: crate::model::Insertable<Model = T>,
+        F: FnOnce(T::Where) -> M,
+        M: crate::query::builder::MapToResult,
+    {
+        self.inner = self.inner.set_model_fields(models, fields_fn);
+        self
+    }
+
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let mut statement = self.inner.to_sql()?;
+        append_scoped_filters::<T>(
+            &mut statement,
+            &self.context_filters,
+            &self.disabled_filters,
+        )?;
+        Ok(statement)
+    }
+
+    pub async fn execute(self) -> crate::Result<u64> {
+        <Self as super::SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: Model> NamedFilterQuery<T> for ScopedUpdateExecutor<'a, T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<'a, T: Model> WithoutFilterQuery<T> for ScopedUpdateExecutor<'a, T> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        if !self.disabled_filters.iter().any(|item| *item == name) {
+            self.disabled_filters.push(name);
+        }
+        self
+    }
+}
+
+impl<'a, T: Model> super::SqlExecutor for ScopedUpdateExecutor<'a, T> {
+    type Output = u64;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        ScopedUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        self.inner.execute_with_sql(sql).await
+    }
+}
 
 /// 统一的 CollectFuture 枚举
 pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
@@ -2753,6 +3197,68 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
     }
 }
 
+#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+fn isolation_level_sql(isolation: IsolationLevel) -> &'static str {
+    match isolation {
+        IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+        IsolationLevel::ReadCommitted => "READ COMMITTED",
+        IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        IsolationLevel::Serializable => "SERIALIZABLE",
+    }
+}
+
+pub(crate) async fn apply_transaction_options(
+    txn: &mut Transaction<'_>,
+    options: TransactionOptions,
+) -> crate::Result<()> {
+    match txn.db_type() {
+        #[cfg(feature = "sqlite")]
+        super::super::DbType::Sqlite => {
+            let _ = options;
+            Ok(())
+        }
+        #[cfg(feature = "postgresql")]
+        super::super::DbType::PostgreSQL => {
+            if let Some(isolation) = options.isolation {
+                txn.execute_sql(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {}",
+                    isolation_level_sql(isolation)
+                ))
+                .await?;
+            }
+            if options.read_only {
+                txn.execute_sql("SET TRANSACTION READ ONLY").await?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "mysql")]
+        super::super::DbType::MySQL => {
+            if let Some(isolation) = options.isolation {
+                txn.execute_sql(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {}",
+                    isolation_level_sql(isolation)
+                ))
+                .await?;
+            }
+            if options.read_only {
+                txn.execute_sql("SET TRANSACTION READ ONLY").await?;
+            }
+            Ok(())
+        }
+        #[cfg(feature = "mssql")]
+        super::super::DbType::MSSQL => {
+            if let Some(isolation) = options.isolation {
+                txn.execute_sql(format!(
+                    "SET TRANSACTION ISOLATION LEVEL {}",
+                    isolation_level_sql(isolation)
+                ))
+                .await?;
+            }
+            Ok(())
+        }
+    }
+}
+
 impl<'a> Transaction<'a> {
     pub fn db_type(&self) -> super::super::DbType {
         match self {
@@ -2803,6 +3309,49 @@ impl<'a> Transaction<'a> {
                 txn.exec_raw(&sql, params).await
             }
             Transaction::_Phantom(_) => unreachable!(),
+        }
+    }
+
+    pub async fn savepoint<R, F>(&mut self, f: F) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(&'tx mut Transaction<'a>) -> TransactionFuture<'tx, R>,
+    {
+        let name = format!(
+            "__ormer_savepoint_{}",
+            SAVEPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        #[cfg(feature = "mssql")]
+        let is_mssql = matches!(self.db_type(), super::super::DbType::MSSQL);
+        #[cfg(not(feature = "mssql"))]
+        let is_mssql = false;
+
+        if is_mssql {
+            self.execute_sql(format!("SAVE TRANSACTION {name}")).await?;
+        } else {
+            self.execute_sql(format!("SAVEPOINT {name}")).await?;
+        }
+
+        match f(self).await {
+            Ok(value) => {
+                if !is_mssql {
+                    self.execute_sql(format!("RELEASE SAVEPOINT {name}"))
+                        .await?;
+                }
+                Ok(value)
+            }
+            Err(err) => {
+                if is_mssql {
+                    let _ = self
+                        .execute_sql(format!("ROLLBACK TRANSACTION {name}"))
+                        .await;
+                } else {
+                    let _ = self
+                        .execute_sql(format!("ROLLBACK TO SAVEPOINT {name}"))
+                        .await;
+                    let _ = self.execute_sql(format!("RELEASE SAVEPOINT {name}")).await;
+                }
+                Err(err)
+            }
         }
     }
 

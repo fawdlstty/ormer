@@ -90,6 +90,22 @@ db.insert_or_update(&vec![user1, user2])
 db.upsert(&user).execute().await?;
 ```
 
+### 对象图插入与更新
+
+`insert_graph` 会在一个事务内先插入根对象，再处理非空关系集合：
+
+```rust
+db.insert_graph(&mut user).execute().await?;
+```
+
+`update_graph` 会更新根对象，并对非空 `has_many`、`has_one`、`through` 关系执行 upsert 或中间表同步：
+
+```rust
+db.update_graph(&mut user).execute().await?;
+```
+
+空 `Vec` 默认表示本次不处理该关系，不会清空已有关系。
+
 ### 可配置插入冲突
 
 在 `insert()` 上指定唯一键冲突目标、更新字段和更新条件：
@@ -221,6 +237,8 @@ db.update::<User>()
     .execute()
     .await?;
 
+// 带 #[version(u64)] 的模型会自动校验版本并递增 version
+
 // 只更新模型中的指定字段，避免覆盖其他列
 db.update::<User>()
     .set_model_fields(&updated_user, |u| (u.name, u.age))
@@ -238,6 +256,12 @@ let count = db
     .await?;
 
 db.delete::<User>().execute().await?;
+
+// 按模型删除；带 #[version(u64)] 时自动追加主键和版本条件
+db.delete::<User>()
+    .model(&user)
+    .execute()
+    .await?;
 ```
 
 ## 表管理

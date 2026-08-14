@@ -1,7 +1,7 @@
 use super::super::DbType;
 use crate::model::{
-    FromRowValues, Model, Row, TableRoute, Value, quote_column_reference, quote_identifier,
-    quote_qualified_identifier, routed_table_name_for_db,
+    FromRowValues, Model, Row, TableRoute, Value, VersionSnapshotUpdate, quote_column_reference,
+    quote_identifier, quote_qualified_identifier, routed_table_name_for_db,
 };
 use crate::query::filter::FilterExpr;
 use crate::query::filter_formatter::FilterFormatter;
@@ -59,6 +59,177 @@ pub fn quote_assignment(db_type: DbType, column: &str, value_sql: &str) -> Strin
     format!("{} = {}", quote_identifier(db_type, column), value_sql)
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelUpdatePlan {
+    pub sets: Vec<(String, Value)>,
+    pub filters: Vec<FilterExpr>,
+    pub version_update: Option<VersionSnapshotUpdate>,
+}
+
+pub type ModelUpdateBatch = Vec<ModelUpdatePlan>;
+
+#[derive(Debug, Clone)]
+pub struct ModelSqlStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+    pub versioned: bool,
+    pub version_update: Option<VersionSnapshotUpdate>,
+}
+
+pub fn model_primary_key_filters<T: Model>(model: &T) -> Vec<FilterExpr> {
+    T::primary_key_columns()
+        .iter()
+        .zip(model.primary_key_values())
+        .map(|(col, val)| FilterExpr::Comparison {
+            column: col.to_string(),
+            operator: "=".to_string(),
+            value: value_to_filter_value(&val),
+        })
+        .collect()
+}
+
+pub fn model_update_plan<T: Model>(
+    model: &T,
+    fields: Option<&[String]>,
+) -> Option<ModelUpdatePlan> {
+    let version_info = T::version_info();
+    let old_version = version_info.map(|_| crate::model::model_version(model));
+    let mut sets = match fields {
+        Some(fields) => model.non_pk_field_values_for_columns(fields),
+        None => model.non_pk_field_values(),
+    }
+    .into_iter()
+    .filter(|(column, _)| {
+        version_info
+            .map(|info| *column != info.column)
+            .unwrap_or(true)
+    })
+    .map(|(column, value)| (column.to_string(), value))
+    .collect::<Vec<_>>();
+
+    if let Some(info) = version_info {
+        let next_version = old_version.unwrap_or(info.initial).saturating_add(1);
+        sets.push((info.column.to_string(), Value::from(next_version)));
+    }
+
+    if sets.is_empty() {
+        return None;
+    }
+
+    let mut filters = model_primary_key_filters(model);
+    let version_update = if let Some(info) = version_info {
+        let old_version = old_version.unwrap_or(info.initial);
+        filters.push(FilterExpr::Comparison {
+            column: info.column.to_string(),
+            operator: "=".to_string(),
+            value: value_to_filter_value(&Value::from(old_version)),
+        });
+        crate::model::version_snapshot_update(model, old_version)
+    } else {
+        None
+    };
+
+    Some(ModelUpdatePlan {
+        sets,
+        filters,
+        version_update,
+    })
+}
+
+pub fn model_delete_filters<T: Model>(model: &T) -> Vec<FilterExpr> {
+    let mut filters = model_primary_key_filters(model);
+    if let Some(info) = T::version_info() {
+        let version = crate::model::model_version(model);
+        filters.push(FilterExpr::Comparison {
+            column: info.column.to_string(),
+            operator: "=".to_string(),
+            value: value_to_filter_value(&Value::from(version)),
+        });
+    }
+    filters
+}
+
+pub fn push_filters_sql(
+    db_type: DbType,
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    filters: &[FilterExpr],
+) -> crate::Result<()> {
+    if filters.is_empty() {
+        return Ok(());
+    }
+    sql.push_str(" WHERE ");
+    let mut param_idx = params.len() + 1;
+    for (i, filter) in filters.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(" AND ");
+        }
+        format_filter_with_params(filter, sql, &mut param_idx, params, db_type)?;
+    }
+    Ok(())
+}
+
+pub fn build_delete_sql<T: Model>(
+    db_type: DbType,
+    filters: &[FilterExpr],
+) -> crate::Result<(String, Vec<Value>)> {
+    let mut sql = format!("DELETE FROM {}", quote_table_name::<T>(db_type));
+    let mut params = Vec::new();
+    push_filters_sql(db_type, &mut sql, &mut params, filters)?;
+    Ok((sql, params))
+}
+
+pub fn build_update_sql<T: Model>(
+    db_type: DbType,
+    sets: &[UpdateAssignment],
+    filters: &[FilterExpr],
+) -> crate::Result<(String, Vec<Value>)> {
+    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    let mut params = Vec::new();
+    for (index, assignment) in sets.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&format_update_assignment(db_type, assignment, &mut params));
+    }
+    push_filters_sql(db_type, &mut sql, &mut params, filters)?;
+    Ok((sql, params))
+}
+
+pub fn build_model_update_sql<T: Model>(
+    db_type: DbType,
+    plan: &ModelUpdatePlan,
+) -> crate::Result<ModelSqlStatement> {
+    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    let mut params = Vec::new();
+    for (index, (column, value)) in plan.sets.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_assignment(
+            db_type,
+            column,
+            &placeholder(db_type, params.len() + 1),
+        ));
+        params.push(value.clone());
+    }
+    push_filters_sql(db_type, &mut sql, &mut params, &plan.filters)?;
+    Ok(ModelSqlStatement {
+        sql,
+        params,
+        versioned: plan.version_update.is_some(),
+        version_update: plan.version_update.clone(),
+    })
+}
+
+pub fn optimistic_lock_conflict<T: Model>() -> crate::OrmerError {
+    if let Some(info) = T::version_info() {
+        crate::OrmerError::optimistic_lock(T::TABLE_NAME, info.column)
+    } else {
+        crate::ormer_error!("Optimistic lock conflict on {}", T::TABLE_NAME)
+    }
+}
+
 pub fn format_update_assignment(
     db_type: DbType,
     assignment: &UpdateAssignment,
@@ -92,6 +263,10 @@ fn format_update_expr(db_type: DbType, expr: &UpdateExpr, params: &mut Vec<Value
             op.sql(),
             format_update_expr(db_type, right, params)
         ),
+        UpdateExpr::Sql(expr) => {
+            let mut param_idx = params.len() as i32 + 1;
+            expr.to_sql(db_type, &mut param_idx, params, None)
+        }
     }
 }
 
@@ -140,6 +315,10 @@ fn format_upsert_update_expr(
             op.sql(),
             format_upsert_update_expr(db_type, right, params)
         ),
+        UpdateExpr::Sql(expr) => {
+            let mut param_idx = params.len() as i32 + 1;
+            expr.to_sql(db_type, &mut param_idx, params, None)
+        }
     }
 }
 

@@ -1,3 +1,4 @@
+mod db_value;
 mod model;
 mod model_enum;
 
@@ -23,6 +24,7 @@ use proc_macro::TokenStream;
         through,
         embed,
         filter,
+        version,
         ormer_ignore
     )
 )]
@@ -47,6 +49,12 @@ pub fn derive_view_model(input: TokenStream) -> TokenStream {
 pub fn derive_model_enum(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model_enum::derive_model_enum(input).into()
+}
+
+#[proc_macro_derive(DbValue, attributes(db_type))]
+pub fn derive_db_value(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as syn::DeriveInput);
+    db_value::derive_db_value(input).into()
 }
 
 #[proc_macro_derive(InsertModel, attributes(table, column))]

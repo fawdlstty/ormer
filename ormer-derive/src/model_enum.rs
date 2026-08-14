@@ -272,6 +272,7 @@ pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
 
             impl ::ormer::model::ModelEnumProvider for #name {
                 const ENUM_VARIANTS: Option<&'static [&'static str]> = Some(#name::VARIANTS);
+                const DB_VALUE_TYPE: Option<fn(::ormer::DbType) -> &'static str> = None;
             }
         }
     };

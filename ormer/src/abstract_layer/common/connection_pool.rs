@@ -2,7 +2,8 @@ use super::super::DbType;
 use super::common_helpers;
 use super::{DbExecutor, SqlExecutor, SqlStatement};
 use crate::impl_insert_conflict_methods;
-use crate::model::{FromRowValues, Model, WritableModel};
+use crate::model::{FromRowValues, Model, RelationSelection, WritableModel};
+use crate::query::builder::{ContextFilter, NamedFilterQuery, WhereExpr};
 use crate::query::insert::InsertConflict;
 use crate::raw_sql::{IntoRawSql, RawSql};
 #[cfg(any(feature = "sqlite", feature = "mssql"))]
@@ -28,7 +29,10 @@ use tokio_postgres::NoTls;
     feature = "mysql",
     feature = "mssql"
 ))]
-use super::unified::{CreateTableExecutor, DropTableExecutor};
+use super::unified::{
+    CreateTableExecutor, DropTableExecutor, RelationNestedLoader, ScopedDeleteExecutor,
+    ScopedUpdateExecutor, primary_key_filter, relation_owner_key,
+};
 
 /// 连接池插入执行器
 pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
@@ -972,6 +976,12 @@ pub struct PooledConnection<'a> {
     _marker: PhantomData<&'a ()>,
 }
 
+#[derive(Clone)]
+pub struct PooledDatabaseScope<'a, 'pool> {
+    conn: &'a PooledConnection<'pool>,
+    context_filters: Vec<ContextFilter>,
+}
+
 impl<'a> Drop for PooledConnection<'a> {
     fn drop(&mut self) {
         if let Some(conn) = self.connection.take() {
@@ -1093,6 +1103,13 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
+    pub fn scope(&self) -> PooledDatabaseScope<'_, 'a> {
+        PooledDatabaseScope {
+            conn: self,
+            context_filters: Vec::new(),
+        }
+    }
+
     /// 创建流式查询执行器
     pub fn stream<T: Model>(&self) -> super::unified::SelectStream<'_, T> {
         PooledConnection::select::<T>(self).stream()
@@ -1185,6 +1202,41 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
+    pub async fn transaction<R, F>(&self, f: F) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut super::unified::Transaction<'_>,
+        ) -> super::unified::TransactionFuture<'tx, R>,
+    {
+        self.transaction_opts(super::unified::TransactionOptions::new(), f)
+            .await
+    }
+
+    pub async fn transaction_opts<R, F>(
+        &self,
+        options: super::unified::TransactionOptions,
+        f: F,
+    ) -> crate::Result<R>
+    where
+        F: for<'tx> FnOnce(
+            &'tx mut super::unified::Transaction<'_>,
+        ) -> super::unified::TransactionFuture<'tx, R>,
+    {
+        let mut txn = self.begin().await?;
+        super::unified::apply_transaction_options(&mut txn, options).await?;
+
+        match f(&mut txn).await {
+            Ok(value) => {
+                txn.commit().await?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = txn.rollback().await;
+                Err(err)
+            }
+        }
+    }
+
     /// 删除表 - 返回执行器
     pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         match self.get_connection() {
@@ -1234,6 +1286,84 @@ impl<'a> PooledConnection<'a> {
                 db.exec_raw(&sql, params).await
             }
         }
+    }
+}
+
+impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
+    pub fn select<T: Model>(&self) -> super::unified::SelectExecutor<'_, T> {
+        self.conn
+            .select::<T>()
+            .with_context_filters(self.context_filters.clone())
+    }
+
+    pub async fn find_by_id<T: Model + 'static + Send + Sync>(
+        &self,
+        key: impl crate::model::PrimaryKey,
+    ) -> crate::Result<Option<T>> {
+        let where_expr = primary_key_filter::<T>(key)?;
+        let results = self
+            .select::<T>()
+            .filter(|_| where_expr)
+            .range(..1)
+            .collect::<Vec<T>>()
+            .await?;
+        Ok(results.into_iter().next())
+    }
+
+    pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+        &self,
+        owner: &T,
+        relation: S,
+    ) -> crate::Result<Vec<S::Target>>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+    {
+        let path = relation.path_info()?;
+        let key = owner.relation_key_value(relation_owner_key(path))?;
+        self.select::<T>()
+            .select_related_with_selection(vec![key], &relation)
+            .await
+    }
+
+    pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+        &self,
+        owners: &mut [T],
+        relation: S,
+    ) -> crate::Result<()>
+    where
+        for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
+        S::Target: Send + Sync,
+        S::Via: Send + Sync,
+    {
+        self.select::<T>()
+            .preload_models_with_selection(owners, relation)
+            .await
+    }
+
+    pub fn delete<T: WritableModel>(&self) -> ScopedDeleteExecutor<'_, T> {
+        ScopedDeleteExecutor {
+            inner: self.conn.delete::<T>(),
+            context_filters: self.context_filters.clone(),
+            disabled_filters: Vec::new(),
+        }
+    }
+
+    pub fn update<T: WritableModel>(&self) -> ScopedUpdateExecutor<'_, T> {
+        ScopedUpdateExecutor {
+            inner: self.conn.update::<T>(),
+            context_filters: self.context_filters.clone(),
+            disabled_filters: Vec::new(),
+        }
+    }
+}
+
+impl<'a, 'pool, T: Model> NamedFilterQuery<T> for PooledDatabaseScope<'a, 'pool> {
+    fn apply_named_filter(mut self, name: &'static str, expr: WhereExpr) -> Self {
+        self.context_filters
+            .push(ContextFilter::new::<T>(name, expr));
+        self
     }
 }
 

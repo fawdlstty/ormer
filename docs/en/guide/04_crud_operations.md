@@ -89,6 +89,22 @@ db.insert_or_update(&vec![user1, user2])
 db.upsert(&user).execute().await?;
 ```
 
+### Object Graph Insert and Update
+
+`insert_graph` inserts the root object first, then handles non-empty relation collections in one transaction:
+
+```rust
+db.insert_graph(&mut user).execute().await?;
+```
+
+`update_graph` updates the root object and upserts or synchronizes non-empty `has_many`, `has_one`, and `through` relations:
+
+```rust
+db.update_graph(&mut user).execute().await?;
+```
+
+An empty `Vec` means the relation is not part of this operation; existing relations are not cleared.
+
 ### Configurable Insert Conflict
 
 Use `insert()` when you need a unique-key conflict target, selected update fields, or an update condition:
@@ -220,6 +236,8 @@ db.update::<User>()
     .execute()
     .await?;
 
+// Models with #[version(u64)] automatically check and increment version
+
 // Update only selected model fields without overwriting other columns
 db.update::<User>()
     .set_model_fields(&updated_user, |u| (u.name, u.age))
@@ -237,6 +255,12 @@ let count = db
     .await?;
 
 db.delete::<User>().execute().await?;
+
+// Delete by model; #[version(u64)] adds primary-key and version conditions
+db.delete::<User>()
+    .model(&user)
+    .execute()
+    .await?;
 ```
 
 ## Table Management

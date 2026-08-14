@@ -33,8 +33,8 @@ use std::marker::PhantomData;
 use tokio_postgres::NoTls;
 use tokio_postgres::types::Type;
 
-type ModelUpdateBatch = Vec<(Vec<(String, Value)>, Vec<FilterExpr>)>;
-type UpdateSqlBatch = Vec<(String, Vec<Value>, Vec<&'static str>)>;
+type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
+type UpdateSqlBatch = Vec<(common_helpers::ModelSqlStatement, Vec<&'static str>)>;
 type PostgreSQLParam = Box<dyn ToSql + Sync + Send>;
 
 fn pg_param_refs(params: &[PostgreSQLParam]) -> Vec<&(dyn ToSql + Sync)> {
@@ -167,6 +167,9 @@ fn pg_collect_update_expr_rust_types<T: Model>(
         UpdateExpr::Binary { left, right, .. } => {
             pg_collect_update_expr_rust_types::<T>(column_rust_type, left, rust_types);
             pg_collect_update_expr_rust_types::<T>(column_rust_type, right, rust_types);
+        }
+        UpdateExpr::Sql(expr) => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
     }
 }
@@ -585,6 +588,42 @@ fn pg_model_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
         .iter()
         .find(|schema| schema.name == column)
         .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
+}
+
+fn pg_collect_update_expr_param_rust_types<T: Model>(
+    expr: &UpdateExpr,
+    column: &str,
+    rust_types: &mut Vec<&'static str>,
+) {
+    match expr {
+        UpdateExpr::Column(_) | UpdateExpr::IncomingColumn(_) => {}
+        UpdateExpr::Value(value) => rust_types.push(
+            pg_model_column_rust_type::<T>(column)
+                .unwrap_or_else(|| infer_model_value_rust_type(value)),
+        ),
+        UpdateExpr::Binary { left, right, .. } => {
+            pg_collect_update_expr_param_rust_types::<T>(left, column, rust_types);
+            pg_collect_update_expr_param_rust_types::<T>(right, column, rust_types);
+        }
+        UpdateExpr::Sql(expr) => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+    }
+}
+
+fn pg_collect_update_assignment_param_rust_types<T: Model>(
+    assignment: &UpdateAssignment,
+    rust_types: &mut Vec<&'static str>,
+) {
+    match &assignment.value {
+        UpdateValue::Literal(value) => rust_types.push(
+            pg_model_column_rust_type::<T>(&assignment.column)
+                .unwrap_or_else(|| infer_model_value_rust_type(value)),
+        ),
+        UpdateValue::Expr(expr) => {
+            pg_collect_update_expr_param_rust_types::<T>(expr, &assignment.column, rust_types);
+        }
+    }
 }
 
 fn is_vec_i32_type(rust_type: &str) -> bool {
@@ -1015,6 +1054,9 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         FilterExpr::ExprIsNull { expr } | FilterExpr::ExprIsNotNull { expr } => {
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
+        FilterExpr::ExprPredicate { expr } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
         FilterExpr::TextSearch { expr, .. } => {
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             rust_types.push("String");
@@ -1040,8 +1082,20 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
         }
         SqlExpr::Cast { expr, .. }
         | SqlExpr::Collate { expr, .. }
-        | SqlExpr::JsonText { expr, .. } => {
+        | SqlExpr::JsonText { expr, .. }
+        | SqlExpr::JsonPathText { expr, .. }
+        | SqlExpr::ArrayLen { expr } => {
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        SqlExpr::JsonContains { left, right }
+        | SqlExpr::ArrayContains { left, right }
+        | SqlExpr::ArrayOverlaps { left, right } => {
+            pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        SqlExpr::JsonSet { expr, value, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(value, rust_types);
         }
         SqlExpr::Aggregate {
             expr,
@@ -2227,6 +2281,7 @@ impl Database {
     pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
+            versioned: false,
             client: &self.client,
             _marker: PhantomData,
         }
@@ -2663,6 +2718,7 @@ impl<'a> Transaction<'a> {
     pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<'_, T> {
         DeleteExecutor {
             filters: Vec::new(),
+            versioned: false,
             client: self.client,
             _marker: PhantomData,
         }
@@ -3020,7 +3076,7 @@ impl_backend_executor_methods!(SelectExecutor, client, &'a tokio_postgres::Clien
 impl<'a, T: Model> SelectExecutor<'a, T> {
     pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         SelectExecutor {
-            select: Select::new(),
+            select: Select::new().with_context_filters(self.select.context_filters()),
             client: self.client,
             _marker: PhantomData,
         }
@@ -3506,6 +3562,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 /// Delete 执行器
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
+    versioned: bool,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<T>,
 }
@@ -3527,8 +3584,19 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         let rust_types = self.filter_param_rust_types();
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
-            vec![SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types)],
+            vec![
+                SingleSqlStatement::new(sql, params)
+                    .with_param_rust_types(rust_types)
+                    .with_optimistic_lock(self.versioned, None),
+            ],
         ))
+    }
+
+    pub fn model(mut self, model: &T) -> Self {
+        self.filters
+            .extend(common_helpers::model_delete_filters(model));
+        self.versioned = T::version_info().is_some();
+        self
     }
 
     /// 执行删除操作并返回影响的行数
@@ -3566,30 +3634,8 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        let mut sql = format!(
-            "DELETE FROM {}",
-            common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
-        );
-        let mut params = Vec::new();
-
-        if !self.filters.is_empty() {
-            sql.push_str(" WHERE ");
-            let mut param_idx: usize = 1;
-            for (i, filter) in self.filters.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(" AND ");
-                }
-                let _ = common_helpers::format_filter_with_params(
-                    filter,
-                    &mut sql,
-                    &mut param_idx,
-                    &mut params,
-                    DbType::PostgreSQL,
-                );
-            }
-        }
-
-        (sql, params)
+        common_helpers::build_delete_sql::<T>(DbType::PostgreSQL, &self.filters)
+            .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 
     fn filter_param_rust_types(&self) -> Vec<&'static str> {
@@ -3618,6 +3664,9 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
         let result =
             pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
                 .await?;
+        if statement.versioned && result == 0 {
+            return Err(common_helpers::optimistic_lock_conflict::<T>());
+        }
         Ok(result)
     }
 }
@@ -3672,46 +3721,15 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     /// db.update::<User>().set_model(&user).execute().await?;
     /// ```
     pub fn set_model(mut self, model: &T) -> Self {
-        let mut model_sets = Vec::new();
-        for (col_name, value) in model.non_pk_field_values() {
-            model_sets.push((col_name.to_string(), value));
+        if let Some(plan) = common_helpers::model_update_plan(model, None) {
+            self.model_updates.push(plan);
         }
-        let pk_columns = T::primary_key_columns();
-        let pk_values = model.primary_key_values();
-        let mut model_filters = Vec::new();
-        for (col, val) in pk_columns.iter().zip(pk_values) {
-            let filter_val =
-                crate::abstract_layer::common::common_helpers::value_to_filter_value(&val);
-            model_filters.push(crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: filter_val,
-            });
-        }
-        self.model_updates.push((model_sets, model_filters));
         self
     }
 
     pub fn set_model_fields(mut self, model: &T, fields: &[String]) -> Self {
-        let model_sets = model
-            .non_pk_field_values_for_columns(fields)
-            .into_iter()
-            .map(|(col_name, value)| (col_name.to_string(), value))
-            .collect::<Vec<_>>();
-        let pk_columns = T::primary_key_columns();
-        let pk_values = model.primary_key_values();
-        let model_filters = pk_columns
-            .iter()
-            .zip(pk_values)
-            .map(|(col, val)| crate::query::filter::FilterExpr::Comparison {
-                column: col.to_string(),
-                operator: "=".to_string(),
-                value: crate::abstract_layer::common::common_helpers::value_to_filter_value(&val),
-            })
-            .collect();
-
-        if !model_sets.is_empty() {
-            self.model_updates.push((model_sets, model_filters));
+        if let Some(plan) = common_helpers::model_update_plan(model, Some(fields)) {
+            self.model_updates.push(plan);
         }
         self
     }
@@ -3719,9 +3737,12 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let statements = self.build_all_sql()?;
         let mut sql_statements = Vec::with_capacity(statements.len());
-        for (sql, params, rust_types) in statements {
-            sql_statements
-                .push(SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types));
+        for (statement, rust_types) in statements {
+            sql_statements.push(
+                SingleSqlStatement::new(statement.sql, statement.params)
+                    .with_param_rust_types(rust_types)
+                    .with_optimistic_lock(statement.versioned, statement.version_update),
+            );
         }
         Ok(SqlStatement::batch(DbType::PostgreSQL, sql_statements))
     }
@@ -3754,98 +3775,45 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let mut sql = format!(
-                "UPDATE {} SET ",
-                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
-            );
-            let mut params = Vec::new();
             let mut rust_types = Vec::new();
-            let mut first = true;
             for assignment in &self.sets {
-                if !first {
-                    sql.push_str(", ");
-                }
-                let param_start = params.len();
-                sql.push_str(&common_helpers::format_update_assignment(
-                    DbType::PostgreSQL,
-                    assignment,
-                    &mut params,
-                ));
-                for value in &params[param_start..] {
-                    rust_types.push(
-                        pg_model_column_rust_type::<T>(&assignment.column)
-                            .unwrap_or_else(|| infer_model_value_rust_type(value)),
-                    );
-                }
-                first = false;
+                pg_collect_update_assignment_param_rust_types::<T>(assignment, &mut rust_types);
             }
-            if !self.filters.is_empty() {
-                sql.push_str(" WHERE ");
-                let mut param_idx = params.len() + 1;
-                for (i, filter) in self.filters.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(" AND ");
-                    }
-                    let _ = common_helpers::format_filter_with_params(
-                        filter,
-                        &mut sql,
-                        &mut param_idx,
-                        &mut params,
-                        DbType::PostgreSQL,
-                    );
-                }
-                for filter in &self.filters {
-                    pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
-                }
+            for filter in &self.filters {
+                pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
             }
-            statements.push((sql, params, rust_types));
+            let (sql, params) = common_helpers::build_update_sql::<T>(
+                DbType::PostgreSQL,
+                &self.sets,
+                &self.filters,
+            )?;
+            statements.push((
+                common_helpers::ModelSqlStatement {
+                    sql,
+                    params,
+                    versioned: false,
+                    version_update: None,
+                },
+                rust_types,
+            ));
         }
 
         // Model UPDATE statements
-        for (model_sets, model_filters) in &self.model_updates {
-            let mut sql = format!(
-                "UPDATE {} SET ",
-                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
-            );
-            let mut params = Vec::new();
+        for plan in &self.model_updates {
             let mut rust_types = Vec::new();
-            let mut first = true;
-            for (col_name, value) in model_sets {
-                if !first {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&common_helpers::quote_assignment(
-                    DbType::PostgreSQL,
-                    col_name,
-                    &common_helpers::placeholder(DbType::PostgreSQL, params.len() + 1),
-                ));
-                params.push(value.clone());
+            for (col_name, value) in &plan.sets {
                 rust_types.push(
                     pg_model_column_rust_type::<T>(col_name)
                         .unwrap_or_else(|| infer_model_value_rust_type(value)),
                 );
-                first = false;
             }
-            if !model_filters.is_empty() {
-                sql.push_str(" WHERE ");
-                let mut param_idx = params.len() + 1;
-                for (i, filter) in model_filters.iter().enumerate() {
-                    if i > 0 {
-                        sql.push_str(" AND ");
-                    }
-                    let _ = common_helpers::format_filter_with_params(
-                        filter,
-                        &mut sql,
-                        &mut param_idx,
-                        &mut params,
-                        DbType::PostgreSQL,
-                    );
-                }
-                for filter in model_filters {
-                    pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
-                }
+            for filter in &plan.filters {
+                pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
             }
-            statements.push((sql, params, rust_types));
+            statements.push((
+                common_helpers::build_model_update_sql::<T>(DbType::PostgreSQL, plan)?,
+                rust_types,
+            ));
         }
 
         Ok(statements)
@@ -3866,6 +3834,14 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
             let result =
                 pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
                     .await?;
+            if statement.versioned && result == 0 {
+                return Err(common_helpers::optimistic_lock_conflict::<T>());
+            }
+            if result > 0 {
+                if let Some(update) = &statement.version_update {
+                    update.apply();
+                }
+            }
             total += result;
         }
         Ok(total)
@@ -3968,6 +3944,9 @@ fn values_to_params_with_types(
     values: &[Value],
     rust_types: &[&str],
 ) -> crate::Result<Vec<PostgreSQLParam>> {
+    if rust_types.is_empty() {
+        return values_to_params(values);
+    }
     let mut params = Vec::with_capacity(values.len());
     for (idx, value) in values.iter().enumerate() {
         let rust_type = rust_types[idx % rust_types.len()];

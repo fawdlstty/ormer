@@ -10,6 +10,55 @@ txn.commit().await?;
 txn.rollback().await?;
 ```
 
+## 闭包式事务
+
+稳定 Rust 使用 boxed future：
+
+```rust
+let user = user.clone();
+db.transaction(|txn| Box::pin(async move {
+    txn.insert(&user).execute().await?;
+    Ok(())
+})).await?;
+```
+
+闭包返回 `Err` 时事务会自动回滚，返回 `Ok` 时自动提交。可通过
+`TransactionOptions` 设置隔离级别和只读事务：
+
+```rust
+use ormer::{IsolationLevel, TransactionOptions};
+
+db.transaction_opts(
+    TransactionOptions::new()
+        .isolation(IsolationLevel::Serializable)
+        .read_only(),
+    |txn| Box::pin(async move {
+        let _: Vec<User> = txn.select::<User>().collect().await?;
+        Ok(())
+    }),
+).await?;
+```
+
+SQLite 对事务选项保持兼容性 no-op。
+
+## Savepoint
+
+事务中可以使用 savepoint，只回滚闭包内的操作：
+
+```rust
+db.transaction(|txn| Box::pin(async move {
+    txn.insert(&user1).execute().await?;
+
+    let nested = txn.savepoint(|txn| Box::pin(async move {
+        txn.insert(&user2).execute().await?;
+        Err::<(), _>(ormer::ormer_error!("cancel nested work"))
+    })).await;
+    assert!(nested.is_err());
+
+    Ok(())
+})).await?;
+```
+
 ## 事务中的操作
 
 ### 插入

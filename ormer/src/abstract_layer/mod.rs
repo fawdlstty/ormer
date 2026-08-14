@@ -88,17 +88,18 @@ pub use common::{
     DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
     DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
     IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,
-    InsertOrUpdateExecutor, InsertPartialExecutor, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    PooledRawSelectExecutor,
-    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
-    RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder, SelectExecutor,
+    InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    NestedInclude, PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor,
+    RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
+    ReplicatedDatabaseBuilder, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor,
     SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
-    TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
-    UpdateExecutor, UpdateGraphExecutor,
+    TransactionFuture, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
+    TransactionRawSelectExecutor, UpdateExecutor, UpdateGraphExecutor,
 };
 
 pub use common::{
-    ConnectionPool, PooledConnection, ReplicatedConnectionPool, ReplicatedPoolBuilder,
+    ConnectionPool, PooledConnection, PooledDatabaseScope, ReplicatedConnectionPool,
+    ReplicatedPoolBuilder,
 };

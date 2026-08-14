@@ -27,13 +27,32 @@ struct User {
 - `#[default(...)]` - 数据库默认值；SQL 表达式使用 `#[default(expr = "...")]`
 - `#[check(expr = "...")]` - CHECK 约束，可配置 `name`
 - `#[foreign(Type)]` - 外键关系；可配置 `name`、`on_delete`、`on_update`
+- `#[embed(prefix = "前缀_")]` - 嵌入值对象，并把字段展开为带前缀的列
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
 - `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
 - `#[filter(filter_name, |m, ...| ...)]` - 模型级可复用过滤器，名称必须以 `filter_` 开头
+- `#[version(u64)]` - 自动添加 `version` 列，用于乐观锁
 - `#[ormer_ignore]` - 字段不映射为数据库列，可用于动态表路由值
 
 PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite 和 MySQL 会使用最后一段表名。
+
+## 乐观锁版本列
+
+```rust
+#[derive(Debug, Model)]
+#[version(u64)]
+#[table = "orders"]
+struct Order {
+    #[primary]
+    id: i32,
+    status: String,
+}
+
+let version = order.version();
+```
+
+`#[version(u64)]` 会创建不可见的 `version` 列，初始值为 `1`。从数据库读取模型后，`version()` 返回当前版本；`set_model` 更新会自动追加版本条件并把版本加一。
 
 ## 模型级过滤器
 
@@ -57,7 +76,18 @@ let orders: Vec<Order> = db
     .filter_valid()
     .collect()
     .await?;
+
+let scoped = db.scope().filter_tenant(tenant_id).filter_valid();
+let orders: Vec<Order> = scoped.select::<Order>().collect().await?;
+
+let include_deleted: Vec<Order> = scoped
+    .select::<Order>()
+    .unset_filter_valid()
+    .collect()
+    .await?;
 ```
+
+`scope()` 上启用的过滤器会继承到查询、关系加载、更新和删除；`unset_filter_*()` 只关闭继承的同名过滤器，不移除当前查询手写的 `filter(...)`。
 
 ## 动态表路由
 
@@ -179,6 +209,33 @@ struct User {
 
 `insert(&model)` 仍会显式写入模型的全部字段；数据库默认值只会在 INSERT 省略列时生效，可用 `insert_partial` 或 `insert_model` 省略列。
 
+## 嵌入值对象
+
+值对象可以派生 `Embed`，再在模型字段上使用 `#[embed(prefix = "...")]` 展开为多列：
+
+```rust
+#[derive(Debug, Clone, ormer::Embed)]
+struct Address {
+    city: String,
+    street: String,
+}
+
+#[derive(Debug, Clone, ormer::Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    #[embed(prefix = "addr_")]
+    address: Address,
+}
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.address.city.eq("Shanghai"))
+    .collect()
+    .await?;
+```
+
 ## 支持的类型
 
 | Rust 类型 | SQL 类型 (SQLite) | SQL 类型 (PostgreSQL) | SQL 类型 (MySQL) | SQL 类型 (MSSQL) |
@@ -193,6 +250,8 @@ struct User {
 | `chrono::NaiveDateTime` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
 | `chrono::NaiveDate` | TEXT | DATE | DATE | DATE |
 | `chrono::NaiveTime` | TEXT | TIME | TIME | TIME |
+| `rust_decimal::Decimal` | TEXT | NUMERIC | DECIMAL(65,30) | DECIMAL(38,18) |
+| `bigdecimal::BigDecimal` | TEXT | NUMERIC | DECIMAL(65,30) | DECIMAL(38,18) |
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
 

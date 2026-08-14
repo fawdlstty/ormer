@@ -40,6 +40,30 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         key: String,
     },
+    JsonPathText {
+        expr: Box<SqlExpr>,
+        path: Vec<String>,
+    },
+    JsonContains {
+        left: Box<SqlExpr>,
+        right: Box<SqlExpr>,
+    },
+    JsonSet {
+        expr: Box<SqlExpr>,
+        path: Vec<String>,
+        value: Box<SqlExpr>,
+    },
+    ArrayContains {
+        left: Box<SqlExpr>,
+        right: Box<SqlExpr>,
+    },
+    ArrayOverlaps {
+        left: Box<SqlExpr>,
+        right: Box<SqlExpr>,
+    },
+    ArrayLen {
+        expr: Box<SqlExpr>,
+    },
     Row(Vec<SqlExpr>),
     Raw(String),
 }
@@ -503,6 +527,151 @@ impl SqlExpr {
                     DbType::MSSQL => format!("JSON_VALUE({}, {})", expr_sql, quote_json_path(key)),
                 }
             }
+            SqlExpr::JsonPathText { expr, path } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{} #>> {}", expr_sql, quote_pg_text_path(path)),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!(
+                        "JSON_UNQUOTE(JSON_EXTRACT({}, {}))",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        format!(
+                            "json_extract({}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        )
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        format!("JSON_VALUE({}, {})", expr_sql, quote_json_path_parts(path))
+                    }
+                }
+            }
+            SqlExpr::JsonContains { left, right } => {
+                let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{}::jsonb @> {}::jsonb", left_sql, right_sql),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("JSON_CONTAINS({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        format!(
+                            "json_type({}) IS NOT NULL AND json_type({}) IS NOT NULL",
+                            left_sql, right_sql
+                        )
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        format!("ISJSON({}) = 1 AND ISJSON({}) = 1", left_sql, right_sql)
+                    }
+                }
+            }
+            SqlExpr::JsonSet { expr, path, value } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                let value_sql = value.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        let value_sql = match value.as_ref() {
+                            SqlExpr::Value(Value::Json(_)) => format!("{value_sql}::jsonb"),
+                            _ => format!("to_jsonb({value_sql})"),
+                        };
+                        format!(
+                            "jsonb_set({}::jsonb, {}, {}, true)",
+                            expr_sql,
+                            quote_pg_text_path(path),
+                            value_sql
+                        )
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
+                        format!(
+                            "JSON_SET({}, {}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path),
+                            value_sql
+                        )
+                    }
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        format!(
+                            "json_set({}, {}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path),
+                            value_sql
+                        )
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => {
+                        format!(
+                            "JSON_MODIFY({}, {}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path),
+                            value_sql
+                        )
+                    }
+                }
+            }
+            SqlExpr::ArrayContains { left, right } => {
+                let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{} @> {}", left_sql, right_sql),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("JSON_CONTAINS({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!(
+                        "EXISTS (SELECT 1 FROM json_each({}) AS l INNER JOIN json_each({}) AS r ON l.value = r.value)",
+                        left_sql, right_sql
+                    ),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!(
+                        "EXISTS (SELECT 1 FROM OPENJSON({}) l INNER JOIN OPENJSON({}) r ON l.value = r.value)",
+                        left_sql, right_sql
+                    ),
+                }
+            }
+            SqlExpr::ArrayOverlaps { left, right } => {
+                let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{} && {}", left_sql, right_sql),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("JSON_OVERLAPS({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!(
+                        "EXISTS (SELECT 1 FROM json_each({}) AS l INNER JOIN json_each({}) AS r ON l.value = r.value)",
+                        left_sql, right_sql
+                    ),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!(
+                        "EXISTS (SELECT 1 FROM OPENJSON({}) l INNER JOIN OPENJSON({}) r ON l.value = r.value)",
+                        left_sql, right_sql
+                    ),
+                }
+            }
+            SqlExpr::ArrayLen { expr } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("cardinality({})", expr_sql),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("JSON_LENGTH({})", expr_sql),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!("json_array_length({})", expr_sql),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("(SELECT COUNT(*) FROM OPENJSON({}))", expr_sql),
+                }
+            }
             SqlExpr::Row(exprs) => {
                 let values = exprs
                     .iter()
@@ -527,6 +696,35 @@ fn quote_json_key(key: &str) -> String {
     format!("'{}'", key.replace('\'', "''"))
 }
 
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
 fn quote_json_path(key: &str) -> String {
     format!("'$.{}'", key.replace('\'', "''"))
+}
+
+#[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
+fn quote_json_path_parts(path: &[String]) -> String {
+    if path.is_empty() {
+        return "'$'".to_string();
+    }
+    format!(
+        "'$.{}'",
+        path.iter()
+            .map(|part| part.replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join(".")
+    )
+}
+
+#[cfg(feature = "postgresql")]
+fn quote_pg_text_path(path: &[String]) -> String {
+    format!(
+        "'{{{}}}'",
+        path.iter()
+            .map(|part| part
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }

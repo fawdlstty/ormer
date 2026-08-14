@@ -10,6 +10,56 @@ txn.commit().await?;
 txn.rollback().await?;
 ```
 
+## Closure Transactions
+
+Stable Rust uses a boxed future:
+
+```rust
+let user = user.clone();
+db.transaction(|txn| Box::pin(async move {
+    txn.insert(&user).execute().await?;
+    Ok(())
+})).await?;
+```
+
+The transaction is committed when the closure returns `Ok` and rolled back
+when it returns `Err`. Use `TransactionOptions` for isolation and read-only
+transactions:
+
+```rust
+use ormer::{IsolationLevel, TransactionOptions};
+
+db.transaction_opts(
+    TransactionOptions::new()
+        .isolation(IsolationLevel::Serializable)
+        .read_only(),
+    |txn| Box::pin(async move {
+        let _: Vec<User> = txn.select::<User>().collect().await?;
+        Ok(())
+    }),
+).await?;
+```
+
+SQLite treats transaction options as compatible no-ops.
+
+## Savepoints
+
+Use a savepoint to roll back only the work inside a nested closure:
+
+```rust
+db.transaction(|txn| Box::pin(async move {
+    txn.insert(&user1).execute().await?;
+
+    let nested = txn.savepoint(|txn| Box::pin(async move {
+        txn.insert(&user2).execute().await?;
+        Err::<(), _>(ormer::ormer_error!("cancel nested work"))
+    })).await;
+    assert!(nested.is_err());
+
+    Ok(())
+})).await?;
+```
+
 ## Operations in Transaction
 
 ### Insert

@@ -10,6 +10,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 提取表名
     let table_name = extract_table_name(&input);
     let filters = extract_model_filters(&input);
+    let version = extract_version_attr(&input);
 
     // 检查是否为元组结构体（用于包装现有模型）
     let is_tuple_struct = matches!(&input.data, syn::Data::Struct(data) if matches!(&data.fields, syn::Fields::Unnamed(_)));
@@ -40,6 +41,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .iter()
         .filter(|info| !info.is_relation() && !info.is_ignored)
         .collect();
+    if let Some(version) = &version {
+        if normal_fields
+            .iter()
+            .any(|info| info.column_name == version.column || info.field_name == "version")
+        {
+            panic!("#[version(u64)] creates a version column; do not declare a version field");
+        }
+    }
     let value_fields: Vec<_> = field_infos
         .iter()
         .filter(|info| !info.is_relation())
@@ -106,7 +115,16 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .map(|info| info.column_name.clone())
         .collect();
 
-    let field_names_lit = field_names
+    let mut column_names = field_names.clone();
+    if let Some(version) = &version {
+        column_names.push(version.column.clone());
+    }
+
+    let field_names_lit = column_names
+        .iter()
+        .map(|name| quote! { #name })
+        .collect::<Vec<_>>();
+    let field_names_without_version_lit = field_names
         .iter()
         .map(|name| quote! { #name })
         .collect::<Vec<_>>();
@@ -164,6 +182,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             } else {
                 quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
             };
+            let db_value_type = info
+                .db_value_type_expr
+                .clone()
+                .unwrap_or_else(|| quote! { None });
 
             quote! {
                 ::ormer::model::ColumnSchema {
@@ -183,6 +205,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     foreign_key: #foreign_key,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
+                    db_value_type: #db_value_type,
                     default: #default,
                     check: #check,
                     hypertable: #hypertable,
@@ -191,6 +214,44 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         })
         .collect::<Vec<_>>();
+    let version_column_schema_entry = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        let rust_type = version.rust_type.as_str();
+        quote! {
+            ::ormer::model::ColumnSchema {
+                rust_name: #column,
+                name: #column,
+                rust_type: #rust_type,
+                is_primary: false,
+                is_auto_increment: false,
+                is_nullable: false,
+                unique_group: None,
+                unique_name: None,
+                is_indexed: false,
+                index_group: None,
+                index_name: None,
+                index_order: None,
+                index_where: None,
+                foreign_key: None,
+                enum_variants: None,
+                data_type: None,
+                db_value_type: None,
+                default: Some(::ormer::model::ColumnDefault::Number("1")),
+                check: None,
+                hypertable: None,
+                compress: false,
+            }
+        }
+    });
+    let base_column_schema_entries = column_schema_entries.clone();
+    let all_column_schema_entries = if let Some(version_entry) = version_column_schema_entry.clone()
+    {
+        let mut entries = column_schema_entries;
+        entries.push(version_entry);
+        entries
+    } else {
+        column_schema_entries
+    };
 
     // 生成 from_row 实现
     let from_row_fields = field_infos
@@ -229,6 +290,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         })
         .collect::<Vec<_>>();
+    let from_row_version_record = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        quote! {
+            let __ormer_version = row.get::<u64>(#column)?;
+        }
+    });
+    let from_row_version_after = if version.is_some() {
+        quote! {
+            ::ormer::model::record_version_snapshot(&__ormer_model, __ormer_version);
+        }
+    } else {
+        quote! {}
+    };
 
     // 生成 from_row_values 实现（按顺序从行值中读取）
     let from_row_values_fields = field_infos
@@ -304,6 +378,22 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         })
         .collect::<Vec<_>>();
+    let from_row_values_version_record = version.as_ref().map(|_| {
+        quote! {
+            let __ormer_version = {
+                let i = __ormer_value_index;
+                __ormer_value_index += 1;
+                <u64 as ::ormer::FromRowValues>::from_row_values(&values[i..i+1])?
+            };
+        }
+    });
+    let from_row_values_version_after = if version.is_some() {
+        quote! {
+            ::ormer::model::record_version_snapshot(&__ormer_model, __ormer_version);
+        }
+    } else {
+        quote! {}
+    };
 
     // 生成 field_values 实现
     let field_names_for_values = normal_fields.iter().map(|info| {
@@ -317,6 +407,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             quote! {
                 values.push(#value_expr);
             }
+        }
+    });
+    let version_field_value = version.as_ref().map(|version| {
+        let initial = version.initial;
+        quote! {
+            values.push(::ormer::Value::from(
+                ::ormer::model::model_version(self).max(#initial)
+            ));
         }
     });
 
@@ -378,7 +476,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         } else if info.embed.is_some() {
             let field_type = info.field_type;
-            let prefix = info.embed.as_ref().map(|embed| embed.prefix.as_str()).unwrap();
+            let prefix = info
+                .embed
+                .as_ref()
+                .map(|embed| embed.prefix.as_str())
+                .unwrap();
             quote! {
                 #field_name: <#field_type as ::ormer::model::Embed>::Where::new_with_prefix(#prefix)
             }
@@ -389,31 +491,66 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
     });
-
-    let update_fields = normal_fields.iter().filter(|info| info.embed.is_none()).map(|info| {
-        let field_name = info.field_name;
-        let field_type = info
-            .effective_data_type_type
-            .as_ref()
-            .unwrap_or(info.field_type);
+    let version_where_field = version.as_ref().map(|version| {
+        let _ = version;
         quote! {
-            pub #field_name: ::ormer::query::update::UpdateField<#field_type>
+            pub version: ::ormer::query::builder::TypedColumn<u64, #name>
+        }
+    });
+    let version_where_default_field = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        quote! {
+            version: ::ormer::query::builder::TypedColumn::new(#column)
         }
     });
 
-    let update_default_fields = normal_fields.iter().filter(|info| info.embed.is_none()).map(|info| {
-        let field_name = info.field_name;
-        let column_name = &info.column_name;
-        quote! {
-            #field_name: ::ormer::query::update::UpdateField::new(#column_name)
-        }
-    });
+    let update_fields = normal_fields
+        .iter()
+        .filter(|info| info.embed.is_none())
+        .map(|info| {
+            let field_name = info.field_name;
+            let field_type = info
+                .effective_data_type_type
+                .as_ref()
+                .unwrap_or(info.field_type);
+            quote! {
+                pub #field_name: ::ormer::query::update::UpdateField<#field_type>
+            }
+        });
 
-    let update_assignment_fields = normal_fields.iter().filter(|info| info.embed.is_none()).map(|info| {
-        let field_name = info.field_name;
+    let update_default_fields = normal_fields
+        .iter()
+        .filter(|info| info.embed.is_none())
+        .map(|info| {
+            let field_name = info.field_name;
+            let column_name = &info.column_name;
+            quote! {
+                #field_name: ::ormer::query::update::UpdateField::new(#column_name)
+            }
+        });
+
+    let update_assignment_fields = normal_fields
+        .iter()
+        .filter(|info| info.embed.is_none())
+        .map(|info| {
+            let field_name = info.field_name;
+            quote! {
+                if let Some(assignment) = self.#field_name.assignment() {
+                    assignments.push(assignment);
+                }
+            }
+        });
+    let version_info_method = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        let rust_type = version.rust_type.as_str();
+        let initial = version.initial;
         quote! {
-            if let Some(assignment) = self.#field_name.assignment() {
-                assignments.push(assignment);
+            fn version_info() -> Option<::ormer::model::VersionInfo> {
+                Some(::ormer::model::VersionInfo {
+                    column: #column,
+                    rust_type: #rust_type,
+                    initial: #initial,
+                })
             }
         }
     });
@@ -487,6 +624,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
     });
+    let version_column_value_arm = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        quote! {
+            #column => Some(::ormer::Value::from(::ormer::model::model_version(self))),
+        }
+    });
 
     let assign_column_value_arms = normal_fields.iter().map(|info| {
         let field_name = info.field_name;
@@ -519,6 +662,16 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     return Ok(());
                 }
             }
+        }
+    });
+    let version_assign_column_value_arm = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        quote! {
+            #column => {
+                let __ormer_version = <u64 as ::ormer::FromValue>::from_value(&value)?;
+                ::ormer::model::record_version_snapshot(self, __ormer_version);
+                return Ok(());
+            },
         }
     });
 
@@ -785,6 +938,17 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             RelationKindAttr::BelongsTo => quote! {},
         }
     });
+    let version_dynamic_column_push = version.as_ref().map(|version| {
+        let column = version.column.as_str();
+        quote! {
+            columns.push(#column);
+        }
+    });
+    let version_dynamic_schema_push = version_column_schema_entry.as_ref().map(|entry| {
+        quote! {
+            columns.push(#entry);
+        }
+    });
     let dynamic_columns_method = if has_embed {
         let embedded_columns = normal_fields.iter().filter_map(|info| {
             info.embed.as_ref().map(|embed| {
@@ -800,8 +964,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         quote! {
             fn columns() -> Vec<&'static str> {
                 let mut columns = Vec::new();
-                columns.extend([#(#field_names_lit),*]);
+                columns.extend([#(#field_names_without_version_lit),*]);
                 #(#embedded_columns)*
+                #version_dynamic_column_push
                 columns
             }
         }
@@ -833,6 +998,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                             foreign_key: None,
                             enum_variants: schema.enum_variants,
                             data_type: schema.data_type,
+                            db_value_type: schema.db_value_type,
                             default: None,
                             check: None,
                             hypertable: None,
@@ -844,8 +1010,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         });
         quote! {
             fn column_schema() -> Vec<::ormer::model::ColumnSchema> {
-                let mut columns = <[_]>::into_vec(Box::new([#(#column_schema_entries),*]));
+                let mut columns = <[_]>::into_vec(Box::new([#(#base_column_schema_entries),*]));
                 #(#embedded_schemas)*
+                #version_dynamic_schema_push
                 columns
             }
         }
@@ -855,6 +1022,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let filter_trait = syn::Ident::new(&format!("{name}FilterExt"), name.span());
     let filter_methods = filters.iter().map(|filter| {
         let method_name = &filter.name;
+        let unset_method_name =
+            syn::Ident::new(&format!("unset_{method_name}"), method_name.span());
         let args = &filter.args;
         let body_expr = &filter.body_expr;
         let model_ident = &filter.model_ident;
@@ -865,7 +1034,21 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     let #model_ident = __ormer_where;
                     #body_expr
                 };
-                ::ormer::FilterQuery::<#name>::append_filter_expr(self, __ormer_expr)
+                ::ormer::NamedFilterQuery::<#name>::apply_named_filter(
+                    self,
+                    stringify!(#method_name),
+                    __ormer_expr,
+                )
+            }
+
+            fn #unset_method_name(self) -> Self
+            where
+                Self: ::ormer::WithoutFilterQuery<#name>,
+            {
+                ::ormer::WithoutFilterQuery::<#name>::without_filter(
+                    self,
+                    stringify!(#method_name),
+                )
             }
         }
     });
@@ -873,11 +1056,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         quote! {}
     } else {
         quote! {
-            pub trait #filter_trait: ::ormer::FilterQuery<#name> + Sized {
+            pub trait #filter_trait: ::ormer::NamedFilterQuery<#name> + Sized {
                 #(#filter_methods)*
             }
 
-            impl<Q> #filter_trait for Q where Q: ::ormer::FilterQuery<#name> + Sized {}
+            impl<Q> #filter_trait for Q where Q: ::ormer::NamedFilterQuery<#name> + Sized {}
         }
     };
 
@@ -886,13 +1069,15 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
         // 生成 Where 结构体
         pub struct #where_name {
-            #(#where_fields),*
+            #(#where_fields,)*
+            #version_where_field
         }
 
         impl Default for #where_name {
             fn default() -> Self {
                 Self {
-                    #(#where_default_fields),*
+                    #(#where_default_fields,)*
+                    #version_where_default_field
                 }
             }
         }
@@ -926,7 +1111,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         impl ::ormer::ViewModel for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
-            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#all_column_schema_entries),*];
 
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = #where_name;
@@ -943,9 +1128,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
 
             fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
-                Ok(Self {
+                #from_row_version_record
+                let __ormer_model = Self {
                     #(#from_row_fields),*
-                })
+                };
+                #from_row_version_after
+                Ok(__ormer_model)
             }
 
             fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
@@ -957,16 +1145,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     ));
                 }
                 let mut __ormer_value_index = 0usize;
-                Ok(Self {
+                let __ormer_model = Self {
                     #(#from_row_values_fields),*
-                })
+                };
+                #from_row_values_version_record
+                #from_row_values_version_after
+                Ok(__ormer_model)
             }
         }
 
         impl ::ormer::Model for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
-            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
+            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#all_column_schema_entries),*];
             const RELATIONS: &'static [::ormer::model::RelationInfo] = &[#(#relation_schema_entries),*];
 
             type AutoIncrementKeyType = #auto_increment_key_type;
@@ -977,6 +1168,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             #dynamic_columns_method
             #dynamic_column_schema_method
+            #version_info_method
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -987,9 +1179,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
 
             fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
-                Ok(Self {
+                #from_row_version_record
+                let __ormer_model = Self {
                     #(#from_row_fields),*
-                })
+                };
+                #from_row_version_after
+                Ok(__ormer_model)
             }
 
             fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
@@ -1001,20 +1196,25 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     ));
                 }
                 let mut __ormer_value_index = 0usize;
-                Ok(Self {
+                let __ormer_model = Self {
                     #(#from_row_values_fields),*
-                })
+                };
+                #from_row_values_version_record
+                #from_row_values_version_after
+                Ok(__ormer_model)
             }
 
             fn field_values(&self) -> Vec<::ormer::Value> {
                 let mut values = Vec::new();
                 #(#field_names_for_values)*
+                #version_field_value
                 values
             }
 
             fn column_value(&self, column: &str) -> Option<::ormer::Value> {
                 match column {
                     #(#column_value_arms,)*
+                    #version_column_value_arm
                     _ => None,
                 }
             }
@@ -1026,6 +1226,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             ) -> ::ormer::Result<()> {
                 match column {
                     #(#assign_column_value_arms,)*
+                    #version_assign_column_value_arm
                     _ => {}
                 }
                 Err(::ormer::ormer_error!(
@@ -1105,6 +1306,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             pub fn query() -> ::ormer::Select<Self> {
                 ::ormer::Select::new()
+            }
+
+            pub fn version(&self) -> u64 {
+                ::ormer::model::model_version(self)
             }
         }
     }
@@ -1209,6 +1414,10 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         } else {
             quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
         };
+        let db_value_type = info
+            .db_value_type_expr
+            .clone()
+            .unwrap_or_else(|| quote! { None });
 
         quote! {
             ::ormer::model::EmbedColumnSchema {
@@ -1218,6 +1427,7 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
                 is_nullable: #is_nullable,
                 enum_variants: #enum_variants,
                 data_type: #data_type,
+                db_value_type: #db_value_type,
             }
         }
     });
@@ -1487,6 +1697,10 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
             } else {
                 quote! { <#field_type as ::ormer::model::ModelEnumProvider>::ENUM_VARIANTS }
             };
+            let db_value_type = info
+                .db_value_type_expr
+                .clone()
+                .unwrap_or_else(|| quote! { None });
 
             quote! {
                 ::ormer::model::ColumnSchema {
@@ -1506,6 +1720,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                     foreign_key: None,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
+                    db_value_type: #db_value_type,
                     default: None,
                     check: None,
                     hypertable: None,
@@ -1812,6 +2027,13 @@ struct ModelFilter {
     model_ident: syn::Pat,
 }
 
+#[derive(Clone)]
+struct VersionAttr {
+    column: String,
+    rust_type: String,
+    initial: u64,
+}
+
 struct FieldInfo<'a> {
     field: &'a syn::Field,
     field_name: &'a syn::Ident,
@@ -1828,6 +2050,7 @@ struct FieldInfo<'a> {
     index_attr: Option<IndexAttr>,
     foreign_key: proc_macro2::TokenStream,
     data_type: proc_macro2::TokenStream,
+    db_value_type_expr: Option<proc_macro2::TokenStream>,
     effective_data_type_type: Option<syn::Type>,
     has_data_type: bool,
     has_i32_data_type: bool,
@@ -1870,6 +2093,8 @@ impl<'a> FieldInfo<'a> {
             }
         });
         let has_data_type = data_type_type.is_some();
+        let db_value_type_expr =
+            db_value_type_expr(effective_data_type_type.as_ref().unwrap_or(field_type));
         let has_i32_data_type = effective_data_type_type
             .as_ref()
             .map(is_i32_type)
@@ -1911,6 +2136,7 @@ impl<'a> FieldInfo<'a> {
             index_attr: extract_index_attr(field),
             foreign_key: extract_foreign_key(field),
             data_type,
+            db_value_type_expr,
             effective_data_type_type,
             has_data_type,
             has_i32_data_type,
@@ -2167,6 +2393,32 @@ fn parse_model_filter(attr: &syn::Attribute) -> ModelFilter {
         body_expr: body.body,
         model_ident,
     }
+}
+
+fn extract_version_attr(input: &DeriveInput) -> Option<VersionAttr> {
+    let mut version = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("version") {
+            continue;
+        }
+        if version.is_some() {
+            panic!("Model can only have one #[version(...)] attribute");
+        }
+        let Meta::List(list) = &attr.meta else {
+            panic!("#[version] must use #[version(u64)]");
+        };
+        let ty: syn::Type = syn::parse2(list.tokens.clone()).expect("#[version] type is invalid");
+        let rust_type = normalize_type_string(quote! { #ty }.to_string());
+        if rust_type != "u64" {
+            panic!("#[version] currently supports only #[version(u64)]");
+        }
+        version = Some(VersionAttr {
+            column: "version".to_string(),
+            rust_type,
+            initial: 1,
+        });
+    }
+    version
 }
 
 /// 为元组结构体包装模型生成实现（例如：struct NewUser(User);）
@@ -2516,6 +2768,55 @@ fn data_type_tokens(data_type: Option<&syn::Type>) -> proc_macro2::TokenStream {
     quote! { None }
 }
 
+fn db_value_type_expr(ty: &syn::Type) -> Option<proc_macro2::TokenStream> {
+    if is_builtin_non_db_value_type(ty) {
+        return None;
+    }
+    let inner = option_inner_type(ty).unwrap_or(ty);
+    Some(quote! {
+        <#inner as ::ormer::model::ModelEnumProvider>::DB_VALUE_TYPE
+    })
+}
+
+fn is_builtin_non_db_value_type(ty: &syn::Type) -> bool {
+    let ty = option_inner_type(ty).unwrap_or(ty);
+    match ty {
+        syn::Type::Reference(_) => true,
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return false;
+            };
+            matches!(
+                segment.ident.to_string().as_str(),
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "isize"
+                    | "usize"
+                    | "f32"
+                    | "f64"
+                    | "Decimal"
+                    | "BigDecimal"
+                    | "String"
+                    | "bool"
+                    | "Vec"
+                    | "Duration"
+                    | "DateTime"
+                    | "NaiveDateTime"
+                    | "NaiveDate"
+                    | "NaiveTime"
+                    | "Value"
+                    | "Uuid"
+            )
+        }
+        _ => false,
+    }
+}
+
 fn validate_data_type(field: &syn::Field, data_type: Option<&syn::Type>) {
     let Some(data_type) = data_type else {
         return;
@@ -2736,8 +3037,8 @@ fn field_assign_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
             }
         }
     } else if info.has_vec_i32_data_type {
-        let inner_type = vec_inner_type(field_type)
-            .expect("#[data_type(Vec<i32>)] requires a Vec<T> field");
+        let inner_type =
+            vec_inner_type(field_type).expect("#[data_type(Vec<i32>)] requires a Vec<T> field");
         quote! {
             let values = <Vec<i32> as ::ormer::FromValue>::from_value(&value)?;
             use ::ormer::model::I32DataTypeDecode as _;

@@ -235,3 +235,70 @@ test_on_all_dbs_result!(test_transaction_commit_impl);
 test_on_all_dbs_result!(test_transaction_rollback_impl);
 test_on_all_dbs_result!(test_transaction_with_query_impl);
 test_on_all_dbs_result!(test_transaction_with_update_impl);
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_closure_transaction_and_savepoint_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    db.create_table::<TestUser>().execute().await?;
+
+    let committed = TestUser {
+        id: None,
+        name: "Committed".to_string(),
+        email: "committed@example.com".to_string(),
+    };
+    db.transaction(|txn| {
+        Box::pin(async move {
+            txn.insert(&committed).execute().await?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    let rolled_back = TestUser {
+        id: None,
+        name: "Rolled back".to_string(),
+        email: "rolled-back@example.com".to_string(),
+    };
+    let rolled_back_for_savepoint = rolled_back.clone();
+    let result = db
+        .transaction(|txn| {
+            Box::pin(async move {
+                txn.insert(&rolled_back).execute().await?;
+                Err::<(), _>(ormer::ormer_error!("rollback closure"))
+            })
+        })
+        .await;
+    assert!(result.is_err());
+
+    let savepoint_after = TestUser {
+        id: None,
+        name: "After savepoint".to_string(),
+        email: "after-savepoint@example.com".to_string(),
+    };
+    db.transaction(|txn| {
+        Box::pin(async move {
+            let nested = txn
+                .savepoint(|txn| {
+                    Box::pin(async move {
+                        txn.insert(&rolled_back_for_savepoint).execute().await?;
+                        Err::<(), _>(ormer::ormer_error!("rollback savepoint"))
+                    })
+                })
+                .await;
+            assert!(nested.is_err());
+            txn.insert(&savepoint_after).execute().await?;
+            Ok(())
+        })
+    })
+    .await?;
+
+    let users = db.select::<TestUser>().collect::<Vec<TestUser>>().await?;
+    assert_eq!(users.len(), 2);
+    assert!(users.iter().any(|user| user.name == "Committed"));
+    assert!(users.iter().any(|user| user.name == "After savepoint"));
+    assert!(!users.iter().any(|user| user.name == "Rolled back"));
+
+    db.drop_table::<TestUser>().execute().await?;
+    Ok(())
+}

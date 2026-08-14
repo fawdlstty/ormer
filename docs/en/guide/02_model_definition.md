@@ -27,13 +27,32 @@ struct User {
 - `#[default(...)]` - Database default; use `#[default(expr = "...")]` for SQL expressions
 - `#[check(expr = "...")]` - CHECK constraint, with optional `name`
 - `#[foreign(Type)]` - Foreign key relationship, with optional `name`, `on_delete`, and `on_update`
+- `#[embed(prefix = "prefix_")]` - Embeds a value object and expands its fields into prefixed columns
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable chunk interval
 - `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
 - `#[filter(filter_name, |m, ...| ...)]` - Model-level reusable filter; the name must start with `filter_`
+- `#[version(u64)]` - Adds an automatic `version` column for optimistic locking
 - `#[ormer_ignore]` - Excludes a field from database columns; useful for dynamic table route values
 
 PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite and MySQL use the final table-name component.
+
+## Optimistic Lock Version
+
+```rust
+#[derive(Debug, Model)]
+#[version(u64)]
+#[table = "orders"]
+struct Order {
+    #[primary]
+    id: i32,
+    status: String,
+}
+
+let version = order.version();
+```
+
+`#[version(u64)]` creates an invisible `version` column with initial value `1`. After loading a model, `version()` returns the current version; `set_model` updates automatically add the version condition and increment the version.
 
 ## Model Filters
 
@@ -57,7 +76,20 @@ let orders: Vec<Order> = db
     .filter_valid()
     .collect()
     .await?;
+
+let scoped = db.scope().filter_tenant(tenant_id).filter_valid();
+let orders: Vec<Order> = scoped.select::<Order>().collect().await?;
+
+let include_deleted: Vec<Order> = scoped
+    .select::<Order>()
+    .unset_filter_valid()
+    .collect()
+    .await?;
 ```
+
+Filters enabled on `scope()` are inherited by queries, relationship loading,
+updates, and deletes. `unset_filter_*()` disables only an inherited named
+filter; it does not remove filters added directly with `filter(...)`.
 
 ## Dynamic Table Routing
 
@@ -179,6 +211,33 @@ struct User {
 
 `insert(&model)` still writes all model fields explicitly; a database default applies only when the column is omitted from the INSERT, which `insert_partial` or `insert_model` can do.
 
+## Embedded Value Objects
+
+Value objects can derive `Embed`, then model fields can use `#[embed(prefix = "...")]` to expand them into multiple columns:
+
+```rust
+#[derive(Debug, Clone, ormer::Embed)]
+struct Address {
+    city: String,
+    street: String,
+}
+
+#[derive(Debug, Clone, ormer::Model)]
+#[table = "users"]
+struct User {
+    #[primary(auto)]
+    id: i32,
+    #[embed(prefix = "addr_")]
+    address: Address,
+}
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.address.city.eq("Shanghai"))
+    .collect()
+    .await?;
+```
+
 ## Supported Types
 
 | Rust Type | SQL Type (SQLite) | SQL Type (PostgreSQL) | SQL Type (MySQL) | SQL Type (MSSQL) |
@@ -193,6 +252,8 @@ struct User {
 | `chrono::NaiveDateTime` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
 | `chrono::NaiveDate` | TEXT | DATE | DATE | DATE |
 | `chrono::NaiveTime` | TEXT | TIME | TIME | TIME |
+| `rust_decimal::Decimal` | TEXT | NUMERIC | DECIMAL(65,30) | DECIMAL(38,18) |
+| `bigdecimal::BigDecimal` | TEXT | NUMERIC | DECIMAL(65,30) | DECIMAL(38,18) |
 
 All basic types can be wrapped with `Option<T>` for nullable fields.
 

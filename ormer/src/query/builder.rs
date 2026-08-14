@@ -35,6 +35,86 @@ pub trait FilterQuery<T: Model>: Sized {
     fn append_filter_expr(self, expr: WhereExpr) -> Self;
 }
 
+/// Query builders or scopes that can receive a named model filter.
+pub trait NamedFilterQuery<T: Model>: Sized {
+    fn apply_named_filter(self, name: &'static str, expr: WhereExpr) -> Self;
+}
+
+/// Query builders that can disable a named context filter inherited from a scope.
+pub trait WithoutFilterQuery<T: Model>: Sized {
+    fn without_filter(self, name: &'static str) -> Self;
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextFilter {
+    model_table: &'static str,
+    name: &'static str,
+    filter: FilterExpr,
+}
+
+impl ContextFilter {
+    pub fn new<T: Model>(name: &'static str, expr: WhereExpr) -> Self {
+        Self {
+            model_table: T::TABLE_NAME,
+            name,
+            filter: expr.into(),
+        }
+    }
+
+    fn applies_to<T: Model>(&self) -> bool {
+        self.model_table == T::TABLE_NAME
+    }
+
+    pub(crate) fn filter_for<T: Model>(&self) -> Option<FilterExpr> {
+        self.applies_to::<T>().then(|| self.filter.clone())
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextFilterKey {
+    model_table: &'static str,
+    name: &'static str,
+}
+
+impl ContextFilterKey {
+    fn new<T: Model>(name: &'static str) -> Self {
+        Self {
+            model_table: T::TABLE_NAME,
+            name,
+        }
+    }
+}
+
+fn context_filter_exprs_for<T: Model>(
+    context_filters: &[ContextFilter],
+    disabled_context_filters: &[ContextFilterKey],
+) -> Vec<FilterExpr> {
+    context_filters
+        .iter()
+        .filter(|filter| filter.applies_to::<T>())
+        .filter(|filter| {
+            !disabled_context_filters.iter().any(|disabled| {
+                disabled.model_table == filter.model_table && disabled.name == filter.name
+            })
+        })
+        .map(|filter| filter.filter.clone())
+        .collect()
+}
+
+fn push_disabled_context_filter<T: Model>(
+    disabled_context_filters: &mut Vec<ContextFilterKey>,
+    name: &'static str,
+) {
+    let key = ContextFilterKey::new::<T>(name);
+    if !disabled_context_filters.iter().any(|item| item == &key) {
+        disabled_context_filters.push(key);
+    }
+}
+
 fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -1172,6 +1252,9 @@ fn collect_filter_param_rust_types<T: Model>(
         FilterExpr::ExprIsNull { expr } | FilterExpr::ExprIsNotNull { expr } => {
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
+        FilterExpr::ExprPredicate { expr } => {
+            collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
         FilterExpr::TextSearch { expr, .. } => {
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             rust_types.push("String");
@@ -1195,8 +1278,20 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
         }
         SqlExpr::Cast { expr, .. }
         | SqlExpr::Collate { expr, .. }
-        | SqlExpr::JsonText { expr, .. } => {
+        | SqlExpr::JsonText { expr, .. }
+        | SqlExpr::JsonPathText { expr, .. }
+        | SqlExpr::ArrayLen { expr } => {
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        SqlExpr::JsonContains { left, right }
+        | SqlExpr::ArrayContains { left, right }
+        | SqlExpr::ArrayOverlaps { left, right } => {
+            collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        SqlExpr::JsonSet { expr, value, .. } => {
+            collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            collect_sql_expr_param_rust_types::<T>(value, rust_types);
         }
         SqlExpr::Aggregate {
             expr,
@@ -1299,6 +1394,8 @@ impl<T> CursorPage<T> {
 
 pub struct Select<T: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -1318,6 +1415,8 @@ impl<T: Model> Clone for Select<T> {
     fn clone(&self) -> Self {
         Self {
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -1338,6 +1437,8 @@ impl<T: Model> Clone for Select<T> {
 /// RelatedSelect - 关联查询结构体(支持2表查询)
 pub struct RelatedSelect<T: Model, R: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -1348,6 +1449,8 @@ pub struct RelatedSelect<T: Model, R: Model> {
 /// MultiTableSelect - 多表关联查询结构体(支持3个或以上表)
 pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -1358,6 +1461,8 @@ pub struct MultiTableSelect<T: Model, R1: Model, R2: Model> {
 /// FourTableSelect - 四表关联查询结构体
 pub struct FourTableSelect<T: Model, R1: Model, R2: Model, R3: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -1370,6 +1475,8 @@ pub struct AggregateSelect<T: Model, R = crate::model::Value> {
     aggregate_func: String, // COUNT, SUM, AVG, MAX, MIN
     column_name: String,
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     table_route: TableRoute,
     _marker: PhantomData<(T, R)>,
 }
@@ -1377,6 +1484,8 @@ pub struct AggregateSelect<T: Model, R = crate::model::Value> {
 /// MappedSelect - 字段投影查询结构体
 pub struct MappedSelect<T: Model, V> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -1401,7 +1510,9 @@ pub struct GroupedSelect<T: Model, V> {
     grouping_clause: Option<GroupingClause>,
     having_filters: Vec<FilterExpr>, // HAVING 条件
     filters: Vec<FilterExpr>,        // WHERE 条件（分组前过滤）
-    order_by: Vec<OrderBy>,          // ORDER BY
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
+    order_by: Vec<OrderBy>, // ORDER BY
     range_start: Option<usize>,
     range_end: Option<usize>,
     table_route: TableRoute,
@@ -1498,6 +1609,8 @@ impl<T: Model, V> Clone for MappedSelect<T, V> {
     fn clone(&self) -> Self {
         Self {
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -1525,6 +1638,8 @@ impl<T: Model, V> Clone for GroupedSelect<T, V> {
             grouping_clause: self.grouping_clause.clone(),
             having_filters: self.having_filters.clone(),
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -1546,6 +1661,8 @@ impl<T: Model, V> Default for GroupedSelect<T, V> {
             grouping_clause: None,
             having_filters: Vec::new(),
             filters: Vec::new(),
+            context_filters: Vec::new(),
+            disabled_context_filters: Vec::new(),
             order_by: Vec::new(),
             range_start: None,
             range_end: None,
@@ -1556,6 +1673,13 @@ impl<T: Model, V> Default for GroupedSelect<T, V> {
 }
 
 impl<T: Model, R> AggregateSelect<T, R> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
@@ -1572,10 +1696,11 @@ impl<T: Model, R> AggregateSelect<T, R> {
         .expect("Failed to write aggregate SELECT clause");
 
         let mut param_idx = 1;
+        let filters = self.effective_filters();
         append_filter_clause(
             &mut sql,
             " WHERE ",
-            &self.filters,
+            &filters,
             FilterFormatter::new(db_type),
             &mut param_idx,
             &mut params,
@@ -1591,13 +1716,19 @@ impl<T: Model, V> MappedSelect<T, V> {
         &self.column_names
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn with_context_filters(mut self, filters: Vec<ContextFilter>) -> Self {
+        self.context_filters.extend(filters);
+        self
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         let mut rust_types = Vec::new();
         for expr in &self.column_exprs {
             collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
         }
-        for filter in &self.filters {
+        for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
         rust_types
@@ -1710,6 +1841,13 @@ impl<T: Model, V> MappedSelect<T, V> {
         self
     }
 
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
@@ -1751,7 +1889,7 @@ impl<T: Model, V> MappedSelect<T, V> {
 
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &self.effective_filters(),
             " WHERE ",
             FilterFormatter::new(db_type),
             &self.order_by,
@@ -1780,10 +1918,29 @@ impl<T: Model, V> FilterQuery<T> for MappedSelect<T, V> {
     }
 }
 
+impl<T: Model, V> NamedFilterQuery<T> for MappedSelect<T, V> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.append_filter_expr(expr)
+    }
+}
+
+impl<T: Model, V> WithoutFilterQuery<T> for MappedSelect<T, V> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
+        self
+    }
+}
+
 impl<T: Model, V> GroupedSelect<T, V> {
     /// 创建新的 GroupedSelect 实例
     pub fn new() -> Self {
         Self::default()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_context_filters(mut self, filters: Vec<ContextFilter>) -> Self {
+        self.context_filters.extend(filters);
+        self
     }
 
     pub fn as_model<R: Model>(self) -> DerivedSelect<R>
@@ -1844,6 +2001,8 @@ impl<T: Model, V> GroupedSelect<T, V> {
             grouping_clause: self.grouping_clause,
             having_filters: self.having_filters,
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -1969,6 +2128,13 @@ impl<T: Model, V> GroupedSelect<T, V> {
         self
     }
 
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
@@ -2010,10 +2176,11 @@ impl<T: Model, V> GroupedSelect<T, V> {
         )
         .expect("Failed to write SELECT clause");
 
+        let filters = self.effective_filters();
         append_filter_clause(
             &mut sql,
             " WHERE ",
-            &self.filters,
+            &filters,
             FilterFormatter::new(db_type),
             &mut param_idx,
             &mut params,
@@ -2127,7 +2294,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
         for expr in &self.group_by_exprs {
             collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
         }
-        for filter in &self.filters {
+        for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
         for filter in &self.having_filters {
@@ -2149,10 +2316,25 @@ impl<T: Model, V> FilterQuery<T> for GroupedSelect<T, V> {
     }
 }
 
+impl<T: Model, V> NamedFilterQuery<T> for GroupedSelect<T, V> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.append_filter_expr(expr)
+    }
+}
+
+impl<T: Model, V> WithoutFilterQuery<T> for GroupedSelect<T, V> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
+        self
+    }
+}
+
 impl<T: Model> Select<T> {
     pub fn new() -> Self {
         Self {
             filters: Vec::new(),
+            context_filters: Vec::new(),
+            disabled_context_filters: Vec::new(),
             order_by: Vec::new(),
             range_start: None,
             range_end: None,
@@ -2169,6 +2351,22 @@ impl<T: Model> Select<T> {
         }
     }
 
+    pub(crate) fn with_context_filters(mut self, filters: Vec<ContextFilter>) -> Self {
+        self.context_filters.extend(filters);
+        self
+    }
+
+    pub(crate) fn context_filters(&self) -> Vec<ContextFilter> {
+        self.context_filters.clone()
+    }
+
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
     /// `select::<User>`().from::<User, Role>()
     pub fn from<T2, R: Model>(self) -> RelatedSelect<T, R>
@@ -2179,6 +2377,8 @@ impl<T: Model> Select<T> {
         // 如果 T2 != T,编译器会在类型推导时报错
         RelatedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2195,6 +2395,8 @@ impl<T: Model> Select<T> {
     {
         MultiTableSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2211,6 +2413,8 @@ impl<T: Model> Select<T> {
     {
         FourTableSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2226,6 +2430,8 @@ impl<T: Model> Select<T> {
             aggregate_func: func.to_string(),
             column_name: column.to_string(),
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             table_route: self.table_route,
             _marker: PhantomData,
         }
@@ -2237,6 +2443,8 @@ impl<T: Model> Select<T> {
             aggregate_func: func.to_string(),
             column_name: column.to_string(),
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             table_route: self.table_route,
             _marker: PhantomData,
         }
@@ -2309,6 +2517,8 @@ impl<T: Model> Select<T> {
         let result = f(where_obj);
         MappedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2358,6 +2568,8 @@ impl<T: Model> Select<T> {
 
         MappedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2391,6 +2603,8 @@ impl<T: Model> Select<T> {
             grouping_clause: None,
             having_filters: Vec::new(),
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -2696,7 +2910,7 @@ impl<T: Model> Select<T> {
         &self,
         db_type: DbType,
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
-        validate_select_parts(&self.filters, &self.order_by)?;
+        validate_select_parts(&self.effective_filters(), &self.order_by)?;
         Ok(self.to_sql_with_params(db_type))
     }
 
@@ -2706,11 +2920,12 @@ impl<T: Model> Select<T> {
             return self.to_sql_with_recursive_cte(db_type);
         }
 
-        if self.filters.iter().any(filter_has_relation) {
+        let filters = self.effective_filters();
+        if filters.iter().any(filter_has_relation) {
             let mut base_filters = Vec::new();
             let mut relation_filters = Vec::new();
             let mut joins = Vec::new();
-            let can_use_joins = self.filters.iter().all(|filter| {
+            let can_use_joins = filters.iter().all(|filter| {
                 split_relation_join_filter(
                     filter,
                     &mut base_filters,
@@ -2752,7 +2967,7 @@ impl<T: Model> Select<T> {
 
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &filters,
             " WHERE ",
             FilterFormatter::new(db_type),
             &self.order_by,
@@ -2836,9 +3051,10 @@ impl<T: Model> Select<T> {
         )
         .unwrap_or_else(|e| panic!("Failed to write recursive CTE SELECT: {}", e));
 
+        let filters = self.effective_filters();
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &filters,
             " WHERE ",
             FilterFormatter::new(db_type),
             &self.order_by,
@@ -2933,7 +3149,7 @@ impl<T: Model> Select<T> {
         for expr in &self.distinct_on {
             collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
         }
-        for filter in &self.filters {
+        for filter in &self.effective_filters() {
             collect_filter_param_rust_types::<T>(filter, &mut rust_types);
         }
         rust_types
@@ -3039,6 +3255,19 @@ impl<T: Model> Select<T> {
 impl<T: Model> FilterQuery<T> for Select<T> {
     fn append_filter_expr(mut self, expr: WhereExpr) -> Self {
         self.filters.push(expr.into());
+        self
+    }
+}
+
+impl<T: Model> NamedFilterQuery<T> for Select<T> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.append_filter_expr(expr)
+    }
+}
+
+impl<T: Model> WithoutFilterQuery<T> for Select<T> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
         self
     }
 }
@@ -3343,9 +3572,16 @@ impl<T: Model> Select<T> {
 }
 
 impl<T: Model, R: Model> RelatedSelect<T, R> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_model_filter_param_rust_types::<T>(&self.filters)
+        collect_model_filter_param_rust_types::<T>(&self.effective_filters())
     }
 
     /// 添加 WHERE 条件（支持两个表的字段比较）
@@ -3396,9 +3632,10 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
+        let filters = self.effective_filters();
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &filters,
             " WHERE ",
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
@@ -3417,9 +3654,16 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
 }
 
 impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_model_filter_param_rust_types::<T>(&self.filters)
+        collect_model_filter_param_rust_types::<T>(&self.effective_filters())
     }
 
     /// 添加 WHERE 条件（支持三个表的字段比较）
@@ -3474,9 +3718,10 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
+        let filters = self.effective_filters();
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &filters,
             " WHERE ",
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
@@ -3495,9 +3740,16 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
 }
 
 impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_model_filter_param_rust_types::<T>(&self.filters)
+        collect_model_filter_param_rust_types::<T>(&self.effective_filters())
     }
 
     /// 添加 WHERE 条件（支持四个表的字段比较）
@@ -3554,9 +3806,10 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
+        let filters = self.effective_filters();
         append_select_tail(
             &mut sql,
-            &self.filters,
+            &filters,
             " WHERE ",
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
@@ -4911,6 +5164,25 @@ impl<T, S> TypedColumn<T, S> {
         })
     }
 
+    pub fn json_path_text<P>(self, path: P) -> TypedExpr<String, S>
+    where
+        P: IntoJsonPath,
+    {
+        TypedExpr::new(SqlExpr::JsonPathText {
+            expr: Box::new(self.sql_expr()),
+            path: path.into_json_path(),
+        })
+    }
+
+    pub fn json_contains(self, value: impl IntoSqlExpr) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::JsonContains {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(value.into_sql_expr()),
+            },
+        })
+    }
+
     pub fn over<F>(self, f: F) -> TypedExpr<T, S>
     where
         F: FnOnce(WindowSpecBuilder) -> WindowSpecBuilder,
@@ -5006,6 +5278,25 @@ impl<T, S> TypedExpr<T, S> {
         TypedExpr::new(SqlExpr::JsonText {
             expr: Box::new(self.sql_expr()),
             key: key.into(),
+        })
+    }
+
+    pub fn json_path_text<P>(self, path: P) -> TypedExpr<String, S>
+    where
+        P: IntoJsonPath,
+    {
+        TypedExpr::new(SqlExpr::JsonPathText {
+            expr: Box::new(self.sql_expr()),
+            path: path.into_json_path(),
+        })
+    }
+
+    pub fn json_contains(self, value: impl IntoSqlExpr) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::JsonContains {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(value.into_sql_expr()),
+            },
         })
     }
 
@@ -5391,6 +5682,180 @@ impl<S> TypedColumn<Vec<String>, S> {
             ..WhereExpr::defaults()
         }
     }
+
+    pub fn contains_all(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayContains {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn overlaps(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayOverlaps {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn len(self) -> TypedExpr<i32, S> {
+        TypedExpr::new(SqlExpr::ArrayLen {
+            expr: Box::new(self.sql_expr()),
+        })
+    }
+}
+
+impl<S> TypedColumn<Vec<i32>, S> {
+    pub fn contains_all(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayContains {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn overlaps(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayOverlaps {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn len(self) -> TypedExpr<i32, S> {
+        TypedExpr::new(SqlExpr::ArrayLen {
+            expr: Box::new(self.sql_expr()),
+        })
+    }
+}
+
+impl<S> TypedColumn<Vec<i64>, S> {
+    pub fn contains_all(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayContains {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn overlaps(self, values: impl IntoArrayValue) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayOverlaps {
+                left: Box::new(self.sql_expr()),
+                right: Box::new(SqlExpr::Value(values.into_array_value())),
+            },
+        })
+    }
+
+    pub fn len(self) -> TypedExpr<i32, S> {
+        TypedExpr::new(SqlExpr::ArrayLen {
+            expr: Box::new(self.sql_expr()),
+        })
+    }
+}
+
+pub trait IntoJsonPath {
+    fn into_json_path(self) -> Vec<String>;
+}
+
+impl IntoJsonPath for &str {
+    fn into_json_path(self) -> Vec<String> {
+        vec![self.to_string()]
+    }
+}
+
+impl IntoJsonPath for String {
+    fn into_json_path(self) -> Vec<String> {
+        vec![self]
+    }
+}
+
+impl<const N: usize> IntoJsonPath for [&str; N] {
+    fn into_json_path(self) -> Vec<String> {
+        self.into_iter().map(str::to_string).collect()
+    }
+}
+
+impl IntoJsonPath for Vec<String> {
+    fn into_json_path(self) -> Vec<String> {
+        self
+    }
+}
+
+impl IntoJsonPath for &[&str] {
+    fn into_json_path(self) -> Vec<String> {
+        self.iter().map(|part| (*part).to_string()).collect()
+    }
+}
+
+pub trait IntoArrayValue {
+    fn into_array_value(self) -> crate::model::Value;
+}
+
+impl IntoArrayValue for Vec<String> {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::TextArray(self)
+    }
+}
+
+impl IntoArrayValue for &[String] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::TextArray(self.to_vec())
+    }
+}
+
+impl<const N: usize> IntoArrayValue for [&str; N] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::TextArray(self.into_iter().map(str::to_string).collect())
+    }
+}
+
+impl IntoArrayValue for &[&str] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::TextArray(self.iter().map(|value| (*value).to_string()).collect())
+    }
+}
+
+impl IntoArrayValue for Vec<i32> {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::IntegerArray(self)
+    }
+}
+
+impl IntoArrayValue for &[i32] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::IntegerArray(self.to_vec())
+    }
+}
+
+impl<const N: usize> IntoArrayValue for [i32; N] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::IntegerArray(self.into_iter().collect())
+    }
+}
+
+impl IntoArrayValue for Vec<i64> {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::BigIntArray(self)
+    }
+}
+
+impl IntoArrayValue for &[i64] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::BigIntArray(self.to_vec())
+    }
+}
+
+impl<const N: usize> IntoArrayValue for [i64; N] {
+    fn into_array_value(self) -> crate::model::Value {
+        crate::model::Value::BigIntArray(self.into_iter().collect())
+    }
 }
 
 // 为所有 TypedColumn 实现聚合方法
@@ -5612,6 +6077,8 @@ impl From<&str> for FilterValue {
 #[allow(dead_code)]
 pub struct LeftJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -5634,6 +6101,8 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
     fn clone(&self) -> Self {
         Self {
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5654,6 +6123,8 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
 #[allow(dead_code)]
 pub struct InnerJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -5676,6 +6147,8 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
     fn clone(&self) -> Self {
         Self {
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5696,6 +6169,8 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
 #[allow(dead_code)]
 pub struct RightJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
+    context_filters: Vec<ContextFilter>,
+    disabled_context_filters: Vec<ContextFilterKey>,
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
@@ -5718,6 +6193,8 @@ impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
     fn clone(&self) -> Self {
         Self {
             filters: self.filters.clone(),
+            context_filters: self.context_filters.clone(),
+            disabled_context_filters: self.disabled_context_filters.clone(),
             order_by: self.order_by.clone(),
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5751,6 +6228,8 @@ impl<T: Model> Select<T> {
 
         LeftJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5782,6 +6261,8 @@ impl<T: Model> Select<T> {
 
         InnerJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5813,6 +6294,8 @@ impl<T: Model> Select<T> {
 
         RightJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5844,6 +6327,8 @@ impl<T: Model> Select<T> {
 
         LeftJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5875,6 +6360,8 @@ impl<T: Model> Select<T> {
 
         InnerJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5906,6 +6393,8 @@ impl<T: Model> Select<T> {
 
         RightJoinedSelect {
             filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
             order_by: self.order_by,
             range_start: self.range_start,
             range_end: self.range_end,
@@ -5923,9 +6412,20 @@ impl<T: Model> Select<T> {
 }
 
 impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(
+            &self.join_source,
+            &self.on_condition,
+            &self.effective_filters(),
+        )
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -5947,12 +6447,13 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
 
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let filters = self.effective_filters();
         join_sql_with_params::<T, J>(
             db_type,
             JoinKind::Left,
             self.lateral,
             JoinSqlParts {
-                filters: &self.filters,
+                filters: &filters,
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
@@ -5967,10 +6468,34 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
     }
 }
 
+impl<T: Model, J: Model> NamedFilterQuery<T> for LeftJoinedSelect<T, J> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<T: Model, J: Model> WithoutFilterQuery<T> for LeftJoinedSelect<T, J> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
+        self
+    }
+}
+
 impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(
+            &self.join_source,
+            &self.on_condition,
+            &self.effective_filters(),
+        )
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -5991,12 +6516,13 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
     }
 
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let filters = self.effective_filters();
         join_sql_with_params::<T, J>(
             db_type,
             JoinKind::Inner,
             self.lateral,
             JoinSqlParts {
-                filters: &self.filters,
+                filters: &filters,
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
@@ -6011,10 +6537,34 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
     }
 }
 
+impl<T: Model, J: Model> NamedFilterQuery<T> for InnerJoinedSelect<T, J> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<T: Model, J: Model> WithoutFilterQuery<T> for InnerJoinedSelect<T, J> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
+        self
+    }
+}
+
 impl<T: Model, J: Model> RightJoinedSelect<T, J> {
+    fn effective_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(&self.join_source, &self.on_condition, &self.filters)
+        collect_join_param_rust_types::<T>(
+            &self.join_source,
+            &self.on_condition,
+            &self.effective_filters(),
+        )
     }
 
     pub fn filter<F>(mut self, f: F) -> Self
@@ -6035,12 +6585,13 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
     }
 
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let filters = self.effective_filters();
         join_sql_with_params::<T, J>(
             db_type,
             JoinKind::Right,
             self.lateral,
             JoinSqlParts {
-                filters: &self.filters,
+                filters: &filters,
                 range_start: self.range_start,
                 range_end: self.range_end,
                 ignored_columns: &self.ignored_columns,
@@ -6052,5 +6603,18 @@ impl<T: Model, J: Model> RightJoinedSelect<T, J> {
                 join_range_end: self.join_range_end,
             },
         )
+    }
+}
+
+impl<T: Model, J: Model> NamedFilterQuery<T> for RightJoinedSelect<T, J> {
+    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
+        self.filter(|_| expr)
+    }
+}
+
+impl<T: Model, J: Model> WithoutFilterQuery<T> for RightJoinedSelect<T, J> {
+    fn without_filter(mut self, name: &'static str) -> Self {
+        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
+        self
     }
 }

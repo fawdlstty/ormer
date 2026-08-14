@@ -94,6 +94,8 @@ pub enum FilterExpr {
     ExprIsNull { expr: SqlExpr },
     /// 表达式 IS NOT NULL
     ExprIsNotNull { expr: SqlExpr },
+    /// 布尔表达式谓词
+    ExprPredicate { expr: SqlExpr },
     /// Full text search
     TextSearch { expr: SqlExpr, query: String },
     /// Runtime dynamic field that could not be resolved against the model.

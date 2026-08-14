@@ -4,7 +4,7 @@ pub mod connection_pool;
 pub mod common_helpers;
 
 use crate::abstract_layer::DbType;
-use crate::model::Value;
+use crate::model::{Value, VersionSnapshotUpdate};
 
 /// 宏定义模块 - 用于减少重复代码
 #[macro_use]
@@ -21,20 +21,20 @@ pub use unified::{
     DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
     DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
     IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,
-    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
-    RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder, SelectExecutor,
-    SelectStream, SelectStreamIterator, Transaction, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor,
+    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel,
+    LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
+    ModelCollectWithFuture, NestedInclude, RawCollectFuture, RawSelectExecutor,
+    RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
+    ReplicatedDatabaseBuilder, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor,
+    SelectStream, SelectStreamIterator, Transaction, TransactionFuture, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
     TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor, UpdateGraphExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
 pub use connection_pool::{
-    ConnectionPool, PooledConnection, PooledRawSelectExecutor, ReplicatedConnectionPool,
-    ReplicatedPoolBuilder,
+    ConnectionPool, PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor,
+    ReplicatedConnectionPool, ReplicatedPoolBuilder,
 };
 
 #[derive(Debug, Clone)]
@@ -42,6 +42,8 @@ pub struct SingleSqlStatement {
     pub sql: String,
     pub params: Vec<Value>,
     pub param_rust_types: Option<Vec<&'static str>>,
+    pub versioned: bool,
+    pub version_update: Option<VersionSnapshotUpdate>,
 }
 
 impl SingleSqlStatement {
@@ -50,11 +52,23 @@ impl SingleSqlStatement {
             sql: sql.into(),
             params,
             param_rust_types: None,
+            versioned: false,
+            version_update: None,
         }
     }
 
     pub fn with_param_rust_types(mut self, param_rust_types: Vec<&'static str>) -> Self {
         self.param_rust_types = Some(param_rust_types);
+        self
+    }
+
+    pub fn with_optimistic_lock(
+        mut self,
+        versioned: bool,
+        version_update: Option<VersionSnapshotUpdate>,
+    ) -> Self {
+        self.versioned = versioned;
+        self.version_update = version_update;
         self
     }
 }

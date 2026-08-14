@@ -25,6 +25,10 @@ pub enum DatabaseErrorKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrmerError {
+    OptimisticLock {
+        table: &'static str,
+        column: &'static str,
+    },
     Database {
         backend: DbType,
         kind: DatabaseErrorKind,
@@ -61,6 +65,10 @@ pub enum OrmerError {
 }
 
 impl OrmerError {
+    pub fn optimistic_lock(table: &'static str, column: &'static str) -> Self {
+        Self::OptimisticLock { table, column }
+    }
+
     pub fn other(message: impl Into<String>) -> Self {
         Self::Other {
             message: message.into(),
@@ -163,6 +171,9 @@ impl OrmerError {
 impl fmt::Display for OrmerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OptimisticLock { table, column } => {
+                write!(formatter, "optimistic lock conflict on {table}.{column}")
+            }
             Self::Database {
                 backend,
                 kind,
