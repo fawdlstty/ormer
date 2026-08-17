@@ -2,7 +2,7 @@
 
 use ormer::Model;
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_direct!(TestDirectUser, "test_direct_users_1");

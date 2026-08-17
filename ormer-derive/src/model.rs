@@ -29,6 +29,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     };
 
     let mut field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
     let mut normal_index = 0;
     for info in &mut field_infos {
         if !info.is_relation() && !info.is_ignored {
@@ -80,6 +81,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     // 获取第一个主键（用于向后兼容）
     let primary_key_field = primary_keys[0].field_name;
     let is_auto_increment = primary_keys[0].primary_auto;
+    if is_auto_increment && is_uuid_type(&primary_keys[0].rust_type) {
+        panic!(
+            "UUID primary key cannot use #[primary(auto)]; generate UUID in Rust or use a database default"
+        );
+    }
 
     // 生成 AutoIncrementKeyType
     // 如果有自增主键，类型为第一个主键的 Rust 类型；否则为 ()
@@ -98,12 +104,27 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             quote! { #column_name }
         })
         .collect();
+    let primary_field_names: Vec<_> = primary_keys
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name.to_string();
+            quote! { #field_name }
+        })
+        .collect();
     let primary_key_column_name = primary_keys[0].column_name.clone();
 
     // 生成主键值获取（支持复合主键）
     let primary_key_values: Vec<_> = primary_keys
         .iter()
         .map(|info| field_to_value_expr(info))
+        .collect();
+    let primary_field_types: Vec<_> = primary_keys.iter().map(|info| info.field_type).collect();
+    let primary_field_values: Vec<_> = primary_keys
+        .iter()
+        .map(|info| {
+            let field_name = info.field_name;
+            quote! { self.#field_name.clone() }
+        })
         .collect();
 
     let primary_key_value_expr = field_to_value_expr(primary_keys[0]);
@@ -1210,6 +1231,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             #dynamic_columns_method
             #dynamic_column_schema_method
             #version_info_method
+            #hypertable_route_key_method
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -1339,6 +1361,18 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
 
+        impl ::ormer::model::PrimaryFields for #name {
+            type Fields = (#(#primary_field_types,)*);
+
+            fn primary_field_names() -> Vec<&'static str> {
+                vec![#(#primary_field_names),*]
+            }
+
+            fn promary_fields(&self) -> Self::Fields {
+                (#(#primary_field_values,)*)
+            }
+        }
+
         // 生成 inherent 方法，使得不需要 import Model trait 也能调用
         impl #name {
             pub fn select() -> ::ormer::Select<Self> {
@@ -1349,8 +1383,20 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 ::ormer::Select::new()
             }
 
+            pub fn primary_field_names() -> Vec<&'static str> {
+                <Self as ::ormer::model::PrimaryFields>::primary_field_names()
+            }
+
+            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
+            }
+
             pub fn version(&self) -> u64 {
                 ::ormer::model::model_version(self)
+            }
+
+            pub fn track(self) -> ::ormer::Tracked<Self> {
+                ::ormer::Tracked::new(self)
             }
         }
     }
@@ -1736,6 +1782,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
     };
 
     let field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
     if field_infos
         .iter()
         .any(|info| info.is_primary || info.is_relation())
@@ -2018,6 +2065,8 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
             type Where = #where_name;
             type Update = ();
 
+            #hypertable_route_key_method
+
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
             }
@@ -2067,6 +2116,16 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
             }
         }
 
+        impl ::ormer::model::PrimaryFields for #name {
+            type Fields = ();
+
+            fn primary_field_names() -> Vec<&'static str> {
+                Vec::new()
+            }
+
+            fn promary_fields(&self) -> Self::Fields {}
+        }
+
         impl #name {
             pub fn select() -> ::ormer::Select<Self> {
                 ::ormer::Select::new()
@@ -2074,6 +2133,14 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
 
             pub fn query() -> ::ormer::Select<Self> {
                 ::ormer::Select::new()
+            }
+
+            pub fn primary_field_names() -> Vec<&'static str> {
+                <Self as ::ormer::model::PrimaryFields>::primary_field_names()
+            }
+
+            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
             }
         }
     }
@@ -2168,6 +2235,7 @@ struct FieldInfo<'a> {
     default: proc_macro2::TokenStream,
     check: proc_macro2::TokenStream,
     hypertable: proc_macro2::TokenStream,
+    hypertable_route: bool,
     compress: bool,
     is_ignored: bool,
     normal_index: Option<usize>,
@@ -2220,6 +2288,7 @@ impl<'a> FieldInfo<'a> {
             })
             .unwrap_or(false);
         let data_type = data_type_tokens(effective_data_type_type.as_ref());
+        let hypertable = extract_hypertable(field, field_type);
         let (is_primary, primary_auto) = extract_primary_attr(field);
         let relation = extract_relation_field(field);
         let embed = extract_embed_attr(field);
@@ -2260,7 +2329,8 @@ impl<'a> FieldInfo<'a> {
             has_vec_i32_data_type,
             default: extract_default(field),
             check: extract_check(field),
-            hypertable: extract_hypertable(field),
+            hypertable: hypertable.duration,
+            hypertable_route: hypertable.route,
             compress: field
                 .attrs
                 .iter()
@@ -2605,6 +2675,10 @@ fn derive_model_tuple_wrapper(
             type Where = <#inner_type as ::ormer::Model>::Where;
             type Update = <#inner_type as ::ormer::Model>::Update;
 
+            fn hypertable_route_key() -> Option<&'static str> {
+                <#inner_type as ::ormer::Model>::hypertable_route_key()
+            }
+
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
             }
@@ -2644,6 +2718,21 @@ fn derive_model_tuple_wrapper(
             }
         }
 
+        impl ::ormer::model::PrimaryFields for #name
+        where
+            #inner_type: ::ormer::model::PrimaryFields,
+        {
+            type Fields = <#inner_type as ::ormer::model::PrimaryFields>::Fields;
+
+            fn primary_field_names() -> Vec<&'static str> {
+                <#inner_type as ::ormer::model::PrimaryFields>::primary_field_names()
+            }
+
+            fn promary_fields(&self) -> Self::Fields {
+                <#inner_type as ::ormer::model::PrimaryFields>::promary_fields(&self.0)
+            }
+        }
+
         impl ::ormer::WritableModel for #name {}
 
         // 生成 inherent 方法
@@ -2654,6 +2743,23 @@ fn derive_model_tuple_wrapper(
 
             pub fn query() -> ::ormer::Select<Self> {
                 ::ormer::Select::new()
+            }
+
+            pub fn track(self) -> ::ormer::Tracked<Self> {
+                ::ormer::Tracked::new(self)
+            }
+        }
+
+        impl #name
+        where
+            #inner_type: ::ormer::model::PrimaryFields,
+        {
+            pub fn primary_field_names() -> Vec<&'static str> {
+                <Self as ::ormer::model::PrimaryFields>::primary_field_names()
+            }
+
+            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
             }
         }
 
@@ -2990,6 +3096,22 @@ fn is_i32_type(ty: &syn::Type) -> bool {
             .segments
             .last()
             .map(|segment| segment.ident == "i32")
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn is_uuid_type(type_name: &str) -> bool {
+    matches!(type_name, "Uuid" | "uuid::Uuid")
+}
+
+fn is_string_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident == "String")
             .unwrap_or(false),
         _ => false,
     }
@@ -3384,18 +3506,75 @@ mod view_model_tests {
     }
 }
 
-/// 提取 hypertable 属性的分片时长信息
-/// 支持语法：#[hypertable(Duration::from_hours(1))]
-fn extract_hypertable(field: &syn::Field) -> proc_macro2::TokenStream {
+struct HypertableAttr {
+    duration: proc_macro2::TokenStream,
+    route: bool,
+}
+
+fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::TokenStream {
+    let route_fields = field_infos
+        .iter()
+        .filter(|info| info.hypertable_route)
+        .collect::<Vec<_>>();
+    if route_fields.len() > 1 {
+        panic!("only one String field can use bare #[hypertable] per model");
+    }
+
+    if let Some(info) = route_fields.first() {
+        let key = info.column_name.as_str();
+        quote! {
+            fn hypertable_route_key() -> Option<&'static str> {
+                Some(#key)
+            }
+        }
+    } else {
+        quote! {}
+    }
+}
+
+fn validate_hypertable_route_field(field: &syn::Field, field_type: &syn::Type) {
+    if is_string_type(field_type) {
+        return;
+    }
+
+    let field_name = field
+        .ident
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unnamed>".to_string());
+    panic!("bare #[hypertable] requires field `{field_name}` to be String");
+}
+
+/// 提取 hypertable 属性信息。
+/// 支持语法：
+/// - #[hypertable(Duration::from_hours(1))]：TimescaleDB 时间分片时长
+/// - #[hypertable]：PostgreSQL/TimescaleDB 字符串拆表路由
+fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> HypertableAttr {
     for attr in &field.attrs {
         if attr.path().is_ident("hypertable") {
-            if let Meta::List(list) = &attr.meta {
-                let tokens = &list.tokens;
-                return quote! { Some(#tokens) };
+            match &attr.meta {
+                Meta::List(list) if !list.tokens.is_empty() => {
+                    let tokens = &list.tokens;
+                    return HypertableAttr {
+                        duration: quote! { Some(#tokens) },
+                        route: false,
+                    };
+                }
+                Meta::List(_) | Meta::Path(_) => {
+                    validate_hypertable_route_field(field, field_type);
+                    return HypertableAttr {
+                        duration: quote! { None },
+                        route: true,
+                    };
+                }
+                _ => panic!("#[hypertable] must use #[hypertable] or #[hypertable(...)]"),
             }
         }
     }
-    quote! { None }
+    HypertableAttr {
+        duration: quote! { None },
+        route: false,
+    }
 }
 
 /// 提取 foreign 属性的外键信息

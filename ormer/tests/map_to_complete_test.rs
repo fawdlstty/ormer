@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // ==================== 测试Model定义 ====================
 // 使用宏定义测试专用模型（唯一表名）

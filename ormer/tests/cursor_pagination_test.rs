@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlite")]
 
-mod _test_common;
+pub mod _test_common;
 
 use ormer::PageCursor;
 

@@ -250,6 +250,18 @@ db.update::<User>()
 
 `set_model(&users)` 和 `set_model_fields(&users, ...)` 接收模型集合时，会在无乐观锁冲突定位需求且主键不重复的场景下自动生成单 SQL 差异更新；不满足条件时保持逐条更新语义。
 
+### 变更跟踪保存
+
+从数据库加载模型后调用 `track()` 可记录当前快照，`save()` 只更新发生变化的非主键字段；没有变更时返回 `0` 且不执行 UPDATE：
+
+```rust
+let mut user = db.find_by_id::<User>(1).await?.unwrap().track();
+user.name = "New Name".to_string();
+user.email = Some("new@example.com".to_string());
+
+db.save(&mut user).execute().await?;
+```
+
 ## 删除 (Delete)
 
 ```rust

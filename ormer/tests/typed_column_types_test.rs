@@ -3,7 +3,7 @@
 use ormer::query::builder::TypedColumn;
 use ormer::query::filter::FilterExpr;
 
-mod _test_common;
+pub mod _test_common;
 
 // 此测试不需要模型定义，仅测试 TypedColumn 类型
 

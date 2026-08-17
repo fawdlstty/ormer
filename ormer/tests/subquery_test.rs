@@ -1,25 +1,12 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_for_join!(TestUser, "test_subquery_users_1");
 define_test_role!(TestRole, "test_subquery_roles_1");
 
 // ==================== MappedSelect SQL 生成测试 ====================
-
-#[allow(dead_code)]
-async fn test_mapped_select_basic_impl(config: &_test_common::DbConfig) {
-    // 测试基本的 map_to SQL 生成（纯SQL生成测试，不需要数据库连接）
-    let sql = ormer::Select::<TestUser>::new()
-        .filter(|u| u.name.eq("Alice"))
-        .map_to(|u| u.id)
-        .to_sql_with_params(config.0);
-
-    println!("SQL: {}", sql.0);
-    assert!(sql.0.starts_with("SELECT id FROM test_subquery_users_1"));
-    assert!(sql.0.contains("WHERE name ="));
-}
 
 #[test]
 fn test_mapped_select_different_column() {

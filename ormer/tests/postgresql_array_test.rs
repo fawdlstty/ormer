@@ -1,6 +1,6 @@
 #![cfg(feature = "postgresql")]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, PartialEq, ormer::Model)]
 #[table = "test_postgresql_arrays_1"]

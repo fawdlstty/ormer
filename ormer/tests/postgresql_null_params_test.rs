@@ -1,6 +1,6 @@
 #![cfg(feature = "postgresql")]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "test_postgresql_null_binary_params"]

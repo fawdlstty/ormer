@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 define_test_user_simple!(RawSqlUser, "raw_sql_users_1");
 
@@ -24,6 +24,7 @@ impl FromRowValues for UserName {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgresql"))]
 #[test]
 fn raw_sql_tokenizer_skips_sql_literal_regions() {
     let raw = ormer::sql(

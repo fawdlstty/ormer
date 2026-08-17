@@ -1,14 +1,12 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
-#![allow(dead_code)]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_simple!(TestUserIOU, "test_users_iou1_1");
 define_test_role_with_unique_group!(TestRoleIOU, "test_roles_iou1_1");
 define_test_user_simple!(TestUserIOU2, "test_users_iou2_1");
 define_test_user_simple!(TestUserIOU3, "test_users_iou3_1");
-define_test_user_simple!(TestUserIOU4, "test_users_iou4_1");
 define_test_user_simple!(TestUserIOU5, "test_users_iou5_1");
 define_test_role_with_unique_group!(TestRoleIOU4, "test_roles_iou4_1");
 

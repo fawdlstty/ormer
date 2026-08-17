@@ -1,7 +1,7 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 /// drop_table 功能测试
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_direct!(TestDropBasicUser, "test_drop_basic_users_1");

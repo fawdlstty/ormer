@@ -351,7 +351,10 @@ macro_rules! sql {
     }};
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "sqlite", feature = "postgresql", feature = "mssql")
+))]
 mod tests {
     use super::*;
 

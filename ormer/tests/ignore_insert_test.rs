@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 define_test_user_simple!(TestUserIgnore, "test_users_ignore_1");
 define_test_user_simple!(TestUserIgnore2, "test_users_ignore_2");

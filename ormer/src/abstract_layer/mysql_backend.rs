@@ -33,6 +33,10 @@ fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::MySQL)
 }
 
+fn is_uuid_rust_type(rust_type: &str) -> bool {
+    matches!(rust_type, "Uuid" | "uuid::Uuid")
+}
+
 fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Value {
     match value {
         crate::model::Value::Integer(v) => mysql_async::Value::Int(*v),
@@ -107,6 +111,9 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
 
         // 首先处理主键类型
         if is_primary {
+            if is_uuid_rust_type(rust_type) {
+                return "CHAR(36) PRIMARY KEY".to_string();
+            }
             let int_type = match rust_type {
                 "i8" | "i16" | "u8" => "TINYINT",
                 "i32" | "u16" => "INT",
@@ -142,6 +149,8 @@ impl DbBackendTypeMapper for MySQLTypeMapper {
             "Duration" | "std::time::Duration" => "BIGINT",
             // 字符串类型
             "String" => "VARCHAR(255)",
+            // UUID 使用规范连字符字符串存储
+            "Uuid" | "uuid::Uuid" => "CHAR(36)",
             // 布尔类型
             "bool" => "TINYINT(1)",
             // 字节数组
@@ -290,32 +299,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         Err(crate::ormer_error!(
             "MySQL does not support RETURNING clause"
         ))
-    }
-
-    #[allow(dead_code)]
-    async fn insert_impl<T: Model>(&self, models: &[&T]) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::MySQL, models)?;
-        let params = values_to_params(&all_values)?;
-
-        conn.exec_drop(&sql, params).trace().await?;
-
-        // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            let last_id = conn.last_insert_id().unwrap_or(0);
-            let result =
-                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
-            return Ok(result);
-        }
-
-        Ok(T::AutoIncrementKeyType::default())
     }
 }
 
@@ -480,45 +463,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
     pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
     }
-
-    #[allow(dead_code)]
-    async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
-        if models.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON DUPLICATE KEY UPDATE ...
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
-            DbType::MySQL,
-            "INSERT INTO",
-            T::table_name_for_db(DbType::MySQL),
-            T::COLUMNS,
-            models,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        // 添加 ON DUPLICATE KEY UPDATE 子句
-        sql.push_str(" ON DUPLICATE KEY UPDATE ");
-        let mut first = true;
-        for col_name in T::COLUMNS.iter() {
-            if !first {
-                sql.push_str(", ");
-            }
-            sql.push_str(&common_helpers::quote_mysql_values_assignment(
-                DbType::MySQL,
-                col_name,
-            ));
-            first = false;
-        }
-
-        let params = values_to_params(&all_values)?;
-
-        conn.exec_drop(&sql, params).trace().await?;
-
-        Ok(())
-    }
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpdateExecutor<'a, I> {
@@ -571,31 +515,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 
     pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
-    }
-
-    #[allow(dead_code)]
-    async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
-        if models.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
-            DbType::MySQL,
-            "INSERT IGNORE INTO",
-            T::table_name_for_db(DbType::MySQL),
-            T::COLUMNS,
-            models,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        let params = values_to_params(&all_values)?;
-
-        conn.exec_drop(&sql, params).trace().await?;
-
-        Ok(())
     }
 }
 
@@ -689,7 +608,7 @@ impl Database {
     ) -> crate::Result<()> {
         // 查询表的列信息
         let sql = r#"
-            SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+            SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
@@ -755,6 +674,7 @@ impl Database {
                     "i8" | "i16" | "u8" => "TINYINT".to_string(),
                     "i32" | "u16" => "INT".to_string(),
                     "i64" | "u32" | "u64" => "BIGINT".to_string(),
+                    "Uuid" | "uuid::Uuid" => "CHAR(36)".to_string(),
                     _ => "INT".to_string(),
                 }
             } else {
@@ -830,10 +750,9 @@ impl Database {
                 // 浮点类型
                 "FLOAT" => "FLOAT".to_string(),
                 "DOUBLE" | "DOUBLEPRECISION" => "DOUBLE".to_string(),
-                // 字符串类型（忽略长度参数）
-                "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
-                    "VARCHAR".to_string()
-                }
+                // 保留 CHAR/VARCHAR 长度，UUID 的 CHAR(36) 不能与其他文本类型等价
+                "VARCHAR" | "CHAR" => upper,
+                "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => "TEXT".to_string(),
                 // 布尔类型（MySQL 使用 TINYINT(1) 存储布尔值）
                 "BOOL" | "BOOLEAN" => "TINYINT".to_string(),
                 // 字节类型
@@ -900,37 +819,6 @@ impl Database {
             pool: &self.pool,
             models,
             _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
-    /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
-    #[allow(dead_code)]
-    pub(crate) async fn insert_impl<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let mut conn = self.pool.get_conn().trace().await?;
-
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::MySQL, models)?;
-        let params = values_to_params(&all_values)?;
-
-        conn.exec_drop(&sql, params).trace().await?;
-
-        // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            let last_id = conn.last_insert_id().unwrap_or(0);
-            let result =
-                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
-            Ok(result)
-        } else {
-            Ok(T::AutoIncrementKeyType::default())
         }
     }
 
@@ -1153,7 +1041,7 @@ impl Database {
         }
         let rows: Vec<mysql_async::Row> = conn
             .exec(
-                "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY \
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY \
                  FROM information_schema.columns \
                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
                  ORDER BY ORDINAL_POSITION",
@@ -2124,7 +2012,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
         for row in rows {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                convert_mysql_value(&row, i)
+                convert_mysql_model_value::<T>(&row, i)
             })?;
             results.push(model);
         }
@@ -2445,7 +2333,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
 /// 将 MySQL Row 解析为 Model
 fn parse_mysql_row<T: Model>(row: &mysql_async::Row) -> crate::Result<T> {
-    common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| convert_mysql_value(row, i))
+    common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+        convert_mysql_model_value::<T>(row, i)
+    })
 }
 
 /// SelectStreamIterator - 真正的流式查询迭代器 (MySQL)
@@ -2522,118 +2412,9 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                                _ => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected integer type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected String type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected float type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected bool type)",
-                                        col_name
-                                    )));
-                                }
-                                _ => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                convert_mysql_model_value::<T>(&row, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -2683,118 +2464,9 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
 
         let mut results = Vec::new();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
-                let rust_type = column_info.rust_type;
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                                _ => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected integer type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected String type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected float type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected bool type)",
-                                        col_name
-                                    )));
-                                }
-                                _ => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                convert_mysql_model_value::<T>(&row, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -2842,14 +2514,17 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
 
         let mut results = Vec::new();
+        let column_schema = T::column_schema();
         for row in rows {
             let mut data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &T::COLUMN_SCHEMA[i];
+                let column_info = &column_schema[i];
                 let rust_type = column_info.rust_type;
                 let is_nullable = column_info.is_nullable;
 
-                let ormer_value = if is_nullable {
+                let ormer_value = if is_uuid_rust_type(rust_type) {
+                    convert_mysql_uuid_value(&row, i)?
+                } else if is_nullable {
                     match rust_type {
                         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
                             let v: Option<i64> = row.get(i).unwrap_or(None);
@@ -3052,11 +2727,13 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
+        let t_column_schema = T::column_schema();
+        let j_column_schema = J::column_schema();
 
         for row in rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
+                let rust_type = t_column_schema[i].rust_type;
                 let ormer_value = match rust_type {
                     "i32" | "i64" | "u32" | "u64" => {
                         let v: i64 = row.get(i).unwrap_or(0);
@@ -3070,6 +2747,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                         let v: f64 = row.get(i).unwrap_or(0.0);
                         crate::model::Value::Real(v)
                     }
+                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, i)?,
                     _ => {
                         return Err(crate::ormer_error!(format!(
                             "Unsupported column type: {rust_type}"
@@ -3085,7 +2763,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             let mut j_is_null = true;
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
+                let rust_type = j_column_schema[i].rust_type;
                 let ormer_value = match rust_type {
                     "i32" | "i64" | "u32" | "u64" => {
                         // 先检查是否为 NULL
@@ -3122,6 +2800,13 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                                 crate::model::Value::Real(v)
                             }
                         }
+                    }
+                    "Uuid" | "uuid::Uuid" => {
+                        let value = convert_mysql_uuid_value(&row, idx)?;
+                        if !matches!(value, crate::model::Value::Null) {
+                            j_is_null = false;
+                        }
+                        value
                     }
                     _ => {
                         return Err(crate::ormer_error!(format!(
@@ -3193,11 +2878,13 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
+        let t_column_schema = T::column_schema();
+        let j_column_schema = J::column_schema();
 
         for row in rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = T::COLUMN_SCHEMA[i].rust_type;
+                let rust_type = t_column_schema[i].rust_type;
                 let ormer_value = match rust_type {
                     "i32" | "i64" | "u32" | "u64" => {
                         let v: i64 = row.get(i).unwrap_or(0);
@@ -3211,6 +2898,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                         let v: f64 = row.get(i).unwrap_or(0.0);
                         crate::model::Value::Real(v)
                     }
+                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, i)?,
                     _ => {
                         return Err(crate::ormer_error!(format!(
                             "Unsupported column type: {rust_type}"
@@ -3224,7 +2912,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let rust_type = J::COLUMN_SCHEMA[i].rust_type;
+                let rust_type = j_column_schema[i].rust_type;
                 let ormer_value = match rust_type {
                     "i32" | "i64" | "u32" | "u64" => {
                         let v: i64 = row.get(idx).unwrap_or(0);
@@ -3238,6 +2926,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                         let v: f64 = row.get(idx).unwrap_or(0.0);
                         crate::model::Value::Real(v)
                     }
+                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, idx)?,
                     _ => {
                         return Err(crate::ormer_error!(format!(
                             "Unsupported column type: {rust_type}"
@@ -3316,16 +3005,71 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
         for row in rows {
             let t_model =
                 common_helpers::decode_optional_model_from_indexed_values::<T, _>(0, |i| {
-                    convert_mysql_value(&row, i)
+                    convert_mysql_model_value::<T>(&row, i)
                 })?;
             let j_model =
                 common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
-                    convert_mysql_value(&row, i)
+                    convert_mysql_model_value_at::<J>(&row, i, i - t_col_count)
                 })?;
             results.push((t_model, j_model));
         }
 
         Ok(results.into_iter().collect())
+    }
+}
+
+fn convert_mysql_uuid_value(
+    row: &mysql_async::Row,
+    index: usize,
+) -> crate::Result<crate::model::Value> {
+    let value = row
+        .get::<Option<mysql_async::Value>, _>(index)
+        .unwrap_or(None);
+
+    match value {
+        Some(mysql_async::Value::NULL) | None => Ok(crate::model::Value::Null),
+        Some(mysql_async::Value::Bytes(bytes)) => {
+            let raw = String::from_utf8(bytes).map_err(|err| {
+                crate::ormer_error!(
+                    "Failed to decode MySQL UUID column {} as UTF-8: {}",
+                    index,
+                    err
+                )
+            })?;
+            uuid::Uuid::parse_str(raw.trim())
+                .map(crate::model::Value::Uuid)
+                .map_err(|err| {
+                    crate::ormer_error!("Failed to parse MySQL UUID column {}: {}", index, err)
+                })
+        }
+        Some(_) => Err(crate::ormer_error!(
+            "Failed to decode MySQL UUID column {} from non-text value",
+            index
+        )),
+    }
+}
+
+fn convert_mysql_model_value<T: Model>(
+    row: &mysql_async::Row,
+    column_index: usize,
+) -> crate::Result<crate::model::Value> {
+    convert_mysql_model_value_at::<T>(row, column_index, column_index)
+}
+
+fn convert_mysql_model_value_at<T: Model>(
+    row: &mysql_async::Row,
+    row_index: usize,
+    model_column_index: usize,
+) -> crate::Result<crate::model::Value> {
+    let columns = T::column_schema();
+    let column = columns
+        .get(model_column_index)
+        .ok_or_else(|| crate::ormer_error!("Column index out of bounds: {}", model_column_index))?;
+
+    if is_uuid_rust_type(column.rust_type) {
+        convert_mysql_uuid_value(row, row_index)
+    } else {
+        convert_mysql_value(row, row_index)
     }
 }
 

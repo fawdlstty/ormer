@@ -1,8 +1,7 @@
-#[allow(unused_imports)]
 use ormer::{FieldType, Model};
 
 #[cfg(feature = "postgresql")]
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, FieldType, PartialEq)]
 enum UserStatus {

@@ -83,6 +83,7 @@ fn decimal_values_roundtrip_without_float_loss() {
 }
 
 #[test]
+#[cfg(feature = "sqlite")]
 fn decimal_filter_builds_typed_params() {
     let (sql, params) = ormer::Select::<DecimalModel>::new()
         .filter(|m| m.price.ge(decimal("10.00")))

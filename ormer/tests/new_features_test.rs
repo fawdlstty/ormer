@@ -2,7 +2,7 @@
 
 use ormer::generate_create_table_sql;
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user!(TestUser, "test_new_features_users_1");

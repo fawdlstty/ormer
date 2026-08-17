@@ -2,7 +2,7 @@
 
 use ormer::query::builder::Select;
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_for_join!(TestUser, "test_lateral_users");

@@ -125,7 +125,7 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
         Value::Date(_) => "NaiveDate",
         Value::Time(_) => "NaiveTime",
         Value::Json(_) => "String",
-        Value::Uuid(_) => "String",
+        Value::Uuid(_) => "uuid::Uuid",
         Value::Null => "i32",
     }
 }
@@ -163,6 +163,16 @@ impl crate::query::builder::ColumnValueType for bigdecimal::BigDecimal {
     }
 }
 
+impl crate::query::builder::ColumnValueType for uuid::Uuid {
+    fn to_filter_value(value: Self) -> Value {
+        Value::Uuid(value)
+    }
+
+    fn supports_comparison() -> bool {
+        false
+    }
+}
+
 impl crate::query::builder::IsInValue<rust_decimal::Decimal> for &rust_decimal::Decimal {
     fn to_in_value(self) -> rust_decimal::Decimal {
         *self
@@ -184,6 +194,24 @@ impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &bigdecimal::B
 impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &&bigdecimal::BigDecimal {
     fn to_in_value(self) -> bigdecimal::BigDecimal {
         (*self).clone()
+    }
+}
+
+impl crate::query::builder::IsInValue<uuid::Uuid> for uuid::Uuid {
+    fn to_in_value(self) -> uuid::Uuid {
+        self
+    }
+}
+
+impl crate::query::builder::IsInValue<uuid::Uuid> for &uuid::Uuid {
+    fn to_in_value(self) -> uuid::Uuid {
+        *self
+    }
+}
+
+impl crate::query::builder::IsInValue<uuid::Uuid> for &&uuid::Uuid {
+    fn to_in_value(self) -> uuid::Uuid {
+        **self
     }
 }
 

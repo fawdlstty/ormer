@@ -6,8 +6,8 @@
 use super::{SqlStatement, common_helpers};
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
-    RelationSelection, TableRouteValue, ThroughRelation, Value, WritableModel,
-    normalize_table_name_for_db,
+    RelationSelection, TableRouteValue, ThroughRelation, Tracked, Value, WritableModel,
+    normalize_table_name_for_db, routed_model_table_name_for_db,
 };
 use crate::query::builder::{ContextFilter, DerivedSelect, DerivedTableSelect};
 use crate::query::builder::{FilterQuery, NamedFilterQuery, WhereExpr, WithoutFilterQuery};
@@ -583,7 +583,17 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
     }
 
     pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
-        let table_name = crate::model::render_table_name_template(T::TABLE_NAME, &route)
+        let db_type = match &self {
+            #[cfg(feature = "sqlite")]
+            CreateTableExecutor::Sqlite(_) => crate::abstract_layer::DbType::Sqlite,
+            #[cfg(feature = "postgresql")]
+            CreateTableExecutor::PostgreSQL(_) => crate::abstract_layer::DbType::PostgreSQL,
+            #[cfg(feature = "mysql")]
+            CreateTableExecutor::MySQL(_) => crate::abstract_layer::DbType::MySQL,
+            #[cfg(feature = "mssql")]
+            CreateTableExecutor::MSSQL(_) => crate::abstract_layer::DbType::MSSQL,
+        };
+        let table_name = routed_model_table_name_for_db::<T>(db_type, &route)
             .unwrap_or_else(|err| panic!("Failed to render table route: {}", err));
         self.with_table_name(&table_name)
     }
@@ -1008,6 +1018,72 @@ where
     }
 }
 
+pub struct SaveExecutor<'a, T: WritableModel> {
+    db: &'a Database,
+    model: &'a mut Tracked<T>,
+}
+
+impl<'a, T: WritableModel> SaveExecutor<'a, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            return Ok(SqlStatement::batch(self.db.db_type(), Vec::new()));
+        }
+        self.db
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .to_sql()
+    }
+
+    pub async fn execute(self) -> crate::Result<u64> {
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            return Ok(0);
+        }
+
+        let affected = self
+            .db
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .execute()
+            .await?;
+        if affected > 0 {
+            self.model.accept_changes();
+        }
+        Ok(affected)
+    }
+
+    pub async fn exec(self) -> crate::Result<u64> {
+        self.execute().await
+    }
+
+    pub async fn execute_with_hooks(self) -> crate::Result<u64>
+    where
+        T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
+    {
+        let mut ctx = crate::HookContext::new(crate::HookOperation::Update);
+        crate::BeforeUpdate::before_update(self.model.as_model_mut(), &mut ctx).await?;
+
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            self.model.accept_changes();
+            return Ok(0);
+        }
+
+        let affected = self
+            .db
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .execute()
+            .await?;
+        if affected > 0 {
+            crate::AfterUpdate::after_update(self.model.as_model(), &mut ctx).await?;
+            self.model.accept_changes();
+        }
+        Ok(affected)
+    }
+}
+
 /// 统一的 InsertOrIgnoreExecutor 枚举
 pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     #[cfg(feature = "sqlite")]
@@ -1359,6 +1435,10 @@ impl Database {
         }
     }
 
+    pub fn save<'a, T: WritableModel>(&'a self, model: &'a mut Tracked<T>) -> SaveExecutor<'a, T> {
+        SaveExecutor { db: self, model }
+    }
+
     pub fn update_graph<'a, T>(&'a self, model: &'a mut T) -> UpdateGraphExecutor<'a, T>
     where
         T: crate::model::GraphWritable,
@@ -1609,9 +1689,8 @@ where
                 }
                 #[cfg(feature = "postgresql")]
                 Database::PostgreSQL(db) => {
-                    let (sql, params, rust_types) = self
-                        .select
-                        .to_sql_with_params_and_types(crate::DbType::PostgreSQL);
+                    let (sql, params, rust_types) =
+                        self.select.to_sql_with_params_and_types(db_type);
                     db.select_raw_with_types::<R, C>(&sql, params, rust_types)
                         .await
                 }
@@ -2469,6 +2548,29 @@ pub enum UpdateExecutor<'a, T: Model> {
 
 crate::impl_unified_update_executor!(UpdateExecutor);
 
+impl<'a, T: Model> UpdateExecutor<'a, T> {
+    pub(crate) fn set_model_columns(self, model: &T, fields: &[String]) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            UpdateExecutor::Sqlite(exec, phantom) => {
+                UpdateExecutor::Sqlite(exec.set_model_fields(model, fields), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            UpdateExecutor::PostgreSQL(exec) => {
+                UpdateExecutor::PostgreSQL(exec.set_model_fields(model, fields))
+            }
+            #[cfg(feature = "mysql")]
+            UpdateExecutor::MySQL(exec) => {
+                UpdateExecutor::MySQL(exec.set_model_fields(model, fields))
+            }
+            #[cfg(feature = "mssql")]
+            UpdateExecutor::MSSQL(exec) => {
+                UpdateExecutor::MSSQL(exec.set_model_fields(model, fields))
+            }
+        }
+    }
+}
+
 impl<'a, T: Model> NamedFilterQuery<T> for UpdateExecutor<'a, T> {
     fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
         self.filter(|_| expr)
@@ -2919,6 +3021,72 @@ pub enum Transaction<'a> {
     MSSQL(mssql_backend::Transaction<'a>),
     // 使用 PhantomData 确保生命周期参数始终被使用
     _Phantom(std::marker::PhantomData<&'a ()>),
+}
+
+pub struct TransactionSaveExecutor<'a, 'tx, T: WritableModel> {
+    txn: &'a mut Transaction<'tx>,
+    model: &'a mut Tracked<T>,
+}
+
+impl<'a, 'tx, T: WritableModel> TransactionSaveExecutor<'a, 'tx, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            return Ok(SqlStatement::batch(self.txn.db_type(), Vec::new()));
+        }
+        self.txn
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .to_sql()
+    }
+
+    pub async fn execute(self) -> crate::Result<u64> {
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            return Ok(0);
+        }
+
+        let affected = self
+            .txn
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .execute()
+            .await?;
+        if affected > 0 {
+            self.model.accept_changes();
+        }
+        Ok(affected)
+    }
+
+    pub async fn exec(self) -> crate::Result<u64> {
+        self.execute().await
+    }
+
+    pub async fn execute_with_hooks(self) -> crate::Result<u64>
+    where
+        T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
+    {
+        let mut ctx = crate::HookContext::new(crate::HookOperation::Update).transaction();
+        crate::BeforeUpdate::before_update(self.model.as_model_mut(), &mut ctx).await?;
+
+        let fields = self.model.dirty_columns();
+        if fields.is_empty() {
+            self.model.accept_changes();
+            return Ok(0);
+        }
+
+        let affected = self
+            .txn
+            .update::<T>()
+            .set_model_columns(self.model.as_model(), &fields)
+            .execute()
+            .await?;
+        if affected > 0 {
+            crate::AfterUpdate::after_update(self.model.as_model(), &mut ctx).await?;
+            self.model.accept_changes();
+        }
+        Ok(affected)
+    }
 }
 
 /// 事务中的插入执行器
@@ -3476,6 +3644,13 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    pub fn save<'op, T: WritableModel>(
+        &'op mut self,
+        model: &'op mut Tracked<T>,
+    ) -> TransactionSaveExecutor<'op, 'a, T> {
+        TransactionSaveExecutor { txn: self, model }
+    }
+
     /// 插入记录 - 返回执行器
     pub fn insert<I: crate::model::Insertable>(
         &mut self,
@@ -3692,7 +3867,6 @@ pub enum GroupedSelectExecutor<'a, T: Model, V> {
 
 impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     /// 添加 GROUP BY 字段
-    #[allow(unused_variables)]
     pub fn group_by<F, G>(self, f: F) -> Self
     where
         F: FnOnce(<T as Model>::Where) -> G,
@@ -3713,7 +3887,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 HAVING 条件
-    #[allow(unused_variables)]
     pub fn having<F, W>(self, f: F) -> Self
     where
         F: FnOnce(<T as Model>::Where) -> W,
@@ -3734,7 +3907,6 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 
     /// 添加 WHERE 条件（分组前过滤）
-    #[allow(unused_variables)]
     pub fn filter<F, W>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> W,
@@ -3894,7 +4066,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 支持：
     /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<'a, T, i32>
     /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<'a, T, (i32, i32)>
-    #[allow(unused_variables)]
     pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(<T as Model>::Where) -> M,
@@ -3913,7 +4084,6 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 选择列（支持聚合函数）- 转换为分组查询
-    #[allow(unused_variables)]
     pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
     where
         F: FnOnce(<T as Model>::Where) -> V,
@@ -4125,7 +4295,6 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
-    #[allow(unused_variables)]
     pub fn collect_with<C, F, M>(self, f: F) -> ModelCollectWithFuture<'a, T, V, C, M, F>
     where
         T: 'static,

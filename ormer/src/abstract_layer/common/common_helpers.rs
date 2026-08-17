@@ -1,13 +1,15 @@
 use super::super::DbType;
 use crate::model::{
     FromRowValues, Model, Row, TableRoute, Value, VersionSnapshotUpdate, quote_column_reference,
-    quote_identifier, quote_qualified_identifier, routed_table_name_for_db,
+    quote_identifier, quote_qualified_identifier, routed_model_table_name_for_db,
 };
 use crate::query::filter::FilterExpr;
 use crate::query::filter_formatter::FilterFormatter;
-use crate::query::insert::{
-    InsertAssignment, InsertConflict, InsertConflictAction, InsertConflictTarget, InsertValue,
-};
+#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+use crate::query::insert::InsertConflictAction;
+#[cfg(any(feature = "postgresql", feature = "sqlite"))]
+use crate::query::insert::InsertConflictTarget;
+use crate::query::insert::{InsertAssignment, InsertConflict, InsertValue};
 use crate::query::update::{UpdateAssignment, UpdateExpr, UpdateValue};
 use std::collections::{HashMap, HashSet};
 
@@ -39,7 +41,7 @@ pub fn quote_routed_table_name<T: Model>(
     db_type: DbType,
     route: &TableRoute,
 ) -> crate::Result<String> {
-    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, route)?;
+    let table_name = routed_model_table_name_for_db::<T>(db_type, route)?;
     Ok(quote_qualified_identifier(db_type, &table_name))
 }
 
@@ -333,13 +335,18 @@ fn model_update_pk_values<T: Model>(plans: &[ModelUpdatePlan]) -> Option<Vec<Vec
     Some(values)
 }
 
+#[cfg(feature = "sqlite")]
 fn bulk_update_params_per_row(db_type: DbType, pk_count: usize, set_count: usize) -> usize {
-    #[allow(unreachable_patterns)]
-    match db_type {
-        #[cfg(feature = "sqlite")]
-        DbType::Sqlite => set_count * (pk_count + 1) + pk_count,
-        _ => pk_count + set_count,
+    if matches!(db_type, DbType::Sqlite) {
+        set_count * (pk_count + 1) + pk_count
+    } else {
+        pk_count + set_count
     }
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn bulk_update_params_per_row(_db_type: DbType, pk_count: usize, set_count: usize) -> usize {
+    pk_count + set_count
 }
 
 fn bulk_update_rows_per_statement(db_type: DbType, pk_count: usize, set_count: usize) -> usize {
@@ -347,6 +354,7 @@ fn bulk_update_rows_per_statement(db_type: DbType, pk_count: usize, set_count: u
     (bind_param_limit(db_type) / params_per_row).max(1)
 }
 
+#[cfg(feature = "sqlite")]
 fn push_pk_match_sql(
     db_type: DbType,
     sql: &mut String,
@@ -601,6 +609,7 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
                 "UPDATE target SET {assignments} FROM {table} AS target JOIN (VALUES {values_sql}) AS source ({source_column_list}) ON {predicates}"
             )
         }
+        #[cfg(any(feature = "sqlite", feature = "mysql"))]
         _ => {
             return Err(crate::ormer_error!(
                 "VALUES source bulk update is not supported for this database"
@@ -996,6 +1005,24 @@ fn parse_column_value_options(
             .or_else(|| real.map(|value| value.to_string()))
     }
 
+    fn uuid_value(
+        string: Option<String>,
+        bytes: Option<Vec<u8>>,
+    ) -> crate::Result<Option<uuid::Uuid>> {
+        let raw = match (string, bytes) {
+            (Some(value), _) => Some(value),
+            (None, Some(value)) => Some(
+                String::from_utf8(value)
+                    .map_err(|err| crate::ormer_error!("Failed to decode UUID text: {}", err))?,
+            ),
+            (None, None) => None,
+        };
+        match raw {
+            Some(raw) => crate::model::uuid_from_text(&raw).map(Some),
+            None => Ok(None),
+        }
+    }
+
     if is_nullable {
         match rust_type {
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => match int {
@@ -1022,6 +1049,10 @@ fn parse_column_value_options(
                 Some(1) => Ok(Value::Boolean(true)),
                 Some(0) => Ok(Value::Boolean(false)),
                 _ => Ok(Value::Null),
+            },
+            "Uuid" | "uuid::Uuid" => match uuid_value(string, bytes)? {
+                Some(value) => Ok(Value::Uuid(value)),
+                None => Ok(Value::Null),
             },
             "Vec<u8>" | "&[u8]" => match bytes {
                 Some(val) => Ok(Value::Bytes(val)),
@@ -1122,6 +1153,19 @@ fn parse_column_value_options(
                         column_name
                     )
                 }),
+            ("Uuid" | "uuid::Uuid", ColumnValueMode::Default) => Ok(Value::Uuid(
+                uuid_value(string, bytes)?.unwrap_or_else(uuid::Uuid::nil),
+            )),
+            ("Uuid" | "uuid::Uuid", ColumnValueMode::Strict { column_name }) => {
+                uuid_value(string, bytes)?
+                    .ok_or_else(|| {
+                        crate::ormer_error!(
+                            "Failed to parse non-nullable column '{}' (expected uuid::Uuid type)",
+                            column_name
+                        )
+                    })
+                    .map(Value::Uuid)
+            }
             ("Vec<u8>" | "&[u8]", ColumnValueMode::Default) => {
                 Ok(Value::Bytes(bytes.unwrap_or_default()))
             }
@@ -1393,11 +1437,11 @@ fn routed_table_name_for_models<T: Model>(db_type: DbType, models: &[&T]) -> cra
         return Ok(T::table_name_for_db(db_type).to_string());
     };
     let first_route = first.table_route()?;
-    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, &first_route)?;
+    let table_name = routed_model_table_name_for_db::<T>(db_type, &first_route)?;
 
     for model in models.iter().skip(1) {
         let route = model.table_route()?;
-        let model_table = routed_table_name_for_db(db_type, T::TABLE_NAME, &route)?;
+        let model_table = routed_model_table_name_for_db::<T>(db_type, &route)?;
         if model_table != table_name {
             return Err(crate::ormer_error!(
                 "Batch insert cannot target multiple routed tables: {} and {}",
@@ -1484,6 +1528,7 @@ pub fn build_partial_insert_statement_for_table<T: Model>(
         match db_type {
             #[cfg(feature = "mysql")]
             DbType::MySQL => format!("INSERT INTO {table_name} () VALUES ()"),
+            #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mssql"))]
             _ => format!("INSERT INTO {table_name} DEFAULT VALUES"),
         }
     } else {
@@ -1560,7 +1605,7 @@ pub fn build_insert_statement_with_conflict<T: Model>(
 ) -> crate::Result<(String, Vec<Value>)> {
     let columns = T::insert_columns();
     let table_name = routed_table_name_for_models(db_type, models)?;
-    let (mut sql, mut values) = build_batch_insert_statement::<T>(
+    let (sql, values) = build_batch_insert_statement::<T>(
         db_type,
         insert_prefix_for_conflict(db_type, conflict),
         &table_name,
@@ -1568,10 +1613,19 @@ pub fn build_insert_statement_with_conflict<T: Model>(
         models,
         BatchInsertValuesMode::WithoutAutoIncrement,
     );
+    #[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+    let (mut sql, mut values) = (sql, values);
 
     if let Some(conflict) = conflict
         && conflict.is_configured()
     {
+        #[cfg(feature = "mssql")]
+        if matches!(db_type, DbType::MSSQL) {
+            return Err(crate::ormer_error!(
+                "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
+            ));
+        }
+        #[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
         append_insert_conflict_clause::<T>(db_type, &mut sql, &mut values, conflict)?;
     }
 
@@ -1627,11 +1681,12 @@ pub fn build_insert_statements_with_conflict<T: Model>(
         .collect()
 }
 
+#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
 fn append_insert_conflict_clause<T: Model>(
-    #[allow(unused_variables)] db_type: DbType,
-    #[allow(unused_variables)] sql: &mut String,
-    #[allow(unused_variables)] params: &mut Vec<Value>,
-    #[allow(unused_variables)] conflict: &InsertConflict,
+    db_type: DbType,
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    conflict: &InsertConflict,
 ) -> crate::Result<()> {
     match db_type {
         #[cfg(feature = "postgresql")]
@@ -1651,7 +1706,7 @@ fn append_insert_conflict_clause<T: Model>(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "postgresql", feature = "sqlite"))]
 fn append_standard_insert_conflict_clause<T: Model>(
     db_type: DbType,
     sql: &mut String,
@@ -1706,7 +1761,7 @@ fn append_standard_insert_conflict_clause<T: Model>(
     Ok(())
 }
 
-#[allow(dead_code, unreachable_patterns)]
+#[cfg(any(feature = "postgresql", feature = "sqlite"))]
 fn append_standard_conflict_target(
     db_type: DbType,
     sql: &mut String,
@@ -1740,6 +1795,7 @@ fn append_standard_conflict_target(
                 sql.push_str(" ON CONSTRAINT ");
                 sql.push_str(&quote_identifier(db_type, _name));
             }
+            #[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
             _ => {
                 return Err(crate::ormer_error!(
                     "on_constraint is only supported for PostgreSQL insert conflict handling"

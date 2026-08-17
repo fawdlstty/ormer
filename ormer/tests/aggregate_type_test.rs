@@ -1,7 +1,7 @@
 // 测试聚合函数的编译期类型推断
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_for_aggregate_type!(TestUser, "test_agg_type_users_1");

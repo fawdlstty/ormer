@@ -3,7 +3,7 @@
 use ormer::Model;
 use ormer::generate_create_table_sql;
 
-mod _test_common;
+pub mod _test_common;
 
 // 定义复合主键模型：用户角色关联表
 #[derive(Debug, ormer::Model, Clone)]
@@ -25,6 +25,25 @@ struct OrderItem {
     #[primary]
     product_id: i32,
     quantity: i32,
+}
+
+#[derive(Debug, ormer::Model, Clone)]
+#[table = "primary_metadata_users_1"]
+struct PrimaryMetadataUser {
+    #[primary]
+    id: i32,
+    name: String,
+}
+
+#[derive(Debug, ormer::Model, Clone)]
+#[table = "primary_metadata_renamed_1"]
+struct RenamedPrimaryMetadata {
+    #[primary]
+    #[column(name = "tenant_id")]
+    tenant: String,
+    #[primary]
+    user_id: i32,
+    name: String,
 }
 
 #[cfg(test)]
@@ -85,6 +104,39 @@ mod composite_primary_key_tests {
 
         // 清理测试表（如果存在）
         // 注意：这里只是单元测试，不需要实际连接数据库
+    }
+
+    #[test]
+    fn test_primary_field_names_and_promary_fields() {
+        let user = PrimaryMetadataUser {
+            id: 42,
+            name: "Alice".to_string(),
+        };
+        assert_eq!(PrimaryMetadataUser::primary_field_names(), vec!["id"]);
+        assert_eq!(user.promary_fields(), (42,));
+
+        let renamed = RenamedPrimaryMetadata {
+            tenant: "acme".to_string(),
+            user_id: 7,
+            name: "Bob".to_string(),
+        };
+        assert_eq!(
+            <RenamedPrimaryMetadata as ormer::Model>::primary_key_columns(),
+            &["tenant_id", "user_id"]
+        );
+        assert_eq!(
+            RenamedPrimaryMetadata::primary_field_names(),
+            vec!["tenant", "user_id"]
+        );
+        assert_eq!(renamed.promary_fields(), ("acme".to_string(), 7));
+
+        let item = OrderItem {
+            id: 10,
+            product_id: 20,
+            quantity: 2,
+        };
+        assert_eq!(OrderItem::primary_field_names(), vec!["id", "product_id"]);
+        assert_eq!(item.promary_fields(), (10, 20));
     }
 
     #[test]

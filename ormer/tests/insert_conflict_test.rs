@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlite")]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "test_insert_conflict_users_1"]

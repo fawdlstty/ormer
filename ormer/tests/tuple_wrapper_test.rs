@@ -3,7 +3,7 @@
 use ormer::Model;
 use ormer::generate_create_table_sql;
 
-mod _test_common;
+pub mod _test_common;
 
 // 基础模型定义 - 使用宏定义（无表名）
 #[derive(Debug, ormer::Model, Clone)]
@@ -62,6 +62,19 @@ mod tuple_wrapper_tests {
         assert!(temp_sql.contains("CREATE TABLE IF NOT EXISTS tuple_wrapper_temp_users_1"));
         assert!(!temp_sql.contains("tuple_wrapper_test_users_1"));
         assert!(temp_sql.contains("id INTEGER PRIMARY KEY AUTOINCREMENT"));
+    }
+
+    #[test]
+    fn test_tuple_wrapper_primary_field_methods() {
+        let user = TestUser(BaseTestUser {
+            id: 5,
+            name: "Alice".to_string(),
+            age: 25,
+            email: None,
+        });
+
+        assert_eq!(TestUser::primary_field_names(), vec!["id"]);
+        assert_eq!(user.promary_fields(), (5,));
     }
 
     async fn test_tuple_wrapper_crud_impl(

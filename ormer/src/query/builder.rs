@@ -1,7 +1,7 @@
 use crate::abstract_layer::DbType;
 use crate::model::{
     ColumnSchema, Model, TableRoute, TableRouteValue, normalize_table_name_for_db,
-    quote_column_reference, quote_qualified_identifier, routed_table_name_for_db,
+    quote_column_reference, quote_qualified_identifier, routed_model_table_name_for_db,
 };
 use crate::query::expr::{
     AliasedExpr, IntoSqlExpr, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
@@ -20,10 +20,7 @@ fn table_name_for<T: Model>(db_type: DbType) -> String {
 }
 
 fn table_name_for_route<T: Model>(db_type: DbType, route: &TableRoute) -> crate::Result<String> {
-    if route.is_empty() {
-        return Ok(table_name_for::<T>(db_type));
-    }
-    let table_name = routed_table_name_for_db(db_type, T::TABLE_NAME, route)?;
+    let table_name = routed_model_table_name_for_db::<T>(db_type, route)?;
     Ok(quote_qualified_identifier(db_type, &table_name))
 }
 
@@ -340,7 +337,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => quote_sql_string("00000000-0000-0000-0000-000000000000"),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => {
-                "CAST(0x00000000000000000000000000000000 AS VARBINARY(16))".to_string()
+                "CAST('00000000-0000-0000-0000-000000000000' AS UNIQUEIDENTIFIER)".to_string()
             }
         },
         _ => quote_sql_string(""),
@@ -1756,12 +1753,6 @@ impl<T: Model, V> MappedSelect<T, V> {
         &self.column_names
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn with_context_filters(mut self, filters: Vec<ContextFilter>) -> Self {
-        self.context_filters.extend(filters);
-        self
-    }
-
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         let mut rust_types = Vec::new();
@@ -1977,12 +1968,6 @@ impl<T: Model, V> GroupedSelect<T, V> {
     /// 创建新的 GroupedSelect 实例
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn with_context_filters(mut self, filters: Vec<ContextFilter>) -> Self {
-        self.context_filters.extend(filters);
-        self
     }
 
     pub fn as_model<R: Model>(self) -> DerivedSelect<R>
@@ -2464,20 +2449,6 @@ impl<T: Model> Select<T> {
             range_start: self.range_start,
             range_end: self.range_end,
             ignored_columns: self.ignored_columns,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 创建聚合查询
-    #[allow(dead_code)]
-    fn aggregate(self, func: &str, column: &str) -> AggregateSelect<T> {
-        AggregateSelect {
-            aggregate_func: func.to_string(),
-            column_name: column.to_string(),
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            table_route: self.table_route,
             _marker: PhantomData,
         }
     }
@@ -6119,7 +6090,6 @@ pub trait ColumnBuilder {
 
 /// 过滤值
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FilterValue {
     inner: crate::query::filter::Value,
 }
@@ -6156,10 +6126,15 @@ impl From<&str> for FilterValue {
     }
 }
 
+impl From<FilterValue> for crate::query::filter::Value {
+    fn from(value: FilterValue) -> Self {
+        value.inner
+    }
+}
+
 // ==================== JOIN 功能 ====================
 
 /// LEFT JOIN 查询结构体
-#[allow(dead_code)]
 pub struct LeftJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     context_filters: Vec<ContextFilter>,
@@ -6205,7 +6180,6 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
 }
 
 /// INNER JOIN 查询结构体
-#[allow(dead_code)]
 pub struct InnerJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     context_filters: Vec<ContextFilter>,
@@ -6251,7 +6225,6 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
 }
 
 /// RIGHT JOIN 查询结构体
-#[allow(dead_code)]
 pub struct RightJoinedSelect<T: Model, J: Model> {
     filters: Vec<FilterExpr>,
     context_filters: Vec<ContextFilter>,

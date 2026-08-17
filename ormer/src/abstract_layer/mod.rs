@@ -92,11 +92,12 @@ pub use common::{
     LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
     NestedInclude, PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor,
     RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
-    ReplicatedDatabaseBuilder, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor,
-    SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
-    TransactionFuture, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor, UpdateExecutor, UpdateGraphExecutor,
+    ReplicatedDatabaseBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
+    SqlStatement, Transaction, TransactionFuture, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
+    UpdateExecutor, UpdateGraphExecutor,
 };
 
 pub use common::{

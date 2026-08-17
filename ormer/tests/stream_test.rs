@@ -1,6 +1,6 @@
 #![cfg(feature = "sqlite")]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型
 define_test_user_for_range!(StreamUser, "stream_users_test");

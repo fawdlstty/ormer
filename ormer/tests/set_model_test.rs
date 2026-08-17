@@ -1,10 +1,11 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user!(SetModelUser, "set_model_users_1");
 define_test_user!(BatchSetModelUser, "set_model_users_batch_1");
+define_test_user!(TrackedSaveUser, "tracked_save_users_1");
 
 async fn test_set_model_impl(
     config: &_test_common::DbConfig,
@@ -134,6 +135,55 @@ async fn test_set_model_impl(
 }
 
 test_on_all_dbs_result!(test_set_model_impl);
+
+async fn test_tracked_save_impl(
+    config: &_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = _test_common::create_db_connection(config).await?;
+    let _ = db.drop_table::<TrackedSaveUser>().execute().await;
+    db.create_table::<TrackedSaveUser>().execute().await?;
+
+    db.insert(&TrackedSaveUser {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 18,
+        email: Some("alice@test.com".to_string()),
+    })
+    .execute()
+    .await?;
+
+    let mut user = db.find_by_id::<TrackedSaveUser>(1).await?.unwrap().track();
+    assert!(!user.is_dirty());
+    assert!(db.save(&mut user).to_sql()?.statements.is_empty());
+
+    user.name = "Alice Updated".to_string();
+    assert_eq!(user.dirty_columns(), vec!["name".to_string()]);
+
+    let save_sql = db.save(&mut user).to_sql()?;
+    assert_eq!(save_sql.statements.len(), 1);
+    let sql = &save_sql.statements[0].sql;
+    assert!(sql.contains("name"));
+    assert!(!sql.contains("age"));
+    assert!(!sql.contains("email"));
+
+    let affected = db.save(&mut user).execute().await?;
+    assert!(affected > 0);
+    assert!(!user.is_dirty());
+    assert_eq!(db.save(&mut user).execute().await?, 0);
+
+    user.email = Some("alice-updated@test.com".to_string());
+    assert!(db.save(&mut user).execute().await? > 0);
+
+    let saved = db.find_by_id::<TrackedSaveUser>(1).await?.unwrap();
+    assert_eq!(saved.name, "Alice Updated");
+    assert_eq!(saved.age, 18);
+    assert_eq!(saved.email, Some("alice-updated@test.com".to_string()));
+
+    db.drop_table::<TrackedSaveUser>().execute().await?;
+    Ok(())
+}
+
+test_on_all_dbs_result!(test_tracked_save_impl);
 
 async fn test_batch_set_model_impl(
     config: &_test_common::DbConfig,

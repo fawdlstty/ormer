@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "test_derived_users_1"]
@@ -26,6 +26,7 @@ struct UserTotal {
 }
 
 #[derive(Debug, Clone, ormer::ViewModel)]
+#[cfg(feature = "sqlite")]
 struct UserName {
     id: i32,
     name: String,
@@ -133,6 +134,7 @@ async fn test_derived_table_from_and_join_impl(
 test_on_all_dbs_result!(test_derived_table_from_and_join_impl);
 
 #[test]
+#[cfg(feature = "sqlite")]
 fn test_mapped_and_select_as_model_sql() {
     let mapped = ormer::Select::<DerivedUser>::new()
         .map_to(|u| (u.id, u.name))
@@ -159,4 +161,15 @@ fn test_mapped_and_select_as_model_sql() {
         join_params.as_slice(),
         [ormer::Value::Integer(30)]
     ));
+}
+
+#[test]
+fn test_view_model_primary_field_methods_are_empty() {
+    let total = UserTotal {
+        user_id: 1,
+        total: 110,
+    };
+
+    assert_eq!(UserTotal::primary_field_names(), Vec::<&'static str>::new());
+    assert_eq!(total.promary_fields(), ());
 }

@@ -850,6 +850,12 @@ fn pg_value_from_row_cell(
                     .map(|value| crate::model::Value::Duration(from_postgres_interval(value)))
                     .unwrap_or(crate::model::Value::Null))
             }
+            "Uuid" | "uuid::Uuid" => {
+                let value: Option<uuid::Uuid> = pg_try_get(row, idx, "uuid::Uuid")?;
+                Ok(value
+                    .map(crate::model::Value::Uuid)
+                    .unwrap_or(crate::model::Value::Null))
+            }
             "String" => {
                 let value: Option<String> = pg_try_get(row, idx, "String")?;
                 Ok(value
@@ -937,6 +943,15 @@ fn pg_value_from_row_cell(
                             idx
                         ))
                     })
+            }
+            "Uuid" | "uuid::Uuid" => {
+                let value: Option<uuid::Uuid> = pg_try_get(row, idx, "uuid::Uuid")?;
+                value.map(crate::model::Value::Uuid).ok_or_else(|| {
+                    crate::ormer_error!(format!(
+                        "Failed to parse non-nullable column at index {} (expected uuid::Uuid type)",
+                        idx
+                    ))
+                })
             }
             "String" => {
                 let value: Option<String> = pg_try_get(row, idx, "String")?;
@@ -2312,67 +2327,6 @@ impl Database {
             )
     }
 
-    /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
-    /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
-    #[allow(dead_code)]
-    pub(crate) async fn insert_impl<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::PostgreSQL, models)?;
-
-        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
-
-        if has_auto_increment {
-            // 获取自增主键列名
-            let pk_col = T::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            // 使用 RETURNING 子句获取插入的ID
-            let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
-            let rows =
-                pg_query_with_types(&self.client, &sql_with_returning, &all_values, &rust_types)
-                    .await?;
-            let row = match rows.first() {
-                Some(row) => row,
-                None => {
-                    return Err(crate::ormer_error!("No rows returned from batch insert"));
-                }
-            };
-            // 根据列类型读取自增主键值（SERIAL = INT4, BIGSERIAL = INT8）
-            let id: i64 = match *row.columns()[0].type_() {
-                Type::INT2 => row.try_get::<_, i16>(0)? as i64,
-                Type::INT4 => row.try_get::<_, i32>(0)? as i64,
-                Type::INT8 => row.try_get::<_, i64>(0)?,
-                _ => {
-                    return Err(crate::ormer_error!(
-                        "Unexpected column type for auto-increment key: {}",
-                        row.columns()[0].type_()
-                    ));
-                }
-            };
-            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
-            Ok(result)
-        } else {
-            pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
-            Ok(T::AutoIncrementKeyType::default())
-        }
-    }
-
     /// 批量插入或更新记录（遇到重复键时更新）
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
@@ -2994,65 +2948,6 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// 批量插入记录
-    #[allow(dead_code)]
-    pub(crate) async fn insert_impl<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::PostgreSQL, models)?;
-
-        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
-
-        if has_auto_increment {
-            // 获取自增主键列名
-            let pk_col = T::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            // 使用 RETURNING 子句获取插入的ID
-            let sql_with_returning = format!("{} RETURNING {}", sql, pk_col);
-            let rows =
-                pg_query_with_types(self.client, &sql_with_returning, &all_values, &rust_types)
-                    .await?;
-            let row = match rows.first() {
-                Some(row) => row,
-                None => {
-                    return Err(crate::ormer_error!("No rows returned from batch insert"));
-                }
-            };
-            // 根据列类型读取自增主键值（SERIAL = INT4, BIGSERIAL = INT8）
-            let id: i64 = match *row.columns()[0].type_() {
-                Type::INT2 => row.try_get::<_, i16>(0)? as i64,
-                Type::INT4 => row.try_get::<_, i32>(0)? as i64,
-                Type::INT8 => row.try_get::<_, i64>(0)?,
-                _ => {
-                    return Err(crate::ormer_error!(
-                        "Unexpected column type for auto-increment key: {}",
-                        row.columns()[0].type_()
-                    ));
-                }
-            };
-            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
-            Ok(result)
-        } else {
-            pg_execute_with_types(self.client, &sql, &all_values, &rust_types).await?;
-            Ok(T::AutoIncrementKeyType::default())
-        }
-    }
-
     /// 批量插入或更新记录（遇到重复键时更新）
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
@@ -3645,7 +3540,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                         Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::Uuid(u) => {
-                        Box::new(u.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
+                        Box::new(u) as Box<dyn postgres_types::ToSql + Sync + Send>
                     }
                     crate::model::Value::BigInt(b) => {
                         Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
@@ -3690,6 +3585,12 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                     let val: Option<PgInterval> =
                         row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                     val.map(|v| crate::model::Value::Duration(from_postgres_interval(v)))
+                        .unwrap_or(crate::model::Value::Null)
+                }
+                Type::UUID => {
+                    let val: Option<uuid::Uuid> =
+                        row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+                    val.map(crate::model::Value::Uuid)
                         .unwrap_or(crate::model::Value::Null)
                 }
                 Type::FLOAT4 => {
@@ -3848,12 +3749,6 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         }
 
         Ok(results)
-    }
-
-    #[allow(dead_code)]
-    fn build_sql(&self) -> String {
-        let (sql, _) = self.build_sql_with_params();
-        sql
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
@@ -4138,7 +4033,7 @@ fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam 
         Value::Date(value) => Box::new(*value),
         Value::Time(value) => Box::new(*value),
         Value::Json(value) => Box::new(value.to_string()),
-        Value::Uuid(value) => Box::new(value.to_string()),
+        Value::Uuid(value) => Box::new(*value),
         Value::BigInt(value) => Box::new(*value as i64),
         Value::Null => match rust_type {
             None => Box::new(None::<i32>),
@@ -4156,6 +4051,7 @@ fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam 
                 Box::new(PgMaybeNumericTextParam(None))
             }
             Some("Duration" | "std::time::Duration") => Box::new(None::<PgInterval>),
+            Some("Uuid" | "uuid::Uuid") => Box::new(None::<uuid::Uuid>),
             Some("bool") => Box::new(None::<bool>),
             Some("Vec<u8>" | "std::vec::Vec<u8>" | "alloc::vec::Vec<u8>" | "&[u8]") => {
                 Box::new(None::<Vec<u8>>)
@@ -4249,7 +4145,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let row_stream = client.query_raw(&sql, param_refs).trace().await?;
 
         Ok(SelectStreamIterator {
-            conn: self.conn,
+            _conn: self.conn,
             row_stream: Box::pin(row_stream),
             _marker: std::marker::PhantomData,
         })
@@ -4258,8 +4154,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 
 /// SelectStreamIterator - 流式查询迭代器 (PostgreSQL)
 pub struct SelectStreamIterator<'a, T: Model> {
-    #[allow(dead_code)]
-    conn: super::common::StreamConnection<'a>,
+    _conn: super::common::StreamConnection<'a>,
     row_stream: std::pin::Pin<Box<tokio_postgres::RowStream>>,
     _marker: std::marker::PhantomData<&'a T>,
 }
@@ -4762,6 +4657,14 @@ fn convert_postgres_value(
                 });
             }
         }
+        Type::UUID => {
+            if let Ok(v) = row.try_get::<_, Option<uuid::Uuid>>(index) {
+                return Ok(match v {
+                    Some(val) => crate::model::Value::Uuid(val),
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         // 文本类型
         Type::TEXT | Type::VARCHAR | Type::CHAR | Type::BPCHAR | Type::NAME => {
             if let Ok(v) = row.try_get::<_, Option<String>>(index) {
@@ -4997,8 +4900,9 @@ impl<
                     }
                     crate::model::Value::Json(j) => Box::new(j.to_string())
                         as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-                    crate::model::Value::Uuid(u) => Box::new(u.to_string())
-                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
+                    crate::model::Value::Uuid(u) => {
+                        Box::new(u) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
+                    }
                     crate::model::Value::BigInt(b) => {
                         Box::new(b as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
                     }

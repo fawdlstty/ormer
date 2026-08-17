@@ -29,7 +29,8 @@ struct User {
 - `#[foreign(Type)]` - 外键关系；可配置 `name`、`on_delete`、`on_update`
 - `#[embed(prefix = "前缀_")]` - 嵌入值对象，并把字段展开为带前缀的列
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
-- `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表分片时长
+- `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表时间分片时长
+- `#[hypertable]` - 标注 `String` 字段作为 PostgreSQL/TimescaleDB 字符串拆表键
 - `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
 - `#[filter(filter_name, |m, ...| ...)]` - 模型级可复用过滤器，名称必须以 `filter_` 开头
 - `#[version(u64)]` - 自动添加 `version` 列，用于乐观锁
@@ -121,6 +122,34 @@ struct Event {
     #[ormer_ignore]
     tenant_id: i64,
 }
+```
+
+TimescaleDB 可用无参 `#[hypertable]` 标注 `String` 字段，让 PostgreSQL 按字段值拆成不同物理表；SQLite、MySQL、MSSQL 不启用该自动拆表。路由键使用字段的 SQL 列名（未配置 `#[column]` 时就是字段名），写入时自动从模型字段取值，查询和建表时显式传入 route。
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events"]
+struct Event {
+    #[primary]
+    id: i64,
+    payload: String,
+    #[hypertable]
+    #[ormer_ignore]
+    tenant: String,
+    #[hypertable(std::time::Duration::from_secs(86400))]
+    created_at: chrono::NaiveDateTime,
+}
+
+db.create_table::<Event>()
+    .route_table("tenant", "acme")
+    .execute()
+    .await?;
+
+let rows: Vec<Event> = db
+    .select::<Event>()
+    .route_table("tenant", "acme")
+    .collect()
+    .await?;
 ```
 
 ## 字段属性
@@ -246,6 +275,7 @@ let users: Vec<User> = db
 | `String` | TEXT | TEXT | TEXT | NVARCHAR(255) |
 | `bool` | INTEGER (0/1) | BOOLEAN | BOOLEAN | BIT |
 | `Vec<u8>` | BLOB | BYTEA | BLOB | VARBINARY(MAX) |
+| `uuid::Uuid` | TEXT | UUID | CHAR(36) | UNIQUEIDENTIFIER |
 | `chrono::DateTime<chrono::Utc>` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
 | `chrono::NaiveDateTime` | TEXT | TIMESTAMPTZ | DATETIME | DATETIME2 |
 | `chrono::NaiveDate` | TEXT | DATE | DATE | DATE |
@@ -254,6 +284,21 @@ let users: Vec<User> = db
 | `bigdecimal::BigDecimal` | TEXT | NUMERIC | DECIMAL(65,30) | DECIMAL(38,18) |
 
 所有基本类型都可使用 `Option<T>` 包装为可空字段。
+
+UUID 字段可以直接使用 `uuid::Uuid` 或 `Option<uuid::Uuid>`：
+
+```rust
+#[derive(Debug, Clone, ormer::Model)]
+#[table = "sessions"]
+struct Session {
+    #[primary]
+    id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    revoked_at: Option<chrono::NaiveDateTime>,
+}
+```
+
+UUID 值由应用层生成，例如 `uuid::Uuid::new_v4()`；应用需要自行启用 `uuid` crate 的 `v4` feature，ORM 不会自动生成 UUID。SQLite 使用 `TEXT`，MySQL 使用 `CHAR(36)` 保存规范 UUID 字符串，MSSQL 使用原生 `UNIQUEIDENTIFIER`。
 
 ## 字段类型
 
@@ -441,7 +486,7 @@ id: i32,
 product_id: i32,
 ```
 
-通过 `primary_key_columns()` 获取主键列名列表。
+通过 `primary_field_names()` 获取 Rust 主键字段名列表，`model.promary_fields()` 获取当前主键字段值元组；通过 `primary_key_columns()` 获取 SQL 主键列名列表。复合主键按字段声明顺序返回。
 
 ## 表操作
 

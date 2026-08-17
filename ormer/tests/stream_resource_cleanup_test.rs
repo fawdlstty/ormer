@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（每个测试函数使用独立的表名，避免并行执行时的冲突）
 define_test_user_for_range!(StreamCleanupUserPollution, "stream_cleanup_pollution");

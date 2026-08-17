@@ -819,7 +819,7 @@ impl SqlExpr {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "postgresql")]
 fn quote_json_key(key: &str) -> String {
     format!("'{}'", key.replace('\'', "''"))
 }

@@ -50,6 +50,9 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
         }
 
         if is_primary {
+            if matches!(rust_type, "Uuid" | "uuid::Uuid") {
+                return "UNIQUEIDENTIFIER PRIMARY KEY".to_string();
+            }
             let int_type = match rust_type {
                 "i8" | "i16" | "u8" => "SMALLINT",
                 "i32" | "u16" => "INT",
@@ -89,6 +92,7 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
             "JsonValue" | "serde_json::Value" => "NVARCHAR(MAX)",
+            "Uuid" | "uuid::Uuid" => "UNIQUEIDENTIFIER",
             _ => "NVARCHAR(255)",
         };
 
@@ -806,50 +810,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             "MSSQL does not support RETURNING clause"
         ))
     }
-
-    #[allow(dead_code)]
-    async fn insert_impl<T: Model>(&self, models: &[&T]) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let has_auto_increment = common_helpers::auto_increment_column::<T>().is_some();
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::MSSQL, models)?;
-
-        let mut client = self.pool.lock().await;
-
-        if has_auto_increment {
-            // 获取自增主键列名
-            let pk_col = T::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            // 使用 OUTPUT 子句获取插入的ID
-            let sql_with_output = format!(
-                "{} OUTPUT {}",
-                sql,
-                common_helpers::quote_column_with_prefix(DbType::MSSQL, "inserted", pk_col)
-            );
-            let mut query = Query::new(&sql_with_output);
-            for param in &all_values {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let row = stream.into_row().trace().await?;
-            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
-            Ok(result)
-        } else {
-            let mut query = Query::new(&sql);
-            for param in &all_values {
-                bind_value(&mut query, param);
-            }
-            query.execute(&mut *client).trace().await?;
-            Ok(T::AutoIncrementKeyType::default())
-        }
-    }
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecutor<'a, I> {
@@ -1011,24 +971,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 
     pub async fn execute(self) -> crate::Result<u64> {
         <Self as SqlExecutor>::execute(self).await
-    }
-
-    #[allow(dead_code)]
-    async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<u64> {
-        if models.is_empty() {
-            return Ok(0);
-        }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
-        common_helpers::append_mssql_merge_update_clause::<T>(&mut sql);
-        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
-
-        let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
-            bind_value(&mut query, param);
-        }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
     }
 }
 
@@ -2643,6 +2585,10 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Valu
     if let Ok(Some(v)) = row.try_get::<Numeric, _>(idx) {
         return Ok(Value::BigDecimal(v.to_string()));
     }
+    // 尝试 UUID (UNIQUEIDENTIFIER)
+    if let Ok(Some(v)) = row.try_get::<uuid::Uuid, _>(idx) {
+        return Ok(Value::Uuid(v));
+    }
     // 尝试 &str (NVARCHAR, VARCHAR, CHAR)
     if let Ok(Some(v)) = row.try_get::<&str, _>(idx) {
         return Ok(Value::Text(v.to_string()));
@@ -2705,39 +2651,6 @@ fn decimal_text_to_mssql_numeric(value: &str) -> Numeric {
     Numeric::new_with_scale(integer, scale as u8)
 }
 
-// 辅助函数：从 tiberius Row 中提取 i64 值（用于聚合查询）
-#[allow(dead_code)]
-fn extract_i64_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Option<i64>> {
-    if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
-        return Ok(Some(v as i64));
-    }
-    if let Ok(Some(v)) = row.try_get::<i64, _>(idx) {
-        return Ok(Some(v));
-    }
-    if let Ok(Some(v)) = row.try_get::<i16, _>(idx) {
-        return Ok(Some(v as i64));
-    }
-    Ok(None)
-}
-
-// 辅助函数：从 tiberius Row 中提取 f64 值（用于 AVG 聚合）
-#[allow(dead_code)]
-fn extract_f64_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Option<f64>> {
-    if let Ok(Some(v)) = row.try_get::<f64, _>(idx) {
-        return Ok(Some(v));
-    }
-    if let Ok(Some(v)) = row.try_get::<f32, _>(idx) {
-        return Ok(Some(v as f64));
-    }
-    if let Ok(Some(v)) = row.try_get::<i32, _>(idx) {
-        return Ok(Some(v as f64));
-    }
-    if let Ok(Some(v)) = row.try_get::<i64, _>(idx) {
-        return Ok(Some(v as f64));
-    }
-    Ok(None)
-}
-
 // 辅助函数：将 Value 绑定到 Query
 fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
     match value {
@@ -2758,7 +2671,7 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
         Value::Date(v) => query.bind(*v),
         Value::Time(v) => query.bind(*v),
         Value::Json(v) => query.bind(v.to_string()),
-        Value::Uuid(v) => query.bind(v.as_bytes().as_slice()),
+        Value::Uuid(v) => query.bind(*v),
         Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
             panic!("MSSQL backend does not support PostgreSQL array values")
         }

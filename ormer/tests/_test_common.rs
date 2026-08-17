@@ -12,44 +12,34 @@ pub type DbConfig = (DbType, &'static str);
 ///
 /// 根据编译时启用的 feature，返回可用的数据库配置列表
 /// 测试函数应该遍历此列表，对每个数据库后端执行测试
-#[allow(dead_code)]
-#[allow(unused_mut)]
-#[allow(clippy::vec_init_then_push)]
 pub fn get_all_db_configs() -> Vec<DbConfig> {
-    let mut configs = Vec::new();
-
-    // Sqlite 仅在启用 sqlite feature 时可用
-    #[cfg(feature = "sqlite")]
-    configs.push((DbType::Sqlite, ":memory:"));
-
-    // PostgreSQL 仅在启用 postgresql feature 时可用
-    #[cfg(feature = "postgresql")]
-    configs.push((
-        DbType::PostgreSQL,
-        option_env!("ORMER_TEST_POSTGRES")
-            .unwrap_or("postgres://postgres:postgres@localhost:5432/ormer_test"),
-    ));
-
-    // MySQL 仅在启用 mysql feature 时可用
-    #[cfg(feature = "mysql")]
-    configs.push((
-        DbType::MySQL,
-        option_env!("ORMER_TEST_MYSQL").unwrap_or("mysql://root:root@localhost:3306/ormer_test"),
-    ));
-
-    configs
+    [
+        #[cfg(feature = "sqlite")]
+        (DbType::Sqlite, ":memory:"),
+        #[cfg(feature = "postgresql")]
+        (
+            DbType::PostgreSQL,
+            option_env!("ORMER_TEST_POSTGRES")
+                .unwrap_or("postgres://postgres:postgres@localhost:5432/ormer_test"),
+        ),
+        #[cfg(feature = "mysql")]
+        (
+            DbType::MySQL,
+            option_env!("ORMER_TEST_MYSQL")
+                .unwrap_or("mysql://root:root@localhost:3306/ormer_test"),
+        ),
+    ]
+    .into()
 }
 
 /// 获取仅包含 Sqlite 的配置（用于快速测试或不支持多数据库的场景）
 #[cfg(feature = "sqlite")]
-#[allow(dead_code)]
 pub fn get_sqlite_config() -> Vec<DbConfig> {
     vec![(DbType::Sqlite, ":memory:")]
 }
 
 /// 辅助函数：创建数据库连接
 /// 从配置创建数据库连接
-#[allow(dead_code)]
 pub async fn create_db_connection(
     config: &DbConfig,
 ) -> Result<ormer::Database, Box<dyn std::error::Error>> {
@@ -57,18 +47,15 @@ pub async fn create_db_connection(
     Ok(db)
 }
 
-#[allow(dead_code)]
 pub async fn prepare_table<T: Model + WritableModel>(db: &Database) -> ormer::Result<()> {
     let _ = db.drop_table::<T>().execute().await;
     db.create_table::<T>().execute().await
 }
 
-#[allow(dead_code)]
 pub async fn clean_table<T: Model + WritableModel>(db: &Database) -> ormer::Result<()> {
     db.drop_table::<T>().execute().await
 }
 
-#[allow(dead_code)]
 pub async fn seed_rows<T: Model + WritableModel + Send + Sync>(
     db: &Database,
     rows: Vec<T>,
@@ -76,7 +63,6 @@ pub async fn seed_rows<T: Model + WritableModel + Send + Sync>(
     db.insert(rows).execute().await.map(|_| ())
 }
 
-#[allow(dead_code)]
 pub async fn seed_score_users<T, F>(db: &Database, mut make_user: F) -> ormer::Result<()>
 where
     T: Model + WritableModel + Send + Sync,
@@ -93,7 +79,6 @@ where
     .await
 }
 
-#[allow(dead_code)]
 pub async fn prepare_pooled_table<T: Model + WritableModel>(
     conn: &PooledConnection<'_>,
 ) -> ormer::Result<()> {
@@ -101,7 +86,6 @@ pub async fn prepare_pooled_table<T: Model + WritableModel>(
     conn.create_table::<T>().execute().await
 }
 
-#[allow(dead_code)]
 pub async fn clean_pooled_table<T: Model + WritableModel>(
     conn: &PooledConnection<'_>,
 ) -> ormer::Result<()> {
@@ -109,7 +93,6 @@ pub async fn clean_pooled_table<T: Model + WritableModel>(
 }
 
 #[cfg(feature = "sqlite")]
-#[allow(dead_code)]
 pub async fn sqlite_pool() -> ormer::Result<ormer::ConnectionPool> {
     Database::create_pool(DbType::Sqlite, ":memory:")
         .range(0..1)
@@ -118,13 +101,11 @@ pub async fn sqlite_pool() -> ormer::Result<ormer::ConnectionPool> {
 }
 
 #[cfg(feature = "sqlite")]
-#[allow(dead_code)]
 pub fn sqlite_config() -> DbConfig {
     (DbType::Sqlite, ":memory:")
 }
 
 #[cfg(feature = "postgresql")]
-#[allow(dead_code)]
 pub fn postgresql_config() -> DbConfig {
     (
         DbType::PostgreSQL,
@@ -134,7 +115,6 @@ pub fn postgresql_config() -> DbConfig {
 }
 
 #[cfg(feature = "mysql")]
-#[allow(dead_code)]
 pub fn mysql_config() -> DbConfig {
     (
         DbType::MySQL,

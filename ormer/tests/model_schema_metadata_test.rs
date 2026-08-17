@@ -5,7 +5,7 @@
     feature = "mssql"
 ))]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, ormer::Model)]
 #[table(schema = "auth", name = "schema_meta_parents_1")]

@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 定义单主键测试模型
 #[derive(Debug, ormer::Model, Clone, PartialEq)]

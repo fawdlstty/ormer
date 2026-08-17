@@ -2,7 +2,7 @@
 
 use ormer::Model;
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_simple!(TestUser, "syntax_validation_users_1");
@@ -10,9 +10,6 @@ define_test_user_simple!(TestUser, "syntax_validation_users_1");
 #[cfg(test)]
 mod syntax_validation {
     use super::*;
-    // ColumnBuilder is used for future tests
-    #[allow(unused_imports)]
-    use ormer::query::builder::ColumnBuilder;
 
     // 注意：为了让语法工作，我们需要为 TestUser 实现字段访问
     // 这需要通过过程宏生成，但这里我们先演示概念
@@ -33,8 +30,6 @@ mod syntax_validation {
     async fn test_query_with_filter_impl(config: &_test_common::DbConfig) {
         // 简化测试:手动创建 FilterExpr
         use ormer::FilterExpr;
-        #[allow(unused_imports)]
-        use ormer::query::builder::FilterValue;
         use ormer::query::filter::Value as FilterValueInner;
 
         // 模拟过程宏生成的代码
@@ -54,9 +49,6 @@ mod syntax_validation {
     }
 
     async fn test_complex_query_impl(config: &_test_common::DbConfig) {
-        #[allow(unused_imports)]
-        use ormer::{OrderBy, OrderDirection};
-
         // offset方法已被range替代，使用range(start..end)语法
         let query = TestUser::query().range(20..30);
 

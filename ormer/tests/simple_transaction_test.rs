@@ -1,7 +1,7 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 /// 简单的事务测试
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_for_simple_txn!(CommitUser, "simple_transaction_commit_1");

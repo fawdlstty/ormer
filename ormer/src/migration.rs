@@ -439,8 +439,11 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                     } else {
                         column_definition(db_type, expected)
                     };
+                    #[cfg(feature = "postgresql")]
                     let using =
                         postgresql_using_expression(db_type, actual, expected, &expected_type);
+                    #[cfg(not(feature = "postgresql"))]
+                    let using = None;
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
                         column: expected.name.to_string(),
@@ -584,6 +587,7 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 "FLOAT8" | "DOUBLEPRECISION" | "FLOAT" => "DOUBLE PRECISION".to_string(),
                 "TIMESTAMPTZ" | "TIMESTAMPWITHTIMEZONE" => "TIMESTAMPTZ".to_string(),
                 "TIMESTAMP" | "TIMESTAMPWITHOUTTIMEZONE" => "TIMESTAMP".to_string(),
+                "UUID" => "UUID".to_string(),
                 "CHARACTERVARYING" | "VARCHAR" | "CHAR" | "BPCHAR" | "TEXT" => "TEXT".to_string(),
                 _ => upper,
             }
@@ -592,9 +596,8 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
         DbType::MySQL => {
             let base = upper.split('(').next().unwrap_or(&upper);
             match base {
-                "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
-                    "TEXT".to_string()
-                }
+                "CHAR" | "VARCHAR" => upper,
+                "TINYTEXT" | "TEXT" | "MEDIUMTEXT" | "LONGTEXT" => "TEXT".to_string(),
                 "TINYINT" if upper.contains("(1)") => "BOOLEAN".to_string(),
                 "TINYINT" => "TINYINT".to_string(),
                 "INTEGER" | "INT" => "INT".to_string(),
@@ -624,67 +627,58 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 "DATE" => "DATE".to_string(),
                 "TIME" => "TIME".to_string(),
                 "VARBINARY" | "BINARY" | "IMAGE" => "BLOB".to_string(),
+                "UNIQUEIDENTIFIER" => "UUID".to_string(),
                 _ => base.to_string(),
             }
         }
     }
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "postgresql")]
 fn postgresql_using_expression(
     db_type: DbType,
     actual: &SchemaColumn,
     expected: &ColumnSchema,
     expected_type: &str,
 ) -> Option<String> {
-    #[cfg(not(feature = "postgresql"))]
-    {
-        let _ = (db_type, actual, expected, expected_type);
-        return None;
-    }
-
-    #[cfg(feature = "postgresql")]
     if !matches!(db_type, DbType::PostgreSQL) {
         return None;
     }
 
-    #[cfg(feature = "postgresql")]
+    let column = expected.name;
+    if expected_type.eq_ignore_ascii_case("TEXT[]")
+        && matches!(
+            normalize_type(DbType::PostgreSQL, &actual.type_name).as_str(),
+            "TEXT" | "JSONB" | "JSON"
+        )
     {
-        let column = expected.name;
-        if expected_type.eq_ignore_ascii_case("TEXT[]")
-            && matches!(
-                normalize_type(DbType::PostgreSQL, &actual.type_name).as_str(),
-                "TEXT" | "JSONB" | "JSON"
-            )
-        {
-            let null_value = if expected.is_nullable {
-                "NULL::TEXT[]"
-            } else {
-                "ARRAY[]::TEXT[]"
-            };
-            if matches!(
-                normalize_type(DbType::PostgreSQL, &actual.type_name).as_str(),
-                "JSONB" | "JSON"
-            ) {
-                return Some(format!(
-                    "CASE WHEN {column} IS NULL THEN {null_value} \
+        let null_value = if expected.is_nullable {
+            "NULL::TEXT[]"
+        } else {
+            "ARRAY[]::TEXT[]"
+        };
+        if matches!(
+            normalize_type(DbType::PostgreSQL, &actual.type_name).as_str(),
+            "JSONB" | "JSON"
+        ) {
+            return Some(format!(
+                "CASE WHEN {column} IS NULL THEN {null_value} \
                  WHEN jsonb_typeof({column}::jsonb) = 'array' \
                  THEN ARRAY(SELECT jsonb_array_elements_text({column}::jsonb)) \
                  WHEN jsonb_typeof({column}::jsonb) = 'string' \
                  THEN ARRAY[({column}::jsonb #>> '{{}}')]::TEXT[] \
                  ELSE ARRAY[{column}::text]::TEXT[] END"
-                ));
-            }
-            return Some(format!(
-                "CASE WHEN {column} IS NULL THEN {null_value} \
+            ));
+        }
+        return Some(format!(
+            "CASE WHEN {column} IS NULL THEN {null_value} \
              WHEN btrim({column}::text) = '' THEN ARRAY[]::TEXT[] \
                  WHEN left(btrim({column}::text), 1) = '[' \
              THEN ARRAY(SELECT jsonb_array_elements_text({column}::jsonb)) \
              ELSE ARRAY[{column}::text]::TEXT[] END"
-            ));
-        }
-        Some(format!("{column}::{expected_type}"))
+        ));
     }
+    Some(format!("{column}::{expected_type}"))
 }
 
 #[cfg(feature = "sqlite")]

@@ -2,56 +2,10 @@
 
 /// Grouped Select 端到端测试
 /// 验证聚合查询在实际数据库中的执行情况
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（每个测试使用唯一表名）
 define_test_user_with_score!(TestGroupedE2EUser, "test_grouped_e2e_basic_1");
-
-use ormer::model::{FromRowValues, Value};
-
-// 定义聚合结果类型（为未来扩展保留）
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct AgeGroupStats {
-    age: i32,
-    user_count: i64,
-    avg_score: f64,
-}
-
-impl FromRowValues for AgeGroupStats {
-    fn from_row_values(values: &[Value]) -> ormer::Result<Self> {
-        if values.len() < 3 {
-            return Err(ormer::ormer_error!("Expected at least 3 values"));
-        }
-
-        let age = match &values[0] {
-            Value::Integer(i) => *i as i32,
-            _ => {
-                return Err(ormer::ormer_error!("Expected integer for age"));
-            }
-        };
-
-        let user_count = match &values[1] {
-            Value::Integer(i) => *i,
-            _ => {
-                return Err(ormer::ormer_error!("Expected integer for user_count"));
-            }
-        };
-
-        let avg_score = match &values[2] {
-            Value::Real(f) => *f,
-            _ => {
-                return Err(ormer::ormer_error!("Expected real for avg_score"));
-            }
-        };
-
-        Ok(AgeGroupStats {
-            age,
-            user_count,
-            avg_score,
-        })
-    }
-}
 
 /// 测试基本的 GROUP BY 聚合查询
 async fn test_grouped_select_basic_impl(

@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 为每个测试使用唯一的表名，避免并发测试冲突
 define_test_user!(TestUserInsert, "test_users_insert_1");

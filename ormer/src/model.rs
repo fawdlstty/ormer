@@ -1011,6 +1011,18 @@ impl PrimaryKey for &str {
     }
 }
 
+impl PrimaryKey for uuid::Uuid {
+    fn into_values(self) -> Vec<Value> {
+        vec![Value::Uuid(self)]
+    }
+}
+
+impl PrimaryKey for &uuid::Uuid {
+    fn into_values(self) -> Vec<Value> {
+        vec![Value::Uuid(*self)]
+    }
+}
+
 // 为两元素元组实现 PrimaryKey（复合主键）
 impl<A, B> PrimaryKey for (A, B)
 where
@@ -1032,6 +1044,14 @@ where
     fn into_values(self) -> Vec<Value> {
         vec![self.0.into(), self.1.into(), self.2.into()]
     }
+}
+
+/// 主键 Rust 字段元数据。
+pub trait PrimaryFields {
+    type Fields;
+
+    fn primary_field_names() -> Vec<&'static str>;
+    fn promary_fields(&self) -> Self::Fields;
 }
 
 /// 只读模型 trait，用于 view、DTO、raw SQL 结果和查询投影。
@@ -1066,6 +1086,15 @@ pub trait ViewModel: Sized {
         Self::COLUMN_SCHEMA.to_vec()
     }
 
+    /// 获取主键 Rust 字段名列表。
+    fn primary_field_names() -> Vec<&'static str> {
+        Self::COLUMN_SCHEMA
+            .iter()
+            .filter(|column| column.is_primary)
+            .map(|column| column.rust_name)
+            .collect()
+    }
+
     fn query() -> Self::QueryBuilder;
     fn select() -> Self::QueryBuilder;
     fn from_row(row: &Row) -> crate::Result<Self>;
@@ -1089,7 +1118,12 @@ pub trait Model: Sized {
 
     /// 从模型实例中提取表路由变量。
     fn table_route(&self) -> crate::Result<TableRoute> {
-        let variables = table_route_variables(Self::TABLE_NAME);
+        let mut variables = table_route_variables(Self::TABLE_NAME);
+        if let Some(route_key) = Self::hypertable_route_key() {
+            if !variables.iter().any(|variable| variable == route_key) {
+                variables.push(route_key.to_string());
+            }
+        }
         let mut route = TableRoute::new();
         for variable in variables {
             let value = self.column_value(&variable).ok_or_else(|| {
@@ -1114,6 +1148,11 @@ pub trait Model: Sized {
         None
     }
 
+    /// 获取 TimescaleDB 字符串拆表路由键（如果有）。
+    fn hypertable_route_key() -> Option<&'static str> {
+        None
+    }
+
     /// 自增主键类型
     /// 如果模型有自增主键（#[primary(auto)]），此类型为主键的 Rust 类型（如 i32, i64）
     /// 如果没有自增主键，此类型为 ()
@@ -1129,6 +1168,15 @@ pub trait Model: Sized {
 
     fn column_schema() -> Vec<ColumnSchema> {
         Self::COLUMN_SCHEMA.to_vec()
+    }
+
+    /// 获取主键 Rust 字段名列表。
+    fn primary_field_names() -> Vec<&'static str> {
+        Self::COLUMN_SCHEMA
+            .iter()
+            .filter(|column| column.is_primary)
+            .map(|column| column.rust_name)
+            .collect()
     }
 
     fn version_info() -> Option<VersionInfo> {
@@ -1276,6 +1324,113 @@ pub trait Model: Sized {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct Tracked<T: Model> {
+    model: T,
+    snapshot: Vec<(&'static str, Value)>,
+}
+
+impl<T: Model> Tracked<T> {
+    pub fn new(model: T) -> Self {
+        let snapshot = tracked_field_values(&model);
+        Self { model, snapshot }
+    }
+
+    pub fn as_model(&self) -> &T {
+        &self.model
+    }
+
+    pub fn as_model_mut(&mut self) -> &mut T {
+        &mut self.model
+    }
+
+    pub fn into_inner(self) -> T {
+        self.model
+    }
+
+    pub fn dirty_columns(&self) -> Vec<String> {
+        tracked_field_values(&self.model)
+            .into_iter()
+            .filter_map(|(column, value)| {
+                let original =
+                    self.snapshot
+                        .iter()
+                        .find_map(|(snapshot_column, snapshot_value)| {
+                            (*snapshot_column == column).then_some(snapshot_value)
+                        });
+                match original {
+                    Some(original) if values_equal(original, &value) => None,
+                    _ => Some(column.to_string()),
+                }
+            })
+            .collect()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        !self.dirty_columns().is_empty()
+    }
+
+    pub fn accept_changes(&mut self) {
+        self.snapshot = tracked_field_values(&self.model);
+    }
+}
+
+impl<T: Model> std::ops::Deref for Tracked<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.model
+    }
+}
+
+impl<T: Model> std::ops::DerefMut for Tracked<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.model
+    }
+}
+
+pub trait TrackableModel: Model + Sized {
+    fn track(self) -> Tracked<Self> {
+        Tracked::new(self)
+    }
+}
+
+impl<T: Model> TrackableModel for T {}
+
+fn tracked_field_values<T: Model>(model: &T) -> Vec<(&'static str, Value)> {
+    let version_column = T::version_info().map(|info| info.column);
+    model
+        .non_pk_field_values()
+        .into_iter()
+        .filter(|(column, _)| Some(*column) != version_column)
+        .collect()
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Integer(left), Value::Integer(right)) => left == right,
+        (Value::BigInt(left), Value::BigInt(right)) => left == right,
+        (Value::Duration(left), Value::Duration(right)) => left == right,
+        (Value::Text(left), Value::Text(right)) => left == right,
+        (Value::TextArray(left), Value::TextArray(right)) => left == right,
+        (Value::Real(left), Value::Real(right)) => left == right,
+        (Value::Decimal(left), Value::Decimal(right)) => left == right,
+        (Value::BigDecimal(left), Value::BigDecimal(right)) => left == right,
+        (Value::Boolean(left), Value::Boolean(right)) => left == right,
+        (Value::Bytes(left), Value::Bytes(right)) => left == right,
+        (Value::IntegerArray(left), Value::IntegerArray(right)) => left == right,
+        (Value::BigIntArray(left), Value::BigIntArray(right)) => left == right,
+        (Value::NullableBigIntArray(left), Value::NullableBigIntArray(right)) => left == right,
+        (Value::DateTime(left), Value::DateTime(right)) => left == right,
+        (Value::Date(left), Value::Date(right)) => left == right,
+        (Value::Time(left), Value::Time(right)) => left == right,
+        (Value::Json(left), Value::Json(right)) => left == right,
+        (Value::Uuid(left), Value::Uuid(right)) => left == right,
+        (Value::Null, Value::Null) => true,
+        _ => false,
+    }
+}
+
 pub enum GraphRelationMut<'a> {
     HasMany {
         relation: &'static RelationInfo,
@@ -1343,20 +1498,19 @@ impl<T: Model + 'static> GraphModels for Vec<T> {
     }
 }
 
-#[allow(async_fn_in_trait)]
 pub trait GraphWritable: WritableModel + Sized {
-    async fn insert_graph_relations<'tx>(
+    fn insert_graph_relations<'tx>(
         _tx: &mut crate::abstract_layer::Transaction<'tx>,
         _owner: &mut Self,
-    ) -> crate::Result<()> {
-        Ok(())
+    ) -> impl std::future::Future<Output = crate::Result<()>> {
+        async { Ok(()) }
     }
 
-    async fn update_graph_relations<'tx>(
+    fn update_graph_relations<'tx>(
         _tx: &mut crate::abstract_layer::Transaction<'tx>,
         _owner: &mut Self,
-    ) -> crate::Result<()> {
-        Ok(())
+    ) -> impl std::future::Future<Output = crate::Result<()>> {
+        async { Ok(()) }
     }
 }
 
@@ -1703,6 +1857,29 @@ pub fn routed_table_name_for_db(
     } else {
         Ok(normalize_table_name_for_db(db_type, table_name).to_string())
     }
+}
+
+pub fn routed_model_table_name_for_db<T: Model>(
+    db_type: crate::abstract_layer::DbType,
+    route: &TableRoute,
+) -> crate::Result<String> {
+    if route.is_empty() {
+        return Ok(normalize_table_name_for_db(db_type, T::TABLE_NAME).to_string());
+    }
+
+    if T::TABLE_NAME.contains('{') {
+        return routed_table_name_for_db(db_type, T::TABLE_NAME, route);
+    }
+
+    #[cfg(feature = "postgresql")]
+    if matches!(db_type, crate::abstract_layer::DbType::PostgreSQL) {
+        if let Some(route_key) = T::hypertable_route_key() {
+            let table_name = format!("{}_{{{}}}", T::TABLE_NAME, route_key);
+            return routed_table_name_for_db(db_type, &table_name, route);
+        }
+    }
+
+    routed_table_name_for_db(db_type, T::TABLE_NAME, route)
 }
 
 /// 拆分支持 schema 的数据库表名，未指定 schema 时使用默认 schema。
@@ -2979,6 +3156,7 @@ impl_from_row_values_single!(
     chrono::NaiveDateTime => "NaiveDateTime",
     chrono::NaiveDate => "NaiveDate",
     chrono::NaiveTime => "NaiveTime",
+    uuid::Uuid => "uuid::Uuid",
     serde_json::Value => "serde_json::Value",
 );
 
@@ -3630,11 +3808,19 @@ impl From<uuid::Uuid> for Value {
     }
 }
 
+pub(crate) fn uuid_from_text(raw: &str) -> crate::Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw.trim())
+        .map_err(|err| crate::ormer_error!("Type mismatch: expected uuid::Uuid text: {}", err))
+}
+
 impl FromValue for uuid::Uuid {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Uuid(v) => Ok(*v),
-            _ => Err(crate::ormer_error!("Type mismatch: expected uuid::Uuid")),
+            Value::Text(v) => uuid_from_text(v),
+            _ => Err(crate::ormer_error!(
+                "Type mismatch: expected uuid::Uuid or UUID text"
+            )),
         }
     }
 }
@@ -3643,10 +3829,7 @@ impl FromValue for Option<uuid::Uuid> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
-            Value::Uuid(v) => Ok(Some(*v)),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<uuid::Uuid>"
-            )),
+            _ => uuid::Uuid::from_value(value).map(Some),
         }
     }
 }

@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "test_ignore_select_users_1"]

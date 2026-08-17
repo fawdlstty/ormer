@@ -25,10 +25,11 @@ pub use unified::{
     LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
     ModelCollectWithFuture, NestedInclude, RawCollectFuture, RawSelectExecutor,
     RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
-    ReplicatedDatabaseBuilder, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor,
-    SelectStream, SelectStreamIterator, Transaction, TransactionFuture, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, UpdateExecutor, UpdateGraphExecutor,
+    ReplicatedDatabaseBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionFuture,
+    TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
+    TransactionRawSelectExecutor, TransactionSaveExecutor, UpdateExecutor, UpdateGraphExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
@@ -95,17 +96,21 @@ impl SqlStatement {
     }
 }
 
-#[allow(async_fn_in_trait)]
 pub trait SqlExecutor: Sized {
     type Output;
 
     fn to_sql(&self) -> crate::Result<SqlStatement>;
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output>;
+    fn execute_with_sql(
+        self,
+        sql: SqlStatement,
+    ) -> impl std::future::Future<Output = crate::Result<Self::Output>>;
 
-    async fn execute(self) -> crate::Result<Self::Output> {
-        let sql = self.to_sql()?;
-        self.execute_with_sql(sql).await
+    fn execute(self) -> impl std::future::Future<Output = crate::Result<Self::Output>> {
+        async move {
+            let sql = self.to_sql()?;
+            self.execute_with_sql(sql).await
+        }
     }
 }
 

@@ -127,25 +127,24 @@ impl<T, S> ConflictColumns for TypedColumn<T, S> {
 }
 
 macro_rules! impl_conflict_columns_for_tuple {
-    ($($name:ident),+) => {
-        impl<$($name),+> ConflictColumns for ($($name,)+)
+    ($($type:ident => $value:ident),+) => {
+        impl<$($type),+> ConflictColumns for ($($type,)+)
         where
-            $($name: ConflictColumns),+
+            $($type: ConflictColumns),+
         {
-            #[allow(non_snake_case)]
             fn conflict_columns(self) -> Vec<&'static str> {
-                let ($($name,)+) = self;
+                let ($($value,)+) = self;
                 let mut columns = Vec::new();
-                $(columns.extend($name.conflict_columns());)+
+                $(columns.extend($value.conflict_columns());)+
                 columns
             }
         }
     };
 }
 
-impl_conflict_columns_for_tuple!(A, B);
-impl_conflict_columns_for_tuple!(A, B, C);
-impl_conflict_columns_for_tuple!(A, B, C, D);
+impl_conflict_columns_for_tuple!(A => a, B => b);
+impl_conflict_columns_for_tuple!(A => a, B => b, C => c);
+impl_conflict_columns_for_tuple!(A => a, B => b, C => c, D => d);
 
 pub trait IntoInsertConflictTarget<M: Model> {
     fn into_insert_conflict_target(self) -> InsertConflictTarget;

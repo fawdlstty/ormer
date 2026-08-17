@@ -2,7 +2,7 @@
 
 use ormer::Database;
 
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_minimal!(SimpleUser, "test_pool_simple_users_1");

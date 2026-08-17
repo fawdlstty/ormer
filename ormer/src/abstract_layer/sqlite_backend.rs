@@ -32,6 +32,33 @@ fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::Sqlite)
 }
 
+fn is_uuid_rust_type(rust_type: &str) -> bool {
+    matches!(rust_type, "Uuid" | "uuid::Uuid")
+}
+
+fn convert_turso_model_value<T: Model>(
+    column_index: usize,
+    value: &turso::Value,
+) -> crate::Result<Value> {
+    let columns = T::column_schema();
+    let column = columns
+        .get(column_index)
+        .ok_or_else(|| crate::ormer_error!("Column index out of bounds: {}", column_index))?;
+
+    if is_uuid_rust_type(column.rust_type) {
+        return match value {
+            turso::Value::Null => Ok(Value::Null),
+            turso::Value::Text(raw) => crate::model::uuid_from_text(raw).map(Value::Uuid),
+            _ => Err(crate::ormer_error!(
+                "Failed to decode SQLite UUID column '{}' from non-text value",
+                column.name
+            )),
+        };
+    }
+
+    convert_turso_value(value)
+}
+
 // 导入宏
 use crate::impl_backend_executor_methods;
 use crate::impl_backend_join_executor_methods;
@@ -56,6 +83,9 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
 
         // 首先处理主键类型
         if is_primary {
+            if is_uuid_rust_type(rust_type) {
+                return "TEXT PRIMARY KEY".to_string();
+            }
             if is_auto_increment {
                 return "INTEGER PRIMARY KEY AUTOINCREMENT".to_string();
             } else {
@@ -74,6 +104,8 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             "Duration" | "std::time::Duration" => "INTEGER",
             // 字符串类型
             "String" => "TEXT",
+            // UUID 使用规范连字符字符串存储
+            "Uuid" | "uuid::Uuid" => "TEXT",
             // 布尔类型（SQLite 没有原生 bool，用 INTEGER 存储）
             "bool" => "INTEGER",
             // 字节数组
@@ -108,12 +140,6 @@ pub struct Database {
 // async/await.
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
-
-// Wrapper type to make turso::Connection explicitly Send
-#[allow(dead_code)]
-struct SendableConnection(turso::Connection);
-
-unsafe impl Send for SendableConnection {}
 
 /// 创建表执行器
 pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
@@ -255,7 +281,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 let model =
                     common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
                         let value = row.get_value(i)?;
-                        convert_turso_value(&value)
+                        convert_turso_model_value::<I::Model>(i, &value)
                     })?;
                 results.push(model);
             }
@@ -849,36 +875,6 @@ impl Database {
             db: self,
             models,
             _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// 批量插入记录，返回自增主键值（如果有自增主键）或 ()
-    /// 对于批量插入，返回的是第一条插入记录的自增ID（即最小值）
-    #[allow(dead_code)]
-    pub(crate) async fn insert_impl<T: Model>(
-        &self,
-        models: &[&T],
-    ) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::Sqlite, models)?;
-        let all_params = values_into_params(all_values)?;
-
-        self.conn.execute(&sql, all_params).trace().await?;
-
-        // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            let last_id = self.conn.last_insert_rowid();
-            // 将 i64 转换为对应的主键类型
-            let result =
-                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
-            Ok(result)
-        } else {
-            Ok(T::AutoIncrementKeyType::default())
         }
     }
 
@@ -1533,117 +1529,6 @@ impl Transaction {
             _marker: std::marker::PhantomData,
         }
     }
-
-    /// 批量插入记录（内部使用），返回自增主键值（如果有自增主键）或 ()
-    #[allow(dead_code)]
-    async fn insert_impl<T: Model>(
-        &mut self,
-        models: &[&T],
-    ) -> crate::Result<T::AutoIncrementKeyType> {
-        if models.is_empty() {
-            return Ok(T::AutoIncrementKeyType::default());
-        }
-
-        let (sql, all_values) =
-            common_helpers::build_routed_insert_statement::<T>(DbType::Sqlite, models)?;
-        let all_params = values_into_params(all_values)?;
-
-        self.conn.execute(&sql, all_params).trace().await?;
-
-        // 获取自增ID（如果有自增主键）
-        let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            let last_id = self.conn.last_insert_rowid();
-            let result =
-                common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)?;
-            Ok(result)
-        } else {
-            Ok(T::AutoIncrementKeyType::default())
-        }
-    }
-
-    /// 批量插入或更新记录（遇到重复键时更新）（内部使用）
-    #[allow(dead_code)]
-    async fn insert_or_update_impl<T: Model>(&mut self, models: &[&T]) -> crate::Result<()> {
-        if models.is_empty() {
-            return Ok(());
-        }
-
-        let columns = T::insert_columns();
-        let col_count = columns.len();
-        let pk_columns = T::primary_key_columns();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::Sqlite,
-                    c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in models.iter() {
-            let pk_values = model.primary_key_values();
-            let delete_params = values_into_params(pk_values)?;
-            self.conn
-                .execute(&delete_sql, delete_params)
-                .trace()
-                .await?;
-
-            let all_values = model.insert_values();
-            let insert_params = values_into_params(all_values)?;
-            self.conn
-                .execute(&insert_sql, insert_params)
-                .trace()
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// 批量插入或忽略记录（遇到重复键时忽略）（内部使用）
-    #[allow(dead_code)]
-    async fn insert_or_ignore_impl<T: Model>(&mut self, models: &[&T]) -> crate::Result<()> {
-        if models.is_empty() {
-            return Ok(());
-        }
-
-        let columns = T::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
-
-        for model in models.iter() {
-            let values = model.insert_values();
-            let params = values_into_params(values)?;
-            match self.conn.execute(&insert_sql, params).trace().await {
-                Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(())
-    }
 }
 
 /// Select 查询执行器
@@ -1722,7 +1607,6 @@ pub struct RelatedSelectExecutor<T: Model, R: Model> {
 }
 
 /// MultiTable 查询执行器（支持3个表关联查询）
-#[allow(dead_code)]
 pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
     select: MultiTableSelect<T, R1, R2>,
     conn: Arc<turso::Connection>,
@@ -1730,7 +1614,6 @@ pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
 }
 
 /// FourTable 查询执行器（支持4个表关联查询）
-#[allow(dead_code)]
 pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
     select: FourTableSelect<T, R1, R2, R3>,
     conn: Arc<turso::Connection>,
@@ -2073,7 +1956,10 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
+                t_data.insert(
+                    col_name.to_string(),
+                    convert_turso_model_value::<T>(i, &value)?,
+                );
             }
             let t_model = T::from_row(&Row::new(t_data))?;
 
@@ -2083,7 +1969,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
                 if let Ok(value) = row.get_value(idx) {
-                    let ormer_value = convert_turso_value(&value)?;
+                    let ormer_value = convert_turso_model_value::<J>(i, &value)?;
                     // 检查是否为 NULL，只有非 NULL 值才设置 j_is_null = false
                     if !matches!(ormer_value, Value::Null) {
                         j_is_null = false;
@@ -2143,7 +2029,10 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
+                t_data.insert(
+                    col_name.to_string(),
+                    convert_turso_model_value::<T>(i, &value)?,
+                );
             }
             let t_model = T::from_row(&Row::new(t_data))?;
 
@@ -2151,7 +2040,10 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
                 let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
-                j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
+                j_data.insert(
+                    col_name.to_string(),
+                    convert_turso_model_value::<J>(i, &value)?,
+                );
             }
             let j_model = J::from_row(&Row::new(j_data))?;
 
@@ -2201,8 +2093,11 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             let mut t_is_null = true;
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 if let Ok(value) = row.get_value(i) {
-                    t_data.insert(col_name.to_string(), convert_turso_value(&value)?);
-                    t_is_null = false;
+                    let ormer_value = convert_turso_model_value::<T>(i, &value)?;
+                    if !matches!(ormer_value, Value::Null) {
+                        t_is_null = false;
+                    }
+                    t_data.insert(col_name.to_string(), ormer_value);
                 }
             }
             let t_model = if t_is_null {
@@ -2215,7 +2110,10 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
                 let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
-                j_data.insert(col_name.to_string(), convert_turso_value(&value)?);
+                j_data.insert(
+                    col_name.to_string(),
+                    convert_turso_model_value::<J>(i, &value)?,
+                );
             }
             let j_model = J::from_row(&Row::new(j_data))?;
 
@@ -2397,6 +2295,14 @@ impl_backend_related_executor_methods!(
     RelatedSelect
 );
 
+impl<T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<T, R1, R2> {
+    crate::__ormer_backend_multi_table_methods!(conn);
+}
+
+impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<T, R1, R2, R3> {
+    crate::__ormer_backend_four_table_methods!(conn);
+}
+
 impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
     /// 执行查询并收集结果
     pub fn collect<C: FromIterator<T> + 'static>(self) -> RelatedCollectFuture<T, R> {
@@ -2422,7 +2328,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         while let Some(row) = rows.next().trace().await? {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                convert_turso_value(&value)
+                convert_turso_model_value::<T>(i, &value)
             })?;
             results.push(model);
         }
@@ -2467,7 +2373,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         while let Some(row) = rows.next().trace().await? {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
-                convert_turso_value(&value)
+                convert_turso_model_value::<T>(i, &value)
             })?;
             results.push(model);
         }
@@ -2535,7 +2441,7 @@ impl<T: Model> DeleteExecutor<T> {
         while let Some(row) = rows.next().trace().await? {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i)?;
-                convert_turso_value(&value)
+                convert_turso_model_value::<T>(i, &value)
             })?;
             results.push(model);
         }
@@ -2551,13 +2457,6 @@ impl<T: Model> DeleteExecutor<T> {
     fn build_ormer_sql(&self) -> (String, Vec<Value>) {
         common_helpers::build_delete_sql::<T>(DbType::Sqlite, &self.filters)
             .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
-    }
-
-    #[allow(dead_code)]
-    fn build_sql(&self) -> (String, Vec<turso::Value>) {
-        let (sql, ormer_params) = self.build_ormer_sql();
-        let turso_params = values_into_params(ormer_params).unwrap_or_default();
-        (sql, turso_params)
     }
 }
 
@@ -2675,7 +2574,7 @@ impl<T: Model> UpdateExecutor<T> {
             while let Some(row) = rows.next().trace().await? {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
-                    convert_turso_value(&value)
+                    convert_turso_model_value::<T>(i, &value)
                 })?;
                 results.push(model);
             }
@@ -2718,14 +2617,6 @@ impl<T: Model> UpdateExecutor<T> {
         }
 
         Ok(statements)
-    }
-
-    #[allow(dead_code)]
-    fn build_all_sql(&self) -> crate::Result<Vec<(String, Vec<turso::Value>)>> {
-        self.build_all_ormer_sql()?
-            .into_iter()
-            .map(|statement| Ok((statement.sql, values_into_params(statement.params)?)))
-            .collect()
     }
 }
 
@@ -3097,7 +2988,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         };
 
         Ok(SelectStreamIterator {
-            conn: super::common::StreamConnection::Sqlite(conn),
+            _conn: super::common::StreamConnection::Sqlite(conn),
             rows,
             polluted: false,
             _marker: std::marker::PhantomData,
@@ -3120,8 +3011,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 /// 当迭代器被 drop 时（无论是正常完成、提前终止还是发生错误），
 /// 底层的 turso::Rows 会自动关闭游标，连接会通过 Arc 的引用计数自动释放。
 pub struct SelectStreamIterator<'a, T: Model> {
-    #[allow(dead_code)]
-    conn: super::common::StreamConnection<'a>,
+    _conn: super::common::StreamConnection<'a>,
     rows: turso::Rows,
     polluted: bool, // 标记是否发生解析错误，污染后不再尝试读取
     _marker: std::marker::PhantomData<&'a T>,
@@ -3149,7 +3039,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                 let mut data = HashMap::new();
                 for (i, col_name) in T::COLUMNS.iter().enumerate() {
                     match row.get_value(i) {
-                        Ok(value) => match convert_turso_value(&value) {
+                        Ok(value) => match convert_turso_model_value::<T>(i, &value) {
                             Ok(ormer_value) => {
                                 data.insert(col_name.to_string(), ormer_value);
                             }

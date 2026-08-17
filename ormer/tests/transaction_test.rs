@@ -1,7 +1,7 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
 /// 事务管理测试
-mod _test_common;
+pub mod _test_common;
 
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user_with_option_id!(TestUser, "test_transaction_users_1");
@@ -204,8 +204,6 @@ async fn test_transaction_with_update_impl(
     let txn = db.begin().await?;
 
     // 在事务中更新数据
-    #[allow(unused_imports)]
-    use ormer::WhereColumn;
     txn.update::<TestUser>()
         .filter(|w| w.name.eq("Original"))
         .set(|w| w.name = w.name.set("Updated".to_string()))

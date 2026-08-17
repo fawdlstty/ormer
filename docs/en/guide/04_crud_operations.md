@@ -249,6 +249,18 @@ db.update::<User>()
 
 When `set_model(&users)` or `set_model_fields(&users, ...)` receives a model collection, Ormer emits a single differential UPDATE when there is no optimistic-lock row attribution requirement and primary keys are unique; otherwise it keeps the per-row update semantics.
 
+### Tracked Save
+
+After loading a model from the database, call `track()` to record its current snapshot. `save()` updates only changed non-primary-key fields; when nothing changed, it returns `0` without running an UPDATE:
+
+```rust
+let mut user = db.find_by_id::<User>(1).await?.unwrap().track();
+user.name = "New Name".to_string();
+user.email = Some("new@example.com".to_string());
+
+db.save(&mut user).execute().await?;
+```
+
 ## Delete
 
 ```rust

@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 #[derive(Debug, ormer::Model, Clone)]
 #[table = "test_special_field_1"]

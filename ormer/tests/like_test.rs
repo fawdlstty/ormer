@@ -1,6 +1,6 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
 
-mod _test_common;
+pub mod _test_common;
 
 // 定义测试模型（包含 email: Option<String> 字段）
 define_test_user!(TestUser, "test_like_users");
