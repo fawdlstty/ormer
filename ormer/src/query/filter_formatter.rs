@@ -460,6 +460,40 @@ impl FilterFormatter {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn format_relation_subquery(
+        &self,
+        sql: &mut String,
+        owner_table: &str,
+        owner_key: &str,
+        select_expr: &str,
+        from_sql: &str,
+        filter_alias: &str,
+        filter: Option<&FilterExpr>,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) {
+        use std::fmt::Write;
+
+        let owner_column = self.outer_column(owner_table, owner_key);
+        write!(
+            sql,
+            "{} IN (SELECT {} FROM {}",
+            owner_column, select_expr, from_sql
+        )
+        .unwrap_or_else(|e| panic!("Failed to write relation EXISTS clause: {}", e));
+
+        if let Some(filter) = filter {
+            let filter_sql = FilterFormatter::new(self.db_type)
+                .with_table_prefix(filter_alias)
+                .format(filter, param_idx, params);
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter_sql);
+        }
+
+        sql.push(')');
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn format_relation_exists(
         &self,
         sql: &mut String,
@@ -471,30 +505,23 @@ impl FilterFormatter {
         param_idx: &mut i32,
         params: &mut Vec<Value>,
     ) {
-        use std::fmt::Write;
-
-        let owner_column = self.outer_column(owner_table, owner_key);
         let target_table = crate::model::quote_qualified_identifier(
             self.db_type,
             normalize_table_name_for_db(self.db_type, target_table),
         );
         let target_key = quote_column_reference(self.db_type, &format!("r0.{target_key}"));
-        write!(
+        let from_sql = format!("{target_table} AS r0");
+        self.format_relation_subquery(
             sql,
-            "{} IN (SELECT {} FROM {} AS r0",
-            owner_column, target_key, target_table
-        )
-        .unwrap_or_else(|e| panic!("Failed to write relation EXISTS clause: {}", e));
-
-        if let Some(filter) = filter {
-            let filter_sql = FilterFormatter::new(self.db_type)
-                .with_table_prefix("r0")
-                .format(filter, param_idx, params);
-            sql.push_str(" WHERE ");
-            sql.push_str(&filter_sql);
-        }
-
-        sql.push(')');
+            owner_table,
+            owner_key,
+            &target_key,
+            &from_sql,
+            "r0",
+            filter,
+            param_idx,
+            params,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -512,9 +539,6 @@ impl FilterFormatter {
         param_idx: &mut i32,
         params: &mut Vec<Value>,
     ) {
-        use std::fmt::Write;
-
-        let owner_column = self.outer_column(owner_table, owner_key);
         let via_table = crate::model::quote_qualified_identifier(
             self.db_type,
             normalize_table_name_for_db(self.db_type, via_table),
@@ -526,22 +550,20 @@ impl FilterFormatter {
         let via_owner_key = quote_column_reference(self.db_type, &format!("r0.{via_owner_key}"));
         let via_target_key = quote_column_reference(self.db_type, &format!("r0.{via_target_key}"));
         let target_key = quote_column_reference(self.db_type, &format!("r1.{target_key}"));
-        write!(
+        let from_sql = format!(
+            "{via_table} AS r0 INNER JOIN {target_table} AS r1 ON {via_target_key} = {target_key}"
+        );
+        self.format_relation_subquery(
             sql,
-            "{} IN (SELECT {} FROM {} AS r0 INNER JOIN {} AS r1 ON {} = {}",
-            owner_column, via_owner_key, via_table, target_table, via_target_key, target_key
-        )
-        .unwrap_or_else(|e| panic!("Failed to write through relation EXISTS clause: {}", e));
-
-        if let Some(filter) = filter {
-            let filter_sql = FilterFormatter::new(self.db_type)
-                .with_table_prefix("r1")
-                .format(filter, param_idx, params);
-            sql.push_str(" WHERE ");
-            sql.push_str(&filter_sql);
-        }
-
-        sql.push(')');
+            owner_table,
+            owner_key,
+            &via_owner_key,
+            &from_sql,
+            "r1",
+            filter,
+            param_idx,
+            params,
+        );
     }
 
     fn outer_column(&self, owner_table: &str, owner_key: &str) -> String {

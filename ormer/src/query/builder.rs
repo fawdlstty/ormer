@@ -1448,28 +1448,59 @@ pub struct Select<T: Model> {
     _marker: PhantomData<T>,
 }
 
-impl<T: Model> Clone for Select<T> {
-    fn clone(&self) -> Self {
-        Self {
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            cursor_columns: self.cursor_columns.clone(),
-            cursor_after: self.cursor_after.clone(),
-            cursor_before: self.cursor_before.clone(),
-            distinct: self.distinct,
-            distinct_on: self.distinct_on.clone(),
-            lock: self.lock,
-            ignored_columns: self.ignored_columns.clone(),
-            table_route: self.table_route.clone(),
-            recursive_cte: self.recursive_cte.clone(),
-            _marker: PhantomData,
+macro_rules! impl_clone_without_bounds {
+    (
+        impl<$($generic:ident $(: $bound:path)?),* $(,)?> Clone for $type:ty {
+            fields: [$($field:ident),* $(,)?],
+            marker: $marker:expr $(,)?
         }
-    }
+    ) => {
+        impl<$($generic $(: $bound)?),*> Clone for $type {
+            fn clone(&self) -> Self {
+                Self {
+                    $($field: self.$field.clone(),)*
+                    _marker: $marker,
+                }
+            }
+        }
+    };
+    (
+        impl<$($generic:ident $(: $bound:path)?),* $(,)?> Clone for $type:ty {
+            fields: [$($field:ident),* $(,)?] $(,)?
+        }
+    ) => {
+        impl<$($generic $(: $bound)?),*> Clone for $type {
+            fn clone(&self) -> Self {
+                Self {
+                    $($field: self.$field.clone(),)*
+                }
+            }
+        }
+    };
 }
+
+impl_clone_without_bounds!(
+    impl<T: Model> Clone for Select<T> {
+        fields: [
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            cursor_columns,
+            cursor_after,
+            cursor_before,
+            distinct,
+            distinct_on,
+            lock,
+            ignored_columns,
+            table_route,
+            recursive_cte,
+        ],
+        marker: PhantomData,
+    }
+);
 
 /// RelatedSelect - 关联查询结构体(支持2表查询)
 pub struct RelatedSelect<T: Model, R: Model> {
@@ -1593,14 +1624,12 @@ pub struct DerivedSelect<R: Model> {
     _marker: PhantomData<R>,
 }
 
-impl<R: Model> Clone for DerivedSelect<R> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<R: Model> Clone for DerivedSelect<R> {
+        fields: [inner],
+        marker: PhantomData,
     }
-}
+);
 
 impl<R: Model> DerivedSelect<R> {
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
@@ -1629,62 +1658,56 @@ pub struct DerivedTableSelect<R: Model> {
     _marker: PhantomData<R>,
 }
 
-impl<R: Model> Clone for DerivedTableSelect<R> {
-    fn clone(&self) -> Self {
-        Self {
-            derived: self.derived.clone(),
-            filters: self.filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<R: Model> Clone for DerivedTableSelect<R> {
+        fields: [derived, filters, order_by, range_start, range_end],
+        marker: PhantomData,
     }
-}
+);
 
-impl<T: Model, V> Clone for MappedSelect<T, V> {
-    fn clone(&self) -> Self {
-        Self {
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            column_names: self.column_names.clone(),
-            column_exprs: self.column_exprs.clone(),
-            alias_names: self.alias_names.clone(),
-            distinct: self.distinct,
-            distinct_on: self.distinct_on.clone(),
-            lock: self.lock,
-            table_route: self.table_route.clone(),
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model, V> Clone for MappedSelect<T, V> {
+        fields: [
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            column_names,
+            column_exprs,
+            alias_names,
+            distinct,
+            distinct_on,
+            lock,
+            table_route,
+        ],
+        marker: PhantomData,
     }
-}
+);
 
-impl<T: Model, V> Clone for GroupedSelect<T, V> {
-    fn clone(&self) -> Self {
-        Self {
-            column_names: self.column_names.clone(),
-            column_exprs: self.column_exprs.clone(),
-            aggregate_funcs: self.aggregate_funcs.clone(),
-            alias_names: self.alias_names.clone(),
-            group_by_columns: self.group_by_columns.clone(),
-            group_by_exprs: self.group_by_exprs.clone(),
-            grouping_clause: self.grouping_clause.clone(),
-            having_filters: self.having_filters.clone(),
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            table_route: self.table_route.clone(),
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model, V> Clone for GroupedSelect<T, V> {
+        fields: [
+            column_names,
+            column_exprs,
+            aggregate_funcs,
+            alias_names,
+            group_by_columns,
+            group_by_exprs,
+            grouping_clause,
+            having_filters,
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            table_route,
+        ],
+        marker: PhantomData,
     }
-}
+);
 
 impl<T: Model, V> Default for GroupedSelect<T, V> {
     fn default() -> Self {
@@ -3534,15 +3557,11 @@ pub struct UnionSelect<T: Model> {
     op: SetOp,
 }
 
-impl<T: Model> Clone for UnionSelect<T> {
-    fn clone(&self) -> Self {
-        Self {
-            left: self.left.clone(),
-            right: self.right.clone(),
-            op: self.op,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model> Clone for UnionSelect<T> {
+        fields: [left, right, op],
     }
-}
+);
 
 impl<T: Model> UnionSelect<T> {
     /// 生成 SQL
@@ -6157,27 +6176,27 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
-    fn clone(&self) -> Self {
-        Self {
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns.clone(),
-            join_source: self.join_source.clone(),
-            join_alias: self.join_alias.clone(),
-            on_condition: self.on_condition.clone(),
-            lateral: self.lateral,
-            join_order_by: self.join_order_by.clone(),
-            join_range_start: self.join_range_start,
-            join_range_end: self.join_range_end,
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model, J: Model> Clone for LeftJoinedSelect<T, J> {
+        fields: [
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            ignored_columns,
+            join_source,
+            join_alias,
+            on_condition,
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+        ],
+        marker: PhantomData,
     }
-}
+);
 
 /// INNER JOIN 查询结构体
 pub struct InnerJoinedSelect<T: Model, J: Model> {
@@ -6202,27 +6221,27 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
-    fn clone(&self) -> Self {
-        Self {
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns.clone(),
-            join_source: self.join_source.clone(),
-            join_alias: self.join_alias.clone(),
-            on_condition: self.on_condition.clone(),
-            lateral: self.lateral,
-            join_order_by: self.join_order_by.clone(),
-            join_range_start: self.join_range_start,
-            join_range_end: self.join_range_end,
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model, J: Model> Clone for InnerJoinedSelect<T, J> {
+        fields: [
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            ignored_columns,
+            join_source,
+            join_alias,
+            on_condition,
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+        ],
+        marker: PhantomData,
     }
-}
+);
 
 /// RIGHT JOIN 查询结构体
 pub struct RightJoinedSelect<T: Model, J: Model> {
@@ -6247,27 +6266,27 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
-    fn clone(&self) -> Self {
-        Self {
-            filters: self.filters.clone(),
-            context_filters: self.context_filters.clone(),
-            disabled_context_filters: self.disabled_context_filters.clone(),
-            order_by: self.order_by.clone(),
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns.clone(),
-            join_source: self.join_source.clone(),
-            join_alias: self.join_alias.clone(),
-            on_condition: self.on_condition.clone(),
-            lateral: self.lateral,
-            join_order_by: self.join_order_by.clone(),
-            join_range_start: self.join_range_start,
-            join_range_end: self.join_range_end,
-            _marker: PhantomData,
-        }
+impl_clone_without_bounds!(
+    impl<T: Model, J: Model> Clone for RightJoinedSelect<T, J> {
+        fields: [
+            filters,
+            context_filters,
+            disabled_context_filters,
+            order_by,
+            range_start,
+            range_end,
+            ignored_columns,
+            join_source,
+            join_alias,
+            on_condition,
+            lateral,
+            join_order_by,
+            join_range_start,
+            join_range_end,
+        ],
+        marker: PhantomData,
     }
-}
+);
 
 impl<T: Model> Select<T> {
     /// LEFT JOIN

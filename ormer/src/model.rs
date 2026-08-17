@@ -36,12 +36,7 @@ pub struct VersionSnapshotUpdate {
 
 impl VersionSnapshotUpdate {
     pub fn apply(&self) {
-        if let Ok(mut snapshots) = version_snapshots().lock() {
-            snapshots.insert(self.key.clone(), self.version);
-        }
-        if let Ok(mut snapshots) = version_object_snapshots().lock() {
-            snapshots.insert(self.object_key, self.version);
-        }
+        store_version_snapshot(&self.key, self.object_key, self.version);
     }
 }
 
@@ -75,6 +70,33 @@ fn version_object_key<T: Model>(model: &T) -> VersionObjectKey {
     }
 }
 
+fn version_snapshot_keys<T: Model>(model: &T) -> (VersionSnapshotKey, VersionObjectKey) {
+    (version_snapshot_key(model), version_object_key(model))
+}
+
+fn store_version_snapshot(key: &VersionSnapshotKey, object_key: VersionObjectKey, version: u64) {
+    if let Ok(mut snapshots) = version_snapshots().lock() {
+        snapshots.insert(key.clone(), version);
+    }
+    if let Ok(mut snapshots) = version_object_snapshots().lock() {
+        snapshots.insert(object_key, version);
+    }
+}
+
+fn snapshot_version(key: &VersionSnapshotKey) -> Option<u64> {
+    version_snapshots()
+        .lock()
+        .ok()
+        .and_then(|snapshots| snapshots.get(key).copied())
+}
+
+fn object_snapshot_version(object_key: VersionObjectKey) -> Option<u64> {
+    version_object_snapshots()
+        .lock()
+        .ok()
+        .and_then(|snapshots| snapshots.get(&object_key).copied())
+}
+
 pub fn clear_version_snapshots<T: Model>() {
     if let Ok(mut snapshots) = version_snapshots().lock() {
         snapshots.retain(|key, _| key.table != T::TABLE_NAME);
@@ -88,35 +110,20 @@ pub fn record_version_snapshot<T: Model>(model: &T, version: u64) {
     if T::version_info().is_none() {
         return;
     }
-    let key = version_snapshot_key(model);
-    if let Ok(mut snapshots) = version_snapshots().lock() {
-        snapshots.insert(key, version);
-    }
-    let object_key = version_object_key(model);
-    if let Ok(mut snapshots) = version_object_snapshots().lock() {
-        snapshots.insert(object_key, version);
-    }
+    let (key, object_key) = version_snapshot_keys(model);
+    store_version_snapshot(&key, object_key, version);
 }
 
 pub fn model_version<T: Model>(model: &T) -> u64 {
     let Some(info) = T::version_info() else {
         return 0;
     };
-    let object_key = version_object_key(model);
-    if let Some(version) = version_object_snapshots()
-        .lock()
-        .ok()
-        .and_then(|snapshots| snapshots.get(&object_key).copied())
-    {
+    let (key, object_key) = version_snapshot_keys(model);
+    if let Some(version) = object_snapshot_version(object_key) {
         return version;
     }
 
-    let key = version_snapshot_key(model);
-    let version = version_snapshots()
-        .lock()
-        .ok()
-        .and_then(|snapshots| snapshots.get(&key).copied())
-        .unwrap_or(info.initial);
+    let version = snapshot_version(&key).unwrap_or(info.initial);
     if let Ok(mut snapshots) = version_object_snapshots().lock() {
         snapshots.insert(object_key, version);
     }
@@ -130,9 +137,10 @@ pub fn version_snapshot_update<T: Model>(
     if T::version_info().is_none() {
         return None;
     }
+    let (key, object_key) = version_snapshot_keys(model);
     Some(VersionSnapshotUpdate {
-        key: version_snapshot_key(model),
-        object_key: version_object_key(model),
+        key,
+        object_key,
         version: old_version.saturating_add(1),
     })
 }
@@ -152,37 +160,22 @@ impl DurationToInterval for std::time::Duration {
         if total_secs < 1.0 && millis > 0 {
             format!("{} milliseconds", millis)
         } else if total_secs < 60.0 {
-            // 秒级，支持小数
-            if total_secs.fract() == 0.0 {
-                format!("{} seconds", total_secs as u64)
-            } else {
-                format!("{:.3} seconds", total_secs)
-            }
+            format_interval_unit(total_secs, "seconds")
         } else if total_secs < 3600.0 {
-            // 分钟级，支持小数
-            let minutes = total_secs / 60.0;
-            if minutes.fract() == 0.0 {
-                format!("{} minutes", minutes as u64)
-            } else {
-                format!("{:.3} minutes", minutes)
-            }
+            format_interval_unit(total_secs / 60.0, "minutes")
         } else if total_secs < 86400.0 {
-            // 小时级，支持小数
-            let hours = total_secs / 3600.0;
-            if hours.fract() == 0.0 {
-                format!("{} hours", hours as u64)
-            } else {
-                format!("{:.3} hours", hours)
-            }
+            format_interval_unit(total_secs / 3600.0, "hours")
         } else {
-            // 天级，支持小数
-            let days = total_secs / 86400.0;
-            if days.fract() == 0.0 {
-                format!("{} days", days as u64)
-            } else {
-                format!("{:.3} days", days)
-            }
+            format_interval_unit(total_secs / 86400.0, "days")
         }
+    }
+}
+
+fn format_interval_unit(value: f64, unit: &str) -> String {
+    if value.fract() == 0.0 {
+        format!("{} {}", value as u64, unit)
+    } else {
+        format!("{:.3} {}", value, unit)
     }
 }
 
@@ -514,6 +507,48 @@ impl<Owner: Model, Target: Model> Clone for Relation<Owner, Target> {
     }
 }
 
+macro_rules! relation_query_entrypoints {
+    () => {
+        pub fn filter<F, W>(self, f: F) -> RelationQuery<Owner, Target, Self>
+        where
+            F: FnOnce(Target::Where) -> W,
+            W: Into<crate::query::builder::WhereExpr>,
+        {
+            RelationQuery::new(self).filter(f)
+        }
+
+        pub fn order_by<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+        where
+            F: FnOnce(Target::Where) -> O,
+            O: Into<crate::query::filter::OrderBy>,
+        {
+            RelationQuery::new(self).order_by(f)
+        }
+
+        pub fn order_by_desc<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
+        where
+            F: FnOnce(Target::Where) -> O,
+            O: Into<crate::query::filter::OrderBy>,
+        {
+            RelationQuery::new(self).order_by_desc(f)
+        }
+
+        pub fn range<R>(self, range: R) -> RelationQuery<Owner, Target, Self>
+        where
+            R: Into<crate::query::builder::RangeBounds>,
+        {
+            RelationQuery::new(self).range(range)
+        }
+
+        pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Self, I>
+        where
+            F: FnOnce(Target::Where) -> I,
+        {
+            RelationQuery::new(self).include(f)
+        }
+    };
+}
+
 impl<Owner: Model, Target: Model> Relation<Owner, Target> {
     pub const fn new(name: &'static str) -> Self {
         Self {
@@ -557,43 +592,7 @@ impl<Owner: Model, Target: Model> Relation<Owner, Target> {
         )
     }
 
-    pub fn filter<F, W>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        RelationQuery::new(self).filter(f)
-    }
-
-    pub fn order_by<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        RelationQuery::new(self).order_by(f)
-    }
-
-    pub fn order_by_desc<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        RelationQuery::new(self).order_by_desc(f)
-    }
-
-    pub fn range<R>(self, range: R) -> RelationQuery<Owner, Target, Self>
-    where
-        R: Into<crate::query::builder::RangeBounds>,
-    {
-        RelationQuery::new(self).range(range)
-    }
-
-    pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Self, I>
-    where
-        F: FnOnce(Target::Where) -> I,
-    {
-        RelationQuery::new(self).include(f)
-    }
+    relation_query_entrypoints!();
 }
 
 impl<Owner: Model, Target: Model + Clone + 'static> RelationHandle<Owner, Target>
@@ -725,43 +724,7 @@ impl<Owner: Model, Via: Model, Target: Model> ThroughRelation<Owner, Via, Target
         )
     }
 
-    pub fn filter<F, W>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        RelationQuery::new(self).filter(f)
-    }
-
-    pub fn order_by<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        RelationQuery::new(self).order_by(f)
-    }
-
-    pub fn order_by_desc<F, O>(self, f: F) -> RelationQuery<Owner, Target, Self>
-    where
-        F: FnOnce(Target::Where) -> O,
-        O: Into<crate::query::filter::OrderBy>,
-    {
-        RelationQuery::new(self).order_by_desc(f)
-    }
-
-    pub fn range<R>(self, range: R) -> RelationQuery<Owner, Target, Self>
-    where
-        R: Into<crate::query::builder::RangeBounds>,
-    {
-        RelationQuery::new(self).range(range)
-    }
-
-    pub fn include<I, F>(self, f: F) -> RelationQuery<Owner, Target, Self, I>
-    where
-        F: FnOnce(Target::Where) -> I,
-    {
-        RelationQuery::new(self).include(f)
-    }
+    relation_query_entrypoints!();
 }
 
 impl<Owner: Model, Via: Model + Clone + 'static, Target: Model> RelationHandle<Owner, Target>
@@ -990,30 +953,9 @@ pub trait PrimaryKey: Sized {
     fn into_values(self) -> Vec<Value>;
 }
 
-// 为 i32 实现 PrimaryKey（最常见的单主键类型）
-impl PrimaryKey for i32 {
+impl<T: Into<Value>> PrimaryKey for T {
     fn into_values(self) -> Vec<Value> {
-        vec![Value::from(self)]
-    }
-}
-
-// 为 String 实现 PrimaryKey
-impl PrimaryKey for String {
-    fn into_values(self) -> Vec<Value> {
-        vec![Value::from(self)]
-    }
-}
-
-// 为 &str 实现 PrimaryKey（方便使用字符串字面量）
-impl PrimaryKey for &str {
-    fn into_values(self) -> Vec<Value> {
-        vec![Value::from(self.to_string())]
-    }
-}
-
-impl PrimaryKey for uuid::Uuid {
-    fn into_values(self) -> Vec<Value> {
-        vec![Value::Uuid(self)]
+        vec![self.into()]
     }
 }
 
@@ -1023,28 +965,21 @@ impl PrimaryKey for &uuid::Uuid {
     }
 }
 
-// 为两元素元组实现 PrimaryKey（复合主键）
-impl<A, B> PrimaryKey for (A, B)
-where
-    A: Into<Value>,
-    B: Into<Value>,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![self.0.into(), self.1.into()]
-    }
+macro_rules! impl_primary_key_tuple {
+    ($($name:ident : $idx:tt),+ $(,)?) => {
+        impl<$($name),+> PrimaryKey for ($($name,)+)
+        where
+            $($name: Into<Value>),+
+        {
+            fn into_values(self) -> Vec<Value> {
+                vec![$(self.$idx.into()),+]
+            }
+        }
+    };
 }
 
-// 为三元素元组实现 PrimaryKey（复合主键）
-impl<A, B, C> PrimaryKey for (A, B, C)
-where
-    A: Into<Value>,
-    B: Into<Value>,
-    C: Into<Value>,
-{
-    fn into_values(self) -> Vec<Value> {
-        vec![self.0.into(), self.1.into(), self.2.into()]
-    }
-}
+impl_primary_key_tuple!(A: 0, B: 1);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2);
 
 /// 主键 Rust 字段元数据。
 pub trait PrimaryFields {
@@ -1953,8 +1888,7 @@ impl<T: FieldTypeProvider> FieldTypeProvider for Option<T> {
     const RUST_TYPE: Option<&'static str> = T::RUST_TYPE;
 }
 
-// 为 Option<T> where T: FieldType 实现 From<Option<T>> for Value
-impl<T: FieldType> From<Option<T>> for Value {
+impl<T: Into<Value>> From<Option<T>> for Value {
     fn from(v: Option<T>) -> Self {
         match v {
             Some(value) => value.into(),
@@ -1963,8 +1897,7 @@ impl<T: FieldType> From<Option<T>> for Value {
     }
 }
 
-// 为 Option<T> where T: FieldType 实现 FromValue
-impl<T: FieldType> FromValue for Option<T> {
+impl<T: FromValue> FromValue for Option<T> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Null => Ok(None),
@@ -3180,49 +3113,39 @@ impl FromValue for f64 {
     }
 }
 
-impl From<rust_decimal::Decimal> for Value {
-    fn from(v: rust_decimal::Decimal) -> Self {
-        Value::Decimal(v.to_string())
-    }
-}
-
-impl FromValue for rust_decimal::Decimal {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
-                v.parse::<rust_decimal::Decimal>().map_err(|err| {
-                    crate::ormer_error!("Type mismatch: expected rust_decimal::Decimal: {}", err)
-                })
+macro_rules! impl_decimal_value_traits {
+    ($type:ty, $variant:ident, $to_string:ident) => {
+        impl From<$type> for Value {
+            fn from(v: $type) -> Self {
+                Value::$variant(v.$to_string())
             }
-            Value::Integer(v) => Ok(rust_decimal::Decimal::from(*v)),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected rust_decimal::Decimal"
-            )),
         }
-    }
-}
 
-impl From<bigdecimal::BigDecimal> for Value {
-    fn from(v: bigdecimal::BigDecimal) -> Self {
-        Value::BigDecimal(v.to_plain_string())
-    }
-}
-
-impl FromValue for bigdecimal::BigDecimal {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
-                v.parse::<bigdecimal::BigDecimal>().map_err(|err| {
-                    crate::ormer_error!("Type mismatch: expected bigdecimal::BigDecimal: {}", err)
-                })
+        impl FromValue for $type {
+            fn from_value(value: &Value) -> crate::Result<Self> {
+                match value {
+                    Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
+                        v.parse::<$type>().map_err(|err| {
+                            crate::ormer_error!(
+                                "Type mismatch: expected {}: {}",
+                                stringify!($type),
+                                err
+                            )
+                        })
+                    }
+                    Value::Integer(v) => Ok(<$type>::from(*v)),
+                    _ => Err(crate::ormer_error!(
+                        "Type mismatch: expected {}",
+                        stringify!($type)
+                    )),
+                }
             }
-            Value::Integer(v) => Ok(bigdecimal::BigDecimal::from(*v)),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected bigdecimal::BigDecimal"
-            )),
         }
-    }
+    };
 }
+
+impl_decimal_value_traits!(rust_decimal::Decimal, Decimal, to_string);
+impl_decimal_value_traits!(bigdecimal::BigDecimal, BigDecimal, to_plain_string);
 
 // String 特殊处理（需要 clone）
 impl FromValue for String {
@@ -3321,93 +3244,11 @@ impl<T1: FromRowValues, T2: FromRowValues, T3: FromRowValues> FromRowValues for 
     }
 }
 
-// 使用宏生成 Option<T> 的 FromValue 实现
-macro_rules! impl_from_value_for_option {
-    ($($type:ty => $variant:ident),* $(,)?) => {
-        $(
-            impl FromValue for Option<$type> {
-                fn from_value(value: &Value) -> crate::Result<Self> {
-                    match value {
-                        Value::Null => Ok(None),
-                        Value::$variant(v) => Ok(Some(*v as $type)),
-                        _ => Err(crate::ormer_error!("Type mismatch: expected Option<{}>", stringify!($type))),
-                    }
-                }
-            }
-        )*
-    };
-}
-
-// 为 Option 类型生成 FromValue 实现
-impl_from_value_for_option!(
-    i32 => Integer,
-    i64 => Integer,
-);
-
-impl FromValue for Option<String> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Text(v) => Ok(Some(v.clone())),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<String>"
-            )),
-        }
-    }
-}
-
-impl FromValue for Option<bool> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Boolean(v) => Ok(Some(*v)),
-            Value::Integer(v) => Ok(Some(*v != 0)), // 向后兼容
-            _ => Err(crate::ormer_error!("Type mismatch: expected Option<bool>")),
-        }
-    }
-}
-
-impl FromValue for Option<f64> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Real(v) => Ok(Some(*v)),
-            Value::Integer(v) => Ok(Some(*v as f64)),
-            _ => Err(crate::ormer_error!("Type mismatch: expected Option<f64>")),
-        }
-    }
-}
-
-impl FromValue for Option<rust_decimal::Decimal> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            _ => rust_decimal::Decimal::from_value(value).map(Some),
-        }
-    }
-}
-
-impl FromValue for Option<bigdecimal::BigDecimal> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            _ => bigdecimal::BigDecimal::from_value(value).map(Some),
-        }
-    }
-}
-
 // 为 Option 类型实现 FromRowValues
 impl<T: FromValue> FromRowValues for Option<T> {
     fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         let value = first_row_value(values, format!("Option<{}>", std::any::type_name::<T>()))?;
-        // 直接使用 Option<T> 的 from_value 实现
-        match value {
-            Value::Null => Ok(None),
-            _ => {
-                let inner = T::from_value(value)?;
-                Ok(Some(inner))
-            }
-        }
+        Option::<T>::from_value(value)
     }
 }
 
@@ -3474,74 +3315,6 @@ impl From<&str> for Value {
 impl From<bool> for Value {
     fn from(v: bool) -> Self {
         Value::Boolean(v)
-    }
-}
-
-// 使用宏生成 Option<T> 的 From 实现
-macro_rules! impl_from_option_for_value {
-    ($($type:ty => $some:expr),* $(,)?) => {
-        $(
-            impl From<Option<$type>> for Value {
-                fn from(v: Option<$type>) -> Self {
-                    match v {
-                        Some(value) => ($some)(value),
-                        None => Value::Null,
-                    }
-                }
-            }
-        )*
-    };
-}
-
-impl_from_option_for_value!(
-    i8 => |value| Value::Integer(value as i64),
-    i16 => |value| Value::Integer(value as i64),
-    i32 => |value| Value::Integer(value as i64),
-    i64 => |value| Value::Integer(value as i64),
-    u8 => |value| Value::Integer(value as i64),
-    u16 => |value| Value::Integer(value as i64),
-    u32 => |value| Value::Integer(value as i64),
-    u64 => |value| Value::Integer(value as i64),
-    isize => |value| Value::Integer(value as i64),
-    usize => |value| Value::Integer(value as i64),
-    String => |value| Value::Text(value),
-    bool => |value| Value::Boolean(value),
-    std::time::Duration => |value| Value::Duration(value),
-    Vec<String> => |value| Value::TextArray(value),
-    Vec<u8> => |value| Value::Bytes(value),
-    chrono::DateTime<chrono::Utc> => |value| Value::DateTime(value),
-    chrono::NaiveDateTime => |value| Value::DateTime(naive_local_to_utc(value)),
-    chrono::NaiveDate => |value| Value::Date(value),
-    chrono::NaiveTime => |value| Value::Time(value),
-    serde_json::Value => |value| Value::Json(value),
-    uuid::Uuid => |value| Value::Uuid(value),
-);
-
-impl From<Option<rust_decimal::Decimal>> for Value {
-    fn from(value: Option<rust_decimal::Decimal>) -> Self {
-        value
-            .map(|value| Value::Decimal(value.to_string()))
-            .unwrap_or(Value::Null)
-    }
-}
-
-impl From<Option<bigdecimal::BigDecimal>> for Value {
-    fn from(value: Option<bigdecimal::BigDecimal>) -> Self {
-        value
-            .map(|value| Value::BigDecimal(value.to_plain_string()))
-            .unwrap_or(Value::Null)
-    }
-}
-
-impl FromValue for Option<std::time::Duration> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Duration(v) => Ok(Some(*v)),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<Duration>"
-            )),
-        }
     }
 }
 
@@ -3617,18 +3390,6 @@ impl FromValue for Vec<Option<i64>> {
     }
 }
 
-impl FromValue for Option<Vec<u8>> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Bytes(v) => Ok(Some(v.clone())),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<Vec<u8>>"
-            )),
-        }
-    }
-}
-
 // chrono::DateTime<Utc> 特殊处理
 impl From<chrono::DateTime<chrono::Utc>> for Value {
     fn from(v: chrono::DateTime<chrono::Utc>) -> Self {
@@ -3647,26 +3408,6 @@ impl FromValue for chrono::DateTime<chrono::Utc> {
             )),
             Value::Text(v) => parse_utc_datetime_text(v),
             _ => Err(crate::ormer_error!("Type mismatch: expected DateTime<Utc>")),
-        }
-    }
-}
-
-impl FromValue for Option<chrono::DateTime<chrono::Utc>> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::DateTime(v) => Ok(Some(*v)),
-            Value::Date(v) => Ok(Some(
-                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                    v.and_hms_opt(0, 0, 0)
-                        .ok_or_else(|| crate::ormer_error!("Invalid date value"))?,
-                    chrono::Utc,
-                ),
-            )),
-            Value::Text(v) => parse_utc_datetime_text(v).map(Some),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<DateTime<Utc>>"
-            )),
         }
     }
 }
@@ -3691,24 +3432,6 @@ impl FromValue for chrono::NaiveDateTime {
     }
 }
 
-impl FromValue for Option<chrono::NaiveDateTime> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::DateTime(v) => Ok(Some(utc_to_naive_local(*v))),
-            Value::Date(v) => {
-                Ok(Some(v.and_hms_opt(0, 0, 0).ok_or_else(|| {
-                    crate::ormer_error!("Invalid date value")
-                })?))
-            }
-            Value::Text(v) => parse_naive_datetime_text(v).map(Some),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<NaiveDateTime>"
-            )),
-        }
-    }
-}
-
 impl From<chrono::NaiveDate> for Value {
     fn from(v: chrono::NaiveDate) -> Self {
         Value::Date(v)
@@ -3722,20 +3445,6 @@ impl FromValue for chrono::NaiveDate {
             Value::DateTime(v) => Ok(v.date_naive()),
             Value::Text(v) => parse_naive_date_text(v),
             _ => Err(crate::ormer_error!("Type mismatch: expected NaiveDate")),
-        }
-    }
-}
-
-impl FromValue for Option<chrono::NaiveDate> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Date(v) => Ok(Some(*v)),
-            Value::DateTime(v) => Ok(Some(v.date_naive())),
-            Value::Text(v) => parse_naive_date_text(v).map(Some),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<NaiveDate>"
-            )),
         }
     }
 }
@@ -3757,20 +3466,6 @@ impl FromValue for chrono::NaiveTime {
     }
 }
 
-impl FromValue for Option<chrono::NaiveTime> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Time(v) => Ok(Some(*v)),
-            Value::DateTime(v) => Ok(Some(v.time())),
-            Value::Text(v) => parse_naive_time_text(v).map(Some),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<NaiveTime>"
-            )),
-        }
-    }
-}
-
 // serde_json::Value 特殊处理
 impl From<serde_json::Value> for Value {
     fn from(v: serde_json::Value) -> Self {
@@ -3784,18 +3479,6 @@ impl FromValue for serde_json::Value {
             Value::Json(v) => Ok(v.clone()),
             _ => Err(crate::ormer_error!(
                 "Type mismatch: expected serde_json::Value"
-            )),
-        }
-    }
-}
-
-impl FromValue for Option<serde_json::Value> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            Value::Json(v) => Ok(Some(v.clone())),
-            _ => Err(crate::ormer_error!(
-                "Type mismatch: expected Option<serde_json::Value>"
             )),
         }
     }
@@ -3821,15 +3504,6 @@ impl FromValue for uuid::Uuid {
             _ => Err(crate::ormer_error!(
                 "Type mismatch: expected uuid::Uuid or UUID text"
             )),
-        }
-    }
-}
-
-impl FromValue for Option<uuid::Uuid> {
-    fn from_value(value: &Value) -> crate::Result<Self> {
-        match value {
-            Value::Null => Ok(None),
-            _ => uuid::Uuid::from_value(value).map(Some),
         }
     }
 }

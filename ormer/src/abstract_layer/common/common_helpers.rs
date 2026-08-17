@@ -87,15 +87,28 @@ pub struct InsertSqlStatement {
 }
 
 pub fn model_primary_key_filters<T: Model>(model: &T) -> Vec<FilterExpr> {
-    T::primary_key_columns()
+    primary_key_filter_exprs(T::primary_key_columns(), model.primary_key_values())
+}
+
+pub(crate) fn primary_key_filter_exprs(
+    pk_columns: &[&'static str],
+    pk_values: Vec<Value>,
+) -> Vec<FilterExpr> {
+    pk_columns
         .iter()
-        .zip(model.primary_key_values())
+        .zip(pk_values)
         .map(|(col, val)| FilterExpr::Comparison {
             column: col.to_string(),
             operator: "=".to_string(),
             value: value_to_filter_value(&val),
         })
         .collect()
+}
+
+pub(crate) fn and_filter_exprs(filters: Vec<FilterExpr>) -> Option<FilterExpr> {
+    filters
+        .into_iter()
+        .reduce(|a, b| FilterExpr::And(Box::new(a), Box::new(b)))
 }
 
 pub fn model_update_plan<T: Model>(
@@ -246,7 +259,7 @@ pub fn bind_param_limit(db_type: DbType) -> usize {
     }
 }
 
-fn value_key(value: &Value) -> String {
+pub(crate) fn model_value_key(value: &Value) -> String {
     match value {
         Value::Integer(v) => format!("i:{v}"),
         Value::BigInt(v) => format!("b:{v}"),
@@ -324,7 +337,7 @@ fn model_update_pk_values<T: Model>(plans: &[ModelUpdatePlan]) -> Option<Vec<Vec
         let pk_values = extract_model_update_pk_values::<T>(plan)?;
         let key = pk_values
             .iter()
-            .map(value_key)
+            .map(model_value_key)
             .collect::<Vec<_>>()
             .join("|");
         if !seen.insert(key) {
@@ -555,56 +568,16 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
     let sql = match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => {
-            let assignments = set_columns
-                .iter()
-                .map(|column| {
-                    quote_assignment(
-                        db_type,
-                        column,
-                        &quote_column_with_prefix(db_type, "source", column),
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let predicates = pk_columns
-                .iter()
-                .map(|pk| {
-                    format!(
-                        "{} = {}",
-                        quote_column_with_prefix(db_type, "target", pk),
-                        quote_column_with_prefix(db_type, "source", pk)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
+            let assignments = source_assignments_sql(db_type, set_columns, None);
+            let predicates = source_pk_predicates_sql(db_type, pk_columns);
             format!(
                 "UPDATE {table} AS target SET {assignments} FROM (VALUES {values_sql}) AS source ({source_column_list}) WHERE {predicates}"
             )
         }
         #[cfg(feature = "mssql")]
         DbType::MSSQL => {
-            let assignments = set_columns
-                .iter()
-                .map(|column| {
-                    format!(
-                        "{} = {}",
-                        quote_column_with_prefix(db_type, "target", column),
-                        quote_column_with_prefix(db_type, "source", column)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            let predicates = pk_columns
-                .iter()
-                .map(|pk| {
-                    format!(
-                        "{} = {}",
-                        quote_column_with_prefix(db_type, "target", pk),
-                        quote_column_with_prefix(db_type, "source", pk)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" AND ");
+            let assignments = source_assignments_sql(db_type, set_columns, Some("target"));
+            let predicates = source_pk_predicates_sql(db_type, pk_columns);
             format!(
                 "UPDATE target SET {assignments} FROM {table} AS target JOIN (VALUES {values_sql}) AS source ({source_column_list}) ON {predicates}"
             )
@@ -624,6 +597,43 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
         version_update: None,
         param_columns: Some(param_columns),
     })
+}
+
+#[cfg(any(feature = "postgresql", feature = "mssql", feature = "mysql"))]
+fn source_assignments_sql(
+    db_type: DbType,
+    set_columns: &[String],
+    target_prefix: Option<&str>,
+) -> String {
+    set_columns
+        .iter()
+        .map(|column| {
+            let target = target_prefix
+                .map(|prefix| quote_column_with_prefix(db_type, prefix, column))
+                .unwrap_or_else(|| quote_identifier(db_type, column));
+            format!(
+                "{} = {}",
+                target,
+                quote_column_with_prefix(db_type, "source", column)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(any(feature = "postgresql", feature = "mssql", feature = "mysql"))]
+fn source_pk_predicates_sql(db_type: DbType, pk_columns: &[&'static str]) -> String {
+    pk_columns
+        .iter()
+        .map(|pk| {
+            format!(
+                "{} = {}",
+                quote_column_with_prefix(db_type, "target", pk),
+                quote_column_with_prefix(db_type, "source", pk)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 #[cfg(feature = "mysql")]
@@ -665,28 +675,8 @@ fn build_mysql_bulk_model_update_sql<T: Model>(
         debug_assert_eq!(params.len(), (index + 1) * source_width);
     }
 
-    let assignments = set_columns
-        .iter()
-        .map(|column| {
-            format!(
-                "{} = {}",
-                quote_column_with_prefix(db_type, "target", column),
-                quote_column_with_prefix(db_type, "source", column)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let predicates = pk_columns
-        .iter()
-        .map(|pk| {
-            format!(
-                "{} = {}",
-                quote_column_with_prefix(db_type, "target", pk),
-                quote_column_with_prefix(db_type, "source", pk)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" AND ");
+    let assignments = source_assignments_sql(db_type, set_columns, Some("target"));
+    let predicates = source_pk_predicates_sql(db_type, pk_columns);
 
     Ok(ModelSqlStatement {
         sql: format!(
@@ -784,23 +774,30 @@ fn format_update_value(db_type: DbType, value: &UpdateValue, params: &mut Vec<Va
             params.push(value.clone());
             placeholder(db_type, params.len())
         }
-        UpdateValue::Expr(expr) => format_update_expr(db_type, expr, params),
+        UpdateValue::Expr(expr) => {
+            format_update_expr_with_incoming(db_type, expr, params, quote_column_reference)
+        }
     }
 }
 
-fn format_update_expr(db_type: DbType, expr: &UpdateExpr, params: &mut Vec<Value>) -> String {
+fn format_update_expr_with_incoming(
+    db_type: DbType,
+    expr: &UpdateExpr,
+    params: &mut Vec<Value>,
+    incoming_column: fn(DbType, &str) -> String,
+) -> String {
     match expr {
         UpdateExpr::Column(column) => quote_column_reference(db_type, column),
-        UpdateExpr::IncomingColumn(column) => quote_column_reference(db_type, column),
+        UpdateExpr::IncomingColumn(column) => incoming_column(db_type, column),
         UpdateExpr::Value(value) => {
             params.push(value.clone());
             placeholder(db_type, params.len())
         }
         UpdateExpr::Binary { left, op, right } => format!(
             "{} {} {}",
-            format_update_expr(db_type, left, params),
+            format_update_expr_with_incoming(db_type, left, params, incoming_column),
             op.sql(),
-            format_update_expr(db_type, right, params)
+            format_update_expr_with_incoming(db_type, right, params, incoming_column)
         ),
         UpdateExpr::Sql(expr) => {
             let mut param_idx = params.len() as i32 + 1;
@@ -832,31 +829,8 @@ fn format_upsert_update_value(
             params.push(value.clone());
             placeholder(db_type, params.len())
         }
-        UpdateValue::Expr(expr) => format_upsert_update_expr(db_type, expr, params),
-    }
-}
-
-fn format_upsert_update_expr(
-    db_type: DbType,
-    expr: &UpdateExpr,
-    params: &mut Vec<Value>,
-) -> String {
-    match expr {
-        UpdateExpr::Column(column) => quote_column_reference(db_type, column),
-        UpdateExpr::IncomingColumn(column) => incoming_column_sql(db_type, column),
-        UpdateExpr::Value(value) => {
-            params.push(value.clone());
-            placeholder(db_type, params.len())
-        }
-        UpdateExpr::Binary { left, op, right } => format!(
-            "{} {} {}",
-            format_upsert_update_expr(db_type, left, params),
-            op.sql(),
-            format_upsert_update_expr(db_type, right, params)
-        ),
-        UpdateExpr::Sql(expr) => {
-            let mut param_idx = params.len() as i32 + 1;
-            expr.to_sql(db_type, &mut param_idx, params, None)
+        UpdateValue::Expr(expr) => {
+            format_update_expr_with_incoming(db_type, expr, params, incoming_column_sql)
         }
     }
 }

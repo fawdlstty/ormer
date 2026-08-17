@@ -69,36 +69,12 @@ use super::super::mysql_backend;
 #[cfg(feature = "mssql")]
 use super::super::mssql_backend;
 
-fn model_value_key(value: &Value) -> String {
-    match value {
-        Value::Integer(v) => format!("i:{v}"),
-        Value::BigInt(v) => format!("b:{v}"),
-        Value::Duration(v) => format!("d:{:?}", v),
-        Value::Text(v) => format!("t:{v}"),
-        Value::TextArray(v) => format!("ta:{v:?}"),
-        Value::Real(v) => format!("r:{v}"),
-        Value::Decimal(v) => format!("de:{v}"),
-        Value::BigDecimal(v) => format!("bd:{v}"),
-        Value::Boolean(v) => format!("o:{v}"),
-        Value::Bytes(v) => format!("x:{v:?}"),
-        Value::IntegerArray(v) => format!("ia:{v:?}"),
-        Value::BigIntArray(v) => format!("ba:{v:?}"),
-        Value::NullableBigIntArray(v) => format!("na:{v:?}"),
-        Value::DateTime(v) => format!("dt:{v}"),
-        Value::Date(v) => format!("da:{v}"),
-        Value::Time(v) => format!("ti:{v}"),
-        Value::Json(v) => format!("j:{v}"),
-        Value::Uuid(v) => format!("u:{v}"),
-        Value::Null => "n:".to_string(),
-    }
-}
-
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
     values
         .into_iter()
         .filter(|value| !matches!(value, Value::Null))
-        .filter(|value| seen.insert(model_value_key(value)))
+        .filter(|value| seen.insert(common_helpers::model_value_key(value)))
         .map(Into::into)
         .collect()
 }
@@ -123,24 +99,13 @@ pub(crate) fn primary_key_filter<T: Model>(
         ));
     }
 
-    let filters = pk_columns.iter().zip(pk_values).map(|(col, val)| {
-        crate::query::filter::FilterExpr::Comparison {
-            column: col.to_string(),
-            operator: "=".to_string(),
-            value: common_helpers::value_to_filter_value(&val),
-        }
-    });
-
-    let mut filters = filters.into_iter();
-    let Some(filter) = filters.next() else {
+    let filters = common_helpers::primary_key_filter_exprs(pk_columns, pk_values);
+    let Some(filter) = common_helpers::and_filter_exprs(filters) else {
         return Err(crate::ormer_error!(
             "Model {} does not have a primary key filter",
             T::TABLE_NAME
         ));
     };
-    let filter = filters.fold(filter, |a, b| {
-        crate::query::filter::FilterExpr::And(Box::new(a), Box::new(b))
-    });
 
     Ok(WhereExpr::from_filter(filter))
 }
@@ -2039,14 +2004,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                     std::collections::HashMap::new();
                 for item in related {
                     if let Some(key) = item.column_value(relation.target_key) {
-                        grouped.entry(model_value_key(&key)).or_default().push(item);
+                        grouped
+                            .entry(common_helpers::model_value_key(&key))
+                            .or_default()
+                            .push(item);
                     }
                 }
 
                 for owner in owners {
                     let key = owner.relation_key_value(relation)?;
                     let values = grouped
-                        .get(&model_value_key(&key))
+                        .get(&common_helpers::model_value_key(&key))
                         .cloned()
                         .unwrap_or_default();
                     owner.assign_relation(relation.name, values)?;
@@ -2068,9 +2036,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                         item.column_value(via_relation.target_key),
                         item.column_value(target_relation.local_key),
                     ) {
-                        let target_key = model_value_key(&target_key);
+                        let target_key = common_helpers::model_value_key(&target_key);
                         target_keys_by_owner
-                            .entry(model_value_key(&owner_key))
+                            .entry(common_helpers::model_value_key(&owner_key))
                             .or_default()
                             .push(target_key.clone());
                     }
@@ -2092,7 +2060,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 for item in &related {
                     if let Some(key) = item.column_value(target_relation.target_key) {
                         targets_by_key
-                            .entry(model_value_key(&key))
+                            .entry(common_helpers::model_value_key(&key))
                             .or_default()
                             .push(item.clone());
                     }
@@ -2100,7 +2068,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
                 for owner in owners {
                     let key = owner.relation_key_value(via_relation)?;
-                    let key = model_value_key(&key);
+                    let key = common_helpers::model_value_key(&key);
                     let values = target_keys_by_owner
                         .get(&key)
                         .map(|target_keys| {

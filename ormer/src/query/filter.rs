@@ -135,33 +135,52 @@ pub(crate) fn infer_model_value_rust_type(value: &crate::model::Value) -> &'stat
     infer_filter_value_rust_type(value)
 }
 
-impl crate::query::builder::AggregateResultType for rust_decimal::Decimal {
-    type Output = Option<rust_decimal::Decimal>;
+macro_rules! impl_decimal_query_traits {
+    ($type:ty) => {
+        impl crate::query::builder::AggregateResultType for $type {
+            type Output = Option<$type>;
+        }
+
+        impl crate::query::builder::ColumnValueType for $type {
+            fn to_filter_value(value: Self) -> Value {
+                Value::from(value)
+            }
+
+            fn supports_comparison() -> bool {
+                true
+            }
+        }
+
+        impl crate::query::builder::IsInValue<$type> for &$type {
+            fn to_in_value(self) -> $type {
+                (*self).clone()
+            }
+        }
+
+        impl crate::query::builder::IsInValue<$type> for &&$type {
+            fn to_in_value(self) -> $type {
+                (**self).clone()
+            }
+        }
+
+        impl crate::query::expr::IntoSqlExpr for $type {
+            fn into_sql_expr(self) -> SqlExpr {
+                SqlExpr::Value(Value::from(self))
+            }
+        }
+
+        impl crate::query::expr::IntoTypedExpr for $type {
+            type Output = $type;
+
+            fn into_typed_expr(self) -> crate::query::expr::TypedExpr<Self::Output> {
+                crate::query::expr::TypedExpr::new(SqlExpr::Value(Value::from(self)))
+            }
+        }
+    };
 }
 
-impl crate::query::builder::AggregateResultType for bigdecimal::BigDecimal {
-    type Output = Option<bigdecimal::BigDecimal>;
-}
-
-impl crate::query::builder::ColumnValueType for rust_decimal::Decimal {
-    fn to_filter_value(value: Self) -> Value {
-        Value::from(value)
-    }
-
-    fn supports_comparison() -> bool {
-        true
-    }
-}
-
-impl crate::query::builder::ColumnValueType for bigdecimal::BigDecimal {
-    fn to_filter_value(value: Self) -> Value {
-        Value::from(value)
-    }
-
-    fn supports_comparison() -> bool {
-        true
-    }
-}
+impl_decimal_query_traits!(rust_decimal::Decimal);
+impl_decimal_query_traits!(bigdecimal::BigDecimal);
 
 impl crate::query::builder::ColumnValueType for uuid::Uuid {
     fn to_filter_value(value: Self) -> Value {
@@ -170,30 +189,6 @@ impl crate::query::builder::ColumnValueType for uuid::Uuid {
 
     fn supports_comparison() -> bool {
         false
-    }
-}
-
-impl crate::query::builder::IsInValue<rust_decimal::Decimal> for &rust_decimal::Decimal {
-    fn to_in_value(self) -> rust_decimal::Decimal {
-        *self
-    }
-}
-
-impl crate::query::builder::IsInValue<rust_decimal::Decimal> for &&rust_decimal::Decimal {
-    fn to_in_value(self) -> rust_decimal::Decimal {
-        **self
-    }
-}
-
-impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &bigdecimal::BigDecimal {
-    fn to_in_value(self) -> bigdecimal::BigDecimal {
-        self.clone()
-    }
-}
-
-impl crate::query::builder::IsInValue<bigdecimal::BigDecimal> for &&bigdecimal::BigDecimal {
-    fn to_in_value(self) -> bigdecimal::BigDecimal {
-        (*self).clone()
     }
 }
 
@@ -212,34 +207,6 @@ impl crate::query::builder::IsInValue<uuid::Uuid> for &uuid::Uuid {
 impl crate::query::builder::IsInValue<uuid::Uuid> for &&uuid::Uuid {
     fn to_in_value(self) -> uuid::Uuid {
         **self
-    }
-}
-
-impl crate::query::expr::IntoSqlExpr for rust_decimal::Decimal {
-    fn into_sql_expr(self) -> SqlExpr {
-        SqlExpr::Value(Value::from(self))
-    }
-}
-
-impl crate::query::expr::IntoTypedExpr for rust_decimal::Decimal {
-    type Output = rust_decimal::Decimal;
-
-    fn into_typed_expr(self) -> crate::query::expr::TypedExpr<Self::Output> {
-        crate::query::expr::TypedExpr::new(SqlExpr::Value(Value::from(self)))
-    }
-}
-
-impl crate::query::expr::IntoSqlExpr for bigdecimal::BigDecimal {
-    fn into_sql_expr(self) -> SqlExpr {
-        SqlExpr::Value(Value::from(self))
-    }
-}
-
-impl crate::query::expr::IntoTypedExpr for bigdecimal::BigDecimal {
-    type Output = bigdecimal::BigDecimal;
-
-    fn into_typed_expr(self) -> crate::query::expr::TypedExpr<Self::Output> {
-        crate::query::expr::TypedExpr::new(SqlExpr::Value(Value::from(self)))
     }
 }
 

@@ -193,21 +193,9 @@ impl IntoRawSql for RawSql {
     }
 }
 
-impl IntoRawSql for &str {
+impl<T: AsRef<str>> IntoRawSql for T {
     fn into_raw_sql(self) -> RawSql {
-        RawSql::plain(self)
-    }
-}
-
-impl IntoRawSql for String {
-    fn into_raw_sql(self) -> RawSql {
-        RawSql::plain(self)
-    }
-}
-
-impl IntoRawSql for &String {
-    fn into_raw_sql(self) -> RawSql {
-        RawSql::plain(self.clone())
+        RawSql::plain(self.as_ref())
     }
 }
 

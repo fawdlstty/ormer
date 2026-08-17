@@ -61,130 +61,100 @@ impl<'a> HookContext<'a> {
     }
 }
 
-/// 插入前钩子
-#[async_trait::async_trait]
-pub trait BeforeInsert: Model {
-    async fn before_insert(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
+macro_rules! define_lifecycle_hook {
+    ($(#[$meta:meta])* $public:ident, $method:ident, $hidden:ident, $call:ident, mut, $($bound:tt)+) => {
+        $(#[$meta])*
+        #[async_trait::async_trait]
+        pub trait $public: Model {
+            async fn $method(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
+        }
+
+        #[doc(hidden)]
+        #[async_trait::async_trait]
+        pub trait $hidden {
+            async fn $call(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
+        }
+
+        #[async_trait::async_trait]
+        impl<M: $public + $($bound)+> $hidden for M {
+            async fn $call(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
+                self.$method(ctx).await
+            }
+        }
+    };
+    ($(#[$meta:meta])* $public:ident, $method:ident, $hidden:ident, $call:ident, ref, $($bound:tt)+) => {
+        $(#[$meta])*
+        #[async_trait::async_trait]
+        pub trait $public: Model {
+            async fn $method(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
+        }
+
+        #[doc(hidden)]
+        #[async_trait::async_trait]
+        pub trait $hidden {
+            async fn $call(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
+        }
+
+        #[async_trait::async_trait]
+        impl<M: $public + $($bound)+> $hidden for M {
+            async fn $call(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
+                self.$method(ctx).await
+            }
+        }
+    };
 }
 
-/// 插入后钩子
-#[async_trait::async_trait]
-pub trait AfterInsert: Model {
-    async fn after_insert(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 更新前钩子
-#[async_trait::async_trait]
-pub trait BeforeUpdate: Model {
-    async fn before_update(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 更新后钩子
-#[async_trait::async_trait]
-pub trait AfterUpdate: Model {
-    async fn after_update(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 删除前钩子
-#[async_trait::async_trait]
-pub trait BeforeDelete: Model {
-    async fn before_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 删除后钩子
-#[async_trait::async_trait]
-pub trait AfterDelete: Model {
-    async fn after_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 钩子执行辅助 trait
-/// 用于在执行器中自动调用钩子
-/// 内部 trait：用于自动调用 BeforeInsert 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookBeforeInsert {
-    async fn call_before_insert(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 内部 trait：用于自动调用 AfterInsert 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookAfterInsert {
-    async fn call_after_insert(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 内部 trait：用于自动调用 BeforeUpdate 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookBeforeUpdate {
-    async fn call_before_update(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 内部 trait：用于自动调用 AfterUpdate 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookAfterUpdate {
-    async fn call_after_update(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 内部 trait：用于自动调用 BeforeDelete 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookBeforeDelete {
-    async fn call_before_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-/// 内部 trait：用于自动调用 AfterDelete 钩子
-#[doc(hidden)]
-#[async_trait::async_trait]
-pub trait HookAfterDelete {
-    async fn call_after_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()>;
-}
-
-// 为实现了 BeforeInsert 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: BeforeInsert + Send> HookBeforeInsert for M {
-    async fn call_before_insert(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.before_insert(ctx).await
-    }
-}
-
-// 为实现了 AfterInsert 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: AfterInsert + Send + Sync> HookAfterInsert for M {
-    async fn call_after_insert(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.after_insert(ctx).await
-    }
-}
-
-// 为实现了 BeforeUpdate 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: BeforeUpdate + Send> HookBeforeUpdate for M {
-    async fn call_before_update(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.before_update(ctx).await
-    }
-}
-
-// 为实现了 AfterUpdate 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: AfterUpdate + Send + Sync> HookAfterUpdate for M {
-    async fn call_after_update(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.after_update(ctx).await
-    }
-}
-
-// 为实现了 BeforeDelete 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: BeforeDelete + Send + Sync> HookBeforeDelete for M {
-    async fn call_before_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.before_delete(ctx).await
-    }
-}
-
-// 为实现了 AfterDelete 的模型生成特化实现
-#[async_trait::async_trait]
-impl<M: AfterDelete + Send + Sync> HookAfterDelete for M {
-    async fn call_after_delete(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
-        self.after_delete(ctx).await
-    }
-}
+define_lifecycle_hook!(
+    /// 插入前钩子
+    BeforeInsert,
+    before_insert,
+    HookBeforeInsert,
+    call_before_insert,
+    mut,
+    Send
+);
+define_lifecycle_hook!(
+    /// 插入后钩子
+    AfterInsert,
+    after_insert,
+    HookAfterInsert,
+    call_after_insert,
+    ref,
+    Send + Sync
+);
+define_lifecycle_hook!(
+    /// 更新前钩子
+    BeforeUpdate,
+    before_update,
+    HookBeforeUpdate,
+    call_before_update,
+    mut,
+    Send
+);
+define_lifecycle_hook!(
+    /// 更新后钩子
+    AfterUpdate,
+    after_update,
+    HookAfterUpdate,
+    call_after_update,
+    ref,
+    Send + Sync
+);
+define_lifecycle_hook!(
+    /// 删除前钩子
+    BeforeDelete,
+    before_delete,
+    HookBeforeDelete,
+    call_before_delete,
+    ref,
+    Send + Sync
+);
+define_lifecycle_hook!(
+    /// 删除后钩子
+    AfterDelete,
+    after_delete,
+    HookAfterDelete,
+    call_after_delete,
+    ref,
+    Send + Sync
+);

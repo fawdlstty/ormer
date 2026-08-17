@@ -23,6 +23,13 @@
 - SQL 拼接优先复用查询构造器公共函数，过滤、排序、分页、锁定、JOIN 与 related/multi select 的共有尾部逻辑不得在不同查询类型中复制。
 - row 解析、列值解析、单列 `FromRowValues` 模板优先复用公共 helper/macro；缺失值策略、nullable 分支和错误信息保持集中维护。
 
+# 样板代码生成规则
+
+- 生命周期 hook、查询 builder、关系入口、decimal/uuid 等成组 trait impl，优先用局部宏或 blanket impl 生成；保留公开 API 名称，不手写多份同构实现。
+- `Clone` 若 `derive(Clone)` 会给泛型增加不必要 bound，必须用无额外 bound 的局部宏生成，禁止逐字段手写复制模板。
+- `Option<T>`、`PrimaryKey`、`IntoRawSql` 等“外层包装只委托内层”的实现，优先用 blanket impl；只有语义确实不同的类型才保留特化实现。
+- `model::Value` 稳定 key、主键过滤表达式、update/upsert expression、bulk update source assignment/predicate、relation exists 子查询尾部必须复用公共 helper，不在调用路径重复拼接。
+
 # 编译与测试
 
 - 修改代码后，必须同时进行编译和测试，不能只执行 `cargo check`。

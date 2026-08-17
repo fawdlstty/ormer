@@ -3487,71 +3487,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
                 }
             }
 
-            // 将ormer::Value转换为postgres_types::ToSql
-            let pg_params: Vec<Box<dyn postgres_types::ToSql + Sync + Send>> = params
-                .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => {
-                        // PostgreSQL INTEGER (Int4) 是 32 位，需要将 i64 转换为 i32
-                        if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                            Box::new(i as i32) as Box<dyn postgres_types::ToSql + Sync + Send>
-                        } else {
-                            Box::new(i) as Box<dyn postgres_types::ToSql + Sync + Send>
-                        }
-                    }
-                    crate::model::Value::Text(t) => {
-                        Box::new(t) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::TextArray(v) => {
-                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Real(r) => {
-                        Box::new(r) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
-                        Box::new(PgNumericTextParam(v))
-                            as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Boolean(b) => {
-                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Bytes(b) => {
-                        Box::new(b) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::IntegerArray(v) => {
-                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::BigIntArray(v) => {
-                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::NullableBigIntArray(v) => {
-                        Box::new(v) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::DateTime(dt) => {
-                        Box::new(dt) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Date(date) => {
-                        Box::new(date) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Time(time) => {
-                        Box::new(time) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Json(j) => {
-                        Box::new(j.to_string()) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Uuid(u) => {
-                        Box::new(u) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::BigInt(b) => {
-                        Box::new(b as i64) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
-                        as Box<dyn postgres_types::ToSql + Sync + Send>,
-                    crate::model::Value::Null => {
-                        Box::new(None::<i32>) as Box<dyn postgres_types::ToSql + Sync + Send>
-                    }
-                })
-                .collect();
+            let pg_params = values_to_params_auto_integer(&params);
 
             let params_ref = pg_param_refs(&pg_params);
 
@@ -4095,6 +4031,33 @@ fn values_to_params_for_query(
     } else {
         values_to_params(values)
     }
+}
+
+fn values_to_params_auto_integer(values: &[Value]) -> Vec<PostgreSQLParam> {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Integer(value) if *value >= i32::MIN as i64 && *value <= i32::MAX as i64 => {
+                Box::new(*value as i32) as PostgreSQLParam
+            }
+            Value::Integer(value) => Box::new(*value) as PostgreSQLParam,
+            Value::Null => Box::new(None::<i32>) as PostgreSQLParam,
+            value => pg_value_to_param(value, None),
+        })
+        .collect()
+}
+
+fn values_to_params_with_integer_hint(
+    values: &[Value],
+    rust_type: &'static str,
+) -> Vec<PostgreSQLParam> {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Integer(_) | Value::Null => pg_value_to_param(value, Some(rust_type)),
+            value => pg_value_to_param(value, None),
+        })
+        .collect()
 }
 
 /// 将 ormer Value 转换为 tokio-postgres 参数（旧版本，根据值大小选择类型）。
@@ -4848,77 +4811,8 @@ impl<
             // 否则使用i32
             let use_i64 = sql.contains("::bigint");
 
-            let pg_params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = params
-                .into_iter()
-                .map(|v| match v {
-                    crate::model::Value::Integer(i) => {
-                        if use_i64 {
-                            Box::new(i) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        } else {
-                            Box::new(i as i32)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                    }
-                    crate::model::Value::Text(t) => {
-                        Box::new(t) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::TextArray(v) => {
-                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Real(r) => {
-                        Box::new(r) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
-                        Box::new(PgNumericTextParam(v))
-                            as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Boolean(b) => {
-                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Bytes(b) => {
-                        Box::new(b) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::IntegerArray(v) => {
-                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::BigIntArray(v) => {
-                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::NullableBigIntArray(v) => {
-                        Box::new(v) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Duration(d) => Box::new(to_postgres_interval(d))
-                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-                    crate::model::Value::DateTime(dt) => {
-                        Box::new(dt) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Date(date) => {
-                        Box::new(date) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Time(time) => {
-                        Box::new(time) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Json(j) => Box::new(j.to_string())
-                        as Box<dyn tokio_postgres::types::ToSql + Sync + Send>,
-                    crate::model::Value::Uuid(u) => {
-                        Box::new(u) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::BigInt(b) => {
-                        Box::new(b as i64) as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                    }
-                    crate::model::Value::Null => {
-                        if use_i64 {
-                            let null_val: Option<i64> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        } else {
-                            let null_val: Option<i32> = None;
-                            Box::new(null_val)
-                                as Box<dyn tokio_postgres::types::ToSql + Sync + Send>
-                        }
-                    }
-                })
-                .collect();
+            let integer_rust_type = if use_i64 { "i64" } else { "i32" };
+            let pg_params = values_to_params_with_integer_hint(&params, integer_rust_type);
 
             let param_refs = pg_param_refs(&pg_params);
 
