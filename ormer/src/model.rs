@@ -1,5 +1,6 @@
 use crate::time::{naive_local_to_utc, utc_to_naive_local};
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
@@ -1263,14 +1264,11 @@ pub trait Model: Sized {
 pub struct Tracked<T: Model> {
     model: T,
     snapshot: Vec<(&'static str, Value)>,
+    original: Option<T>,
+    clone_model: Option<fn(&T) -> T>,
 }
 
 impl<T: Model> Tracked<T> {
-    pub fn new(model: T) -> Self {
-        let snapshot = tracked_field_values(&model);
-        Self { model, snapshot }
-    }
-
     pub fn as_model(&self) -> &T {
         &self.model
     }
@@ -1304,10 +1302,57 @@ impl<T: Model> Tracked<T> {
     pub fn is_dirty(&self) -> bool {
         !self.dirty_columns().is_empty()
     }
+}
 
+impl<T: Model> Tracked<T> {
+    pub fn new(model: T) -> Self {
+        let snapshot = tracked_field_values(&model);
+        Self {
+            model,
+            snapshot,
+            original: None,
+            clone_model: None,
+        }
+    }
+}
+
+impl<T: Model + Clone> Tracked<T> {
+    pub fn new_graph(model: T) -> Self {
+        let snapshot = tracked_field_values(&model);
+        let original = model.clone();
+        Self {
+            model,
+            snapshot,
+            original: Some(original),
+            clone_model: Some(clone_model::<T>),
+        }
+    }
+}
+
+impl<T: Model> Tracked<T> {
     pub fn accept_changes(&mut self) {
         self.snapshot = tracked_field_values(&self.model);
+        if let Some(clone_model) = self.clone_model {
+            self.original = Some(clone_model(&self.model));
+        }
     }
+
+    pub(crate) async fn sync_graph_relations<'tx>(
+        &mut self,
+        tx: &mut crate::abstract_layer::Transaction<'tx>,
+    ) -> crate::Result<u64>
+    where
+        T: GraphWritable,
+    {
+        let Some(original) = self.original.as_mut() else {
+            return Ok(0);
+        };
+        <T as GraphWritable>::sync_tracked_graph_relations(tx, original, &mut self.model).await
+    }
+}
+
+fn clone_model<T: Clone>(model: &T) -> T {
+    model.clone()
 }
 
 impl<T: Model> std::ops::Deref for Tracked<T> {
@@ -1324,13 +1369,13 @@ impl<T: Model> std::ops::DerefMut for Tracked<T> {
     }
 }
 
-pub trait TrackableModel: Model + Sized {
+pub trait TrackableModel: Model + Clone + Sized {
     fn track(self) -> Tracked<Self> {
-        Tracked::new(self)
+        Tracked::new_graph(self)
     }
 }
 
-impl<T: Model> TrackableModel for T {}
+impl<T: Model + Clone> TrackableModel for T {}
 
 fn tracked_field_values<T: Model>(model: &T) -> Vec<(&'static str, Value)> {
     let version_column = T::version_info().map(|info| info.column);
@@ -1364,6 +1409,74 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Null, Value::Null) => true,
         _ => false,
     }
+}
+
+pub fn model_scalar_values_equal<T: Model>(left: &T, right: &T) -> bool {
+    let left_values = left.field_values();
+    let right_values = right.field_values();
+    left_values.len() == right_values.len()
+        && left_values
+            .iter()
+            .zip(right_values.iter())
+            .all(|(left, right)| values_equal(left, right))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GraphRelationDiff {
+    pub deleted: Vec<usize>,
+    pub inserted: Vec<usize>,
+    pub matched: Vec<(usize, usize)>,
+}
+
+fn model_primary_key_sort_key<T: Model>(model: &T) -> Vec<String> {
+    model
+        .primary_key_values()
+        .into_iter()
+        .map(|value| crate::abstract_layer::common::common_helpers::model_value_key(&value))
+        .collect()
+}
+
+pub fn graph_relation_diff<T: Model>(original: &mut [T], current: &mut [T]) -> GraphRelationDiff {
+    original.sort_by_cached_key(model_primary_key_sort_key);
+    current.sort_by_cached_key(model_primary_key_sort_key);
+    let original_keys = original
+        .iter()
+        .map(model_primary_key_sort_key)
+        .collect::<Vec<_>>();
+    let current_keys = current
+        .iter()
+        .map(model_primary_key_sort_key)
+        .collect::<Vec<_>>();
+
+    let mut diff = GraphRelationDiff::default();
+    let mut original_index = 0;
+    let mut current_index = 0;
+    while original_index < original.len() && current_index < current.len() {
+        match original_keys[original_index].cmp(&current_keys[current_index]) {
+            Ordering::Less => {
+                diff.deleted.push(original_index);
+                original_index += 1;
+            }
+            Ordering::Greater => {
+                diff.inserted.push(current_index);
+                current_index += 1;
+            }
+            Ordering::Equal => {
+                diff.matched.push((original_index, current_index));
+                original_index += 1;
+                current_index += 1;
+            }
+        }
+    }
+    while original_index < original.len() {
+        diff.deleted.push(original_index);
+        original_index += 1;
+    }
+    while current_index < current.len() {
+        diff.inserted.push(current_index);
+        current_index += 1;
+    }
+    diff
 }
 
 pub enum GraphRelationMut<'a> {
@@ -1447,6 +1560,14 @@ pub trait GraphWritable: WritableModel + Sized {
     ) -> impl std::future::Future<Output = crate::Result<()>> {
         async { Ok(()) }
     }
+
+    fn sync_tracked_graph_relations<'tx>(
+        _tx: &mut crate::abstract_layer::Transaction<'tx>,
+        _original: &mut Self,
+        _current: &mut Self,
+    ) -> impl std::future::Future<Output = crate::Result<u64>> {
+        async { Ok(0) }
+    }
 }
 
 pub fn graph_assign_parent_key<Owner, Target>(
@@ -1468,6 +1589,26 @@ pub fn graph_auto_increment_key_value<K: Into<Value>>(key: K) -> Value {
 
 pub fn graph_is_no_auto_increment_key(value: &Value) -> bool {
     matches!(value, Value::Null)
+}
+
+pub fn graph_model_has_default_auto_increment_key<T>(model: &T) -> bool
+where
+    T: Model,
+    T::AutoIncrementKeyType: Into<Value>,
+{
+    let Some(column) = T::column_schema()
+        .into_iter()
+        .find(|column| column.is_auto_increment)
+    else {
+        return false;
+    };
+    let Some(value) = model.column_value(column.name) else {
+        return false;
+    };
+    values_equal(
+        &value,
+        &<T::AutoIncrementKeyType as Default>::default().into(),
+    )
 }
 
 pub fn graph_relation_info<Owner, Target>(

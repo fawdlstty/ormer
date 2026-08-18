@@ -1,6 +1,9 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::db_first::{
+    DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
+};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value, WritableModel};
@@ -20,6 +23,113 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
+
+async fn traced_sqlite_execute<P: turso::IntoParams>(
+    conn: &Arc<turso::Connection>,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<u64> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    if let Some(returning_sql) = sqlite_sql_with_returning_count(trace.sql()) {
+        return match conn.query(&returning_sql, params).await {
+            Ok(mut rows) => {
+                let mut count = 0;
+                while rows.next().trace().await?.is_some() {
+                    count += 1;
+                }
+                trace.finish_ok();
+                Ok(count)
+            }
+            Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+        };
+    }
+
+    match conn.execute(trace.sql(), params).await {
+        Ok(result) => {
+            trace.finish_ok();
+            Ok(result)
+        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::execute", error)),
+    }
+}
+
+async fn traced_sqlite_query<P: turso::IntoParams>(
+    conn: &Arc<turso::Connection>,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<turso::Rows> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match conn.query(trace.sql(), params).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+    }
+}
+
+async fn traced_sqlite_schema_execute(
+    conn: &Arc<turso::Connection>,
+    sql: &str,
+) -> crate::Result<u64> {
+    let trace = crate::sql_trace::start_sql_trace(sql, &[]);
+    match conn.execute(trace.sql(), ()).await {
+        Ok(result) => {
+            trace.finish_ok();
+            Ok(result)
+        }
+        Err(error) => {
+            let should_retry = is_turso_partial_index_unsupported(&error);
+            if should_retry {
+                if let Some(fallback_sql) = sqlite_index_sql_without_where(trace.sql()) {
+                    return match conn.execute(&fallback_sql, ()).await {
+                        Ok(result) => {
+                            trace.finish_ok();
+                            Ok(result)
+                        }
+                        Err(error) => {
+                            Err(trace.finish_external_error("turso::Connection::execute", error))
+                        }
+                    };
+                }
+            }
+            Err(trace.finish_external_error("turso::Connection::execute", error))
+        }
+    }
+}
+
+fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
+    let sql = sql.trim_start();
+    let is_dml = ["INSERT", "UPDATE", "REPLACE"].iter().any(|keyword| {
+        sql.get(..keyword.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(keyword))
+    });
+    if !is_dml || sql.to_ascii_lowercase().contains(" returning ") {
+        return None;
+    }
+
+    let sql = sql.trim_end().strip_suffix(';').unwrap_or(sql).trim_end();
+    Some(format!("{sql} RETURNING 1"))
+}
+
+fn is_turso_partial_index_unsupported(error: &turso::Error) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("partial indexes are not supported")
+}
+
+fn sqlite_index_sql_without_where(sql: &str) -> Option<String> {
+    let sql = sql.trim();
+    let lower_sql = sql.to_ascii_lowercase();
+    if !lower_sql.starts_with("create index ") {
+        return None;
+    }
+    let where_pos = lower_sql.rfind(" where ")?;
+    Some(sql[..where_pos].trim_end().to_string())
+}
 
 /// 判断错误是否为约束冲突错误（如主键/唯一键重复）
 /// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
@@ -176,7 +286,14 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
-            self.db.conn.execute(&statement.sql, ()).trace().await?;
+            for sql in statement
+                .sql
+                .split(';')
+                .map(str::trim)
+                .filter(|sql| !sql.is_empty())
+            {
+                traced_sqlite_schema_execute(&self.db.conn, sql).await?;
+            }
         }
         Ok(())
     }
@@ -214,7 +331,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
-            self.db.conn.execute(&statement.sql, ()).trace().await?;
+            traced_sqlite_execute(&self.db.conn, &statement.sql, (), &[]).await?;
         }
         Ok(())
     }
@@ -268,14 +385,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let sql = self.to_sql()?;
         let mut results = Vec::new();
         for statement in &sql.statements {
-            let all_params = values_into_params(statement.params.clone())?;
+            let all_params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows = self
-                .db
-                .conn
-                .query(&sql_with_returning, all_params)
-                .trace()
-                .await?;
+            let mut rows = traced_sqlite_query(
+                &self.db.conn,
+                &sql_with_returning,
+                all_params,
+                &statement.params,
+            )
+            .await?;
 
             while let Some(row) = rows.next().trace().await? {
                 let model =
@@ -310,7 +428,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let mut rows_affected = 0;
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
-            rows_affected += self.db.conn.execute(&statement.sql, params).trace().await?;
+            rows_affected +=
+                traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params)
+                    .await?;
         }
         self.models.run_after_insert(hook_ctx).await?;
 
@@ -402,7 +522,8 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
 
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        let rows_affected = self.db.conn.execute(&statement.sql, params).trace().await?;
+        let rows_affected =
+            traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
 
         if rows_affected == 0 {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
@@ -484,21 +605,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         for model in refs.iter() {
             // 先删除已有记录
             let pk_values = model.primary_key_values();
-            let delete_params = values_into_params(pk_values)?;
-            self.db
-                .conn
-                .execute(&delete_sql, delete_params)
-                .trace()
-                .await?;
+            let delete_params = values_to_params(&pk_values)?;
+            traced_sqlite_execute(&self.db.conn, &delete_sql, delete_params, &pk_values).await?;
 
             // 然后插入新记录
             let all_values = model.field_values();
-            let insert_params = values_into_params(all_values)?;
-            self.db
-                .conn
-                .execute(&insert_sql, insert_params)
-                .trace()
-                .await?;
+            let insert_params = values_to_params(&all_values)?;
+            traced_sqlite_execute(&self.db.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -519,7 +632,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         }
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        self.db.conn.execute(&statement.sql, params).trace().await?;
+        traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
         Ok(())
     }
 }
@@ -571,8 +684,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 
         for model in refs.iter() {
             let values = model.insert_values();
-            let params = values_into_params(values)?;
-            match self.db.conn.execute(&sql, params).trace().await {
+            let params = values_to_params(&values)?;
+            match traced_sqlite_execute(&self.db.conn, &sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -599,7 +712,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         }
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        match self.db.conn.execute(&statement.sql, params).trace().await {
+        match traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await
+        {
             Ok(_) => {}
             Err(e) if is_constraint_error(&e) => {
                 // 忽略约束冲突（重复主键/唯一键）
@@ -645,6 +759,153 @@ impl Database {
         self.validate_table_schema::<T>().await
     }
 
+    pub(crate) async fn db_first_tables(
+        &self,
+        schema: Option<&str>,
+    ) -> crate::Result<Vec<DbFirstTable>> {
+        if let Some(schema) = schema.filter(|schema| !schema.is_empty() && *schema != "main") {
+            return Err(crate::ormer_error!(
+                "SQLite only supports the main schema for entity generation, got {schema}"
+            ));
+        }
+
+        let table_names = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'table' \
+                       AND name NOT LIKE 'sqlite_%' \
+                       AND name != '__ormer_migrations' \
+                     ORDER BY name",
+                    (),
+                )
+                .trace()
+                .await?;
+            let mut table_names = Vec::new();
+            while let Some(row) = rows.next().trace().await? {
+                if let turso::Value::Text(name) =
+                    row.get_value(0).trace_for("turso::Row::get_value")?
+                {
+                    table_names.push(name);
+                }
+            }
+            table_names
+        };
+        let mut tables = Vec::with_capacity(table_names.len());
+        for table_name in table_names {
+            tables.push(self.db_first_table(&table_name).await?);
+        }
+        Ok(tables)
+    }
+
+    async fn db_first_table(&self, table_name: &str) -> crate::Result<DbFirstTable> {
+        let create_sql = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    [table_name],
+                )
+                .trace()
+                .await?;
+            match rows.next().trace().await? {
+                Some(row) => match row.get_value(0).trace_for("turso::Row::get_value")? {
+                    turso::Value::Text(sql) => sql,
+                    _ => String::new(),
+                },
+                None => String::new(),
+            }
+        };
+        let create_sql_lower = create_sql.to_ascii_lowercase();
+        let mut columns = Vec::new();
+        {
+            let mut rows = self
+                .conn
+                .query(&format!("PRAGMA table_info({table_name})"), ())
+                .trace()
+                .await?;
+            while let Some(row) = rows.next().trace().await? {
+                let turso::Value::Text(name) =
+                    row.get_value(1).trace_for("turso::Row::get_value")?
+                else {
+                    continue;
+                };
+                let type_name = match row.get_value(2).trace_for("turso::Row::get_value")? {
+                    turso::Value::Text(value) => value,
+                    _ => String::new(),
+                };
+                let nullable = !matches!(
+                    row.get_value(3).trace_for("turso::Row::get_value")?,
+                    turso::Value::Integer(value) if value != 0
+                );
+                let primary_key = matches!(
+                    row.get_value(5).trace_for("turso::Row::get_value")?,
+                    turso::Value::Integer(value) if value != 0
+                );
+                let auto_increment = primary_key
+                    && type_name.eq_ignore_ascii_case("INTEGER")
+                    && create_sql_lower.contains("autoincrement");
+                columns.push(DbFirstColumn {
+                    name,
+                    type_name,
+                    nullable,
+                    primary_key,
+                    auto_increment,
+                    enum_variants: Vec::new(),
+                });
+            }
+        }
+
+        let mut indexes = self.sqlite_unique_indexes(&create_sql)?;
+        indexes.extend(self.sqlite_explicit_indexes(table_name).await?);
+        let foreign_keys = self.sqlite_foreign_keys(&create_sql)?;
+
+        Ok(DbFirstTable {
+            schema: None,
+            name: table_name.to_string(),
+            columns,
+            indexes,
+            foreign_keys,
+        })
+    }
+
+    async fn sqlite_explicit_indexes(&self, table_name: &str) -> crate::Result<Vec<DbFirstIndex>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
+                 ORDER BY name",
+                [table_name],
+            )
+            .trace()
+            .await?;
+        let mut indexes = Vec::new();
+        while let Some(row) = rows.next().trace().await? {
+            let name = match row.get_value(0).trace_for("turso::Row::get_value")? {
+                turso::Value::Text(value) => value,
+                _ => continue,
+            };
+            let sql = match row.get_value(1).trace_for("turso::Row::get_value")? {
+                turso::Value::Text(value) => value,
+                _ => continue,
+            };
+            if let Some(index) = parse_sqlite_index_sql(&name, &sql) {
+                indexes.push(index);
+            }
+        }
+        Ok(indexes)
+    }
+
+    fn sqlite_unique_indexes(&self, create_sql: &str) -> crate::Result<Vec<DbFirstIndex>> {
+        Ok(parse_sqlite_unique_indexes(create_sql))
+    }
+
+    fn sqlite_foreign_keys(&self, create_sql: &str) -> crate::Result<Vec<DbFirstForeignKey>> {
+        Ok(parse_sqlite_foreign_keys(create_sql))
+    }
+
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
         let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
@@ -672,7 +933,7 @@ impl Database {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", table_name_for::<T>());
 
-        let mut rows = self.conn.query(&sql, ()).trace().await?;
+        let mut rows = traced_sqlite_query(&self.conn, &sql, (), &[]).await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool, bool)> = Vec::new();
@@ -913,18 +1174,12 @@ impl Database {
 
         for model in models.iter() {
             let pk_values = model.primary_key_values();
-            let delete_params = values_into_params(pk_values)?;
-            self.conn
-                .execute(&delete_sql, delete_params)
-                .trace()
-                .await?;
+            let delete_params = values_to_params(&pk_values)?;
+            traced_sqlite_execute(&self.conn, &delete_sql, delete_params, &pk_values).await?;
 
             let all_values = model.insert_values();
-            let insert_params = values_into_params(all_values)?;
-            self.conn
-                .execute(&insert_sql, insert_params)
-                .trace()
-                .await?;
+            let insert_params = values_to_params(&all_values)?;
+            traced_sqlite_execute(&self.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         Ok(())
@@ -948,8 +1203,8 @@ impl Database {
 
         for model in models.iter() {
             let values = model.insert_values();
-            let params = values_into_params(values)?;
-            match self.conn.execute(&insert_sql, params).trace().await {
+            let params = values_to_params(&values)?;
+            match traced_sqlite_execute(&self.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -1011,7 +1266,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction> {
-        self.conn.execute("BEGIN", ()).trace().await?;
+        traced_sqlite_execute(&self.conn, "BEGIN", (), &[]).await?;
         Ok(Transaction {
             conn: self.conn.clone(),
             committed: false,
@@ -1039,11 +1294,11 @@ impl Database {
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, sql, (), &params).await?
         } else {
-            self.conn.query(sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -1060,11 +1315,11 @@ impl Database {
     }
 
     pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
         if turso_params.is_empty() {
-            Ok(self.conn.execute(sql, ()).trace().await?)
+            traced_sqlite_execute(&self.conn, sql, (), &params).await
         } else {
-            Ok(self.conn.execute(sql, turso_params).trace().await?)
+            traced_sqlite_execute(&self.conn, sql, turso_params, &params).await
         }
     }
 
@@ -1151,7 +1406,9 @@ impl Database {
 
     /// 检查连接是否有效
     pub async fn is_valid(&self) -> bool {
-        self.conn.execute("SELECT 1", ()).trace().await.is_ok()
+        traced_sqlite_execute(&self.conn, "SELECT 1", (), &[])
+            .await
+            .is_ok()
     }
 }
 
@@ -1171,7 +1428,7 @@ impl Drop for Transaction {
         let conn = Arc::clone(&self.conn);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = conn.execute("ROLLBACK", ()).trace().await;
+                let _ = traced_sqlite_execute(&conn, "ROLLBACK", (), &[]).await;
             });
         }
     }
@@ -1312,20 +1569,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
 
         for model in refs.iter() {
             let pk_values = model.primary_key_values();
-            let delete_params = values_into_params(pk_values)?;
-            self.txn
-                .conn
-                .execute(&delete_sql, delete_params)
-                .trace()
-                .await?;
+            let delete_params = values_to_params(&pk_values)?;
+            traced_sqlite_execute(&self.txn.conn, &delete_sql, delete_params, &pk_values).await?;
 
             let all_values = model.field_values();
-            let insert_params = values_into_params(all_values)?;
-            self.txn
-                .conn
-                .execute(&insert_sql, insert_params)
-                .trace()
-                .await?;
+            let insert_params = values_to_params(&all_values)?;
+            traced_sqlite_execute(&self.txn.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1380,8 +1629,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 
         for model in refs.iter() {
             let values = model.insert_values();
-            let params = values_into_params(values)?;
-            match self.txn.conn.execute(&insert_sql, params).trace().await {
+            let params = values_to_params(&values)?;
+            match traced_sqlite_execute(&self.txn.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -1397,11 +1646,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 
 impl Transaction {
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
         if turso_params.is_empty() {
-            Ok(self.conn.execute(sql, ()).trace().await?)
+            traced_sqlite_execute(&self.conn, sql, (), &params).await
         } else {
-            Ok(self.conn.execute(sql, turso_params).trace().await?)
+            traced_sqlite_execute(&self.conn, sql, turso_params, &params).await
         }
     }
 
@@ -1410,11 +1659,11 @@ impl Transaction {
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, sql, (), &params).await?
         } else {
-            self.conn.query(sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -1437,7 +1686,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn.execute("COMMIT", ()).trace().await?;
+        traced_sqlite_execute(&self.conn, "COMMIT", (), &[]).await?;
         self.committed = true;
         Ok(())
     }
@@ -1449,7 +1698,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        self.conn.execute("ROLLBACK", ()).trace().await?;
+        traced_sqlite_execute(&self.conn, "ROLLBACK", (), &[]).await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -1941,12 +2190,12 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2014,12 +2263,12 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
 
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2077,12 +2326,12 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
 
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2161,12 +2410,12 @@ impl<
         Box::pin(async move {
             let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Sqlite);
 
-            let turso_params = values_into_params(params)?;
+            let turso_params = values_to_params(&params)?;
 
             let mut rows = if turso_params.is_empty() {
-                self.conn.query(&sql, ()).trace().await?
+                traced_sqlite_query(&self.conn, &sql, (), &params).await?
             } else {
-                self.conn.query(&sql, turso_params).trace().await?
+                traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
             };
 
             if let Some(row) = rows.next().trace().await? {
@@ -2315,12 +2564,12 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
 
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2360,12 +2609,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
         let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
 
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2435,7 +2684,8 @@ impl<T: Model> DeleteExecutor<T> {
         let params = values_to_params(&statement.params)?;
 
         let sql_with_returning = format!("{} RETURNING *", statement.sql);
-        let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
+        let mut rows =
+            traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params).await?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
@@ -2473,7 +2723,8 @@ impl<T: Model> SqlExecutor for DeleteExecutor<T> {
         }
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        let result = self.conn.execute(&statement.sql, params).trace().await?;
+        let result =
+            traced_sqlite_execute(&self.conn, &statement.sql, params, &statement.params).await?;
         if statement.versioned && result == 0 {
             return Err(common_helpers::optimistic_lock_conflict::<T>());
         }
@@ -2570,7 +2821,9 @@ impl<T: Model> UpdateExecutor<T> {
         for statement in &statements.statements {
             let params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows = self.conn.query(&sql_with_returning, params).trace().await?;
+            let mut rows =
+                traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
+                    .await?;
             while let Some(row) = rows.next().trace().await? {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
@@ -2631,7 +2884,9 @@ impl<T: Model> SqlExecutor for UpdateExecutor<T> {
         let mut total = 0;
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
-            let affected = self.conn.execute(&statement.sql, params).trace().await?;
+            let affected =
+                traced_sqlite_execute(&self.conn, &statement.sql, params, &statement.params)
+                    .await?;
             if statement.versioned && affected == 0 {
                 return Err(common_helpers::optimistic_lock_conflict::<T>());
             }
@@ -2681,10 +2936,6 @@ fn value_to_turso_value(value: Value) -> turso::Value {
 
 fn values_to_params(values: &[Value]) -> crate::Result<Vec<turso::Value>> {
     Ok(values.iter().cloned().map(value_to_turso_value).collect())
-}
-
-fn values_into_params(values: Vec<Value>) -> crate::Result<Vec<turso::Value>> {
-    Ok(values.into_iter().map(value_to_turso_value).collect())
 }
 
 /// 将 turso Value 转换为 ormer Value
@@ -2809,12 +3060,12 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
 
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2921,12 +3172,12 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         let (sql, params) = self.select.build_sql(DbType::Sqlite);
 
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            self.conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
-            self.conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2979,12 +3230,12 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         // 从 StreamConnection 获取连接
         let conn = self.conn.expect_sqlite().clone();
 
-        let turso_params = values_into_params(params)?;
+        let turso_params = values_to_params(&params)?;
 
         let rows = if turso_params.is_empty() {
-            conn.query(&sql, ()).trace().await?
+            traced_sqlite_query(&conn, &sql, (), &params).await?
         } else {
-            conn.query(&sql, turso_params).trace().await?
+            traced_sqlite_query(&conn, &sql, turso_params, &params).await?
         };
 
         Ok(SelectStreamIterator {
@@ -3066,4 +3317,275 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             }
         }
     }
+}
+
+fn sqlite_table_items(create_sql: &str) -> Vec<String> {
+    let Some(open_idx) = create_sql.find('(') else {
+        return Vec::new();
+    };
+    let Some(close_idx) = create_sql.rfind(')') else {
+        return Vec::new();
+    };
+    let body = &create_sql[open_idx + 1..close_idx];
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut in_bracket = false;
+    let mut chars = body.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            current.push(ch);
+            if ch == '\'' {
+                if matches!(chars.peek(), Some('\'')) {
+                    current.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_single = false;
+                }
+            }
+            continue;
+        }
+        if in_double {
+            current.push(ch);
+            if ch == '"' {
+                if matches!(chars.peek(), Some('"')) {
+                    current.push(chars.next().expect("peeked quote"));
+                } else {
+                    in_double = false;
+                }
+            }
+            continue;
+        }
+        if in_backtick {
+            current.push(ch);
+            if ch == '`' {
+                if matches!(chars.peek(), Some('`')) {
+                    current.push(chars.next().expect("peeked backtick"));
+                } else {
+                    in_backtick = false;
+                }
+            }
+            continue;
+        }
+        if in_bracket {
+            current.push(ch);
+            if ch == ']' {
+                if matches!(chars.peek(), Some(']')) {
+                    current.push(chars.next().expect("peeked bracket"));
+                } else {
+                    in_bracket = false;
+                }
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                current.push(ch);
+                in_single = true;
+            }
+            '"' => {
+                current.push(ch);
+                in_double = true;
+            }
+            '`' => {
+                current.push(ch);
+                in_backtick = true;
+            }
+            '[' => {
+                current.push(ch);
+                in_bracket = true;
+            }
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let item = current.trim();
+                if !item.is_empty() {
+                    items.push(item.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let item = current.trim();
+    if !item.is_empty() {
+        items.push(item.to_string());
+    }
+    items
+}
+
+fn sqlite_parenthesized_list(segment: &str) -> Vec<String> {
+    let Some(open_idx) = segment.find('(') else {
+        return Vec::new();
+    };
+    let Some(close_idx) = segment[open_idx + 1..].find(')') else {
+        return Vec::new();
+    };
+    segment[open_idx + 1..open_idx + 1 + close_idx]
+        .split(',')
+        .map(|value| sqlite_strip_identifier(value.trim()))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn sqlite_strip_identifier(value: &str) -> String {
+    let trimmed = value.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('`')
+                .and_then(|value| value.strip_suffix('`'))
+        })
+        .or_else(|| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+        })
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn sqlite_parse_constraint_name(item: &str) -> (String, &str) {
+    let trimmed = item.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("CONSTRAINT ") {
+        return (String::new(), trimmed);
+    }
+    let rest = trimmed["CONSTRAINT ".len()..].trim_start();
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("").trim().to_string();
+    let tail = parts.next().unwrap_or("").trim_start();
+    (sqlite_strip_identifier(&name), tail)
+}
+
+fn sqlite_parse_action_clause(item: &str, keyword: &str) -> Option<String> {
+    let upper = item.to_ascii_uppercase();
+    let start = upper.find(keyword)?;
+    let rest = item[start + keyword.len()..].trim_start();
+    let end = rest.to_ascii_uppercase().find(" ON ").unwrap_or(rest.len());
+    let clause = rest[..end].trim();
+    if clause.is_empty() {
+        None
+    } else {
+        Some(
+            clause
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+}
+
+fn parse_sqlite_index_sql(name: &str, sql: &str) -> Option<DbFirstIndex> {
+    let upper = sql.to_ascii_uppercase();
+    let unique = upper.starts_with("CREATE UNIQUE INDEX");
+    let on_idx = upper.find(" ON ")?;
+    let before_on = sql[..on_idx].trim();
+    let index_name = before_on
+        .split_whitespace()
+        .last()
+        .map(sqlite_strip_identifier)
+        .unwrap_or_else(|| name.to_string());
+    let columns = sqlite_parenthesized_list(&sql[on_idx..]);
+    if columns.is_empty() {
+        return None;
+    }
+    Some(DbFirstIndex {
+        name: index_name,
+        columns: columns
+            .into_iter()
+            .map(|column| DbFirstIndexColumn {
+                name: column,
+                descending: false,
+            })
+            .collect(),
+        unique,
+    })
+}
+
+fn parse_sqlite_unique_indexes(create_sql: &str) -> Vec<DbFirstIndex> {
+    let mut indexes = Vec::new();
+    for item in sqlite_table_items(create_sql) {
+        let upper = item.to_ascii_uppercase();
+        if !upper.contains("UNIQUE") || upper.contains("FOREIGN KEY") {
+            continue;
+        }
+        let (name, rest) = sqlite_parse_constraint_name(&item);
+        let rest_upper = rest.to_ascii_uppercase();
+        let columns = if rest_upper.starts_with("UNIQUE") {
+            sqlite_parenthesized_list(rest)
+        } else if let Some(first) = item.split_whitespace().next() {
+            vec![sqlite_strip_identifier(first)]
+        } else {
+            Vec::new()
+        };
+        if columns.is_empty() {
+            continue;
+        }
+        indexes.push(DbFirstIndex {
+            name,
+            columns: columns
+                .into_iter()
+                .map(|column| DbFirstIndexColumn {
+                    name: column,
+                    descending: false,
+                })
+                .collect(),
+            unique: true,
+        });
+    }
+    indexes
+}
+
+fn parse_sqlite_foreign_keys(create_sql: &str) -> Vec<DbFirstForeignKey> {
+    let mut foreign_keys = Vec::new();
+    for item in sqlite_table_items(create_sql) {
+        let upper = item.to_ascii_uppercase();
+        if !upper.contains("FOREIGN KEY") {
+            continue;
+        }
+        let (name, rest) = sqlite_parse_constraint_name(&item);
+        let rest_upper = rest.to_ascii_uppercase();
+        let Some(foreign_idx) = rest_upper.find("FOREIGN KEY") else {
+            continue;
+        };
+        let local_cols = sqlite_parenthesized_list(&rest[foreign_idx + "FOREIGN KEY".len()..]);
+        let Some(references_idx) = rest_upper.find("REFERENCES") else {
+            continue;
+        };
+        let after_references = rest[references_idx + "REFERENCES".len()..].trim_start();
+        let ref_table = after_references
+            .split_once('(')
+            .map(|(table, _)| sqlite_strip_identifier(table.trim()))
+            .unwrap_or_default();
+        let ref_cols = sqlite_parenthesized_list(after_references);
+        let on_delete = sqlite_parse_action_clause(&item, "ON DELETE");
+        let on_update = sqlite_parse_action_clause(&item, "ON UPDATE");
+        for (column, ref_column) in local_cols.into_iter().zip(ref_cols.into_iter()) {
+            foreign_keys.push(DbFirstForeignKey {
+                name: (!name.is_empty()).then_some(name.clone()),
+                column,
+                ref_schema: None,
+                ref_table: ref_table.clone(),
+                ref_column,
+                on_delete: on_delete.clone(),
+                on_update: on_update.clone(),
+            });
+        }
+    }
+    foreign_keys
 }

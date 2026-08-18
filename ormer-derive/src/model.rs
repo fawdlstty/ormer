@@ -1000,6 +1000,280 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             RelationKindAttr::BelongsTo => quote! {},
         }
     });
+    let graph_sync_entries = relation_fields.iter().map(|relation| {
+        let field_name = &relation.field_name;
+        let target_type = &relation.target_type;
+        match relation.kind {
+            RelationKindAttr::HasMany => quote! {
+                {
+                    let relation =
+                        ::ormer::model::graph_relation_info::<Self, #target_type>(
+                            stringify!(#field_name),
+                        )?;
+                    let owner_key =
+                        <Self as ::ormer::model::Model>::relation_key_value(current, relation)?;
+                    let ::ormer::model::GraphRelationDiff {
+                        deleted,
+                        inserted,
+                        matched,
+                    } = ::ormer::model::graph_relation_diff(
+                        &mut original.#field_name,
+                        &mut current.#field_name,
+                    );
+
+                    for index in deleted {
+                        affected += tx
+                            .delete::<#target_type>()
+                            .model(&original.#field_name[index])
+                            .execute()
+                            .await?;
+                    }
+
+                    for index in inserted {
+                        let item = &mut current.#field_name[index];
+                        <#target_type as ::ormer::model::Model>::assign_column_value(
+                            item,
+                            relation.target_key,
+                            owner_key.clone(),
+                        )?;
+                        let key = tx.insert(&*item).execute().await?;
+                        let key_value = ::ormer::model::graph_auto_increment_key_value(key);
+                        if !::ormer::model::graph_is_no_auto_increment_key(&key_value) {
+                            <#target_type as ::ormer::model::Model>::assign_column_value(
+                                item,
+                                <#target_type as ::ormer::model::Model>::primary_key_columns()[0],
+                                key_value,
+                            )?;
+                        }
+                        <#target_type as ::ormer::model::GraphWritable>::insert_graph_relations(
+                            tx,
+                            item,
+                        )
+                        .await?;
+                        affected += 1;
+                    }
+
+                    for (original_index, current_index) in matched {
+                        let original_item = &mut original.#field_name[original_index];
+                        let current_item = &mut current.#field_name[current_index];
+                        <#target_type as ::ormer::model::Model>::assign_column_value(
+                            current_item,
+                            relation.target_key,
+                            owner_key.clone(),
+                        )?;
+                        if !::ormer::model::model_scalar_values_equal(
+                            original_item,
+                            current_item,
+                        ) {
+                            affected += tx
+                                .update::<#target_type>()
+                                .set_model(&*current_item)
+                                .execute()
+                                .await?;
+                        }
+                        affected +=
+                            <#target_type as ::ormer::model::GraphWritable>::sync_tracked_graph_relations(
+                                tx,
+                                original_item,
+                                current_item,
+                            )
+                            .await?;
+                    }
+                }
+            },
+            RelationKindAttr::HasOne => quote! {
+                {
+                    let relation =
+                        ::ormer::model::graph_relation_info::<Self, #target_type>(
+                            stringify!(#field_name),
+                        )?;
+                    let owner_key =
+                        <Self as ::ormer::model::Model>::relation_key_value(current, relation)?;
+                    let mut original_items =
+                        original.#field_name.take().into_iter().collect::<Vec<_>>();
+                    let mut current_items =
+                        current.#field_name.take().into_iter().collect::<Vec<_>>();
+                    let relation_result = async {
+                        let ::ormer::model::GraphRelationDiff {
+                            deleted,
+                            inserted,
+                            matched,
+                        } = ::ormer::model::graph_relation_diff(
+                            &mut original_items,
+                            &mut current_items,
+                        );
+
+                        for index in deleted {
+                            affected += tx
+                                .delete::<#target_type>()
+                                .model(&original_items[index])
+                                .execute()
+                                .await?;
+                        }
+
+                        for index in inserted {
+                            let item = &mut current_items[index];
+                            <#target_type as ::ormer::model::Model>::assign_column_value(
+                                item,
+                                relation.target_key,
+                                owner_key.clone(),
+                            )?;
+                            let key = tx.insert(&*item).execute().await?;
+                            let key_value =
+                                ::ormer::model::graph_auto_increment_key_value(key);
+                            if !::ormer::model::graph_is_no_auto_increment_key(&key_value) {
+                                <#target_type as ::ormer::model::Model>::assign_column_value(
+                                    item,
+                                    <#target_type as ::ormer::model::Model>::primary_key_columns()[0],
+                                    key_value,
+                                )?;
+                            }
+                            <#target_type as ::ormer::model::GraphWritable>::insert_graph_relations(
+                                tx,
+                                item,
+                            )
+                            .await?;
+                            affected += 1;
+                        }
+
+                        for (original_index, current_index) in matched {
+                            let original_item = &mut original_items[original_index];
+                            let current_item = &mut current_items[current_index];
+                            <#target_type as ::ormer::model::Model>::assign_column_value(
+                                current_item,
+                                relation.target_key,
+                                owner_key.clone(),
+                            )?;
+                            if !::ormer::model::model_scalar_values_equal(
+                                original_item,
+                                current_item,
+                            ) {
+                                affected += tx
+                                    .update::<#target_type>()
+                                    .set_model(&*current_item)
+                                    .execute()
+                                    .await?;
+                            }
+                            affected +=
+                                <#target_type as ::ormer::model::GraphWritable>::sync_tracked_graph_relations(
+                                    tx,
+                                    original_item,
+                                    current_item,
+                                )
+                                .await?;
+                        }
+
+                        Ok::<(), ::ormer::OrmerError>(())
+                    }
+                    .await;
+                    current.#field_name = current_items.into_iter().next();
+                    relation_result?;
+                }
+            },
+            RelationKindAttr::Through => {
+                let via_type = through_via_type(relation, &relation_fields);
+                quote! {
+                    {
+                        let (_, via_relation, target_relation) =
+                            ::ormer::model::graph_through_infos::<Self, #via_type, #target_type>(
+                                stringify!(#field_name),
+                            )?;
+                        let owner_key =
+                            <Self as ::ormer::model::Model>::relation_key_value(
+                                current,
+                                via_relation,
+                            )?;
+                        let ::ormer::model::GraphRelationDiff {
+                            deleted,
+                            inserted,
+                            matched,
+                        } = ::ormer::model::graph_relation_diff(
+                            &mut original.#field_name,
+                            &mut current.#field_name,
+                        );
+
+                        for index in inserted {
+                            let item = &mut current.#field_name[index];
+                            if ::ormer::model::graph_model_has_default_auto_increment_key(item) {
+                                let key = tx.insert(&*item).execute().await?;
+                                let key_value =
+                                    ::ormer::model::graph_auto_increment_key_value(key);
+                                if !::ormer::model::graph_is_no_auto_increment_key(&key_value) {
+                                    <#target_type as ::ormer::model::Model>::assign_column_value(
+                                        item,
+                                        <#target_type as ::ormer::model::Model>::primary_key_columns()[0],
+                                        key_value,
+                                    )?;
+                                }
+                            } else {
+                                tx.insert_or_update(&*item).execute().await?;
+                            }
+                            <#target_type as ::ormer::model::GraphWritable>::insert_graph_relations(
+                                tx,
+                                item,
+                            )
+                            .await?;
+                            let target_key =
+                                ::ormer::model::graph_target_key_value(item, target_relation)?;
+                            ::ormer::model::graph_insert_through_link_values::<#via_type>(
+                                tx,
+                                via_relation.target_key,
+                                owner_key.clone(),
+                                target_relation.local_key,
+                                target_key,
+                            )
+                            .await?;
+                            affected += 1;
+                        }
+
+                        for (original_index, current_index) in matched {
+                            let original_item = &mut original.#field_name[original_index];
+                            let current_item = &mut current.#field_name[current_index];
+                            if !::ormer::model::model_scalar_values_equal(
+                                original_item,
+                                current_item,
+                            ) {
+                                affected += tx
+                                    .update::<#target_type>()
+                                    .set_model(&*current_item)
+                                    .execute()
+                                    .await?;
+                            }
+                            affected +=
+                                <#target_type as ::ormer::model::GraphWritable>::sync_tracked_graph_relations(
+                                    tx,
+                                    original_item,
+                                    current_item,
+                                )
+                                .await?;
+                        }
+
+                        if !deleted.is_empty() {
+                            let target_keys = current.#field_name
+                                .iter()
+                                .map(|item| {
+                                    ::ormer::model::graph_target_key_value(
+                                        item,
+                                        target_relation,
+                                    )
+                                })
+                                .collect::<::ormer::Result<Vec<_>>>()?;
+                            ::ormer::model::graph_sync_through_links::<Self, #via_type>(
+                                tx,
+                                current,
+                                via_relation,
+                                target_relation,
+                                &target_keys,
+                            )
+                            .await?;
+                            affected += deleted.len() as u64;
+                        }
+                    }
+                }
+            }
+            RelationKindAttr::BelongsTo => quote! {},
+        }
+    });
     let version_dynamic_column_push = version.as_ref().map(|version| {
         let column = version.column.as_str();
         quote! {
@@ -1123,6 +1397,19 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
 
             impl<Q> #filter_trait for Q where Q: ::ormer::NamedFilterQuery<#name> + Sized {}
+        }
+    };
+    let track_method = if relation_fields.is_empty() {
+        quote! {
+            pub fn track(self) -> ::ormer::Tracked<Self> {
+                ::ormer::Tracked::new(self)
+            }
+        }
+    } else {
+        quote! {
+            pub fn track(self) -> ::ormer::Tracked<Self> {
+                ::ormer::Tracked::new_graph(self)
+            }
         }
     };
 
@@ -1359,6 +1646,16 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 #(#graph_update_entries)*
                 Ok(())
             }
+
+            async fn sync_tracked_graph_relations<'tx>(
+                tx: &mut ::ormer::Transaction<'tx>,
+                original: &mut Self,
+                current: &mut Self,
+            ) -> ::ormer::Result<u64> {
+                let mut affected = 0u64;
+                #(#graph_sync_entries)*
+                Ok(affected)
+            }
         }
 
         impl ::ormer::model::PrimaryFields for #name {
@@ -1395,9 +1692,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 ::ormer::model::model_version(self)
             }
 
-            pub fn track(self) -> ::ormer::Tracked<Self> {
-                ::ormer::Tracked::new(self)
-            }
+            #track_method
         }
     }
 }
@@ -2621,6 +2916,12 @@ fn derive_model_tuple_wrapper(
     _where_name: &syn::Ident,
     table_name: String,
 ) -> TokenStream {
+    let track_method = quote! {
+        pub fn track(self) -> ::ormer::Tracked<Self> {
+            ::ormer::Tracked::new(self)
+        }
+    };
+
     // 提取元组结构体中的内部类型
     let inner_type = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
@@ -2734,6 +3035,7 @@ fn derive_model_tuple_wrapper(
         }
 
         impl ::ormer::WritableModel for #name {}
+        impl ::ormer::model::GraphWritable for #name {}
 
         // 生成 inherent 方法
         impl #name {
@@ -2745,9 +3047,7 @@ fn derive_model_tuple_wrapper(
                 ::ormer::Select::new()
             }
 
-            pub fn track(self) -> ::ormer::Tracked<Self> {
-                ::ormer::Tracked::new(self)
-            }
+            #track_method
         }
 
         impl #name

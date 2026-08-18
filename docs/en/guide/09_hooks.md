@@ -83,6 +83,33 @@ db.delete::<User>()
 
 For an insert inside a transaction, `ctx.in_transaction()` is `true`. Hook failures are returned as `Result` and do not commit the transaction; the caller chooses `commit()` or `rollback()`.
 
+## SQL Trace
+
+`sql_trace()` registers global SQL execution callbacks. Use it to record SQL, parameter views, elapsed time, errors, slow SQL, and to rewrite SQL text before execution.
+
+```rust
+let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+
+db.sql_trace()
+    .before(|sql| println!("before: {sql}"))
+    .after(|sql, elapsed| println!("after: {sql} {elapsed:?}"))
+    .on_error(|sql, err| eprintln!("error: {sql} {err}"))
+    .slow_sql_threshold(std::time::Duration::from_millis(100))
+    .slow(|sql, elapsed| eprintln!("slow: {sql} {elapsed:?}"));
+```
+
+Use `before_with`, `after_with`, or `on_error_with` when callbacks need parameters. Parameter redaction only changes the callback view; it does not change the bound values sent to the database.
+
+```rust
+db.sql_trace()
+    .redact_params(|params| {
+        params.iter().map(|_| ormer::Value::Text("***".into())).collect()
+    })
+    .before_with(|event| {
+        println!("sql={} params={:?}", event.sql(), event.params());
+    });
+```
+
 ## HookContext
 
 `HookContext` exposes:

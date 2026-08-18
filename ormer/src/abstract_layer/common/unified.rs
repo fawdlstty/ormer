@@ -4,6 +4,7 @@
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::{SqlStatement, common_helpers};
+use crate::db_first;
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
     RelationSelection, TableRouteValue, ThroughRelation, Tracked, Value, WritableModel,
@@ -381,6 +382,10 @@ impl ReplicatedDatabaseBuilder {
 impl ReplicatedDatabase {
     pub fn db_type(&self) -> super::super::DbType {
         self.db_type
+    }
+
+    pub fn sql_trace(&self) -> crate::SqlTraceBuilder {
+        crate::global_sql_trace().builder()
     }
 
     pub fn write(&self) -> &Database {
@@ -983,12 +988,12 @@ where
     }
 }
 
-pub struct SaveExecutor<'a, T: WritableModel> {
+pub struct SaveExecutor<'a, T: WritableModel + crate::model::GraphWritable> {
     db: &'a Database,
     model: &'a mut Tracked<T>,
 }
 
-impl<'a, T: WritableModel> SaveExecutor<'a, T> {
+impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable> SaveExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let fields = self.model.dirty_columns();
         if fields.is_empty() {
@@ -1001,21 +1006,36 @@ impl<'a, T: WritableModel> SaveExecutor<'a, T> {
     }
 
     pub async fn execute(self) -> crate::Result<u64> {
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            return Ok(0);
+        let SaveExecutor { db, model } = self;
+        let fields = model.dirty_columns();
+        let mut tx = db.begin().await?;
+        let result = async {
+            let mut affected = 0u64;
+            if !fields.is_empty() {
+                affected += tx
+                    .update::<T>()
+                    .set_model_columns(model.as_model(), &fields)
+                    .execute()
+                    .await?;
+            }
+            affected += model.sync_graph_relations(&mut tx).await?;
+            Ok::<u64, crate::OrmerError>(affected)
         }
+        .await;
 
-        let affected = self
-            .db
-            .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .execute()
-            .await?;
-        if affected > 0 {
-            self.model.accept_changes();
+        match result {
+            Ok(affected) => {
+                tx.commit().await?;
+                if affected > 0 {
+                    model.accept_changes();
+                }
+                Ok(affected)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
         }
-        Ok(affected)
     }
 
     pub async fn exec(self) -> crate::Result<u64> {
@@ -1026,26 +1046,42 @@ impl<'a, T: WritableModel> SaveExecutor<'a, T> {
     where
         T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
     {
+        let SaveExecutor { db, model } = self;
         let mut ctx = crate::HookContext::new(crate::HookOperation::Update);
-        crate::BeforeUpdate::before_update(self.model.as_model_mut(), &mut ctx).await?;
+        crate::BeforeUpdate::before_update(model.as_model_mut(), &mut ctx).await?;
 
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            self.model.accept_changes();
-            return Ok(0);
+        let fields = model.dirty_columns();
+        let mut tx = db.begin().await?;
+        let result = async {
+            let mut affected = 0u64;
+            if !fields.is_empty() {
+                affected += tx
+                    .update::<T>()
+                    .set_model_columns(model.as_model(), &fields)
+                    .execute()
+                    .await?;
+            }
+            affected += model.sync_graph_relations(&mut tx).await?;
+            if affected > 0 {
+                crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
+            }
+            Ok::<u64, crate::OrmerError>(affected)
         }
+        .await;
 
-        let affected = self
-            .db
-            .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .execute()
-            .await?;
-        if affected > 0 {
-            crate::AfterUpdate::after_update(self.model.as_model(), &mut ctx).await?;
-            self.model.accept_changes();
+        match result {
+            Ok(affected) => {
+                tx.commit().await?;
+                if affected > 0 {
+                    model.accept_changes();
+                }
+                Ok(affected)
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                Err(err)
+            }
         }
-        Ok(affected)
     }
 }
 
@@ -1092,6 +1128,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
 impl Database {
     pub fn replicated(db_type: super::super::DbType) -> ReplicatedDatabaseBuilder {
         ReplicatedDatabaseBuilder::new(db_type)
+    }
+
+    pub fn sql_trace(&self) -> crate::SqlTraceBuilder {
+        crate::global_sql_trace().builder()
     }
 
     /// 连接到数据库,根据 DbType 选择后端
@@ -1149,6 +1189,21 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.validate_table::<T>().await,
         }
+    }
+
+    /// Generate Rust model definitions from the database schema.
+    pub async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
+        let tables = match self {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => db.db_first_tables(schema).await?,
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.db_first_tables(schema).await?,
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => db.db_first_tables(schema).await?,
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => db.db_first_tables(schema).await?,
+        };
+        Ok(db_first::generate_entities(self.db_type(), &tables))
     }
 
     /// 插入记录 - 返回执行器
@@ -1400,7 +1455,10 @@ impl Database {
         }
     }
 
-    pub fn save<'a, T: WritableModel>(&'a self, model: &'a mut Tracked<T>) -> SaveExecutor<'a, T> {
+    pub fn save<'a, T: WritableModel + crate::model::GraphWritable>(
+        &'a self,
+        model: &'a mut Tracked<T>,
+    ) -> SaveExecutor<'a, T> {
         SaveExecutor { db: self, model }
     }
 
@@ -2991,12 +3049,14 @@ pub enum Transaction<'a> {
     _Phantom(std::marker::PhantomData<&'a ()>),
 }
 
-pub struct TransactionSaveExecutor<'a, 'tx, T: WritableModel> {
+pub struct TransactionSaveExecutor<'a, 'tx, T: WritableModel + crate::model::GraphWritable> {
     txn: &'a mut Transaction<'tx>,
     model: &'a mut Tracked<T>,
 }
 
-impl<'a, 'tx, T: WritableModel> TransactionSaveExecutor<'a, 'tx, T> {
+impl<'a, 'tx, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
+    TransactionSaveExecutor<'a, 'tx, T>
+{
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let fields = self.model.dirty_columns();
         if fields.is_empty() {
@@ -3009,19 +3069,19 @@ impl<'a, 'tx, T: WritableModel> TransactionSaveExecutor<'a, 'tx, T> {
     }
 
     pub async fn execute(self) -> crate::Result<u64> {
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            return Ok(0);
+        let TransactionSaveExecutor { txn, model } = self;
+        let fields = model.dirty_columns();
+        let mut affected = 0u64;
+        if !fields.is_empty() {
+            affected += txn
+                .update::<T>()
+                .set_model_columns(model.as_model(), &fields)
+                .execute()
+                .await?;
         }
-
-        let affected = self
-            .txn
-            .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .execute()
-            .await?;
+        affected += model.sync_graph_relations(txn).await?;
         if affected > 0 {
-            self.model.accept_changes();
+            model.accept_changes();
         }
         Ok(affected)
     }
@@ -3034,24 +3094,23 @@ impl<'a, 'tx, T: WritableModel> TransactionSaveExecutor<'a, 'tx, T> {
     where
         T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
     {
+        let TransactionSaveExecutor { txn, model } = self;
         let mut ctx = crate::HookContext::new(crate::HookOperation::Update).transaction();
-        crate::BeforeUpdate::before_update(self.model.as_model_mut(), &mut ctx).await?;
+        crate::BeforeUpdate::before_update(model.as_model_mut(), &mut ctx).await?;
 
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            self.model.accept_changes();
-            return Ok(0);
+        let fields = model.dirty_columns();
+        let mut affected = 0u64;
+        if !fields.is_empty() {
+            affected += txn
+                .update::<T>()
+                .set_model_columns(model.as_model(), &fields)
+                .execute()
+                .await?;
         }
-
-        let affected = self
-            .txn
-            .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .execute()
-            .await?;
+        affected += model.sync_graph_relations(txn).await?;
         if affected > 0 {
-            crate::AfterUpdate::after_update(self.model.as_model(), &mut ctx).await?;
-            self.model.accept_changes();
+            crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
+            model.accept_changes();
         }
         Ok(affected)
     }
@@ -3612,7 +3671,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn save<'op, T: WritableModel>(
+    pub fn save<'op, T: WritableModel + crate::model::GraphWritable>(
         &'op mut self,
         model: &'op mut Tracked<T>,
     ) -> TransactionSaveExecutor<'op, 'a, T> {

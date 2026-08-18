@@ -262,6 +262,29 @@ user.email = Some("new@example.com".to_string());
 db.save(&mut user).execute().await?;
 ```
 
+关联集合可在查询时一起加载，再通过 `track()` 记录原始对象图。之后对关联集合的删除、插入和已有条目修改会在 `save()` 中于同一事务内同步；集合会按主键排序后计算差异，清空集合会删除对应的关联行：
+
+```rust
+let mut user = db
+    .select::<User>()
+    .include(|user| user.posts)
+    .collect::<Vec<_>>()
+    .await?
+    .into_iter()
+    .next()
+    .unwrap()
+    .track();
+
+user.posts.pop();
+user.posts.push(Post {
+    id: 0,
+    user_id: user.id,
+    title: "New post".to_string(),
+});
+
+db.save(&mut user).execute().await?;
+```
+
 ## 删除 (Delete)
 
 ```rust

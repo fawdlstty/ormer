@@ -38,6 +38,14 @@ struct User {
 
 PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite 和 MySQL 会使用最后一段表名。
 
+## DbFirst 生成实体
+
+```rust
+let code = db.generate_entities(None).await?;
+```
+
+PostgreSQL 可传 `Some("public")`，MSSQL 可传 `Some("dbo")`；未指定时使用后端默认 schema。
+
 ## 乐观锁版本列
 
 ```rust

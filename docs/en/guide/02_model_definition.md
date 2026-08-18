@@ -38,6 +38,14 @@ struct User {
 
 PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite and MySQL use the final table-name component.
 
+## DbFirst Entity Generation
+
+```rust
+let code = db.generate_entities(None).await?;
+```
+
+Pass `Some("public")` for PostgreSQL or `Some("dbo")` for MSSQL when needed; omitted schemas use the backend default.
+
 ## Optimistic Lock Version
 
 ```rust

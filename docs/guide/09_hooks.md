@@ -83,6 +83,33 @@ db.delete::<User>()
 
 在事务中执行插入时，`ctx.in_transaction()` 为 `true`。Hook 错误会作为 `Result` 返回，不会自动提交事务；调用方应根据业务语义选择 `commit()` 或 `rollback()`。
 
+## SQL Trace
+
+`sql_trace()` 用于注册全局 SQL 执行回调，可记录 SQL、参数视图、耗时、错误、慢 SQL，并可在执行前改写 SQL 文本。
+
+```rust
+let db = ormer::Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+
+db.sql_trace()
+    .before(|sql| println!("before: {sql}"))
+    .after(|sql, elapsed| println!("after: {sql} {elapsed:?}"))
+    .on_error(|sql, err| eprintln!("error: {sql} {err}"))
+    .slow_sql_threshold(std::time::Duration::from_millis(100))
+    .slow(|sql, elapsed| eprintln!("slow: {sql} {elapsed:?}"));
+```
+
+需要访问参数时使用 `before_with`、`after_with` 或 `on_error_with`。参数脱敏只影响回调视图，不改变真实绑定值。
+
+```rust
+db.sql_trace()
+    .redact_params(|params| {
+        params.iter().map(|_| ormer::Value::Text("***".into())).collect()
+    })
+    .before_with(|event| {
+        println!("sql={} params={:?}", event.sql(), event.params());
+    });
+```
+
 ## HookContext
 
 `HookContext` 提供：

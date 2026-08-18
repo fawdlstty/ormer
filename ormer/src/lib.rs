@@ -1,10 +1,12 @@
 pub mod abstract_layer;
+pub mod db_first;
 pub mod error;
 pub mod hooks;
 pub mod migration;
 pub mod model;
 pub mod query;
 pub mod raw_sql;
+pub mod sql_trace;
 mod time;
 pub mod utils;
 
@@ -19,6 +21,9 @@ compile_error!(
 );
 
 pub use abstract_layer::DbType;
+pub use db_first::{
+    DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
+};
 pub use migration::{
     MIGRATION_TABLE_NAME, Migration, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
     TableMigration,
@@ -77,6 +82,7 @@ pub use query::update::{
     UpdateAssignment, UpdateBinaryOp, UpdateExpr, UpdateField, UpdateFields, UpdateValue,
 };
 pub use raw_sql::{IntoRawSql, RawSql, sql};
+pub use sql_trace::{SqlTrace, SqlTraceBuilder, SqlTraceEvent, global_sql_trace};
 
 #[doc(hidden)]
 #[macro_export]

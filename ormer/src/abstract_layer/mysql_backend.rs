@@ -1,6 +1,9 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::db_first::{
+    DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
+};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value, WritableModel};
@@ -24,10 +27,73 @@ use crate::{
 use chrono::{Datelike, Timelike};
 use mysql_async::Pool;
 use mysql_async::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
+
+async fn traced_mysql_query(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+) -> crate::Result<Vec<mysql_async::Row>> {
+    let trace = crate::sql_trace::start_sql_trace(sql, &[]);
+    match conn.query(trace.sql()).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::query", error)),
+    }
+}
+
+async fn traced_mysql_query_drop(conn: &mut mysql_async::Conn, sql: &str) -> crate::Result<()> {
+    let trace = crate::sql_trace::start_sql_trace(sql, &[]);
+    match conn.query_drop(trace.sql()).await {
+        Ok(()) => {
+            trace.finish_ok();
+            Ok(())
+        }
+        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::query_drop", error)),
+    }
+}
+
+async fn traced_mysql_exec(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    params: Vec<mysql_async::Value>,
+    trace_params: &[Value],
+) -> crate::Result<Vec<mysql_async::Row>> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match conn
+        .exec(trace.sql(), mysql_async::Params::Positional(params))
+        .await
+    {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::exec", error)),
+    }
+}
+
+async fn traced_mysql_exec_drop(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    params: Vec<mysql_async::Value>,
+    trace_params: &[Value],
+) -> crate::Result<()> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match conn
+        .exec_drop(trace.sql(), mysql_async::Params::Positional(params))
+        .await
+    {
+        Ok(()) => {
+            trace.finish_ok();
+            Ok(())
+        }
+        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::exec_drop", error)),
+    }
+}
 
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::MySQL)
@@ -35,6 +101,51 @@ fn table_name_for<T: Model>() -> &'static str {
 
 fn is_uuid_rust_type(rust_type: &str) -> bool {
     matches!(rust_type, "Uuid" | "uuid::Uuid")
+}
+
+fn parse_mysql_enum_variants(type_name: &str) -> Vec<String> {
+    let trimmed = type_name.trim();
+    if !trimmed.to_ascii_lowercase().starts_with("enum(") || !trimmed.ends_with(')') {
+        return Vec::new();
+    }
+    let inner = &trimmed["enum(".len()..trimmed.len() - 1];
+    let mut variants = Vec::new();
+    let mut chars = inner.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\'' {
+            continue;
+        }
+        let mut value = String::new();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    value.push('\'');
+                    chars.next();
+                } else {
+                    break;
+                }
+            } else if ch == '\\' {
+                if let Some(next) = chars.next() {
+                    value.push(next);
+                }
+            } else {
+                value.push(ch);
+            }
+        }
+        variants.push(value);
+    }
+    variants
+}
+
+fn mysql_fk_action(action: &str) -> Option<&'static str> {
+    match action.replace('_', " ").to_ascii_uppercase().as_str() {
+        "NO ACTION" => Some("NO ACTION"),
+        "RESTRICT" => Some("RESTRICT"),
+        "CASCADE" => Some("CASCADE"),
+        "SET NULL" => Some("SET NULL"),
+        "SET DEFAULT" => Some("SET DEFAULT"),
+        _ => None,
+    }
 }
 
 fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Value {
@@ -214,7 +325,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut conn = self.pool.get_conn().trace().await?;
         for statement in sql.statements {
-            conn.query_drop(&statement.sql).trace().await?;
+            traced_mysql_query_drop(&mut conn, &statement.sql).await?;
         }
         Ok(())
     }
@@ -253,7 +364,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut conn = self.pool.get_conn().trace().await?;
         for statement in sql.statements {
-            conn.query_drop(&statement.sql).trace().await?;
+            traced_mysql_query_drop(&mut conn, &statement.sql).await?;
         }
         Ok(())
     }
@@ -320,7 +431,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let mut conn = self.pool.get_conn().trace().await?;
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
-            conn.exec_drop(&statement.sql, params).trace().await?;
+            traced_mysql_exec_drop(&mut conn, &statement.sql, params, &statement.params).await?;
         }
 
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -409,7 +520,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let mut conn = self.db.pool.get_conn().trace().await?;
-        conn.exec_drop(&statement.sql, params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &statement.sql, params, &statement.params).await?;
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
@@ -481,7 +592,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
-        conn.exec_drop(&statement.sql, params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &statement.sql, params, &statement.params).await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -534,7 +645,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
-        conn.exec_drop(&statement.sql, params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &statement.sql, params, &statement.params).await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -550,6 +661,182 @@ impl Database {
         let pool = Pool::new(opts);
 
         Ok(Self { pool })
+    }
+
+    pub(crate) async fn db_first_tables(
+        &self,
+        schema: Option<&str>,
+    ) -> crate::Result<Vec<DbFirstTable>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            if let Some(schema) = schema.filter(|value| !value.is_empty()) {
+                conn.exec(
+                    "SELECT TABLE_SCHEMA, TABLE_NAME \
+                 FROM information_schema.tables \
+                 WHERE TABLE_TYPE = 'BASE TABLE' \
+                   AND TABLE_SCHEMA = ? \
+                   AND TABLE_NAME != ? \
+                 ORDER BY TABLE_NAME",
+                    (schema, crate::migration::MIGRATION_TABLE_NAME),
+                )
+                .trace()
+                .await?
+            } else {
+                conn.query(format!(
+                    "SELECT TABLE_SCHEMA, TABLE_NAME \
+                     FROM information_schema.tables \
+                     WHERE TABLE_TYPE = 'BASE TABLE' \
+                       AND TABLE_SCHEMA = DATABASE() \
+                       AND TABLE_NAME != '{}' \
+                     ORDER BY TABLE_NAME",
+                    crate::migration::MIGRATION_TABLE_NAME.replace('\'', "''")
+                ))
+                .trace()
+                .await?
+            };
+        drop(conn);
+
+        let mut tables = Vec::with_capacity(rows.len());
+        for row in rows {
+            let schema_name: String = row.get(0).unwrap_or_default();
+            let table_name: String = row.get(1).unwrap_or_default();
+            let columns = self.db_first_columns(&schema_name, &table_name).await?;
+            let indexes = self.db_first_indexes(&schema_name, &table_name).await?;
+            let foreign_keys = self
+                .db_first_foreign_keys(&schema_name, &table_name)
+                .await?;
+            tables.push(DbFirstTable {
+                schema: Some(schema_name),
+                name: table_name,
+                columns,
+                indexes,
+                foreign_keys,
+            });
+        }
+        Ok(tables)
+    }
+
+    async fn db_first_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstColumn>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let rows: Vec<mysql_async::Row> = conn
+            .exec(
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA \
+                 FROM information_schema.columns \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
+                 ORDER BY ORDINAL_POSITION",
+                (schema_name, table_name),
+            )
+            .trace()
+            .await?;
+        let columns = rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0).unwrap_or_default();
+                let type_name: String = row.get(1).unwrap_or_default();
+                let nullable: String = row.get(2).unwrap_or_default();
+                let key: String = row.get(3).unwrap_or_default();
+                let extra: String = row.get(4).unwrap_or_default();
+                DbFirstColumn {
+                    name,
+                    type_name: type_name.clone(),
+                    nullable: nullable == "YES",
+                    primary_key: key == "PRI",
+                    auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
+                    enum_variants: parse_mysql_enum_variants(&type_name),
+                }
+            })
+            .collect();
+        Ok(columns)
+    }
+
+    async fn db_first_indexes(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstIndex>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let rows: Vec<mysql_async::Row> = conn
+            .exec(
+                "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME, COLLATION \
+                 FROM information_schema.statistics \
+                 WHERE TABLE_SCHEMA = ? \
+                   AND TABLE_NAME = ? \
+                   AND INDEX_NAME != 'PRIMARY' \
+                 ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+                (schema_name, table_name),
+            )
+            .trace()
+            .await?;
+        let mut indexes = BTreeMap::<String, DbFirstIndex>::new();
+        for row in rows {
+            let name: String = row.get(0).unwrap_or_default();
+            let non_unique: u64 = row.get(1).unwrap_or(1);
+            let column: String = row.get(2).unwrap_or_default();
+            let collation: String = row.get(3).unwrap_or_default();
+            indexes
+                .entry(name.clone())
+                .or_insert_with(|| DbFirstIndex {
+                    name,
+                    columns: Vec::new(),
+                    unique: non_unique == 0,
+                })
+                .columns
+                .push(DbFirstIndexColumn {
+                    name: column,
+                    descending: collation == "D",
+                });
+        }
+        Ok(indexes.into_values().collect())
+    }
+
+    async fn db_first_foreign_keys(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstForeignKey>> {
+        let mut conn = self.pool.get_conn().trace().await?;
+        let rows: Vec<mysql_async::Row> = conn
+            .exec(
+                "SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
+                        kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, \
+                        kcu.REFERENCED_COLUMN_NAME, rc.DELETE_RULE, rc.UPDATE_RULE \
+                 FROM information_schema.key_column_usage kcu \
+                 JOIN information_schema.referential_constraints rc \
+                   ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA \
+                  AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
+                  AND rc.TABLE_NAME = kcu.TABLE_NAME \
+                 WHERE kcu.TABLE_SCHEMA = ? \
+                   AND kcu.TABLE_NAME = ? \
+                   AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
+                 ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
+                (schema_name, table_name),
+            )
+            .trace()
+            .await?;
+        let mut foreign_keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.get(0).unwrap_or_default();
+            let column: String = row.get(1).unwrap_or_default();
+            let ref_schema: String = row.get(2).unwrap_or_default();
+            let ref_table: String = row.get(3).unwrap_or_default();
+            let ref_column: String = row.get(4).unwrap_or_default();
+            let on_delete: String = row.get(5).unwrap_or_default();
+            let on_update: String = row.get(6).unwrap_or_default();
+            foreign_keys.push(DbFirstForeignKey {
+                name: Some(name),
+                column,
+                ref_schema: Some(ref_schema),
+                ref_table,
+                ref_column,
+                on_delete: mysql_fk_action(&on_delete).map(str::to_string),
+                on_update: mysql_fk_action(&on_update).map(str::to_string),
+            });
+        }
+        Ok(foreign_keys)
     }
 
     /// 从已有的 mysql_async Pool 创建 Database
@@ -856,7 +1143,7 @@ impl Database {
 
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &sql, params, &all_values).await?;
 
         Ok(())
     }
@@ -881,7 +1168,7 @@ impl Database {
 
         let params = values_to_params(&all_values)?;
 
-        conn.exec_drop(&sql, params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &sql, params, &all_values).await?;
 
         Ok(())
     }
@@ -938,7 +1225,7 @@ impl Database {
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
         let mut conn = self.pool.get_conn().trace().await?;
 
-        conn.query_drop("START TRANSACTION").trace().await?;
+        traced_mysql_query_drop(&mut conn, "START TRANSACTION").await?;
 
         Ok(Transaction {
             conn: Some(conn),
@@ -971,11 +1258,9 @@ impl Database {
         let mut conn = self.pool.get_conn().trace().await?;
         let mysql_params = values_to_params(&params)?;
         let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-            conn.query(sql).trace().await?
+            traced_mysql_query(&mut conn, sql).await?
         } else {
-            conn.exec(sql, mysql_async::Params::Positional(mysql_params))
-                .trace()
-                .await?
+            traced_mysql_exec(&mut conn, sql, mysql_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -992,11 +1277,9 @@ impl Database {
         let mut conn = self.pool.get_conn().trace().await?;
         let mysql_params = values_to_params(&params)?;
         if mysql_params.is_empty() {
-            conn.query_drop(sql).trace().await?;
+            traced_mysql_query_drop(&mut conn, sql).await?;
         } else {
-            conn.exec_drop(sql, mysql_async::Params::Positional(mysql_params))
-                .trace()
-                .await?;
+            traced_mysql_exec_drop(&mut conn, sql, mysql_params, &params).await?;
         }
         Ok(conn.affected_rows())
     }
@@ -1065,7 +1348,7 @@ impl Database {
     /// 检查连接是否有效
     pub async fn is_valid(&self) -> bool {
         if let Ok(mut conn) = self.pool.get_conn().trace().await {
-            conn.query_drop("SELECT 1").trace().await.is_ok()
+            traced_mysql_query_drop(&mut conn, "SELECT 1").await.is_ok()
         } else {
             false
         }
@@ -1089,7 +1372,7 @@ impl<'a> Drop for Transaction<'a> {
         if let Some(mut conn) = self.conn.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = conn.query_drop("ROLLBACK").trace().await;
+                    let _ = traced_mysql_query_drop(&mut conn, "ROLLBACK").await;
                 });
             }
         }
@@ -1150,7 +1433,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         let result = if let Some(conn) = self.conn.as_mut() {
             for statement in &sql.statements {
                 let params = values_to_params(&statement.params)?;
-                conn.exec_drop(&statement.sql, params).trace().await?;
+                traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
             }
 
             let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
@@ -1233,7 +1516,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         let params = values_to_params(&statement.params)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&statement.sql, params).trace().await?;
+            traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1249,11 +1532,9 @@ impl<'a> Transaction<'a> {
             .ok_or_else(|| crate::ormer_error!("Transaction connection is unavailable"))?;
         let mysql_params = values_to_params(&params)?;
         if mysql_params.is_empty() {
-            conn.query_drop(sql).trace().await?;
+            traced_mysql_query_drop(conn, sql).await?;
         } else {
-            conn.exec_drop(sql, mysql_async::Params::Positional(mysql_params))
-                .trace()
-                .await?;
+            traced_mysql_exec_drop(conn, sql, mysql_params, &params).await?;
         }
         Ok(conn.affected_rows())
     }
@@ -1273,11 +1554,9 @@ impl<'a> Transaction<'a> {
             .ok_or_else(|| crate::ormer_error!("Transaction connection is unavailable"))?;
         let mysql_params = values_to_params(&params)?;
         let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-            conn.query(sql).trace().await?
+            traced_mysql_query(conn, sql).await?
         } else {
-            conn.exec(sql, mysql_async::Params::Positional(mysql_params))
-                .trace()
-                .await?
+            traced_mysql_exec(conn, sql, mysql_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -1298,7 +1577,7 @@ impl<'a> Transaction<'a> {
             ));
         }
         if let Some(mut conn) = self.conn.take() {
-            conn.query_drop("COMMIT").trace().await?;
+            traced_mysql_query_drop(&mut conn, "COMMIT").await?;
         }
         self.committed = true;
         Ok(())
@@ -1312,7 +1591,7 @@ impl<'a> Transaction<'a> {
             ));
         }
         if let Some(mut conn) = self.conn.take() {
-            conn.query_drop("ROLLBACK").trace().await?;
+            traced_mysql_query_drop(&mut conn, "ROLLBACK").await?;
         }
         self.rolled_back = true;
         Ok(())
@@ -1427,7 +1706,7 @@ impl<'a> Transaction<'a> {
         let params = values_to_params(&all_values)?;
 
         if let Some(ref mut conn) = self.conn {
-            conn.exec_drop(&sql, params).trace().await?;
+            traced_mysql_exec_drop(conn, &sql, params, &all_values).await?;
         }
 
         Ok(())
@@ -1483,7 +1762,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         let params = values_to_params(&statement.params)?;
 
         if let Some(conn) = self.conn.as_mut() {
-            conn.exec_drop(&statement.sql, params).trace().await?;
+            traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1595,17 +1874,13 @@ impl<
             let mut conn = self.pool.get_conn().trace().await?;
 
             // 将ormer::Value转换为mysql_async::Params
-            let mysql_params: Vec<mysql_async::Value> = params
-                .into_iter()
-                .map(|v| mysql_value_from_ormer_value(&v))
-                .collect();
+            let mysql_params: Vec<mysql_async::Value> =
+                params.iter().map(mysql_value_from_ormer_value).collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-                conn.query(&sql).trace().await?
+                traced_mysql_query(&mut conn, &sql).await?
             } else {
-                conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
-                    .trace()
-                    .await?
+                traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?
             };
 
             let mut results = Vec::new();
@@ -2006,7 +2281,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
         let mysql_params = values_to_params(&params)?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
 
@@ -2094,7 +2370,7 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
         let statement = &sql.statements[0];
         let mysql_params = values_to_params(&statement.params)?;
         let mut conn = self.pool.get_conn().trace().await?;
-        conn.exec_drop(&statement.sql, mysql_params).trace().await?;
+        traced_mysql_exec_drop(&mut conn, &statement.sql, mysql_params, &statement.params).await?;
         let affected = conn.affected_rows();
         if statement.versioned && affected == 0 {
             return Err(common_helpers::optimistic_lock_conflict::<T>());
@@ -2238,8 +2514,9 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
         let mut total: u64 = 0;
         for statement in &sql.statements {
             let mysql_params = values_to_params(&statement.params)?;
-            let result = conn.exec_iter(&statement.sql, mysql_params).trace().await?;
-            let affected = result.affected_rows();
+            traced_mysql_exec_drop(&mut conn, &statement.sql, mysql_params, &statement.params)
+                .await?;
+            let affected = conn.affected_rows();
             if statement.versioned && affected == 0 {
                 return Err(common_helpers::optimistic_lock_conflict::<T>());
             }
@@ -2408,7 +2685,8 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2460,7 +2738,8 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -2511,7 +2790,8 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         let mysql_params: Vec<mysql_async::Value> =
             params.iter().map(mysql_value_from_ormer_value).collect();
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         let column_schema = T::column_schema();
@@ -2723,7 +3003,8 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2874,7 +3155,8 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -2997,7 +3279,8 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let rows: Vec<mysql_async::Row> = conn.exec(&sql, mysql_params).trace().await?;
+        let rows: Vec<mysql_async::Row> =
+            traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
@@ -3259,17 +3542,13 @@ impl<
             let mut conn = self.executor.pool.get_conn().trace().await?;
 
             // 将ormer::Value转换为mysql_async::Params
-            let mysql_params: Vec<mysql_async::Value> = params
-                .into_iter()
-                .map(|v| mysql_value_from_ormer_value(&v))
-                .collect();
+            let mysql_params: Vec<mysql_async::Value> =
+                params.iter().map(mysql_value_from_ormer_value).collect();
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-                conn.query(&sql).trace().await?
+                traced_mysql_query(&mut conn, &sql).await?
             } else {
-                conn.exec(&sql, mysql_async::Params::Positional(mysql_params))
-                    .trace()
-                    .await?
+                traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?
             };
 
             let mut results = Vec::new();

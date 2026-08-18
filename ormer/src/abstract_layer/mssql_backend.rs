@@ -1,6 +1,9 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::db_first::{
+    DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
+};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Value, WritableModel};
@@ -21,6 +24,7 @@ use crate::{
     impl_backend_multi_table_executor_methods_with_lifetime,
     impl_backend_related_executor_methods_with_lifetime, impl_insert_conflict_methods,
 };
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,6 +37,50 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
 type CollectMarker<'a, C> = PhantomData<(fn() -> C, &'a ())>;
 type MssqlBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+type MssqlClient = Client<tokio_util::compat::Compat<TcpStream>>;
+
+fn build_traced_mssql_query<'a>(
+    trace: &'a crate::sql_trace::SqlTraceExecution,
+    params: &'a [Value],
+) -> Query<'a> {
+    let mut query = Query::new(trace.sql());
+    for param in params {
+        bind_value(&mut query, param);
+    }
+    query
+}
+
+async fn traced_mssql_execute(
+    client: &mut MssqlClient,
+    sql: &str,
+    params: &[Value],
+) -> crate::Result<u64> {
+    let trace = crate::sql_trace::start_sql_trace(sql, params);
+    let query = build_traced_mssql_query(&trace, params);
+    match query.execute(client).await {
+        Ok(result) => {
+            trace.finish_ok();
+            Ok(result.total() as u64)
+        }
+        Err(error) => Err(trace.finish_external_error("tiberius::Query::execute", error)),
+    }
+}
+
+async fn traced_mssql_query(
+    client: &mut MssqlClient,
+    sql: &str,
+    params: &[Value],
+) -> crate::Result<Vec<tiberius::Row>> {
+    let trace = crate::sql_trace::start_sql_trace(sql, params);
+    let query = build_traced_mssql_query(&trace, params);
+    match query.query(client).await {
+        Ok(stream) => {
+            trace.finish_ok();
+            stream.into_first_result().trace().await
+        }
+        Err(error) => Err(trace.finish_external_error("tiberius::Query::query", error)),
+    }
+}
 
 /// MSSQL 类型映射器
 pub struct MSSQLTypeMapper;
@@ -107,6 +155,21 @@ pub struct Database {
     pool: Pool,
 }
 
+fn mssql_escape_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn mssql_fk_action(action: &str) -> Option<&'static str> {
+    match action.replace('_', " ").to_ascii_uppercase().as_str() {
+        "NO ACTION" => Some("NO ACTION"),
+        "RESTRICT" => Some("RESTRICT"),
+        "CASCADE" => Some("CASCADE"),
+        "SET NULL" => Some("SET NULL"),
+        "SET DEFAULT" => Some("SET DEFAULT"),
+        _ => None,
+    }
+}
+
 impl Database {
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
         let config = Config::from_ado_string(connection_string)
@@ -118,6 +181,217 @@ impl Database {
         Ok(Self {
             pool: Arc::new(Mutex::new(client)),
         })
+    }
+
+    pub(crate) async fn db_first_tables(
+        &self,
+        schema: Option<&str>,
+    ) -> crate::Result<Vec<DbFirstTable>> {
+        let schema_name = schema.filter(|value| !value.is_empty()).unwrap_or("dbo");
+        let schema_literal = mssql_escape_literal(schema_name);
+        let migration_literal = mssql_escape_literal(crate::migration::MIGRATION_TABLE_NAME);
+        let query_sql = format!(
+            "SELECT TABLE_SCHEMA, TABLE_NAME \
+             FROM INFORMATION_SCHEMA.TABLES \
+             WHERE TABLE_TYPE = 'BASE TABLE' \
+               AND TABLE_SCHEMA = '{}' \
+               AND TABLE_NAME != '{}' \
+             ORDER BY TABLE_NAME",
+            schema_literal, migration_literal
+        );
+        let mut client = self.pool.lock().await;
+        let stream = Query::new(&query_sql).query(&mut *client).trace().await?;
+        let rows = stream.into_first_result().trace().await?;
+        let table_names = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<&str, _>(0).unwrap_or("").to_string(),
+                    row.get::<&str, _>(1).unwrap_or("").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(client);
+
+        let mut tables = Vec::with_capacity(table_names.len());
+        for (schema_name, table_name) in table_names {
+            tables.push(self.db_first_table(&schema_name, &table_name).await?);
+        }
+        Ok(tables)
+    }
+
+    async fn db_first_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<DbFirstTable> {
+        Ok(DbFirstTable {
+            schema: Some(schema_name.to_string()),
+            name: table_name.to_string(),
+            columns: self.db_first_columns(schema_name, table_name).await?,
+            indexes: self.db_first_indexes(schema_name, table_name).await?,
+            foreign_keys: self.db_first_foreign_keys(schema_name, table_name).await?,
+        })
+    }
+
+    async fn db_first_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstColumn>> {
+        let schema_literal = mssql_escape_literal(schema_name);
+        let table_literal = mssql_escape_literal(table_name);
+        let columns_sql = format!(
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+                    CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_PRIMARY, \
+                    CASE WHEN sc.is_identity = 1 THEN 1 ELSE 0 END AS IS_IDENTITY \
+             FROM INFORMATION_SCHEMA.COLUMNS c \
+             JOIN sys.schemas s ON s.name = c.TABLE_SCHEMA \
+             JOIN sys.tables t ON t.name = c.TABLE_NAME AND t.schema_id = s.schema_id \
+             JOIN sys.columns sc ON sc.object_id = t.object_id AND sc.name = c.COLUMN_NAME \
+             LEFT JOIN ( \
+                 SELECT k.TABLE_SCHEMA, k.TABLE_NAME, k.COLUMN_NAME \
+                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
+                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k \
+                   ON tc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA \
+                  AND tc.CONSTRAINT_NAME = k.CONSTRAINT_NAME \
+                  AND tc.TABLE_SCHEMA = k.TABLE_SCHEMA \
+                  AND tc.TABLE_NAME = k.TABLE_NAME \
+                 WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
+             ) pk ON pk.TABLE_SCHEMA = c.TABLE_SCHEMA \
+                 AND pk.TABLE_NAME = c.TABLE_NAME \
+                 AND pk.COLUMN_NAME = c.COLUMN_NAME \
+             WHERE c.TABLE_SCHEMA = '{}' AND c.TABLE_NAME = '{}' \
+             ORDER BY c.ORDINAL_POSITION",
+            schema_literal, table_literal
+        );
+        let mut client = self.pool.lock().await;
+        let stream = Query::new(&columns_sql).query(&mut *client).trace().await?;
+        let rows = stream.into_first_result().trace().await?;
+        let columns = rows
+            .into_iter()
+            .map(|row| {
+                let name = row.get::<&str, _>(0).unwrap_or("").to_string();
+                let type_name = row.get::<&str, _>(1).unwrap_or("").to_string();
+                let nullable = row.get::<&str, _>(2).unwrap_or("") == "YES";
+                let primary_key = row.get::<i32, _>(3).unwrap_or(0) != 0;
+                let auto_increment = row.get::<i32, _>(4).unwrap_or(0) != 0;
+                DbFirstColumn {
+                    name,
+                    type_name,
+                    nullable: nullable && !primary_key,
+                    primary_key,
+                    auto_increment,
+                    enum_variants: Vec::new(),
+                }
+            })
+            .collect();
+        Ok(columns)
+    }
+
+    async fn db_first_indexes(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstIndex>> {
+        let schema_literal = mssql_escape_literal(schema_name);
+        let table_literal = mssql_escape_literal(table_name);
+        let indexes_sql = format!(
+            "SELECT i.name, \
+                    CASE WHEN i.is_unique = 1 THEN 1 ELSE 0 END AS IS_UNIQUE, \
+                    c.name, \
+                    CASE WHEN ic.is_descending_key = 1 THEN 1 ELSE 0 END AS IS_DESC \
+             FROM sys.indexes i \
+             JOIN sys.tables t ON t.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id = ic.column_id \
+             WHERE s.name = '{}' \
+               AND t.name = '{}' \
+               AND i.name IS NOT NULL \
+               AND i.is_primary_key = 0 \
+               AND i.is_hypothetical = 0 \
+               AND ic.key_ordinal > 0 \
+             ORDER BY i.name, ic.key_ordinal",
+            schema_literal, table_literal
+        );
+        let mut client = self.pool.lock().await;
+        let stream = Query::new(&indexes_sql).query(&mut *client).trace().await?;
+        let rows = stream.into_first_result().trace().await?;
+        let mut indexes = BTreeMap::<String, DbFirstIndex>::new();
+        for row in rows {
+            let name = row.get::<&str, _>(0).unwrap_or("").to_string();
+            let unique = row.get::<i32, _>(1).unwrap_or(0) != 0;
+            let column = row.get::<&str, _>(2).unwrap_or("").to_string();
+            let descending = row.get::<i32, _>(3).unwrap_or(0) != 0;
+            indexes
+                .entry(name.clone())
+                .or_insert_with(|| DbFirstIndex {
+                    name,
+                    columns: Vec::new(),
+                    unique,
+                })
+                .columns
+                .push(DbFirstIndexColumn {
+                    name: column,
+                    descending,
+                });
+        }
+        Ok(indexes.into_values().collect())
+    }
+
+    async fn db_first_foreign_keys(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstForeignKey>> {
+        let schema_literal = mssql_escape_literal(schema_name);
+        let table_literal = mssql_escape_literal(table_name);
+        let foreign_keys_sql = format!(
+            "SELECT fk.name, parent_col.name, ref_schema.name, ref_table.name, ref_col.name, \
+                    fk.delete_referential_action_desc, fk.update_referential_action_desc \
+             FROM sys.foreign_keys fk \
+             JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+             JOIN sys.tables parent_table ON parent_table.object_id = fk.parent_object_id \
+             JOIN sys.schemas parent_schema ON parent_schema.schema_id = parent_table.schema_id \
+             JOIN sys.tables ref_table ON ref_table.object_id = fk.referenced_object_id \
+             JOIN sys.schemas ref_schema ON ref_schema.schema_id = ref_table.schema_id \
+             JOIN sys.columns parent_col \
+               ON parent_col.object_id = parent_table.object_id \
+              AND parent_col.column_id = fkc.parent_column_id \
+             JOIN sys.columns ref_col \
+               ON ref_col.object_id = ref_table.object_id \
+              AND ref_col.column_id = fkc.referenced_column_id \
+             WHERE parent_schema.name = '{}' AND parent_table.name = '{}' \
+             ORDER BY fk.name, fkc.constraint_column_id",
+            schema_literal, table_literal
+        );
+        let mut client = self.pool.lock().await;
+        let stream = Query::new(&foreign_keys_sql)
+            .query(&mut *client)
+            .trace()
+            .await?;
+        let rows = stream.into_first_result().trace().await?;
+        let mut foreign_keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name = row.get::<&str, _>(0).unwrap_or("").to_string();
+            let column = row.get::<&str, _>(1).unwrap_or("").to_string();
+            let ref_schema = row.get::<&str, _>(2).unwrap_or("").to_string();
+            let ref_table = row.get::<&str, _>(3).unwrap_or("").to_string();
+            let ref_column = row.get::<&str, _>(4).unwrap_or("").to_string();
+            let on_delete = row.get::<&str, _>(5).unwrap_or("");
+            let on_update = row.get::<&str, _>(6).unwrap_or("");
+            foreign_keys.push(DbFirstForeignKey {
+                name: Some(name),
+                column,
+                ref_schema: Some(ref_schema),
+                ref_table,
+                ref_column,
+                on_delete: mssql_fk_action(on_delete).map(str::to_string),
+                on_update: mssql_fk_action(on_update).map(str::to_string),
+            });
+        }
+        Ok(foreign_keys)
     }
 
     pub fn get_pool(&self) -> Pool {
@@ -522,8 +796,7 @@ impl Database {
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
         let mut client = self.pool.lock().await;
-        let query = Query::new("BEGIN TRANSACTION");
-        query.execute(&mut *client).trace().await?;
+        traced_mssql_execute(&mut client, "BEGIN TRANSACTION", &[]).await?;
         Ok(Transaction {
             pool: self.pool.clone(),
             committed: false,
@@ -545,12 +818,7 @@ impl Database {
         C: FromIterator<V>,
     {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let stream = query.query(&mut *client).trace().await?;
-        let rows = stream.into_first_result().trace().await?;
+        let rows = traced_mssql_query(&mut client, sql, &params).await?;
         let mut results = Vec::new();
         for row in rows {
             results.push(common_helpers::decode_row_values_from_indexed_values(
@@ -563,12 +831,7 @@ impl Database {
 
     pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        traced_mssql_execute(&mut client, sql, &params).await
     }
 
     pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
@@ -1172,12 +1435,7 @@ impl<'a> Drop for Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        traced_mssql_execute(&mut client, sql, &params).await
     }
 
     pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
@@ -1186,12 +1444,7 @@ impl<'a> Transaction<'a> {
         C: FromIterator<V>,
     {
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let stream = query.query(&mut *client).trace().await?;
-        let rows = stream.into_first_result().trace().await?;
+        let rows = traced_mssql_query(&mut client, sql, &params).await?;
         let mut results = Vec::new();
         for row in rows {
             results.push(common_helpers::decode_row_values_from_indexed_values(
@@ -1932,12 +2185,7 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
         }
         let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param);
-        }
-        let result = query.execute(&mut *client).trace().await?;
-        let affected = result.total() as u64;
+        let affected = traced_mssql_execute(&mut client, &statement.sql, &statement.params).await?;
         if statement.versioned && affected == 0 {
             return Err(common_helpers::optimistic_lock_conflict::<T>());
         }
@@ -2058,12 +2306,8 @@ impl<'a, T: Model> SqlExecutor for UpdateExecutor<'a, T> {
         let mut client = self.pool.lock().await;
         let mut total: u64 = 0;
         for statement in &sql.statements {
-            let mut query = Query::new(&statement.sql);
-            for param in &statement.params {
-                bind_value(&mut query, param);
-            }
-            let result = query.execute(&mut *client).trace().await?;
-            let affected = result.total() as u64;
+            let affected =
+                traced_mssql_execute(&mut client, &statement.sql, &statement.params).await?;
             if statement.versioned && affected == 0 {
                 return Err(common_helpers::optimistic_lock_conflict::<T>());
             }
@@ -2242,12 +2486,7 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
             let (sql, params) =
                 select.try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2276,12 +2515,7 @@ impl<
                 .aggregate_select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
             if rows.is_empty() {
                 return Err(crate::ormer_error!("Aggregate query returned no rows"));
             }
@@ -2318,12 +2552,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2355,12 +2584,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2392,12 +2616,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let t_col_count = T::COLUMNS.len();
             let mut results = Vec::new();
@@ -2435,12 +2654,7 @@ where
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2471,12 +2685,7 @@ impl<
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2508,12 +2717,7 @@ impl<
                 .select
                 .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
             let mut client = self.executor.pool.lock().await;
-            let mut query = Query::new(&sql);
-            for param in &params {
-                bind_value(&mut query, param);
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
+            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let mut results = Vec::new();
             for row in rows {
@@ -2535,12 +2739,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
             .select
             .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
         let mut client = self.executor.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &params {
-            bind_value(&mut query, param);
-        }
-        let stream = query.query(&mut *client).trace().await?;
-        let rows = stream.into_first_result().trace().await?;
+        let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
         let mut results = Vec::new();
         for row in rows {

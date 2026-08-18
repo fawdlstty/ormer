@@ -1,6 +1,9 @@
 use super::common::common_helpers;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
+use crate::db_first::{
+    DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
+};
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{
@@ -55,7 +58,7 @@ async fn pg_query_with_types(
 ) -> crate::Result<Vec<tokio_postgres::Row>> {
     let pg_params = values_to_params_with_types(params, rust_types)?;
     let param_refs = pg_param_refs(&pg_params);
-    client.query(sql, &param_refs).trace().await
+    traced_pg_query(client, sql, params, &param_refs).await
 }
 
 async fn pg_execute_with_types(
@@ -66,7 +69,7 @@ async fn pg_execute_with_types(
 ) -> crate::Result<u64> {
     let pg_params = values_to_params_with_types(params, rust_types)?;
     let param_refs = pg_param_refs(&pg_params);
-    client.execute(sql, &param_refs).trace().await
+    traced_pg_execute(client, sql, params, &param_refs).await
 }
 
 async fn pg_query_for_query(
@@ -77,7 +80,7 @@ async fn pg_query_for_query(
 ) -> crate::Result<Vec<tokio_postgres::Row>> {
     let pg_params = values_to_params_for_query(params, rust_types)?;
     let param_refs = pg_param_refs(&pg_params);
-    client.query(sql, &param_refs).trace().await
+    traced_pg_query(client, sql, params, &param_refs).await
 }
 
 async fn pg_query_untyped(
@@ -87,7 +90,7 @@ async fn pg_query_untyped(
 ) -> crate::Result<Vec<tokio_postgres::Row>> {
     let pg_params = values_to_params(params)?;
     let param_refs = pg_param_refs(&pg_params);
-    client.query(sql, &param_refs).trace().await
+    traced_pg_query(client, sql, params, &param_refs).await
 }
 
 async fn pg_execute_untyped(
@@ -97,7 +100,43 @@ async fn pg_execute_untyped(
 ) -> crate::Result<u64> {
     let pg_params = values_to_params(params)?;
     let param_refs = pg_param_refs(&pg_params);
-    client.execute(sql, &param_refs).trace().await
+    traced_pg_execute(client, sql, params, &param_refs).await
+}
+
+async fn traced_pg_query(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    trace_params: &[Value],
+    params: &[&(dyn ToSql + Sync)],
+) -> crate::Result<Vec<tokio_postgres::Row>> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match client.query(trace.sql(), params).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("tokio_postgres::Client::query", error)),
+    }
+}
+
+async fn traced_pg_execute(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    trace_params: &[Value],
+    params: &[&(dyn ToSql + Sync)],
+) -> crate::Result<u64> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match client.execute(trace.sql(), params).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("tokio_postgres::Client::execute", error)),
+    }
+}
+
+async fn traced_pg_execute_empty(client: &tokio_postgres::Client, sql: &str) -> crate::Result<u64> {
+    traced_pg_execute(client, sql, &[], &[]).await
 }
 
 fn append_postgresql_upsert_clause<T: Model>(sql: &mut String, columns: &[&str]) {
@@ -1364,6 +1403,22 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
+fn postgres_fk_action(action: &str) -> Option<&'static str> {
+    match action.replace('_', " ").to_ascii_uppercase().as_str() {
+        "A" => Some("NO ACTION"),
+        "R" => Some("RESTRICT"),
+        "C" => Some("CASCADE"),
+        "N" => Some("SET NULL"),
+        "D" => Some("SET DEFAULT"),
+        "NO ACTION" => Some("NO ACTION"),
+        "RESTRICT" => Some("RESTRICT"),
+        "CASCADE" => Some("CASCADE"),
+        "SET NULL" => Some("SET NULL"),
+        "SET DEFAULT" => Some("SET DEFAULT"),
+        _ => None,
+    }
+}
+
 /// PostgreSQL 数据库连接封装
 pub struct Database {
     client: tokio_postgres::Client,
@@ -1447,7 +1502,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
-            self.client.execute(&statement.sql, &[]).trace().await?;
+            traced_pg_execute_empty(self.client, &statement.sql).await?;
         }
         Ok(())
     }
@@ -1485,7 +1540,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
-            self.client.execute(&statement.sql, &[]).trace().await?;
+            traced_pg_execute_empty(self.client, &statement.sql).await?;
         }
         Ok(())
     }
@@ -1949,12 +2004,227 @@ impl Database {
         });
 
         // 将服务端消息级别设为 WARNING，过滤掉 NOTICE/INFO/LOG/DEBUG（如 "关系已存在, 跳过"）
-        client
-            .execute("SET client_min_messages TO WARNING;", &[])
-            .trace()
-            .await?;
+        traced_pg_execute_empty(&client, "SET client_min_messages TO WARNING;").await?;
 
         Ok(Self { client })
+    }
+
+    pub(crate) async fn db_first_tables(
+        &self,
+        schema: Option<&str>,
+    ) -> crate::Result<Vec<DbFirstTable>> {
+        let schema_name = schema.filter(|value| !value.is_empty()).unwrap_or("public");
+        let rows = self
+            .client
+            .query(
+                "SELECT table_schema, table_name \
+                 FROM information_schema.tables \
+                 WHERE table_type = 'BASE TABLE' AND table_schema = $1 \
+                   AND table_name != $2 \
+                 ORDER BY table_name",
+                &[&schema_name, &crate::migration::MIGRATION_TABLE_NAME],
+            )
+            .trace()
+            .await?;
+        let mut tables = Vec::with_capacity(rows.len());
+        for row in rows {
+            let schema_name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let table_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            tables.push(self.db_first_table(&schema_name, &table_name).await?);
+        }
+        Ok(tables)
+    }
+
+    async fn db_first_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<DbFirstTable> {
+        Ok(DbFirstTable {
+            schema: Some(schema_name.to_string()),
+            name: table_name.to_string(),
+            columns: self.db_first_columns(schema_name, table_name).await?,
+            indexes: self.db_first_indexes(schema_name, table_name).await?,
+            foreign_keys: self.db_first_foreign_keys(schema_name, table_name).await?,
+        })
+    }
+
+    async fn db_first_columns(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstColumn>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT c.column_name, \
+                        CASE WHEN c.data_type = 'ARRAY' THEN c.udt_name \
+                             WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name \
+                             ELSE c.data_type END AS type_name, \
+                        c.udt_name, c.is_nullable, c.column_default, c.is_identity, \
+                        EXISTS (
+                            SELECT 1
+                            FROM information_schema.table_constraints tc
+                            JOIN information_schema.key_column_usage kcu
+                              ON tc.constraint_name = kcu.constraint_name
+                             AND tc.table_schema = kcu.table_schema
+                             AND tc.table_name = kcu.table_name
+                            WHERE tc.constraint_type = 'PRIMARY KEY'
+                              AND kcu.table_schema = c.table_schema
+                              AND kcu.table_name = c.table_name
+                              AND kcu.column_name = c.column_name
+                        ) AS is_primary
+                 FROM information_schema.columns c
+                 WHERE c.table_schema = $1 AND c.table_name = $2
+                 ORDER BY c.ordinal_position",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let type_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let default: Option<String> =
+                row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+            let identity: String = row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
+            let primary_key: bool = row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
+            let enum_variants = self
+                .db_first_postgres_enum_variants(schema_name, &udt_name)
+                .await?;
+            let auto_increment = identity == "YES"
+                || default
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("nextval("));
+            columns.push(DbFirstColumn {
+                name,
+                type_name,
+                nullable: nullable == "YES" && !primary_key,
+                primary_key,
+                auto_increment,
+                enum_variants,
+            });
+        }
+        Ok(columns)
+    }
+
+    async fn db_first_postgres_enum_variants(
+        &self,
+        schema_name: &str,
+        type_name: &str,
+    ) -> crate::Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT e.enumlabel
+                 FROM pg_type t
+                 JOIN pg_enum e ON e.enumtypid = t.oid
+                 JOIN pg_namespace n ON n.oid = t.typnamespace
+                 WHERE n.nspname = $1 AND t.typname = $2
+                 ORDER BY e.enumsortorder",
+                &[&schema_name, &type_name],
+            )
+            .trace()
+            .await?;
+        rows.into_iter()
+            .map(|row| row.try_get(0).trace_for("tokio_postgres::Row::try_get"))
+            .collect()
+    }
+
+    async fn db_first_indexes(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstIndex>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT i.relname, ix.indisunique, a.attname, \
+                        (ix.indoption[ord.ordinality - 1] & 1) = 1 AS descending
+                 FROM pg_index ix
+                 JOIN pg_class i ON i.oid = ix.indexrelid
+                 JOIN pg_class t ON t.oid = ix.indrelid
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace
+                 JOIN unnest(ix.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
+                 JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum
+                 WHERE ns.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary
+                 ORDER BY i.relname, ord.ordinality",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        let mut indexes = std::collections::BTreeMap::<String, DbFirstIndex>::new();
+        for row in rows {
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let unique: bool = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let column: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let descending: bool = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            indexes
+                .entry(name.clone())
+                .or_insert_with(|| DbFirstIndex {
+                    name,
+                    columns: Vec::new(),
+                    unique,
+                })
+                .columns
+                .push(DbFirstIndexColumn {
+                    name: column,
+                    descending,
+                });
+        }
+        Ok(indexes.into_values().collect())
+    }
+
+    async fn db_first_foreign_keys(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<DbFirstForeignKey>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT con.conname, local_col.attname, ref_ns.nspname, ref_table.relname, \
+                        ref_col.attname, con.confdeltype::text, con.confupdtype::text
+                 FROM pg_constraint con
+                 JOIN pg_class local_table ON local_table.oid = con.conrelid
+                 JOIN pg_namespace local_ns ON local_ns.oid = local_table.relnamespace
+                 JOIN pg_class ref_table ON ref_table.oid = con.confrelid
+                 JOIN pg_namespace ref_ns ON ref_ns.oid = ref_table.relnamespace
+                 JOIN unnest(con.conkey) WITH ORDINALITY AS local_key(attnum, ordinality) ON TRUE
+                 JOIN unnest(con.confkey) WITH ORDINALITY AS ref_key(attnum, ordinality)
+                   ON ref_key.ordinality = local_key.ordinality
+                 JOIN pg_attribute local_col
+                   ON local_col.attrelid = local_table.oid AND local_col.attnum = local_key.attnum
+                 JOIN pg_attribute ref_col
+                   ON ref_col.attrelid = ref_table.oid AND ref_col.attnum = ref_key.attnum
+                 WHERE con.contype = 'f' AND local_ns.nspname = $1 AND local_table.relname = $2
+                 ORDER BY con.conname, local_key.ordinality",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        let mut foreign_keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let column: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let ref_schema: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let ref_table: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let ref_column: String = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+            let on_delete: String = row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
+            let on_update: String = row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
+            foreign_keys.push(DbFirstForeignKey {
+                name: Some(name),
+                column,
+                ref_schema: Some(ref_schema),
+                ref_table,
+                ref_column,
+                on_delete: postgres_fk_action(&on_delete).map(str::to_string),
+                on_update: postgres_fk_action(&on_update).map(str::to_string),
+            });
+        }
+        Ok(foreign_keys)
     }
 
     /// 从 bb8 PooledConnection 创建 Database
@@ -2439,7 +2709,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
-        self.client.execute("BEGIN", &[]).trace().await?;
+        traced_pg_execute_empty(&self.client, "BEGIN").await?;
         Ok(Transaction {
             client: &self.client,
             committed: false,
@@ -2585,7 +2855,9 @@ impl Database {
 
     /// 检查连接是否有效
     pub async fn is_valid(&self) -> bool {
-        self.client.execute("SELECT 1", &[]).trace().await.is_ok()
+        traced_pg_execute_empty(&self.client, "SELECT 1")
+            .await
+            .is_ok()
     }
 }
 
@@ -2855,7 +3127,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client.execute("COMMIT", &[]).trace().await?;
+        traced_pg_execute_empty(self.client, "COMMIT").await?;
         self.committed = true;
         Ok(())
     }
@@ -2867,7 +3139,7 @@ impl<'a> Transaction<'a> {
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        self.client.execute("ROLLBACK", &[]).trace().await?;
+        traced_pg_execute_empty(self.client, "ROLLBACK").await?;
         self.rolled_back = true;
         Ok(())
     }

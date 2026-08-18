@@ -278,3 +278,130 @@ async fn sqlite_update_graph_upserts_children_and_syncs_through_links() -> ormer
 
     Ok(())
 }
+
+#[tokio::test]
+async fn sqlite_tracked_save_diffs_included_relations() -> ormer::Result<()> {
+    let db = Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
+    prepare_graph_tables(&db).await?;
+
+    let mut user = GraphUser {
+        id: 0,
+        name: "Alice".to_string(),
+        profile: None,
+        posts: vec![
+            GraphPost {
+                id: 0,
+                user_id: 0,
+                title: "First".to_string(),
+            },
+            GraphPost {
+                id: 0,
+                user_id: 0,
+                title: "Second".to_string(),
+            },
+        ],
+        user_roles: Vec::new(),
+        roles: vec![
+            GraphRole {
+                id: 1,
+                name: "admin".to_string(),
+            },
+            GraphRole {
+                id: 2,
+                name: "viewer".to_string(),
+            },
+        ],
+    };
+    db.insert_graph(&mut user).execute().await?;
+
+    let mut tracked = db
+        .select::<GraphUser>()
+        .filter(|model| model.id.eq(user.id))
+        .include(|model| model.posts.order_by_desc(|post| post.id))
+        .include(|model| model.roles.order_by_desc(|role| role.id))
+        .collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .next()
+        .unwrap()
+        .track();
+
+    let changed_post_id = tracked.posts[1].id;
+    tracked.posts[1].title = "First updated".to_string();
+    tracked.posts.remove(0);
+    tracked.posts.push(GraphPost {
+        id: 0,
+        user_id: 0,
+        title: "Third".to_string(),
+    });
+    tracked.posts.reverse();
+
+    tracked.roles[0].name = "viewer updated".to_string();
+    tracked.roles.remove(1);
+    tracked.roles.push(GraphRole {
+        id: 3,
+        name: "auditor".to_string(),
+    });
+    tracked.roles.reverse();
+
+    let affected = db.save(&mut tracked).execute().await?;
+    assert!(affected > 0);
+
+    let posts = db
+        .select::<GraphPost>()
+        .filter(|post| post.user_id.eq(user.id))
+        .order_by(|post| post.id.asc())
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(posts.len(), 2);
+    assert!(!posts.iter().any(|post| post.title == "Second"));
+    assert_eq!(
+        posts
+            .iter()
+            .find(|post| post.id == changed_post_id)
+            .unwrap()
+            .title,
+        "First updated"
+    );
+    assert!(tracked.posts.iter().any(|post| post.title == "Third"));
+    assert!(tracked.posts.iter().all(|post| post.id > 0));
+
+    let links = db
+        .select::<GraphUserRole>()
+        .filter(|link| link.user_id.eq(user.id))
+        .order_by(|link| link.role_id.asc())
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(
+        links.iter().map(|link| link.role_id).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    let mut roles = db.select::<GraphRole>().collect::<Vec<_>>().await?;
+    roles.sort_by_key(|role| role.id);
+    assert_eq!(roles[0].name, "viewer updated");
+    assert_eq!(roles[1].name, "viewer");
+    assert_eq!(roles[2].name, "auditor");
+
+    tracked.posts.clear();
+    tracked.roles.clear();
+    let affected = db.save(&mut tracked).execute().await?;
+    assert!(affected > 0);
+    assert_eq!(
+        db.select::<GraphPost>()
+            .filter(|post| post.user_id.eq(user.id))
+            .collect::<Vec<_>>()
+            .await?
+            .len(),
+        0
+    );
+    assert_eq!(
+        db.select::<GraphUserRole>()
+            .filter(|link| link.user_id.eq(user.id))
+            .collect::<Vec<_>>()
+            .await?
+            .len(),
+        0
+    );
+
+    Ok(())
+}

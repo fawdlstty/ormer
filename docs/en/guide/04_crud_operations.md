@@ -261,6 +261,29 @@ user.email = Some("new@example.com".to_string());
 db.save(&mut user).execute().await?;
 ```
 
+Load relations before calling `track()` to capture the original object graph. On `save()`, removed, inserted, and modified related rows are synchronized in the same transaction; both collections are sorted by primary key before the diff is calculated, and clearing a collection deletes its related rows:
+
+```rust
+let mut user = db
+    .select::<User>()
+    .include(|user| user.posts)
+    .collect::<Vec<_>>()
+    .await?
+    .into_iter()
+    .next()
+    .unwrap()
+    .track();
+
+user.posts.pop();
+user.posts.push(Post {
+    id: 0,
+    user_id: user.id,
+    title: "New post".to_string(),
+});
+
+db.save(&mut user).execute().await?;
+```
+
 ## Delete
 
 ```rust

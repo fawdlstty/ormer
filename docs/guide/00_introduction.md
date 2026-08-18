@@ -21,6 +21,7 @@ Ormer 是极简、高性能的 Rust ORM 框架,提供类型安全的数据库操
 - 流式查询与字段忽略
 - 模型关系加载 (`has_many`、`belongs_to`、preload)
 - 原生 SQL 参数绑定
+- 全局 SQL trace 回调
 - 版本化迁移与模型迁移计划
 - 事务支持 (ACID)
 
