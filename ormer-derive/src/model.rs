@@ -58,7 +58,6 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .iter()
         .filter_map(|info| info.relation.clone())
         .collect();
-    let has_embed = normal_fields.iter().any(|info| info.embed.is_some());
 
     // 提取主键字段列表（支持复合主键）
     let primary_keys: Vec<_> = normal_fields
@@ -145,11 +144,6 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .iter()
         .map(|name| quote! { #name })
         .collect::<Vec<_>>();
-    let field_names_without_version_lit = field_names
-        .iter()
-        .map(|name| quote! { #name })
-        .collect::<Vec<_>>();
-
     // 生成字段元数据 (COLUMN_SCHEMA)
     let column_schema_entries = normal_fields
         .iter()
@@ -323,8 +317,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 field_from_vec_i32_expr(info.field, quote! { row.get::<Vec<i32>>(#column_name)? })
             } else {
                 let column_name = &info.column_name;
+                let rust_field_name = info.field_name.to_string();
+                let field_type = info.field_type;
                 quote! {
-                    #field_name: row.get(#column_name)?
+                    #field_name: <#field_type as ::ormer::model::FieldTypeProvider>::model_from_row(
+                        #rust_field_name,
+                        #column_name,
+                        row,
+                    )?
                 }
             }
         })
@@ -427,12 +427,20 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     )
                 } else {
                     let field_type = info.field_type;
+                    let column_name = &info.column_name;
+                    let rust_field_name = info.field_name.to_string();
                     quote! {
                         #field_name: {
-                            let i = __ormer_value_index;
-                            __ormer_value_index += 1;
-                            <#field_type as ::ormer::FromRowValues>::from_row_values(
-                                &values[i..i+1]
+                            let start = __ormer_value_index;
+                            let end = start
+                                + <#field_type as ::ormer::model::FieldTypeProvider>::model_columns(
+                                    #column_name
+                                ).len();
+                            __ormer_value_index = end;
+                            <#field_type as ::ormer::model::FieldTypeProvider>::model_from_row_values(
+                                #rust_field_name,
+                                #column_name,
+                                &values[start..end]
                             )?
                         }
                     }
@@ -464,10 +472,18 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             quote! {
                 values.extend(::ormer::model::Embed::field_values(&self.#field_name));
             }
-        } else {
+        } else if info.has_data_type {
             let value_expr = field_to_value_expr(info);
             quote! {
                 values.push(#value_expr);
+            }
+        } else {
+            let field_name = info.field_name;
+            let field_type = info.field_type;
+            quote! {
+                values.extend(<#field_type as ::ormer::model::FieldTypeProvider>::model_field_values(
+                    &self.#field_name
+                ));
             }
         }
     });
@@ -675,14 +691,32 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 }
             };
         }
-        let value_expr = field_to_value_expr(info);
-        if rust_field_name == column_name {
-            quote! {
-                #column_name => Some(#value_expr)
+        if info.has_data_type {
+            let value_expr = field_to_value_expr(info);
+            if rust_field_name == column_name {
+                quote! {
+                    #column_name => Some(#value_expr)
+                }
+            } else {
+                quote! {
+                    #column_name | #rust_field_name => Some(#value_expr)
+                }
             }
         } else {
+            let field_type = info.field_type;
             quote! {
-                #column_name | #rust_field_name => Some(#value_expr)
+                column if <#field_type as ::ormer::model::FieldTypeProvider>::model_has_column(
+                    #column_name,
+                    #rust_field_name,
+                    column,
+                ) => {
+                    <#field_type as ::ormer::model::FieldTypeProvider>::model_column_value(
+                        &self.#field_name,
+                        #column_name,
+                        #rust_field_name,
+                        column,
+                    )
+                }
             }
         }
     });
@@ -709,19 +743,40 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             };
         }
         let column_name = info.column_name.as_str();
-        let assign_expr = field_assign_value_expr(info);
-        if rust_field_name == column_name {
-            quote! {
-                #column_name => {
-                    #assign_expr
-                    return Ok(());
+        if info.has_data_type {
+            let assign_expr = field_assign_value_expr(info);
+            if rust_field_name == column_name {
+                quote! {
+                    #column_name => {
+                        #assign_expr
+                        return Ok(());
+                    }
+                }
+            } else {
+                quote! {
+                    #column_name | #rust_field_name => {
+                        #assign_expr
+                        return Ok(());
+                    }
                 }
             }
         } else {
+            let field_type = info.field_type;
             quote! {
-                #column_name | #rust_field_name => {
-                    #assign_expr
-                    return Ok(());
+                column if <#field_type as ::ormer::model::FieldTypeProvider>::model_has_column(
+                    #column_name,
+                    #rust_field_name,
+                    column,
+                ) => {
+                    if <#field_type as ::ormer::model::FieldTypeProvider>::model_assign_column_value(
+                        &mut self.#field_name,
+                        #column_name,
+                        #rust_field_name,
+                        column,
+                        value.clone(),
+                    )? {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -1285,33 +1340,51 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             columns.push(#entry);
         }
     });
-    let dynamic_columns_method = if has_embed {
-        let embedded_columns = normal_fields.iter().filter_map(|info| {
-            info.embed.as_ref().map(|embed| {
-                let field_type = info.field_type;
-                let prefix = &embed.prefix;
-                quote! {
-                    for column in <#field_type as ::ormer::model::Embed>::COLUMNS {
-                        columns.push(Box::leak(format!("{}{}", #prefix, column).into_boxed_str()));
-                    }
+    let expanded_columns = normal_fields.iter().map(|info| {
+        if info.has_data_type {
+            let column_name = &info.column_name;
+            quote! {
+                columns.push(#column_name);
+            }
+        } else if let Some(embed) = &info.embed {
+            let field_type = info.field_type;
+            let prefix = &embed.prefix;
+            quote! {
+                for column in <#field_type as ::ormer::model::Embed>::COLUMNS {
+                    columns.push(Box::leak(format!("{}{}", #prefix, column).into_boxed_str()));
                 }
-            })
-        });
+            }
+        } else {
+            let field_type = info.field_type;
+            let column_name = &info.column_name;
+            quote! {
+                columns.extend(
+                    <#field_type as ::ormer::model::FieldTypeProvider>::model_columns(#column_name)
+                );
+            }
+        }
+    });
+    let dynamic_columns_method = {
         quote! {
             fn columns() -> Vec<&'static str> {
                 let mut columns = Vec::new();
-                columns.extend([#(#field_names_without_version_lit),*]);
-                #(#embedded_columns)*
+                #(#expanded_columns)*
                 #version_dynamic_column_push
                 columns
             }
         }
-    } else {
-        quote! {}
     };
-    let dynamic_column_schema_method = if has_embed {
-        let embedded_schemas = normal_fields.iter().filter_map(|info| {
-            info.embed.as_ref().map(|embed| {
+    let expanded_schemas =
+        normal_fields
+            .iter()
+            .zip(base_column_schema_entries.iter())
+            .map(|(info, base_schema)| {
+                if info.has_data_type {
+                    let base_schema = base_schema.clone();
+                    quote! {
+                        columns.push(#base_schema);
+                    }
+                } else if let Some(embed) = &info.embed {
                 let field_type = info.field_type;
                 let field_name = info.field_name.to_string();
                 let prefix = &embed.prefix;
@@ -1342,18 +1415,27 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                         });
                     }
                 }
-            })
-        });
+                } else {
+                    let field_type = info.field_type;
+                    let base_schema = base_schema.clone();
+                    quote! {
+                        columns.extend(
+                            <#field_type as ::ormer::model::FieldTypeProvider>::model_column_schema(
+                                #base_schema
+                            )
+                        );
+                    }
+                }
+            });
+    let dynamic_column_schema_method = {
         quote! {
             fn column_schema() -> Vec<::ormer::model::ColumnSchema> {
-                let mut columns = <[_]>::into_vec(Box::new([#(#base_column_schema_entries),*]));
-                #(#embedded_schemas)*
+                let mut columns = Vec::new();
+                #(#expanded_schemas)*
                 #version_dynamic_schema_push
                 columns
             }
         }
-    } else {
-        quote! {}
     };
     let filter_trait = syn::Ident::new(&format!("{name}FilterExt"), name.span());
     let filter_methods = filters.iter().map(|filter| {

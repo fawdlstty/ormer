@@ -403,6 +403,23 @@ let users: Vec<User> = db
 
 关系字段不会参与表列映射；集合关系结果为空时返回空 `Vec`，单对象关系未找到目标时为 `None`。
 
+## 批量查询编排
+
+`batch` 顺序执行多个已构造查询，并按 tuple 结构返回结果；`batch_many` 顺序执行查询集合并返回 `Vec`。
+
+```rust
+let (users, orders): (Vec<User>, Vec<Order>) = db
+    .batch((
+        db.select::<User>().include(|u| u.roles),
+        db.select::<Order>().include(|o| o.items),
+    ))
+    .await?;
+
+let orders: Vec<Vec<Order>> = db.batch_many(order_queries).await?;
+```
+
+不会合并 SQL，也不会自动开启事务；需要事务时，在 `transaction` 闭包里使用 `tx.batch(...)`。
+
 ## 集合操作
 
 ### UNION / UNION ALL

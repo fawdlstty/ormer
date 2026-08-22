@@ -1846,6 +1846,85 @@ pub trait FieldTypeProvider {
     fn rust_type() -> Option<&'static str> {
         Self::RUST_TYPE
     }
+
+    fn model_columns(column: &'static str) -> Vec<&'static str> {
+        vec![column]
+    }
+
+    fn model_column_schema(column: ColumnSchema) -> Vec<ColumnSchema> {
+        vec![column]
+    }
+
+    fn model_has_column(
+        discriminator_column: &'static str,
+        rust_field: &'static str,
+        column: &str,
+    ) -> bool {
+        column == discriminator_column || column == rust_field
+    }
+
+    fn model_from_row(
+        _rust_field: &'static str,
+        discriminator_column: &'static str,
+        row: &Row,
+    ) -> crate::Result<Self>
+    where
+        Self: Sized + FromValue,
+    {
+        row.get(discriminator_column)
+    }
+
+    fn model_from_row_values(
+        _rust_field: &'static str,
+        _discriminator_column: &'static str,
+        values: &[Value],
+    ) -> crate::Result<Self>
+    where
+        Self: Sized + FromRowValues,
+    {
+        <Self as FromRowValues>::from_row_values(values)
+    }
+
+    fn model_field_values(&self) -> Vec<Value>
+    where
+        Self: Clone + Into<Value>,
+    {
+        vec![self.clone().into()]
+    }
+
+    fn model_column_value(
+        &self,
+        discriminator_column: &'static str,
+        rust_field: &'static str,
+        column: &str,
+    ) -> Option<Value>
+    where
+        Self: Clone + Into<Value>,
+    {
+        if Self::model_has_column(discriminator_column, rust_field, column) {
+            Some(self.clone().into())
+        } else {
+            None
+        }
+    }
+
+    fn model_assign_column_value(
+        &mut self,
+        discriminator_column: &'static str,
+        rust_field: &'static str,
+        column: &str,
+        value: Value,
+    ) -> crate::Result<bool>
+    where
+        Self: Sized + FromValue,
+    {
+        if Self::model_has_column(discriminator_column, rust_field, column) {
+            *self = <Self as FromValue>::from_value(&value)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 /// 去掉 schema 前缀，返回最后一段表名。

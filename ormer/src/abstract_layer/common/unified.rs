@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type TransactionFuture<'a, R> = Pin<Box<dyn Future<Output = crate::Result<R>> + Send + 'a>>;
+pub type BatchQueryFuture<'a, T> = Pin<Box<dyn Future<Output = crate::Result<T>> + Send + 'a>>;
 
 static SAVEPOINT_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -56,6 +57,117 @@ impl TransactionOptions {
         Self::new().isolation(IsolationLevel::Serializable)
     }
 }
+
+pub struct BatchFuture<'a, B> {
+    batch: B,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, B> BatchFuture<'a, B> {
+    pub(crate) fn new(batch: B) -> Self {
+        Self {
+            batch,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, B> std::future::IntoFuture for BatchFuture<'a, B>
+where
+    B: BatchQueries<'a> + Send + 'a,
+{
+    type Output = crate::Result<B::Output>;
+    type IntoFuture = BatchQueryFuture<'a, B::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        self.batch.into_batch_future()
+    }
+}
+
+pub struct BatchManyFuture<'a, Q> {
+    queries: Vec<Q>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, Q> BatchManyFuture<'a, Q> {
+    pub(crate) fn new<I>(queries: I) -> Self
+    where
+        I: IntoIterator<Item = Q>,
+    {
+        Self {
+            queries: queries.into_iter().collect(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, Q> std::future::IntoFuture for BatchManyFuture<'a, Q>
+where
+    Q: BatchQuery<'a> + Send + 'a,
+{
+    type Output = crate::Result<Vec<Q::Output>>;
+    type IntoFuture = BatchQueryFuture<'a, Vec<Q::Output>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(self.queries.len());
+            for query in self.queries {
+                results.push(query.into_batch_future().await?);
+            }
+            Ok(results)
+        })
+    }
+}
+
+pub trait BatchQuery<'a>: Sized {
+    type Output: Send + 'a;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output>;
+}
+
+pub trait BatchQueries<'a>: Sized {
+    type Output: Send + 'a;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output>;
+}
+
+macro_rules! impl_batch_tuple {
+    ($($name:ident => $var:ident),+ $(,)?) => {
+        impl<'a, $($name,)+> BatchQueries<'a> for ($($name,)+)
+        where
+            $($name: BatchQuery<'a> + Send + 'a,)+
+        {
+            type Output = ($($name::Output,)+);
+
+            fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+                let ($($var,)+) = self;
+                Box::pin(async move {
+                    $(
+                        let $var = $var.into_batch_future().await?;
+                    )+
+                    Ok(($($var,)+))
+                })
+            }
+        }
+    };
+}
+
+impl<'a> BatchQueries<'a> for () {
+    type Output = ();
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+impl_batch_tuple!(A => a);
+impl_batch_tuple!(A => a, B => b);
+impl_batch_tuple!(A => a, B => b, C => c);
+impl_batch_tuple!(A => a, B => b, C => c, D => d);
+impl_batch_tuple!(A => a, B => b, C => c, D => d, E => e);
+impl_batch_tuple!(A => a, B => b, C => c, D => d, E => e, F => f);
+impl_batch_tuple!(A => a, B => b, C => c, D => d, E => e, F => f, G => g);
+impl_batch_tuple!(A => a, B => b, C => c, D => d, E => e, F => f, G => g, H => h);
 
 // 根据启用的 feature 导入后端实现
 #[cfg(feature = "sqlite")]
@@ -1309,6 +1421,21 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrIgnoreExecutor::MSSQL(db.insert_or_ignore::<I>(models)),
         }
+    }
+
+    pub fn batch<'a, B>(&'a self, batch: B) -> BatchFuture<'a, B>
+    where
+        B: BatchQueries<'a>,
+    {
+        BatchFuture::new(batch)
+    }
+
+    pub fn batch_many<'a, I, Q>(&'a self, queries: I) -> BatchManyFuture<'a, Q>
+    where
+        I: IntoIterator<Item = Q>,
+        Q: BatchQuery<'a>,
+    {
+        BatchManyFuture::new(queries)
     }
 
     /// 根据主键查找单条记录
@@ -3620,6 +3747,21 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    pub fn batch<'b, B>(&'b self, batch: B) -> BatchFuture<'b, B>
+    where
+        B: BatchQueries<'b>,
+    {
+        BatchFuture::new(batch)
+    }
+
+    pub fn batch_many<'b, I, Q>(&'b self, queries: I) -> BatchManyFuture<'b, Q>
+    where
+        I: IntoIterator<Item = Q>,
+        Q: BatchQuery<'b>,
+    {
+        BatchManyFuture::new(queries)
+    }
+
     /// 创建分组聚合查询执行器
     pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         match self {
@@ -4473,6 +4615,165 @@ where
                 Ok(vec.into_iter().map(mapper).collect())
             }),
         }
+    }
+}
+
+impl<'a, T> BatchQuery<'a> for SelectExecutor<'a, T>
+where
+    T: Model + 'static + Send + Sync,
+{
+    type Output = Vec<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<T>>().await })
+    }
+}
+
+impl<'a, T> BatchQuery<'a> for FirstFuture<'a, T>
+where
+    T: Model + 'static + Send + Sync,
+{
+    type Output = Option<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        std::future::IntoFuture::into_future(self)
+    }
+}
+
+impl<'a, T, R> BatchQuery<'a> for AggregateFuture<'a, T, R>
+where
+    T: Model + 'static + Send,
+    R: crate::model::FromValue + 'static + Send,
+{
+    type Output = R;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        std::future::IntoFuture::into_future(self)
+    }
+}
+
+impl<'a, R> BatchQuery<'a> for DerivedTableSelectExecutor<'a, R>
+where
+    R: Model + crate::model::FromRowValues + 'static + Send,
+{
+    type Output = Vec<R>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<R>>().await })
+    }
+}
+
+impl<'a, T> BatchQuery<'a> for RawSelectExecutor<'a, T>
+where
+    T: crate::model::FromRowValues + 'static + Send,
+{
+    type Output = Vec<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<T>>().await })
+    }
+}
+
+impl<'a, T, R> BatchQuery<'a> for RelatedSelectExecutor<'a, T, R>
+where
+    T: Model + 'static + Send + Sync,
+    R: Model + 'static + Send + Sync,
+{
+    type Output = Vec<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<T>>().await })
+    }
+}
+
+impl<'a, T, J> BatchQuery<'a> for LeftJoinedSelectExecutor<'a, T, J>
+where
+    T: Model + 'static + Send,
+    J: Model + 'static + Send,
+{
+    type Output = Vec<(T, Option<J>)>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<(T, Option<J>)>>().await })
+    }
+}
+
+impl<'a, T, J> BatchQuery<'a> for InnerJoinedSelectExecutor<'a, T, J>
+where
+    T: Model + 'static + Send,
+    J: Model + 'static + Send,
+{
+    type Output = Vec<(T, J)>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<(T, J)>>().await })
+    }
+}
+
+impl<'a, T, J> BatchQuery<'a> for RightJoinedSelectExecutor<'a, T, J>
+where
+    T: Model + 'static + Send,
+    J: Model + 'static + Send,
+{
+    type Output = Vec<(Option<T>, J)>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<(Option<T>, J)>>().await })
+    }
+}
+
+impl<'a, T, V> BatchQuery<'a> for GroupedSelectExecutor<'a, T, V>
+where
+    T: Model + 'static + Send + Sync,
+    V: crate::model::FromRowValues + 'static + Send + Sync,
+{
+    type Output = Vec<V>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<V>>().await })
+    }
+}
+
+impl<'a, T, V> BatchQuery<'a> for MappedSelectExecutor<'a, T, V>
+where
+    T: Model + 'static + Send + Sync,
+    V: crate::model::FromRowValues + 'static + Send + Sync,
+{
+    type Output = Vec<V>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<V>>().await })
+    }
+}
+
+impl<'a, T, S> BatchQuery<'a> for IncludedSelectExecutor<'a, T, S>
+where
+    T: Model + 'static + Send + Sync,
+    S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync + 'a + 'static,
+    S::Target: Clone + 'static + Send + Sync,
+    S::Via: Send + Sync,
+{
+    type Output = Vec<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<T>>().await })
+    }
+}
+
+impl<'a, T, S1, S2> BatchQuery<'a> for DoubleIncludedSelectExecutor<'a, T, S1, S2>
+where
+    T: Model + 'static + Send + Sync,
+    S1: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync + 'a + 'static,
+    S2: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync + 'a + 'static,
+    S1::Target: Clone + 'static + Send + Sync,
+    S1::Via: Send + Sync,
+    S2::Target: Clone + 'static + Send + Sync,
+    S2::Via: Send + Sync,
+{
+    type Output = Vec<T>;
+
+    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
+        Box::pin(async move { self.collect::<Vec<T>>().await })
     }
 }
 

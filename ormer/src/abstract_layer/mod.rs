@@ -84,7 +84,8 @@ impl DbType {
 }
 
 pub use common::{
-    AggregateFuture, CollectFuture, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
+    AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
+    CollectFuture, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
     DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
     DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
     IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,

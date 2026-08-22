@@ -348,6 +348,34 @@ let active: Vec<User> = db
     .await?;
 ```
 
+A `ModelEnum` with named fields can be used as a polymorphic field inside a model. The model field column stores the discriminator value, and variant fields are flattened into nullable columns on the same table:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "documents"]
+struct Document {
+    #[primary]
+    id: i64,
+    title: String,
+    body: DocumentBody,
+}
+
+#[derive(Debug, Clone, PartialEq, ormer::ModelEnum)]
+#[db_type(String)]
+enum DocumentBody {
+    Article {
+        article_body: String,
+        article_word_count: i32,
+    },
+    Video {
+        video_url: String,
+        video_duration_seconds: i32,
+    },
+}
+```
+
+`#[db_type(String)]` stores the snake_case variant name as the discriminator value, so `Article` is stored as `"article"`. `Document::columns()` includes `body`, `article_body`, `article_word_count`, `video_url`, and `video_duration_seconds`; reading and writing `Document` automatically dispatches by the `body` column.
+
 For an existing numeric enum or wrapper type where you do not want to derive `FieldType`, use `#[data_type(i32)]`. A nullable field must use `#[data_type(Option<i32>)]`:
 
 ```rust

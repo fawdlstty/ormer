@@ -37,17 +37,18 @@ pub use migration::{
     feature = "mssql"
 ))]
 pub use abstract_layer::{
-    ConnectionPool, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
-    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
-    DoubleIncludedSelectExecutor, DropTableExecutor, InsertGraphExecutor, InsertPartialExecutor,
-    IsolationLevel, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    NestedInclude, PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor,
-    RawCollectFuture, RawSelectExecutor, RelationNestedLoader, ReplicatedConnectionPool,
-    ReplicatedDatabase, ReplicatedDatabaseBuilder, ReplicatedPoolBuilder, SaveExecutor,
-    ScopedDeleteExecutor, ScopedUpdateExecutor, SelectStream, SelectStreamIterator,
-    SingleSqlStatement, SqlExecutor, SqlStatement, Transaction, TransactionFuture,
-    TransactionInsertOrIgnoreExecutor, TransactionOptions, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor, TransactionSaveExecutor, UpdateGraphExecutor,
+    BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, ConnectionPool,
+    CreateTableExecutor, Database, DbExecutor, DeleteExecutor, DerivedTableCollectFuture,
+    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
+    DropTableExecutor, InsertGraphExecutor, InsertPartialExecutor, IsolationLevel,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
+    PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor, RawCollectFuture,
+    RawSelectExecutor, RelationNestedLoader, ReplicatedConnectionPool, ReplicatedDatabase,
+    ReplicatedDatabaseBuilder, ReplicatedPoolBuilder, SaveExecutor, ScopedDeleteExecutor,
+    ScopedUpdateExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
+    SqlStatement, Transaction, TransactionFuture, TransactionInsertOrIgnoreExecutor,
+    TransactionOptions, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    TransactionSaveExecutor, UpdateGraphExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};

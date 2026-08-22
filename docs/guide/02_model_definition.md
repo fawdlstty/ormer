@@ -346,6 +346,34 @@ let active: Vec<User> = db
     .await?;
 ```
 
+带具名字段的 `ModelEnum` 可作为模型内的多态字段。字段本身的列保存鉴别器值，变体字段会平铺为同一张表的可空列：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "documents"]
+struct Document {
+    #[primary]
+    id: i64,
+    title: String,
+    body: DocumentBody,
+}
+
+#[derive(Debug, Clone, PartialEq, ormer::ModelEnum)]
+#[db_type(String)]
+enum DocumentBody {
+    Article {
+        article_body: String,
+        article_word_count: i32,
+    },
+    Video {
+        video_url: String,
+        video_duration_seconds: i32,
+    },
+}
+```
+
+`#[db_type(String)]` 使用 snake_case 变体名作为鉴别器值，例如 `Article` 存为 `"article"`。`Document::columns()` 会包含 `body`、`article_body`、`article_word_count`、`video_url` 和 `video_duration_seconds`；读写 `Document` 时会按 `body` 列自动分发到对应 enum 变体。
+
 如果已有数值枚举或包装类型且不想派生 `FieldType`，可以用 `#[data_type(i32)]` 指定数据库类型。可空字段必须同时使用 `#[data_type(Option<i32>)]`：
 
 ```rust

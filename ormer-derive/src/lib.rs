@@ -46,13 +46,13 @@ pub fn derive_view_model(input: TokenStream) -> TokenStream {
     model::derive_view_model(input).into()
 }
 
-#[proc_macro_derive(ModelEnum)]
+#[proc_macro_derive(ModelEnum, attributes(db_type, column))]
 pub fn derive_model_enum(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model_enum::derive_model_enum(input).into()
 }
 
-#[proc_macro_derive(FieldType)]
+#[proc_macro_derive(FieldType, attributes(db_type, column))]
 pub fn derive_field_type(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
     model_enum::derive_field_type(input).into()

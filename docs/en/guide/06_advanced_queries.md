@@ -403,6 +403,23 @@ let users: Vec<User> = db
 
 Relation fields are excluded from column mapping. Empty collection relations return an empty `Vec`, while missing single-object relations return `None`.
 
+## Batch Query Orchestration
+
+`batch` executes already-built queries in order and returns the same tuple shape. `batch_many` executes a query collection in order and returns a `Vec`.
+
+```rust
+let (users, orders): (Vec<User>, Vec<Order>) = db
+    .batch((
+        db.select::<User>().include(|u| u.roles),
+        db.select::<Order>().include(|o| o.items),
+    ))
+    .await?;
+
+let orders: Vec<Vec<Order>> = db.batch_many(order_queries).await?;
+```
+
+SQL is not merged, and no transaction is opened automatically. Use `tx.batch(...)` inside a `transaction` closure when a transaction is required.
+
 ## Set Operations
 
 ### UNION / UNION ALL

@@ -17,19 +17,20 @@ pub use stream_connection::StreamConnection;
 /// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
 mod unified;
 pub use unified::{
-    AggregateFuture, CollectFuture, CreateTableExecutor, Database, DeleteExecutor,
-    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
-    DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
-    IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,
-    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel,
-    LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
-    ModelCollectWithFuture, NestedInclude, RawCollectFuture, RawSelectExecutor,
-    RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
-    ReplicatedDatabaseBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
-    SelectExecutor, SelectStream, SelectStreamIterator, Transaction, TransactionFuture,
-    TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor, TransactionSaveExecutor, UpdateExecutor, UpdateGraphExecutor,
+    AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
+    CollectFuture, CreateTableExecutor, Database, DeleteExecutor, DerivedTableCollectFuture,
+    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
+    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
+    IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor,
+    InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture,
+    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    NestedInclude, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder,
+    SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
+    SelectStreamIterator, Transaction, TransactionFuture, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
+    UpdateExecutor, UpdateGraphExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
@@ -122,4 +123,19 @@ pub trait DbExecutor {
     fn select<T: crate::model::Model>(&self) -> SelectExecutor<'_, T>;
 
     fn select_column<T: crate::model::Model, V>(&self) -> GroupedSelectExecutor<'_, T, V>;
+
+    fn batch<'a, B>(&'a self, batch: B) -> BatchFuture<'a, B>
+    where
+        B: BatchQueries<'a>,
+    {
+        BatchFuture::new(batch)
+    }
+
+    fn batch_many<'a, I, Q>(&'a self, queries: I) -> BatchManyFuture<'a, Q>
+    where
+        I: IntoIterator<Item = Q>,
+        Q: BatchQuery<'a>,
+    {
+        BatchManyFuture::new(queries)
+    }
 }
