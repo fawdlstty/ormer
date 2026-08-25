@@ -367,6 +367,8 @@ impl FilterFormatter {
                     crate::DbType::Sqlite => format!("{} MATCH {}", expr_sql, query_sql),
                     #[cfg(feature = "mssql")]
                     crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
+                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+                    _ => format!("{} LIKE {}", expr_sql, query_sql),
                 };
                 write!(sql, "{sql_fragment}")
                     .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));

@@ -6,6 +6,8 @@
 - PostgreSQL
 - MySQL
 - MSSQL
+- DuckDB (SQL type mapping only; connection execution is not implemented yet)
+- ClickHouse (SQL type mapping only; connection execution is not implemented yet)
 
 ## Enable Features
 
@@ -29,6 +31,17 @@ ormer = { version = "0.2", features = ["sqlite"] }
 
 **MSSQL:**
 - `mssql://user:password@localhost/dbname`
+
+**DuckDB:**
+- `app.duckdb`
+
+**ClickHouse:**
+- `http://localhost:8123?database=default`
+
+The DuckDB and ClickHouse features are available for dialect/type generation.
+Because a verified async connection, transaction, and streaming adapter is not
+available yet, `Database::connect` returns `UnsupportedFeature` instead of
+pretending that a connection was established.
 
 ## Example
 

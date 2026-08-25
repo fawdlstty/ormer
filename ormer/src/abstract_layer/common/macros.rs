@@ -501,6 +501,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                 }
             }
 
@@ -521,6 +523,10 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.append_filter_expr(expr))
+                    }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.append_filter_expr(expr))
                     }
                 }
             }
@@ -546,6 +552,10 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.with_context_filters(filters))
                     }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.with_context_filters(filters))
+                    }
                 }
             }
 
@@ -563,6 +573,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.without_filter(name)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.without_filter(name)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.without_filter(name)),
                 }
             }
 
@@ -581,6 +593,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter_dynamic(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter_dynamic(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter_dynamic(f)),
                 }
             }
 
@@ -606,6 +620,10 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.route_table(key, value))
                     }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.route_table(key, value))
+                    }
                 }
             }
 
@@ -627,6 +645,10 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.with_table_route(route))
                     }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.with_table_route(route))
+                    }
                 }
             }
 
@@ -646,6 +668,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by(f)),
                 }
             }
 
@@ -665,6 +689,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_desc(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_desc(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by_desc(f)),
                 }
             }
 
@@ -685,6 +711,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.order_by_dynamic(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_dynamic(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by_dynamic(f)),
                 }
             }
 
@@ -704,6 +732,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.cursor_by(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.cursor_by(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.cursor_by(f)),
                 }
             }
 
@@ -722,6 +752,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.after(cursor)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.after(cursor)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.after(cursor)),
                 }
             }
 
@@ -740,6 +772,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.before(cursor)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.before(cursor)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.before(cursor)),
                 }
             }
 
@@ -755,6 +789,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.limit(limit)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.limit(limit)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.limit(limit)),
                 }
             }
 
@@ -770,6 +806,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
                 }
             }
 
@@ -794,6 +832,10 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.descendants(f, root_id))
+                    }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.descendants(f, root_id))
                     }
                 }
             }
@@ -820,6 +862,10 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => {
                         $executor_name::MSSQL(exec.ancestors(f, leaf_id))
                     }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.ancestors(f, leaf_id))
+                    }
                 }
             }
 
@@ -836,6 +882,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => exec.fetch_page().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.fetch_page().await,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.fetch_page().await,
                 }
             }
 
@@ -850,6 +898,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.distinct()),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.distinct()),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.distinct()),
                 }
             }
 
@@ -867,6 +917,8 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.ignore(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.ignore(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.ignore(f)),
                 }
             }
         }
@@ -894,6 +946,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                 }
             }
 
@@ -911,6 +965,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.model(model)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.model(model)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.model(model)),
                 }
             }
 
@@ -924,6 +980,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.to_sql(),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.to_sql(),
                 }
             }
 
@@ -937,6 +995,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.execute().await,
                 }
             }
 
@@ -990,6 +1050,8 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MySQL(exec) => exec.returning().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.returning().await,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.returning().await,
                 }
             }
         }
@@ -1027,6 +1089,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                 }
             }
 
@@ -1045,6 +1109,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.set(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.set(f)),
                 }
             }
 
@@ -1081,6 +1147,10 @@ macro_rules! impl_unified_update_executor {
                         #[cfg(feature = "mssql")]
                         $executor_name::MSSQL(exec) => {
                             result = $executor_name::MSSQL(exec.set_model(model_ref));
+                        }
+                        #[cfg(feature = "duckdb")]
+                        $executor_name::DuckDB(exec) => {
+                            result = $executor_name::DuckDB(exec.set_model(model_ref));
                         }
                     }
                 }
@@ -1122,6 +1192,11 @@ macro_rules! impl_unified_update_executor {
                             result =
                                 $executor_name::MSSQL(exec.set_model_fields(model_ref, &fields));
                         }
+                        #[cfg(feature = "duckdb")]
+                        $executor_name::DuckDB(exec) => {
+                            result =
+                                $executor_name::DuckDB(exec.set_model_fields(model_ref, &fields));
+                        }
                     }
                 }
                 result
@@ -1137,6 +1212,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.to_sql(),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.to_sql(),
                 }
             }
 
@@ -1150,6 +1227,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.execute().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.execute().await,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.execute().await,
                 }
             }
 
@@ -1203,6 +1282,8 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MySQL(exec) => exec.returning().await,
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => exec.returning().await,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => exec.returning().await,
                 }
             }
         }
@@ -1243,6 +1324,8 @@ macro_rules! impl_unified_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "duckdb")]
+                    $future_name::DuckDB(future) => Box::pin(future.into_future()),
                 }
             }
         }
@@ -1273,6 +1356,8 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::MySQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(async move { future.await }),
+                    #[cfg(feature = "duckdb")]
+                    $future_name::DuckDB(future) => Box::pin(async move { future.await }),
                 }
             }
         }
@@ -1300,6 +1385,8 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                 }
             }
 
@@ -1317,6 +1404,8 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
                 }
             }
         }
@@ -1347,6 +1436,8 @@ macro_rules! impl_unified_join_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "duckdb")]
+                    $future_name::DuckDB(future) => Box::pin(future.into_future()),
                 }
             }
         }
@@ -1374,6 +1465,8 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.filter(f)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                 }
             }
 
@@ -1391,6 +1484,8 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MySQL(exec) => $executor_name::MySQL(exec.range(range)),
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
                 }
             }
 
@@ -1415,6 +1510,10 @@ macro_rules! impl_unified_related_select_executor {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => {
                         RelatedCollectFuture::MSSQL(exec.into_collect_future())
+                    }
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(exec) => {
+                        RelatedCollectFuture::DuckDB(exec.into_collect_future())
                     }
                 }
             }
@@ -1448,6 +1547,8 @@ macro_rules! impl_unified_related_collect_future {
                     $future_name::MySQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "mssql")]
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "duckdb")]
+                    $future_name::DuckDB(future) => Box::pin(future.into_future()),
                 }
             }
         }

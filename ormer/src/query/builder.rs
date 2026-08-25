@@ -178,6 +178,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "NULL".to_string(),
         };
     }
 
@@ -197,6 +199,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS INT)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "0".to_string(),
         },
         "i64" | "u64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -207,6 +211,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "0".to_string(),
         },
         "f32" | "f64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -217,6 +223,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0.0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS FLOAT)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "0.0".to_string(),
         },
         "bool" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -227,6 +235,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "FALSE".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIT)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "FALSE".to_string(),
         },
         "Duration" | "std::time::Duration" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -237,6 +247,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "0".to_string(),
         },
         "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
             quote_sql_string("")
@@ -250,6 +262,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "X''".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('' AS VARBINARY(MAX))".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "NULL".to_string(),
         },
         "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -260,6 +274,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "NULL".to_string(),
         },
         "Vec<i64>"
         | "std::vec::Vec<i64>"
@@ -275,6 +291,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => "NULL".to_string(),
         },
         "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -285,6 +303,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDateTime" | "chrono::NaiveDateTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -295,6 +315,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDate" | "chrono::NaiveDate" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -305,6 +327,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01' AS DATE)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01' AS DATE)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("1970-01-01"),
         },
         "NaiveTime" | "chrono::NaiveTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -315,6 +339,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('00:00:00' AS TIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('00:00:00' AS TIME)".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("00:00:00"),
         },
         "JsonValue" | "serde_json::Value" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -325,6 +351,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('null' AS JSON)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => quote_sql_string("null"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("null"),
         },
         "Uuid" | "uuid::Uuid" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -339,6 +367,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => {
                 "CAST('00000000-0000-0000-0000-000000000000' AS UNIQUEIDENTIFIER)".to_string()
             }
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => quote_sql_string("00000000-0000-0000-0000-000000000000"),
         },
         _ => quote_sql_string(""),
     }
@@ -3045,6 +3075,10 @@ impl<T: Model> Select<T> {
         let with_recursive = match db_type {
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "WITH",
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => "WITH",
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => "WITH",
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => "WITH RECURSIVE",
             #[cfg(feature = "postgresql")]

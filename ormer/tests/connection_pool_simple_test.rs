@@ -44,6 +44,22 @@ async fn test_pool_basic_impl(
                 .build()
                 .await?
         }
+        #[cfg(feature = "duckdb")]
+        ormer::DbType::DuckDB => {
+            return Err(ormer::OrmerError::UnsupportedFeature {
+                backend: ormer::DbType::DuckDB,
+                feature: "ConnectionPool",
+            }
+            .into());
+        }
+        #[cfg(feature = "clickhouse")]
+        ormer::DbType::ClickHouse => {
+            return Err(ormer::OrmerError::UnsupportedFeature {
+                backend: ormer::DbType::ClickHouse,
+                feature: "ConnectionPool",
+            }
+            .into());
+        }
     };
 
     println!("Pool created successfully");

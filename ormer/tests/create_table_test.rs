@@ -53,6 +53,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
 
         let db_type_name = match config.0 {
@@ -64,6 +68,10 @@ mod create_table_tests {
             ormer::DbType::MySQL => "MySQL",
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => "MSSQL",
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => "DuckDB",
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => "ClickHouse",
         };
         println!("{} SQL: {}", db_type_name, sql);
         Ok(())
@@ -110,6 +118,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
         Ok(())
     }
@@ -155,6 +167,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
         Ok(())
     }
@@ -257,6 +273,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
         Ok(())
     }
@@ -306,6 +326,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
         Ok(())
     }
@@ -348,6 +372,10 @@ mod create_table_tests {
             }
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => {}
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => {}
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => {}
         }
 
         let db_type_name = match config.0 {
@@ -359,6 +387,10 @@ mod create_table_tests {
             ormer::DbType::MySQL => "MySQL",
             #[cfg(feature = "mssql")]
             ormer::DbType::MSSQL => "MSSQL",
+            #[cfg(feature = "duckdb")]
+            ormer::DbType::DuckDB => "DuckDB",
+            #[cfg(feature = "clickhouse")]
+            ormer::DbType::ClickHouse => "ClickHouse",
         };
         println!("{} Complete Types SQL: {}", db_type_name, sql);
         Ok(())

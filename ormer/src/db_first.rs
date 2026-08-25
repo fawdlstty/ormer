@@ -1,4 +1,5 @@
 use crate::abstract_layer::DbType;
+use crate::model::{ForeignKeyAction, Model};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +19,7 @@ pub struct DbFirstColumn {
     pub primary_key: bool,
     pub auto_increment: bool,
     pub enum_variants: Vec<String>,
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +44,244 @@ pub struct DbFirstForeignKey {
     pub ref_column: String,
     pub on_delete: Option<String>,
     pub on_update: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_model_constraints<T: Model>(
+    db_type: DbType,
+    actual: &DbFirstTable,
+) -> crate::Result<()> {
+    let mut expected_unique = BTreeMap::<i32, (Option<&str>, Vec<&str>)>::new();
+    let mut expected_indexes = BTreeMap::<i32, (Option<&str>, Vec<(&str, bool)>)>::new();
+    let mut ungrouped_index = i32::MIN;
+    for column in T::COLUMN_SCHEMA {
+        if let Some(group) = column.unique_group {
+            let entry = expected_unique
+                .entry(group)
+                .or_insert_with(|| (column.unique_name, Vec::new()));
+            entry.1.push(column.name);
+        }
+        if column.is_indexed {
+            let group = column.index_group.unwrap_or_else(|| {
+                let value = ungrouped_index;
+                ungrouped_index += 1;
+                value
+            });
+            let entry = expected_indexes
+                .entry(group)
+                .or_insert_with(|| (column.index_name, Vec::new()));
+            entry
+                .1
+                .push((column.name, column.index_order == Some("DESC")));
+        }
+    }
+
+    for column in T::COLUMN_SCHEMA {
+        let expected_default = column
+            .default
+            .map(|default| normalize_default(&default.to_sql(db_type)));
+        let actual_column = actual
+            .columns
+            .iter()
+            .find(|actual| actual.name == column.name);
+        let actual_default = actual_column
+            .and_then(|actual| actual.default.as_deref())
+            .map(normalize_default);
+        if actual_column.is_some_and(|actual| actual.auto_increment) && expected_default.is_none() {
+            continue;
+        }
+        if expected_default != actual_default {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: Default value mismatch for '{}': expected {:?}, but actual is {:?}",
+                T::TABLE_NAME,
+                column.name,
+                expected_default,
+                actual_default
+            ));
+        }
+    }
+
+    let actual_unique = actual
+        .indexes
+        .iter()
+        .filter(|index| index.unique)
+        .collect::<Vec<_>>();
+    if actual_unique.len() != expected_unique.len() {
+        return Err(crate::ormer_error!(
+            "Schema mismatch: table {}, reason: Unique constraint count mismatch: expected {}, but actual is {}",
+            T::TABLE_NAME,
+            expected_unique.len(),
+            actual_unique.len()
+        ));
+    }
+    for (name, columns) in expected_unique.values() {
+        let found = actual_unique.iter().any(|index| {
+            constraint_name_matches(db_type, *name, &index.name)
+                && index
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .eq(columns.iter().copied())
+        });
+        if !found {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: Unique constraint mismatch for columns ({})",
+                T::TABLE_NAME,
+                columns.join(", ")
+            ));
+        }
+    }
+
+    if supports_enum_variants(db_type) {
+        for (name, expected_variants) in T::COLUMN_SCHEMA
+            .iter()
+            .filter_map(|column| column.enum_variants.map(|variants| (column.name, variants)))
+        {
+            let Some(actual_column) = actual.columns.iter().find(|column| column.name == name)
+            else {
+                continue;
+            };
+            let actual_variants = actual_column
+                .enum_variants
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if actual_variants != expected_variants {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Enum variants mismatch for '{}'",
+                    T::TABLE_NAME,
+                    name
+                ));
+            }
+        }
+    }
+
+    let actual_indexes = actual
+        .indexes
+        .iter()
+        .filter(|index| !index.unique)
+        .collect::<Vec<_>>();
+    if actual_indexes.len() != expected_indexes.len() {
+        return Err(crate::ormer_error!(
+            "Schema mismatch: table {}, reason: Index count mismatch: expected {}, but actual is {}",
+            T::TABLE_NAME,
+            expected_indexes.len(),
+            actual_indexes.len()
+        ));
+    }
+    for (name, columns) in expected_indexes.values() {
+        let found = actual_indexes.iter().any(|index| {
+            name.map_or(true, |expected| expected == index.name.as_str())
+                && index.columns.len() == columns.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(columns)
+                    .all(|(actual, (expected, descending))| {
+                        actual.name == *expected && actual.descending == *descending
+                    })
+        });
+        if !found {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: Index mismatch for columns ({})",
+                T::TABLE_NAME,
+                columns
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+
+    let expected_foreign_keys = T::COLUMN_SCHEMA
+        .iter()
+        .filter_map(|column| {
+            column
+                .foreign_key
+                .as_ref()
+                .map(|foreign_key| (column.name, foreign_key))
+        })
+        .collect::<Vec<_>>();
+    if actual.foreign_keys.len() != expected_foreign_keys.len() {
+        return Err(crate::ormer_error!(
+            "Schema mismatch: table {}, reason: Foreign key count mismatch: expected {}, but actual is {}",
+            T::TABLE_NAME,
+            expected_foreign_keys.len(),
+            actual.foreign_keys.len()
+        ));
+    }
+    for (column, expected) in expected_foreign_keys {
+        let expected_table = crate::model::normalize_table_name_for_db(db_type, expected.ref_table);
+        let expected_ref_column = expected.get_ref_column();
+        let found = actual.foreign_keys.iter().any(|foreign_key| {
+            let table_matches =
+                if let Some((expected_schema, expected_name)) = expected_table.rsplit_once('.') {
+                    foreign_key.ref_schema.as_deref() == Some(expected_schema)
+                        && foreign_key.ref_table == expected_name
+                } else {
+                    foreign_key.ref_table == expected_table
+                };
+            foreign_key.column == column
+                && table_matches
+                && foreign_key.ref_column == expected_ref_column
+                && foreign_key_action_matches(expected.on_delete, foreign_key.on_delete.as_deref())
+                && foreign_key_action_matches(expected.on_update, foreign_key.on_update.as_deref())
+        });
+        if !found {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: Foreign key mismatch for '{}'",
+                T::TABLE_NAME,
+                column
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn foreign_key_action_matches(expected: Option<ForeignKeyAction>, actual: Option<&str>) -> bool {
+    expected.map_or(true, |expected| {
+        actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected.as_sql()))
+    })
+}
+
+#[allow(dead_code)]
+#[allow(unused_variables)]
+fn constraint_name_matches(db_type: DbType, expected: Option<&str>, actual: &str) -> bool {
+    #[cfg(feature = "sqlite")]
+    if matches!(db_type, DbType::Sqlite) {
+        return true;
+    }
+    expected.map_or(true, |expected| expected == actual)
+}
+
+#[allow(dead_code)]
+fn supports_enum_variants(db_type: DbType) -> bool {
+    let _ = db_type;
+    #[cfg(feature = "postgresql")]
+    if matches!(db_type, DbType::PostgreSQL) {
+        return true;
+    }
+    #[cfg(feature = "mysql")]
+    if matches!(db_type, DbType::MySQL) {
+        return true;
+    }
+    false
+}
+
+fn normalize_default(value: &str) -> String {
+    let mut value = value.trim().to_ascii_uppercase();
+    while value.starts_with('(') && value.ends_with(')') && value.len() >= 2 {
+        value = value[1..value.len() - 1].trim().to_string();
+    }
+    if let Some((expression, _type_name)) = value.split_once("::") {
+        value = expression.trim().to_string();
+    }
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value = value[1..value.len() - 1].replace("''", "'");
+    }
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +616,8 @@ fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> String {
         DbType::MySQL => mysql_rust_type(&lower),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => mssql_rust_type(&lower),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => "String".to_string(),
     }
 }
 

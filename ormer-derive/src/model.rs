@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{DeriveInput, Lit, Meta};
+use syn::{DeriveInput, Lit, Meta, spanned::Spanned};
 
 pub fn derive_model(input: DeriveInput) -> TokenStream {
     let name = &input.ident;
@@ -191,6 +191,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             // 检查 compress 属性
             let compress = info.compress;
+            let compression = &info.compression;
 
             let enum_variants = if has_data_type {
                 quote! { None }
@@ -235,6 +236,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     check: #check,
                     hypertable: #hypertable,
                     compress: #compress,
+                    compression: #compression,
                 }
             }
         })
@@ -265,6 +267,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 check: None,
                 hypertable: None,
                 compress: false,
+                compression: None,
             }
         }
     });
@@ -1340,7 +1343,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             columns.push(#entry);
         }
     });
-    let expanded_columns = normal_fields.iter().map(|info| {
+    let expanded_columns: Vec<_> = normal_fields.iter().map(|info| {
         if info.has_data_type {
             let column_name = &info.column_name;
             quote! {
@@ -1363,7 +1366,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 );
             }
         }
-    });
+    }).collect();
     let dynamic_columns_method = {
         quote! {
             fn columns() -> Vec<&'static str> {
@@ -1374,17 +1377,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             }
         }
     };
-    let expanded_schemas =
-        normal_fields
-            .iter()
-            .zip(base_column_schema_entries.iter())
-            .map(|(info, base_schema)| {
-                if info.has_data_type {
-                    let base_schema = base_schema.clone();
-                    quote! {
-                        columns.push(#base_schema);
-                    }
-                } else if let Some(embed) = &info.embed {
+    let mut base_schema_index = 0usize;
+    let expanded_schemas: Vec<_> = normal_fields
+        .iter()
+        .map(|info| {
+            if let Some(embed) = &info.embed {
                 let field_type = info.field_type;
                 let field_name = info.field_name.to_string();
                 let prefix = &embed.prefix;
@@ -1411,13 +1408,20 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                             default: None,
                             check: None,
                             hypertable: None,
-                            compress: false,
+                            compress: schema.compress,
+                            compression: schema.compression,
                         });
                     }
                 }
+            } else {
+                let base_schema = base_column_schema_entries[base_schema_index].clone();
+                base_schema_index += 1;
+                if info.has_data_type {
+                    quote! {
+                        columns.push(#base_schema);
+                    }
                 } else {
                     let field_type = info.field_type;
-                    let base_schema = base_schema.clone();
                     quote! {
                         columns.extend(
                             <#field_type as ::ormer::model::FieldTypeProvider>::model_column_schema(
@@ -1426,7 +1430,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                         );
                     }
                 }
-            });
+            }
+        })
+        .collect();
     let dynamic_column_schema_method = {
         quote! {
             fn column_schema() -> Vec<::ormer::model::ColumnSchema> {
@@ -1872,6 +1878,8 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         let field_type = info.field_type;
         let rust_type = &info.rust_type;
         let is_nullable = info.is_nullable;
+        let compress = info.compress;
+        let compression = &info.compression;
         let data_type = &info.data_type;
         let enum_variants = if info.has_data_type {
             quote! { None }
@@ -1902,6 +1910,8 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
                 enum_variants: #enum_variants,
                 data_type: #data_type,
                 db_value_type: #db_value_type,
+                compress: #compress,
+                compression: #compression,
             }
         }
     });
@@ -2233,6 +2243,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                     check: None,
                     hypertable: None,
                     compress: false,
+                    compression: None,
                 }
             }
         })
@@ -2614,6 +2625,7 @@ struct FieldInfo<'a> {
     hypertable: proc_macro2::TokenStream,
     hypertable_route: bool,
     compress: bool,
+    compression: proc_macro2::TokenStream,
     is_ignored: bool,
     normal_index: Option<usize>,
 }
@@ -2708,10 +2720,14 @@ impl<'a> FieldInfo<'a> {
             check: extract_check(field),
             hypertable: hypertable.duration,
             hypertable_route: hypertable.route,
-            compress: field
-                .attrs
-                .iter()
-                .any(|attr| attr.path().is_ident("compress")),
+            compress: extract_compress_attr(field).is_some(),
+            compression: extract_compress_attr(field)
+                .map(|algorithm| {
+                    quote! {
+                        Some(::ormer::model::CompressionAlgorithm::#algorithm)
+                    }
+                })
+                .unwrap_or_else(|| quote! { None }),
             is_ignored: field
                 .attrs
                 .iter()
@@ -2743,6 +2759,37 @@ fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
         }
     }
     (false, false)
+}
+
+fn extract_compress_attr(field: &syn::Field) -> Option<syn::Ident> {
+    let Some(attr) = field
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("compress"))
+    else {
+        return None;
+    };
+
+    let algorithm = match &attr.meta {
+        Meta::Path(_) => "pglz".to_string(),
+        Meta::List(list) => list.tokens.to_string().trim().to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    let variant = match algorithm.as_str() {
+        "pglz" => "Pglz",
+        "lz4" => "Lz4",
+        "zlib" => "Zlib",
+        "zstd" => "Zstd",
+        _ => panic!(
+            "unsupported #[compress] algorithm `{}`; expected pglz, lz4, zlib, or zstd",
+            if algorithm.is_empty() {
+                "<empty>"
+            } else {
+                algorithm.as_str()
+            }
+        ),
+    };
+    Some(syn::Ident::new(variant, attr.span()))
 }
 
 fn relation_default_expr(relation: Option<&RelationField>) -> Option<proc_macro2::TokenStream> {

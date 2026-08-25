@@ -36,6 +36,10 @@ async fn test_data_type_override_impl(
         ormer::DbType::MSSQL => {
             assert!(sql.contains("big_count BIGINT NOT NULL"));
         }
+        #[cfg(feature = "duckdb")]
+        ormer::DbType::DuckDB => {}
+        #[cfg(feature = "clickhouse")]
+        ormer::DbType::ClickHouse => {}
     }
 
     Ok(())

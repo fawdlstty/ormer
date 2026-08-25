@@ -80,3 +80,7 @@ for migration in history {
 ```
 
 SQLite cannot add a foreign key after table creation; `MigrationStep::AddForeignKey` returns an error on SQLite.
+
+`migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
+
+Model `#[compress(...)]` attributes are included in schema validation and migration. PostgreSQL uses column-level `SET COMPRESSION`; MySQL uses the table-level `COMPRESSION` option, so all compressed columns in one MySQL table must use the same algorithm.

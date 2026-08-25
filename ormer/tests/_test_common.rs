@@ -148,6 +148,10 @@ macro_rules! test_on_all_dbs {
                         ormer::DbType::MySQL => "MySQL",
                         #[cfg(feature = "mssql")]
                         ormer::DbType::MSSQL => "MSSQL",
+                        #[cfg(feature = "duckdb")]
+                        ormer::DbType::DuckDB => "DuckDB",
+                        #[cfg(feature = "clickhouse")]
+                        ormer::DbType::ClickHouse => "ClickHouse",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);
@@ -178,6 +182,10 @@ macro_rules! test_on_all_dbs_result {
                         ormer::DbType::MySQL => "MySQL",
                         #[cfg(feature = "mssql")]
                         ormer::DbType::MSSQL => "MSSQL",
+                        #[cfg(feature = "duckdb")]
+                        ormer::DbType::DuckDB => "DuckDB",
+                        #[cfg(feature = "clickhouse")]
+                        ormer::DbType::ClickHouse => "ClickHouse",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);

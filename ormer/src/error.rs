@@ -152,6 +152,14 @@ impl OrmerError {
         if type_name.contains("tiberius") {
             return Self::database(DbType::MSSQL, message);
         }
+        #[cfg(feature = "clickhouse")]
+        if type_name.contains("clickhouse") {
+            return Self::database(DbType::ClickHouse, message);
+        }
+        #[cfg(feature = "duckdb")]
+        if type_name.contains("duckdb") || type_name.contains("duckcompat") {
+            return Self::database(DbType::DuckDB, message);
+        }
 
         Self::other(message)
     }
@@ -306,6 +314,20 @@ impl From<tiberius::error::Error> for OrmerError {
     }
 }
 
+#[cfg(feature = "clickhouse")]
+impl From<clickhouse::error::Error> for OrmerError {
+    fn from(error: clickhouse::error::Error) -> Self {
+        Self::from_external("clickhouse::error::Error", error)
+    }
+}
+
+#[cfg(feature = "duckdb")]
+impl From<crate::abstract_layer::duckdb_backend::duckcompat::Error> for OrmerError {
+    fn from(error: crate::abstract_layer::duckdb_backend::duckcompat::Error) -> Self {
+        Self::from_external("duckdb::Error", error)
+    }
+}
+
 fn backend_name(backend: DbType) -> &'static str {
     match backend {
         #[cfg(feature = "sqlite")]
@@ -316,6 +338,10 @@ fn backend_name(backend: DbType) -> &'static str {
         DbType::MySQL => "MySQL",
         #[cfg(feature = "mssql")]
         DbType::MSSQL => "MSSQL",
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => "DuckDB",
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => "ClickHouse",
     }
 }
 

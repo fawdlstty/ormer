@@ -27,7 +27,9 @@ use tokio_postgres::NoTls;
     feature = "sqlite",
     feature = "postgresql",
     feature = "mysql",
-    feature = "mssql"
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
 ))]
 use super::unified::{
     CreateTableExecutor, DropTableExecutor, RelationNestedLoader, ScopedDeleteExecutor,
@@ -607,6 +609,10 @@ impl ManualPool {
                 .await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => Err(crate::ormer_error!(
+                "connection pools for DuckDB and ClickHouse are not implemented"
+            )),
         }
     }
 
@@ -766,6 +772,10 @@ impl PoolBuilder {
                 }
                 Ok(ConnectionPool::MSSQL(pool))
             }
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => Err(crate::ormer_error!(
+                "connection pools for DuckDB and ClickHouse are not implemented"
+            )),
         }
     }
 }

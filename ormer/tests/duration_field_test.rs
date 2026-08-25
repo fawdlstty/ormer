@@ -33,6 +33,10 @@ async fn test_duration_sql_type_impl(
         ormer::DbType::MSSQL => {
             assert!(sql.contains("duration BIGINT NOT NULL"));
         }
+        #[cfg(feature = "duckdb")]
+        ormer::DbType::DuckDB => {}
+        #[cfg(feature = "clickhouse")]
+        ormer::DbType::ClickHouse => {}
     }
 
     Ok(())

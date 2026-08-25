@@ -23,6 +23,8 @@ pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
         DbType::Sqlite => "?".to_string(),
         #[cfg(feature = "mysql")]
         DbType::MySQL => "?".to_string(),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => "?".to_string(),
     }
 }
 
@@ -256,6 +258,10 @@ pub fn bind_param_limit(db_type: DbType) -> usize {
         DbType::MySQL => 65_535,
         #[cfg(feature = "mssql")]
         DbType::MSSQL => 2_100,
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => 65_535,
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => 65_535,
     }
 }
 
@@ -709,6 +715,10 @@ fn build_bulk_model_update_sql<T: Model>(
         DbType::MSSQL => {
             build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
         }
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => Err(crate::ormer_error!(
+            "bulk model update is not implemented for this backend"
+        )),
     }
 }
 
@@ -816,6 +826,8 @@ fn incoming_column_sql(db_type: DbType, column: &str) -> String {
         DbType::MySQL => format!("VALUES({})", quote_identifier(db_type, column)),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => quote_column_with_prefix(db_type, "source", column),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => quote_column_with_prefix(db_type, "excluded", column),
     }
 }
 
@@ -1391,6 +1403,8 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
                 format!("{sql}{output}")
             }
         }
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => sql,
     }
 }
 
@@ -1676,6 +1690,10 @@ fn append_insert_conflict_clause<T: Model>(
         #[cfg(feature = "mssql")]
         DbType::MSSQL => Err(crate::ormer_error!(
             "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
+        )),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => Err(crate::ormer_error!(
+            "insert conflict handling is not implemented for this backend"
         )),
     }
 }

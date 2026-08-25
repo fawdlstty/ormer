@@ -31,7 +31,8 @@ struct User {
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表时间分片时长
 - `#[hypertable]` - 标注 `String` 字段作为 PostgreSQL/TimescaleDB 字符串拆表键
-- `#[compress]` - PostgreSQL 列级压缩（生成 `COMPRESSION pglz`）
+- `#[compress]` - 列压缩，默认使用 PostgreSQL `pglz`
+- `#[compress(lz4)]` - 指定压缩算法；PostgreSQL 按列生成 `COMPRESSION lz4`，MySQL 按表生成 `COMPRESSION='LZ4'`
 - `#[filter(filter_name, |m, ...| ...)]` - 模型级可复用过滤器，名称必须以 `filter_` 开头
 - `#[version(u64)]` - 自动添加 `version` 列，用于乐观锁
 - `#[ormer_ignore]` - 字段不映射为数据库列，可用于动态表路由值
@@ -537,6 +538,8 @@ db.create_table::<User>().execute().await?;
 ```rust
 db.validate_table::<User>().await?;
 ```
+
+`validate_table` 会检查列数量、顺序、名称、类型、可空性、主键、自增属性、唯一约束、索引和外键；PostgreSQL 模型还会检查 TimescaleDB 超表及时间分片间隔。
 
 ### 删除表
 

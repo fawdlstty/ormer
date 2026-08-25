@@ -182,6 +182,12 @@ use super::super::mysql_backend;
 #[cfg(feature = "mssql")]
 use super::super::mssql_backend;
 
+#[cfg(feature = "duckdb")]
+use super::super::duckdb_backend;
+
+#[cfg(feature = "clickhouse")]
+use super::super::clickhouse_backend;
+
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
     values
@@ -422,6 +428,8 @@ fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
         super::super::DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
         #[cfg(feature = "mysql")]
         super::super::DbType::MySQL => crate::model::quote_identifier(db_type, normalized),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => crate::model::quote_identifier(db_type, normalized),
     }
 }
 
@@ -435,6 +443,8 @@ pub enum Database {
     MySQL(mysql_backend::Database),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::Database),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::Database),
 }
 
 pub struct ReplicatedDatabaseBuilder {
@@ -634,6 +644,8 @@ pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
     MySQL(mysql_backend::CreateTableExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::CreateTableExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::CreateTableExecutor<'a, T>),
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
@@ -655,6 +667,10 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MSSQL(exec) => {
                 CreateTableExecutor::MSSQL(exec.with_table_name(table_name))
             }
+            #[cfg(feature = "duckdb")]
+            CreateTableExecutor::DuckDB(exec) => {
+                CreateTableExecutor::DuckDB(exec.with_table_name(table_name))
+            }
         }
     }
 
@@ -674,6 +690,8 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MySQL(_) => crate::abstract_layer::DbType::MySQL,
             #[cfg(feature = "mssql")]
             CreateTableExecutor::MSSQL(_) => crate::abstract_layer::DbType::MSSQL,
+            #[cfg(feature = "duckdb")]
+            CreateTableExecutor::DuckDB(_) => crate::abstract_layer::DbType::DuckDB,
         };
         let table_name = routed_model_table_name_for_db::<T>(db_type, &route)
             .unwrap_or_else(|err| panic!("Failed to render table route: {}", err));
@@ -690,6 +708,8 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             CreateTableExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            CreateTableExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -703,6 +723,8 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             CreateTableExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            CreateTableExecutor::DuckDB(exec) => exec.execute().await,
         }?;
         crate::model::clear_version_snapshots::<T>();
         Ok(())
@@ -719,6 +741,8 @@ pub enum DropTableExecutor<'a, T: crate::model::WritableModel> {
     MySQL(mysql_backend::DropTableExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::DropTableExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::DropTableExecutor<'a, T>),
 }
 
 impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
@@ -732,6 +756,8 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
             DropTableExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             DropTableExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            DropTableExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -745,6 +771,8 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
             DropTableExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             DropTableExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            DropTableExecutor::DuckDB(exec) => exec.execute().await,
         }?;
         crate::model::clear_version_snapshots::<T>();
         Ok(())
@@ -761,6 +789,8 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::InsertExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InsertExecutor<'a, I>),
 }
 
 pub enum InsertPartialExecutor<'a, T: Model> {
@@ -775,6 +805,8 @@ pub enum InsertPartialExecutor<'a, T: Model> {
     MySQL(mysql_backend::InsertPartialExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertPartialExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InsertPartialExecutor<'a, T>),
 }
 
 impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
@@ -796,6 +828,8 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MySQL(exec) => InsertPartialExecutor::MySQL(exec.set(f)),
             #[cfg(feature = "mssql")]
             InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.set(f)),
+            #[cfg(feature = "duckdb")]
+            InsertPartialExecutor::DuckDB(exec) => InsertPartialExecutor::DuckDB(exec.set(f)),
         }
     }
 
@@ -817,6 +851,8 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MySQL(exec) => InsertPartialExecutor::MySQL(exec.default(f)),
             #[cfg(feature = "mssql")]
             InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.default(f)),
+            #[cfg(feature = "duckdb")]
+            InsertPartialExecutor::DuckDB(exec) => InsertPartialExecutor::DuckDB(exec.default(f)),
         }
     }
 
@@ -830,6 +866,8 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertPartialExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertPartialExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -843,6 +881,8 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertPartialExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            InsertPartialExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
 }
@@ -862,6 +902,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_conflict(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_conflict(f)),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_conflict(f)),
         }
     }
 
@@ -880,6 +922,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_constraint(target)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_constraint(target)),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_constraint(target)),
         }
     }
 
@@ -897,6 +941,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.conflict_where(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.conflict_where(f)),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.conflict_where(f)),
         }
     }
 
@@ -910,6 +956,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_nothing()),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_nothing()),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_nothing()),
         }
     }
 
@@ -923,6 +971,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update()),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update()),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update()),
         }
     }
 
@@ -940,6 +990,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update_if(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update_if(f)),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update_if(f)),
         }
     }
 
@@ -956,6 +1008,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.set(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.set(f)),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.set(f)),
         }
     }
 
@@ -969,6 +1023,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -984,6 +1040,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
 
@@ -997,6 +1055,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::MySQL(exec) => exec.returning().await,
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.returning().await,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDB(exec) => exec.returning().await,
         }
     }
 }
@@ -1011,6 +1071,8 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::InsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertOrUpdateExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InsertOrUpdateExecutor<'a, I>),
 }
 
 pub struct InsertGraphExecutor<'a, T: crate::model::GraphWritable> {
@@ -1034,6 +1096,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             InsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -1047,6 +1111,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             InsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "duckdb")]
+            InsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
         }
     }
 }
@@ -1207,6 +1273,8 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::InsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InsertOrIgnoreExecutor<'a, I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
@@ -1220,6 +1288,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -1233,6 +1303,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "duckdb")]
+            InsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
         }
     }
 }
@@ -1272,6 +1344,16 @@ impl Database {
                 let db = mssql_backend::Database::connect(db_type, connection_string).await?;
                 Ok(Database::MSSQL(db))
             }
+            #[cfg(feature = "duckdb")]
+            super::super::DbType::DuckDB => {
+                let db = duckdb_backend::Database::connect(db_type, connection_string).await?;
+                Ok(Database::DuckDB(db))
+            }
+            #[cfg(feature = "clickhouse")]
+            super::super::DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+                backend: super::super::DbType::ClickHouse,
+                feature: "Database::connect",
+            }),
         }
     }
 
@@ -1286,6 +1368,8 @@ impl Database {
             Database::MySQL(db) => CreateTableExecutor::MySQL(db.create_table::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => CreateTableExecutor::MSSQL(db.create_table::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => CreateTableExecutor::DuckDB(db.create_table::<T>()),
         }
     }
 
@@ -1300,6 +1384,8 @@ impl Database {
             Database::MySQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => db.validate_table::<T>().await,
         }
     }
 
@@ -1314,6 +1400,8 @@ impl Database {
             Database::MySQL(db) => db.db_first_tables(schema).await?,
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.db_first_tables(schema).await?,
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => db.db_first_tables(schema).await?,
         };
         Ok(db_first::generate_entities(self.db_type(), &tables))
     }
@@ -1329,6 +1417,8 @@ impl Database {
             Database::MySQL(db) => InsertExecutor::MySQL(db.insert::<I>(models)),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertExecutor::MSSQL(db.insert::<I>(models)),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => InsertExecutor::DuckDB(db.insert::<I>(models)),
         }
     }
 
@@ -1344,6 +1434,8 @@ impl Database {
             Database::MySQL(db) => InsertPartialExecutor::MySQL(db.insert_partial::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_partial::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => InsertPartialExecutor::DuckDB(db.insert_partial::<T>()),
         }
     }
 
@@ -1367,6 +1459,8 @@ impl Database {
             Database::MySQL(db) => InsertPartialExecutor::MySQL(db.insert_model::<T>(model)),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_model::<T>(model)),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => InsertPartialExecutor::DuckDB(db.insert_model::<T>(model)),
         }
     }
 
@@ -1395,6 +1489,8 @@ impl Database {
             Database::MySQL(db) => InsertOrUpdateExecutor::MySQL(db.insert_or_update::<I>(models)),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrUpdateExecutor::MSSQL(db.insert_or_update::<I>(models)),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => InsertOrUpdateExecutor::DuckDB(db.insert_or_update::<I>(models)),
         }
     }
 
@@ -1420,6 +1516,8 @@ impl Database {
             Database::MySQL(db) => InsertOrIgnoreExecutor::MySQL(db.insert_or_ignore::<I>(models)),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrIgnoreExecutor::MSSQL(db.insert_or_ignore::<I>(models)),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => InsertOrIgnoreExecutor::DuckDB(db.insert_or_ignore::<I>(models)),
         }
     }
 
@@ -1514,6 +1612,8 @@ impl Database {
             Database::MySQL(db) => SelectExecutor::MySQL(db.select::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => SelectExecutor::MSSQL(db.select::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => SelectExecutor::DuckDB(db.select::<T>()),
         }
     }
 
@@ -1547,6 +1647,8 @@ impl Database {
             Database::MySQL(db) => GroupedSelectExecutor::MySQL(db.select_column::<T, V>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => GroupedSelectExecutor::MSSQL(db.select_column::<T, V>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => GroupedSelectExecutor::DuckDB(db.select_column::<T, V>()),
         }
     }
 
@@ -1563,6 +1665,8 @@ impl Database {
             Database::MySQL(db) => DeleteExecutor::MySQL(db.delete::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => DeleteExecutor::MSSQL(db.delete::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => DeleteExecutor::DuckDB(db.delete::<T>()),
         }
     }
 
@@ -1579,6 +1683,8 @@ impl Database {
             Database::MySQL(db) => UpdateExecutor::MySQL(db.update::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => UpdateExecutor::MSSQL(db.update::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => UpdateExecutor::DuckDB(db.update::<T>()),
         }
     }
 
@@ -1609,6 +1715,8 @@ impl Database {
             Database::MySQL(db) => RelatedSelectExecutor::MySQL(db.related::<T, R>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => RelatedSelectExecutor::MSSQL(db.related::<T, R>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => RelatedSelectExecutor::DuckDB(db.related::<T, R>()),
         }
     }
 
@@ -1634,6 +1742,11 @@ impl Database {
             Database::MSSQL(db) => {
                 let txn = db.begin().await?;
                 Ok(Transaction::MSSQL(txn))
+            }
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => {
+                let txn = db.begin().await?;
+                Ok(Transaction::DuckDB(txn))
             }
         }
     }
@@ -1679,6 +1792,8 @@ impl Database {
             Database::MySQL(db) => DropTableExecutor::MySQL(db.drop_table::<T>()),
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => DropTableExecutor::MSSQL(db.drop_table::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => DropTableExecutor::DuckDB(db.drop_table::<T>()),
         }
     }
 
@@ -1712,6 +1827,11 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => {
                 let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+                db.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => {
+                let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
                 db.exec_raw(&sql, params).await
             }
         }
@@ -1854,6 +1974,11 @@ where
                     let (sql, params) = self.select.to_sql_with_params(db_type);
                     db.select_raw::<R, C>(&sql, params).await
                 }
+                #[cfg(feature = "duckdb")]
+                Database::DuckDB(db) => {
+                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    db.select_raw::<R, C>(&sql, params).await
+                }
             }
         })
     }
@@ -1915,6 +2040,11 @@ where
                 #[cfg(feature = "mssql")]
                 Database::MSSQL(db) => {
                     let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "duckdb")]
+                Database::DuckDB(db) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
             }
@@ -1980,6 +2110,11 @@ where
                     let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
                     txn.select_raw::<T, C>(&sql, params).await
                 }
+                #[cfg(feature = "duckdb")]
+                Transaction::DuckDB(txn) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
                 Transaction::_Phantom(_) => unreachable!(),
             }
         })
@@ -1996,6 +2131,8 @@ pub enum SelectExecutor<'a, T: Model> {
     MySQL(mysql_backend::SelectExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::SelectExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::SelectExecutor<'a, T>),
 }
 
 crate::impl_unified_select_executor_methods!(SelectExecutor);
@@ -2031,6 +2168,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.select_model::<R>()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.select_model::<R>()),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.select_model::<R>()),
         }
     }
 
@@ -2044,6 +2183,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -2293,6 +2434,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => RelatedSelectExecutor::MySQL(exec.from::<T2, R>()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => RelatedSelectExecutor::MSSQL(exec.from::<T2, R>()),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => RelatedSelectExecutor::DuckDB(exec.from::<T2, R>()),
         }
     }
 
@@ -2320,6 +2463,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 MultiTableSelectExecutor::MSSQL(exec.from3::<T2, R1, R2>())
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => MultiTableSelectExecutor::DuckDB(
+                exec.from3::<T2, R1, R2>(),
+                std::marker::PhantomData,
+            ),
         }
     }
 
@@ -2349,6 +2497,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 FourTableSelectExecutor::MSSQL(exec.from4::<T2, R1, R2, R3>())
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => FourTableSelectExecutor::DuckDB(
+                exec.from4::<T2, R1, R2, R3>(),
+                std::marker::PhantomData,
+            ),
         }
     }
 
@@ -2370,6 +2523,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => LeftJoinedSelectExecutor::MySQL(exec.left_join::<J>(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => LeftJoinedSelectExecutor::MSSQL(exec.left_join::<J>(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => LeftJoinedSelectExecutor::DuckDB(exec.left_join::<J>(f)),
         }
     }
 
@@ -2395,6 +2550,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 InnerJoinedSelectExecutor::MSSQL(exec.inner_join::<J>(f))
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                InnerJoinedSelectExecutor::DuckDB(exec.inner_join::<J>(f))
+            }
         }
     }
 
@@ -2419,6 +2578,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => {
                 RightJoinedSelectExecutor::MSSQL(exec.right_join::<J>(f))
+            }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                RightJoinedSelectExecutor::DuckDB(exec.right_join::<J>(f))
             }
         }
     }
@@ -2446,6 +2609,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 LeftJoinedSelectExecutor::MSSQL(exec.left_join_derived::<J>(derived, f))
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                LeftJoinedSelectExecutor::DuckDB(exec.left_join_derived::<J>(derived, f))
+            }
         }
     }
 
@@ -2471,6 +2638,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => {
                 InnerJoinedSelectExecutor::MSSQL(exec.inner_join_derived::<J>(derived, f))
+            }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                InnerJoinedSelectExecutor::DuckDB(exec.inner_join_derived::<J>(derived, f))
             }
         }
     }
@@ -2498,6 +2669,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 RightJoinedSelectExecutor::MSSQL(exec.right_join_derived::<J>(derived, f))
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                RightJoinedSelectExecutor::DuckDB(exec.right_join_derived::<J>(derived, f))
+            }
         }
     }
 
@@ -2520,6 +2695,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => {
                 CollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => CollectFuture::DuckDB(exec.clone().collect::<C>()),
         }
     }
 
@@ -2537,6 +2714,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => FirstFuture::MySQL(exec.first()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => FirstFuture::MSSQL(exec.first()),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => FirstFuture::DuckDB(exec.first()),
         }
     }
 
@@ -2556,6 +2735,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.count(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.count(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.count(f)),
         }
     }
 
@@ -2576,6 +2757,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.sum(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.sum(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.sum(f)),
         }
     }
 
@@ -2596,6 +2779,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.avg(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.avg(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.avg(f)),
         }
     }
 
@@ -2616,6 +2801,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.max(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.max(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.max(f)),
         }
     }
 
@@ -2636,6 +2823,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => AggregateFuture::MySQL(exec.min(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.min(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.min(f)),
         }
     }
 }
@@ -2653,6 +2842,8 @@ pub enum DeleteExecutor<'a, T: Model> {
     MySQL(mysql_backend::DeleteExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::DeleteExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::DeleteExecutor<T>),
 }
 
 crate::impl_unified_delete_executor!(DeleteExecutor);
@@ -2680,6 +2871,8 @@ impl<'a, T: Model> super::SqlExecutor for DeleteExecutor<'a, T> {
             DeleteExecutor::MySQL(exec) => exec.execute_with_sql(sql).await,
             #[cfg(feature = "mssql")]
             DeleteExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "duckdb")]
+            DeleteExecutor::DuckDB(exec) => exec.execute_with_sql(sql).await,
         }
     }
 }
@@ -2697,6 +2890,8 @@ pub enum UpdateExecutor<'a, T: Model> {
     MySQL(mysql_backend::UpdateExecutor<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::UpdateExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::UpdateExecutor<T>),
 }
 
 crate::impl_unified_update_executor!(UpdateExecutor);
@@ -2719,6 +2914,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             UpdateExecutor::MSSQL(exec) => {
                 UpdateExecutor::MSSQL(exec.set_model_fields(model, fields))
+            }
+            #[cfg(feature = "duckdb")]
+            UpdateExecutor::DuckDB(exec) => {
+                UpdateExecutor::DuckDB(exec.set_model_fields(model, fields))
             }
         }
     }
@@ -2747,6 +2946,8 @@ impl<'a, T: Model> super::SqlExecutor for UpdateExecutor<'a, T> {
             UpdateExecutor::MySQL(exec) => exec.execute_with_sql(sql).await,
             #[cfg(feature = "mssql")]
             UpdateExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "duckdb")]
+            UpdateExecutor::DuckDB(exec) => exec.execute_with_sql(sql).await,
         }
     }
 }
@@ -2954,6 +3155,8 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
     MySQL(mysql_backend::CollectFuture<'a, T, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::CollectFuture<'a, T, C>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::CollectFuture<'a, T, C>),
 }
 
 /// 统一的 FirstFuture 枚举
@@ -2966,6 +3169,8 @@ pub enum FirstFuture<'a, T: Model> {
     MySQL(mysql_backend::FirstFuture<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::FirstFuture<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::FirstFuture<'a, T>),
 }
 
 /// 统一的 AggregateFuture 枚举
@@ -2981,6 +3186,8 @@ pub enum AggregateFuture<'a, T: Model, R> {
     MySQL(mysql_backend::AggregateFuture<'a, T, R>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::AggregateFuture<'a, T, R>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::AggregateFuture<T, R>),
 }
 
 crate::impl_unified_aggregate_future!(AggregateFuture);
@@ -2998,6 +3205,8 @@ pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
     MySQL(mysql_backend::RelatedSelectExecutor<'a, T, R>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::RelatedSelectExecutor<'a, T, R>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::RelatedSelectExecutor<T, R>),
 }
 
 /// 统一的 MultiTableSelectExecutor 枚举
@@ -3013,6 +3222,11 @@ pub enum MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
     MySQL(mysql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(
+        duckdb_backend::MultiTableSelectExecutor<T, R1, R2>,
+        std::marker::PhantomData<&'a ()>,
+    ),
 }
 
 /// 统一的 FourTableSelectExecutor 枚举
@@ -3028,6 +3242,11 @@ pub enum FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> 
     MySQL(mysql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(
+        duckdb_backend::FourTableSelectExecutor<T, R1, R2, R3>,
+        std::marker::PhantomData<&'a ()>,
+    ),
 }
 
 /// 统一的 InnerJoinedSelectExecutor 枚举
@@ -3043,6 +3262,8 @@ pub enum InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
     MySQL(mysql_backend::InnerJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InnerJoinedSelectExecutor<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InnerJoinedSelectExecutor<T, J>),
 }
 
 /// 统一的 RightJoinedSelectExecutor 枚举
@@ -3058,6 +3279,8 @@ pub enum RightJoinedSelectExecutor<'a, T: Model, J: Model> {
     MySQL(mysql_backend::RightJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::RightJoinedSelectExecutor<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::RightJoinedSelectExecutor<T, J>),
 }
 
 /// 统一的 LeftJoinedSelectExecutor 枚举
@@ -3073,6 +3296,8 @@ pub enum LeftJoinedSelectExecutor<'a, T: Model, J: Model> {
     MySQL(mysql_backend::LeftJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::LeftJoinedSelectExecutor<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::LeftJoinedSelectExecutor<T, J>),
 }
 
 /// 统一的 LeftJoinCollectFuture 枚举
@@ -3088,6 +3313,8 @@ pub enum LeftJoinCollectFuture<'a, T: Model, J: Model> {
     MySQL(mysql_backend::LeftJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::LeftJoinCollectFuture<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::LeftJoinCollectFuture<T, J>),
 }
 
 /// 统一的 InnerJoinCollectFuture 枚举
@@ -3103,6 +3330,8 @@ pub enum InnerJoinCollectFuture<'a, T: Model, J: Model> {
     MySQL(mysql_backend::InnerJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InnerJoinCollectFuture<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::InnerJoinCollectFuture<T, J>),
 }
 
 /// 统一的 RightJoinCollectFuture 枚举
@@ -3118,6 +3347,8 @@ pub enum RightJoinCollectFuture<'a, T: Model, J: Model> {
     MySQL(mysql_backend::RightJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::RightJoinCollectFuture<'a, T, J>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::RightJoinCollectFuture<T, J>),
 }
 
 crate::impl_unified_collect_future!(CollectFuture);
@@ -3139,6 +3370,8 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
             FirstFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
             FirstFuture::MSSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "duckdb")]
+            FirstFuture::DuckDB(future) => Box::pin(future.into_future()),
         }
     }
 }
@@ -3158,6 +3391,8 @@ pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
     MySQL(mysql_backend::RelatedCollectFuture<'a, T, R>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::RelatedCollectFuture<'a, T, R>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::RelatedCollectFuture<T, R>),
 }
 
 crate::impl_unified_related_collect_future!(RelatedCollectFuture);
@@ -3172,6 +3407,8 @@ pub enum Transaction<'a> {
     MySQL(mysql_backend::Transaction<'a>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::Transaction<'a>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::Transaction),
     // 使用 PhantomData 确保生命周期参数始终被使用
     _Phantom(std::marker::PhantomData<&'a ()>),
 }
@@ -3253,6 +3490,8 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::TransactionInsertExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::TransactionInsertExecutor<'a, I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
@@ -3278,6 +3517,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.on_conflict(f))
             }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.on_conflict(f))
+            }
         }
     }
 
@@ -3301,6 +3544,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.on_constraint(target))
+            }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.on_constraint(target))
             }
         }
     }
@@ -3327,6 +3574,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.conflict_where(f))
             }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.conflict_where(f))
+            }
         }
     }
 
@@ -3348,6 +3599,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.do_nothing())
             }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.do_nothing())
+            }
         }
     }
 
@@ -3368,6 +3623,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.do_update())
+            }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.do_update())
             }
         }
     }
@@ -3394,6 +3653,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => {
                 TransactionInsertExecutor::MSSQL(exec.do_update_if(f))
             }
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.do_update_if(f))
+            }
         }
     }
 
@@ -3414,6 +3677,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MySQL(exec) => TransactionInsertExecutor::MySQL(exec.set(f)),
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => TransactionInsertExecutor::MSSQL(exec.set(f)),
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => TransactionInsertExecutor::DuckDB(exec.set(f)),
         }
     }
 
@@ -3427,6 +3692,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -3442,6 +3709,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            TransactionInsertExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
 }
@@ -3456,6 +3725,8 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::TransactionInsertOrUpdateExecutor<'a, I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
@@ -3469,6 +3740,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -3482,6 +3755,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
 }
@@ -3496,6 +3771,8 @@ pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MySQL(mysql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
@@ -3509,6 +3786,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
         }
     }
 
@@ -3522,6 +3801,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
 }
@@ -3585,6 +3866,10 @@ pub(crate) async fn apply_transaction_options(
             }
             Ok(())
         }
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => Err(crate::ormer_error!(
+            "transaction options are not implemented for this backend"
+        )),
     }
 }
 
@@ -3599,6 +3884,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(_) => super::super::DbType::MySQL,
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(_) => super::super::DbType::MSSQL,
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(_) => super::super::DbType::DuckDB,
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3635,6 +3922,11 @@ impl<'a> Transaction<'a> {
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => {
                 let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+                txn.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => {
+                let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
                 txn.exec_raw(&sql, params).await
             }
             Transaction::_Phantom(_) => unreachable!(),
@@ -3695,6 +3987,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => txn.commit().await,
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => txn.commit().await,
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => txn.commit().await,
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3710,6 +4004,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => txn.rollback().await,
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => txn.rollback().await,
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => txn.rollback().await,
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3743,6 +4039,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => SelectExecutor::MySQL(txn.select::<T>()),
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => SelectExecutor::MSSQL(txn.select::<T>()),
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => SelectExecutor::DuckDB(txn.select::<T>()),
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3775,6 +4073,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => GroupedSelectExecutor::MySQL(txn.select_column::<T, V>()),
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => GroupedSelectExecutor::MSSQL(txn.select_column::<T, V>()),
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => GroupedSelectExecutor::DuckDB(txn.select_column::<T, V>()),
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3792,6 +4092,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => DeleteExecutor::MySQL(txn.delete::<T>()),
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => DeleteExecutor::MSSQL(txn.delete::<T>()),
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => DeleteExecutor::DuckDB(txn.delete::<T>()),
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3809,6 +4111,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => UpdateExecutor::MySQL(txn.update::<T>()),
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => UpdateExecutor::MSSQL(txn.update::<T>()),
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => UpdateExecutor::DuckDB(txn.update::<T>()),
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3836,6 +4140,8 @@ impl<'a> Transaction<'a> {
             Transaction::MySQL(txn) => TransactionInsertExecutor::MySQL(txn.insert::<I>(models)),
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => TransactionInsertExecutor::MSSQL(txn.insert::<I>(models)),
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => TransactionInsertExecutor::DuckDB(txn.insert::<I>(models)),
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -3861,6 +4167,10 @@ impl<'a> Transaction<'a> {
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => {
                 TransactionInsertOrUpdateExecutor::MSSQL(txn.insert_or_update::<I>(models))
+            }
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => {
+                TransactionInsertOrUpdateExecutor::DuckDB(txn.insert_or_update::<I>(models))
             }
             Transaction::_Phantom(_) => unreachable!(),
         }
@@ -3894,6 +4204,10 @@ impl<'a> Transaction<'a> {
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => {
                 TransactionInsertOrIgnoreExecutor::MSSQL(txn.insert_or_ignore::<I>(models))
+            }
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => {
+                TransactionInsertOrIgnoreExecutor::DuckDB(txn.insert_or_ignore::<I>(models))
             }
             Transaction::_Phantom(_) => unreachable!(),
         }
@@ -3937,6 +4251,10 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             LeftJoinedSelectExecutor::MSSQL(exec) => {
                 LeftJoinCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
+            #[cfg(feature = "duckdb")]
+            LeftJoinedSelectExecutor::DuckDB(exec) => {
+                LeftJoinCollectFuture::DuckDB(exec.collect::<C>())
+            }
         }
     }
 }
@@ -3965,6 +4283,10 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             #[cfg(feature = "mssql")]
             InnerJoinedSelectExecutor::MSSQL(exec) => {
                 InnerJoinCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
+            }
+            #[cfg(feature = "duckdb")]
+            InnerJoinedSelectExecutor::DuckDB(exec) => {
+                InnerJoinCollectFuture::DuckDB(exec.collect::<C>())
             }
         }
     }
@@ -3997,6 +4319,10 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             RightJoinedSelectExecutor::MSSQL(exec) => {
                 RightJoinCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
+            #[cfg(feature = "duckdb")]
+            RightJoinedSelectExecutor::DuckDB(exec) => {
+                RightJoinCollectFuture::DuckDB(exec.collect::<C>())
+            }
         }
     }
 }
@@ -4020,6 +4346,8 @@ pub enum MappedSelectExecutor<'a, T: Model, V> {
     MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::MappedSelectExecutor<'a, T, V>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::MappedSelectExecutor<'a, T, V>),
 }
 
 /// 统一的 GroupedSelectExecutor 枚举
@@ -4032,6 +4360,8 @@ pub enum GroupedSelectExecutor<'a, T: Model, V> {
     MySQL(mysql_backend::GroupedSelectExecutor<'a, T, V>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::GroupedSelectExecutor<'a, T, V>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::GroupedSelectExecutor<'a, T, V>),
 }
 
 impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
@@ -4052,6 +4382,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.group_by(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.group_by(f)),
+            #[cfg(feature = "duckdb")]
+            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.group_by(f)),
         }
     }
 
@@ -4072,6 +4404,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.having(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.having(f)),
+            #[cfg(feature = "duckdb")]
+            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.having(f)),
         }
     }
 
@@ -4092,6 +4426,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.filter(f)),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.filter(f)),
+            #[cfg(feature = "duckdb")]
+            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.filter(f)),
         }
     }
 
@@ -4115,6 +4451,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => GroupedCollectFuture::MySQL(exec.collect::<C>()),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
+            #[cfg(feature = "duckdb")]
+            GroupedSelectExecutor::DuckDB(exec) => GroupedCollectFuture::DuckDB(exec.collect::<C>()),
         }
     }
 
@@ -4132,6 +4470,8 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "duckdb")]
+            GroupedSelectExecutor::DuckDB(exec) => exec.as_model::<R>(),
         }
     }
 }
@@ -4153,6 +4493,8 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MSSQL(exec) => {
                 MappedSelectExecutor::MSSQL(exec.clone_with_pool())
             }
+            #[cfg(feature = "duckdb")]
+            MappedSelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.clone()),
         }
     }
 }
@@ -4167,6 +4509,8 @@ pub enum MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator
     MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::MappedCollectFuture<'a, T, V, C>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::MappedCollectFuture<'a, T, V, C>),
 }
 
 /// 统一的 GroupedCollectFuture 枚举
@@ -4179,6 +4523,8 @@ pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     MySQL(mysql_backend::GroupedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::GroupedCollectFuture<'a, T, V, C>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::GroupedCollectFuture<'a, T, V, C>),
 }
 
 impl<
@@ -4202,6 +4548,8 @@ impl<
             GroupedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
             GroupedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "duckdb")]
+            GroupedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
         }
     }
 }
@@ -4228,6 +4576,8 @@ pub enum ModelCollectWithFuture<'a, T: Model + 'static, V: 'static, C, M, F> {
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::ModelCollectWithFuture<'a, T, V, C, M, F>),
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -4249,6 +4599,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => MappedSelectExecutor::MySQL(exec.map_to(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => MappedSelectExecutor::MSSQL(exec.map_to(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.map_to(f)),
         }
     }
 
@@ -4269,6 +4621,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.select_column(f)),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.select_column(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.select_column(f)),
         }
     }
 }
@@ -4434,6 +4788,8 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
             #[cfg(feature = "mssql")]
             MappedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+            #[cfg(feature = "duckdb")]
+            MappedSelectExecutor::DuckDB(exec) => exec.as_model::<R>(),
         }
     }
 
@@ -4458,6 +4814,8 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MSSQL(exec) => {
                 MappedCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
             }
+            #[cfg(feature = "duckdb")]
+            MappedSelectExecutor::DuckDB(exec) => MappedCollectFuture::DuckDB(exec.collect::<C>()),
         }
     }
 
@@ -4498,6 +4856,10 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
                 let future = exec_clone.collect::<Vec<V>>();
                 ModelCollectWithFuture::MSSQLCollect(future, f, std::marker::PhantomData)
             }
+            #[cfg(feature = "duckdb")]
+            MappedSelectExecutor::DuckDB(exec) => {
+                ModelCollectWithFuture::DuckDB(exec.collect_with::<C, F, M>(f))
+            }
         }
     }
 }
@@ -4514,6 +4876,8 @@ impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a
             MappedSelectExecutor::MySQL(exec) => exec.to_subquery_sql(),
             #[cfg(feature = "mssql")]
             MappedSelectExecutor::MSSQL(exec) => exec.to_subquery_sql(),
+            #[cfg(feature = "duckdb")]
+            MappedSelectExecutor::DuckDB(exec) => exec.to_subquery_sql(),
         }
     }
 }
@@ -4579,6 +4943,8 @@ impl<
             MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
             MappedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "duckdb")]
+            MappedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
         }
     }
 }
@@ -4614,6 +4980,8 @@ where
                 let vec = future.await?;
                 Ok(vec.into_iter().map(mapper).collect())
             }),
+            #[cfg(feature = "duckdb")]
+            ModelCollectWithFuture::DuckDB(future) => Box::pin(future.into_future()),
         }
     }
 }
@@ -4787,6 +5155,8 @@ pub enum SelectStream<'a, T: Model> {
     MySQL(mysql_backend::SelectStream<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::SelectStream<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::SelectStream<'a, T>),
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -4801,6 +5171,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MySQL(exec) => SelectStream::MySQL(exec.stream()),
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => SelectStream::MSSQL(exec.stream()),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectStream::DuckDB(exec.stream()),
         }
     }
 }
@@ -4815,6 +5187,8 @@ pub enum SelectStreamIterator<'a, T: Model> {
     MySQL(mysql_backend::SelectStreamIterator<'a, T>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::SelectStreamIterator<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::SelectStreamIterator<'a, T>),
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
@@ -4841,6 +5215,11 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 let iter = stream.into_iter().await?;
                 Ok(SelectStreamIterator::MSSQL(iter))
             }
+            #[cfg(feature = "duckdb")]
+            SelectStream::DuckDB(stream) => {
+                let iter = stream.into_iter().await?;
+                Ok(SelectStreamIterator::DuckDB(iter))
+            }
         }
     }
 }
@@ -4857,6 +5236,8 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             SelectStreamIterator::MySQL(iter) => iter.next().await,
             #[cfg(feature = "mssql")]
             SelectStreamIterator::MSSQL(iter) => iter.next().await,
+            #[cfg(feature = "duckdb")]
+            SelectStreamIterator::DuckDB(iter) => iter.next().await,
         }
     }
 }

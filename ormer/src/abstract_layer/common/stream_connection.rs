@@ -1,6 +1,8 @@
 use std::marker::PhantomData;
 #[cfg(feature = "sqlite")]
 use std::sync::Arc;
+#[cfg(feature = "duckdb")]
+use std::sync::Arc as DuckDbArc;
 
 /// 统一的流式查询连接持有者
 ///
@@ -41,6 +43,11 @@ pub enum StreamConnection<'a> {
     #[cfg(feature = "sqlite")]
     Sqlite(Arc<turso::Connection>),
 
+    /// DuckDB connection. Queries are materialized by the backend before
+    /// entering the async iterator.
+    #[cfg(feature = "duckdb")]
+    DuckDB(DuckDbArc<super::super::duckdb_backend::duckcompat::Connection>),
+
     /// PostgreSQL 连接 - 使用Client引用
     #[cfg(feature = "postgresql")]
     PostgreSQL(&'a tokio_postgres::Client),
@@ -73,6 +80,16 @@ impl<'a> StreamConnection<'a> {
             _ => unreachable!("Expected PostgreSQL connection"),
         }
     }
+
+    #[cfg(feature = "duckdb")]
+    pub fn expect_duckdb(
+        &self,
+    ) -> &DuckDbArc<super::super::duckdb_backend::duckcompat::Connection> {
+        match self {
+            StreamConnection::DuckDB(conn) => conn,
+            _ => unreachable!("Expected DuckDB connection"),
+        }
+    }
 }
 
 impl<'a> Drop for StreamConnection<'a> {
@@ -83,6 +100,9 @@ impl<'a> Drop for StreamConnection<'a> {
                 // Arc 会在最后一个引用释放时自动清理
                 // 不需要显式操作
             }
+
+            #[cfg(feature = "duckdb")]
+            StreamConnection::DuckDB(_) => {}
 
             #[cfg(feature = "postgresql")]
             StreamConnection::PostgreSQL(_) => {

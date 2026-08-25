@@ -203,7 +203,42 @@ pub struct ColumnSchema {
     pub default: Option<ColumnDefault>,                                           // 数据库端默认值
     pub check: Option<CheckConstraint>,                                           // CHECK 约束
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
-    pub compress: bool, // 是否启用数据库级压缩（PostgreSQL: COMPRESSION pglz）
+    pub compress: bool,                          // 是否启用数据库级压缩
+    pub compression: Option<CompressionAlgorithm>, // 压缩算法
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompressionAlgorithm {
+    Pglz,
+    Lz4,
+    Zlib,
+    Zstd,
+}
+
+impl CompressionAlgorithm {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pglz => "pglz",
+            Self::Lz4 => "lz4",
+            Self::Zlib => "zlib",
+            Self::Zstd => "zstd",
+        }
+    }
+
+    pub const fn as_upper_str(self) -> &'static str {
+        match self {
+            Self::Pglz => "PGLZ",
+            Self::Lz4 => "LZ4",
+            Self::Zlib => "ZLIB",
+            Self::Zstd => "ZSTD",
+        }
+    }
+}
+
+pub fn column_compression_algorithm(column: &ColumnSchema) -> Option<CompressionAlgorithm> {
+    column
+        .compression
+        .or_else(|| column.compress.then_some(CompressionAlgorithm::Pglz))
 }
 
 /// 字段默认值。
@@ -233,6 +268,14 @@ impl ColumnDefault {
                 }
                 #[cfg(feature = "mssql")]
                 crate::abstract_layer::DbType::MSSQL => if value { "1" } else { "0" }.to_string(),
+                #[cfg(feature = "duckdb")]
+                crate::abstract_layer::DbType::DuckDB => {
+                    if value { "TRUE" } else { "FALSE" }.to_string()
+                }
+                #[cfg(feature = "clickhouse")]
+                crate::abstract_layer::DbType::ClickHouse => {
+                    if value { "TRUE" } else { "FALSE" }.to_string()
+                }
             },
             Self::Expression(expr) => expr.to_string(),
         }
@@ -908,6 +951,8 @@ pub struct EmbedColumnSchema {
     pub enum_variants: Option<&'static [&'static str]>,
     pub data_type: Option<&'static str>,
     pub db_value_type: Option<fn(crate::abstract_layer::DbType) -> &'static str>,
+    pub compress: bool,
+    pub compression: Option<CompressionAlgorithm>,
 }
 
 pub trait Embed: Sized {
@@ -1762,6 +1807,12 @@ where
             "IF NOT EXISTS (SELECT 1 FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}) \
              INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})"
         ),
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => {
+            return Err(crate::ormer_error!(
+                "through-link insertion is not implemented for this backend"
+            ));
+        }
     };
     let raw = crate::RawSql::new(sql)
         .bind(owner_value.clone())
@@ -1949,6 +2000,8 @@ pub fn normalize_table_name_for_db(
         crate::abstract_layer::DbType::PostgreSQL => table_name,
         #[cfg(feature = "mssql")]
         crate::abstract_layer::DbType::MSSQL => table_name,
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => table_name,
     }
 }
 
@@ -2578,6 +2631,14 @@ pub fn quote_identifier(db_type: crate::abstract_layer::DbType, identifier: &str
         crate::abstract_layer::DbType::PostgreSQL => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
+        #[cfg(feature = "duckdb")]
+        crate::abstract_layer::DbType::DuckDB => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+        #[cfg(feature = "clickhouse")]
+        crate::abstract_layer::DbType::ClickHouse => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
     }
 }
 
@@ -2607,6 +2668,14 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
+    #[cfg(feature = "clickhouse")]
+    if matches!(db_type, crate::abstract_layer::DbType::ClickHouse) {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "CREATE TABLE without explicit ClickHouse engine settings",
+        });
+    }
+
     let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
     let quoted_table_name = quote_qualified_identifier(db_type, table_name);
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", quoted_table_name);
@@ -2648,7 +2717,7 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
             }
         };
 
-        // 添加压缩属性（仅 PostgreSQL 支持，且必须在 NOT NULL 之前）
+        // 添加列级压缩属性（PostgreSQL 支持，且必须在 NOT NULL 之前）
         let is_postgresql = {
             #[cfg(feature = "postgresql")]
             {
@@ -2659,16 +2728,33 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
                 false
             }
         };
-        if column.compress && is_postgresql {
-            if sql_type.ends_with(" NOT NULL") {
-                let base = &sql_type[..sql_type.len() - " NOT NULL".len()];
-                sql.push_str(&format!(
-                    "{} {base} COMPRESSION pglz NOT NULL",
-                    quote_identifier(db_type, column.name)
-                ));
+        if is_postgresql {
+            if let Some(compression) = column_compression_algorithm(column) {
+                if !matches!(
+                    compression,
+                    CompressionAlgorithm::Pglz | CompressionAlgorithm::Lz4
+                ) {
+                    return Err(crate::ormer_error!(
+                        "PostgreSQL does not support compression algorithm {}",
+                        compression.as_str()
+                    ));
+                }
+                let method = compression.as_str();
+                if sql_type.ends_with(" NOT NULL") {
+                    let base = &sql_type[..sql_type.len() - " NOT NULL".len()];
+                    sql.push_str(&format!(
+                        "{} {base} COMPRESSION {method} NOT NULL",
+                        quote_identifier(db_type, column.name)
+                    ));
+                } else {
+                    sql.push_str(&format!(
+                        "{} {sql_type} COMPRESSION {method}",
+                        quote_identifier(db_type, column.name)
+                    ));
+                }
             } else {
                 sql.push_str(&format!(
-                    "{} {sql_type} COMPRESSION pglz",
+                    "{} {sql_type}",
                     quote_identifier(db_type, column.name)
                 ));
             }
@@ -2732,6 +2818,15 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
 
     sql.push(')');
 
+    #[cfg(feature = "mysql")]
+    if matches!(db_type, crate::abstract_layer::DbType::MySQL) {
+        if let Some(compression) = table_compression_algorithm::<T>()? {
+            sql.push_str(" COMPRESSION='");
+            sql.push_str(compression.as_upper_str());
+            sql.push('\'');
+        }
+    }
+
     // 添加索引
     let index_sql = generate_indexes_with_name::<T>(db_type, table_name)?;
     if !index_sql.is_empty() {
@@ -2740,6 +2835,38 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
     }
 
     Ok(sql)
+}
+
+#[cfg(feature = "mysql")]
+pub(crate) fn table_compression_algorithm<T: Model>() -> crate::Result<Option<CompressionAlgorithm>>
+{
+    let mut compression: Option<CompressionAlgorithm> = None;
+    for column in T::column_schema() {
+        let Some(candidate) = column_compression_algorithm(&column) else {
+            continue;
+        };
+        if !matches!(
+            candidate,
+            CompressionAlgorithm::Lz4 | CompressionAlgorithm::Zlib
+        ) {
+            return Err(crate::ormer_error!(
+                "MySQL does not support compression algorithm {}",
+                candidate.as_str()
+            ));
+        }
+        if let Some(existing) = compression {
+            if existing != candidate {
+                return Err(crate::ormer_error!(
+                    "MySQL table compression cannot use multiple algorithms: {} and {}",
+                    existing.as_str(),
+                    candidate.as_str()
+                ));
+            }
+        } else {
+            compression = Some(candidate);
+        }
+    }
+    Ok(compression)
 }
 
 /// 生成 UNIQUE 约束
@@ -2988,7 +3115,12 @@ pub(crate) fn parse_string_vec_text(raw: &str) -> Vec<String> {
     vec![raw.to_string()]
 }
 
-#[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "duckdb"
+))]
 pub(crate) fn stringify_string_vec(values: &[String]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }

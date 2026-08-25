@@ -8,7 +8,7 @@ pub mod _test_common;
 define_test_user_simple!(TestUser, "schema_validation_users_1");
 
 #[derive(Debug, Model)]
-#[table = "schema_validation_users_different_1"]
+#[table = "schema_validation_users_1"]
 struct TestUserDifferent {
     #[primary]
     id: i32,
@@ -19,7 +19,7 @@ struct TestUserDifferent {
 }
 
 #[derive(Debug, Model)]
-#[table = "schema_validation_users_missing_1"]
+#[table = "schema_validation_users_1"]
 struct TestUserMissingColumn {
     #[primary]
     id: i32,
@@ -51,25 +51,27 @@ async fn test_schema_validation_impl(
 
     // 测试 3: 尝试用不同的表结构创建（应该失败）
     println!("测试 3: 尝试用不同的表结构创建");
-    match db.create_table::<TestUserDifferent>().execute().await {
-        Ok(_) => {
-            println!("✗ 应该失败但却成功了\n");
-            // 如果意外成功，清理该表
-            db.drop_table::<TestUserDifferent>().execute().await?;
-        }
-        Err(e) => println!("✓ 正确检测到表结构不匹配: {e}\n"),
-    }
+    let different_result = db.validate_table::<TestUserDifferent>().await;
+    assert!(
+        different_result.is_err(),
+        "different model schema should be rejected"
+    );
+    println!(
+        "✓ 正确检测到表结构不匹配: {:?}\n",
+        different_result.as_ref().err()
+    );
 
     // 测试 4: 尝试用缺少列的表结构创建（应该失败）
     println!("测试 4: 尝试用缺少列的表结构创建");
-    match db.create_table::<TestUserMissingColumn>().execute().await {
-        Ok(_) => {
-            println!("✗ 应该失败但却成功了\n");
-            // 如果意外成功，清理该表
-            db.drop_table::<TestUserMissingColumn>().execute().await?;
-        }
-        Err(e) => println!("✓ 正确检测到表结构不匹配: {e}\n"),
-    }
+    let missing_result = db.validate_table::<TestUserMissingColumn>().await;
+    assert!(
+        missing_result.is_err(),
+        "missing model columns should be rejected"
+    );
+    println!(
+        "✓ 正确检测到表结构不匹配: {:?}\n",
+        missing_result.as_ref().err()
+    );
 
     println!("=== 测试完成 ===");
 

@@ -5,7 +5,7 @@ use crate::db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };
 use crate::hooks::{HookContext, HookOperation};
-use crate::migration::{SchemaColumn, schema_column};
+use crate::migration::{SchemaColumn, schema_column_with_compression};
 use crate::model::{DbBackendTypeMapper, Model, Row, Value, WritableModel};
 use crate::query::builder::{
     FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
@@ -135,6 +135,48 @@ fn parse_mysql_enum_variants(type_name: &str) -> Vec<String> {
         variants.push(value);
     }
     variants
+}
+
+fn parse_mysql_table_compression(create_options: &str) -> Option<String> {
+    let options = create_options.as_bytes();
+    let lower = create_options.to_ascii_lowercase();
+    let marker = "compression";
+    let mut offset = 0;
+
+    while let Some(relative) = lower[offset..].find(marker) {
+        let start = offset + relative;
+        let end = start + marker.len();
+        let has_boundary_before =
+            start == 0 || !options[start - 1].is_ascii_alphanumeric() && options[start - 1] != b'_';
+        let has_boundary_after =
+            end == options.len() || !options[end].is_ascii_alphanumeric() && options[end] != b'_';
+        if !has_boundary_before || !has_boundary_after {
+            offset = end;
+            continue;
+        }
+
+        let mut value = create_options[end..].trim_start();
+        if let Some(rest) = value.strip_prefix('=') {
+            value = rest.trim_start();
+        }
+        let quote = value.chars().next();
+        if matches!(quote, Some('"') | Some('\'')) {
+            value = &value[1..];
+        }
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || ch == '"' || ch == '\'')
+            .unwrap_or(value.len());
+        let value = value[..end].trim();
+        if value.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        if !value.is_empty() {
+            return Some(value.to_ascii_uppercase());
+        }
+        return None;
+    }
+
+    None
 }
 
 fn mysql_fk_action(action: &str) -> Option<&'static str> {
@@ -724,7 +766,7 @@ impl Database {
         let mut conn = self.pool.get_conn().trace().await?;
         let rows: Vec<mysql_async::Row> = conn
             .exec(
-                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA \
+                "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA, COLUMN_DEFAULT \
                  FROM information_schema.columns \
                  WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
                  ORDER BY ORDINAL_POSITION",
@@ -740,6 +782,7 @@ impl Database {
                 let nullable: String = row.get(2).unwrap_or_default();
                 let key: String = row.get(3).unwrap_or_default();
                 let extra: String = row.get(4).unwrap_or_default();
+                let default: Option<String> = row.get(5).unwrap_or(None);
                 DbFirstColumn {
                     name,
                     type_name: type_name.clone(),
@@ -747,6 +790,7 @@ impl Database {
                     primary_key: key == "PRI",
                     auto_increment: extra.to_ascii_lowercase().contains("auto_increment"),
                     enum_variants: parse_mysql_enum_variants(&type_name),
+                    default,
                 }
             })
             .collect();
@@ -893,9 +937,21 @@ impl Database {
         &self,
         conn: &mut mysql_async::Conn,
     ) -> crate::Result<()> {
+        let table_options: Option<String> = conn
+            .exec_first(
+                "SELECT CREATE_OPTIONS FROM INFORMATION_SCHEMA.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                (table_name_for::<T>(),),
+            )
+            .trace()
+            .await?;
+        let actual_compression = table_options
+            .as_deref()
+            .and_then(parse_mysql_table_compression);
+
         // 查询表的列信息
         let sql = r#"
-            SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
+            SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
@@ -904,12 +960,22 @@ impl Database {
         let rows: Vec<mysql_async::Row> = conn.exec(sql, (table_name_for::<T>(),)).trace().await?;
 
         // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
+        let mut actual_columns: Vec<(String, String, bool, bool, bool)> = Vec::new();
         for row in rows {
             let name: String = row.get(0).unwrap_or_default();
             let col_type: String = row.get(1).unwrap_or_default();
             let is_nullable: String = row.get(2).unwrap_or_default();
-            actual_columns.push((name, col_type, is_nullable == "YES"));
+            let key: String = row.get(3).unwrap_or_default();
+            let extra: String = row.get(4).unwrap_or_default();
+            actual_columns.push((
+                name,
+                col_type,
+                is_nullable == "YES",
+                key.eq_ignore_ascii_case("PRI"),
+                extra
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("auto_increment")),
+            ));
         }
 
         // 比较列数量
@@ -932,7 +998,8 @@ impl Database {
                 ));
             }
 
-            let (actual_name, actual_type, actual_nullable) = &actual_columns[i];
+            let (actual_name, actual_type, actual_nullable, actual_primary, actual_auto_increment) =
+                &actual_columns[i];
 
             // 检查列名
             if actual_name != expected_col.name {
@@ -945,9 +1012,30 @@ impl Database {
                 ));
             }
 
+            if expected_col.is_primary != *actual_primary {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    if expected_col.is_primary { "" } else { "not " },
+                    if *actual_primary { "" } else { "not " }
+                ));
+            }
+
+            if expected_col.is_auto_increment != *actual_auto_increment {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    expected_col.is_auto_increment,
+                    actual_auto_increment
+                ));
+            }
+
             // 检查列类型（只比较基础类型，不包含约束）
+            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
             let expected_type = crate::abstract_layer::DbType::MySQL.sql_type(
-                expected_col.rust_type,
+                effective_rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 expected_col.is_nullable,
@@ -957,7 +1045,7 @@ impl Database {
             // 对于类型比较，我们需要提取基础类型（不包含 AUTO_INCREMENT, PRIMARY KEY, NOT NULL 等约束）
             let type_to_compare = if expected_col.is_primary {
                 // 主键的基础类型
-                match expected_col.rust_type {
+                match effective_rust_type {
                     "i8" | "i16" | "u8" => "TINYINT".to_string(),
                     "i32" | "u16" => "INT".to_string(),
                     "i64" | "u32" | "u64" => "BIGINT".to_string(),
@@ -967,7 +1055,7 @@ impl Database {
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
                 let full_type = crate::abstract_layer::DbType::MySQL.sql_type(
-                    expected_col.rust_type,
+                    effective_rust_type,
                     false,
                     expected_col.is_auto_increment,
                     expected_col.is_nullable,
@@ -1000,6 +1088,33 @@ impl Database {
             }
         }
 
+        let expected_compression = crate::model::table_compression_algorithm::<T>()?;
+        let expected_compression_name = expected_compression.map(|value| value.as_upper_str());
+        if expected_compression_name != actual_compression.as_deref() {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: Compression mismatch: expected {}, but actual is {}",
+                T::TABLE_NAME,
+                expected_compression_name.unwrap_or("NONE"),
+                actual_compression.as_deref().unwrap_or("NONE")
+            ));
+        }
+
+        let table_name = table_name_for::<T>();
+        let actual_table = self
+            .db_first_tables(None)
+            .await?
+            .into_iter()
+            .find(|table| table.name == table_name)
+            .ok_or_else(|| {
+                crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Table metadata is unavailable",
+                    T::TABLE_NAME
+                )
+            })?;
+        crate::db_first::validate_model_constraints::<T>(
+            crate::abstract_layer::DbType::MySQL,
+            &actual_table,
+        )?;
         Ok(())
     }
 
@@ -1332,6 +1447,17 @@ impl Database {
             )
             .trace()
             .await?;
+        let create_options: Option<String> = conn
+            .exec_first(
+                "SELECT CREATE_OPTIONS FROM INFORMATION_SCHEMA.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                (table_name,),
+            )
+            .trace()
+            .await?;
+        let table_compression = create_options
+            .as_deref()
+            .and_then(parse_mysql_table_compression);
         let columns = rows
             .into_iter()
             .map(|row| {
@@ -1339,7 +1465,13 @@ impl Database {
                 let type_name: String = row.get(1).unwrap_or_default();
                 let nullable: String = row.get(2).unwrap_or_default();
                 let key: String = row.get(3).unwrap_or_default();
-                schema_column(name, type_name, nullable == "YES", key == "PRI")
+                schema_column_with_compression(
+                    name,
+                    type_name,
+                    nullable == "YES",
+                    key == "PRI",
+                    table_compression.clone(),
+                )
             })
             .collect();
         Ok(Some(columns))
@@ -1894,6 +2026,25 @@ impl<
 
             Ok(results.into_iter().collect())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mysql_table_compression;
+
+    #[test]
+    fn parses_mysql_table_compression_options() {
+        assert_eq!(
+            parse_mysql_table_compression("COMPRESSION=\"lz4\""),
+            Some("LZ4".to_string())
+        );
+        assert_eq!(
+            parse_mysql_table_compression("ROW_FORMAT=COMPRESSED COMPRESSION='zlib'"),
+            Some("ZLIB".to_string())
+        );
+        assert_eq!(parse_mysql_table_compression("COMPRESSION=none"), None);
+        assert_eq!(parse_mysql_table_compression("ROW_FORMAT=DYNAMIC"), None);
     }
 }
 

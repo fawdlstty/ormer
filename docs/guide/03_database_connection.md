@@ -6,6 +6,8 @@
 - PostgreSQL
 - MySQL
 - MSSQL
+- DuckDB（当前仅提供 SQL 类型映射，连接执行暂未实现）
+- ClickHouse（当前仅提供 SQL 类型映射，连接执行暂未实现）
 
 ## 启用特性
 
@@ -29,6 +31,16 @@ ormer = { version = "0.2", features = ["sqlite"] }
 
 **MSSQL:**
 - `mssql://user:password@localhost/dbname`
+
+**DuckDB:**
+- `app.duckdb`
+
+**ClickHouse:**
+- `http://localhost:8123?database=default`
+
+DuckDB 与 ClickHouse feature 已预留并会参与 SQL 方言生成；由于当前版本尚未
+完成可验证的异步连接、事务和结果流适配，调用 `Database::connect` 会返回
+`UnsupportedFeature`，不会伪装成已连接。
 
 ## 示例
 

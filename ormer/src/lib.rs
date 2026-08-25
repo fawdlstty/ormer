@@ -14,10 +14,12 @@ pub mod utils;
     feature = "sqlite",
     feature = "postgresql",
     feature = "mysql",
-    feature = "mssql"
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
 )))]
 compile_error!(
-    "At least one database feature must be enabled: sqlite, postgresql, mysql, or mssql"
+    "At least one database feature must be enabled: sqlite, postgresql, mysql, mssql, duckdb, or clickhouse"
 );
 
 pub use abstract_layer::DbType;
@@ -34,7 +36,9 @@ pub use migration::{
     feature = "sqlite",
     feature = "postgresql",
     feature = "mysql",
-    feature = "mssql"
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
 ))]
 pub use abstract_layer::{
     BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, ConnectionPool,
@@ -54,12 +58,12 @@ pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
 pub use model::{
     ActiveValue, AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
-    DbValue, Embed, EmbedWhere, FieldType, FieldTypeProvider, FromRowValues, FromSingleValue,
-    FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum, ModelEnumProvider,
-    NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle, RelationInfo, RelationKind,
-    RelationPathInfo, RelationQuery, RelationSelection, Row, TableRoute, TableRouteValue,
-    ThroughInfo, ThroughRelation, TrackableModel, Tracked, Value, ViewModel, WritableModel,
-    generate_create_table_sql, generate_create_table_sql_with_name,
+    CompressionAlgorithm, DbValue, Embed, EmbedWhere, FieldType, FieldTypeProvider, FromRowValues,
+    FromSingleValue, FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum,
+    ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
+    RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
+    TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel, Tracked, Value,
+    ViewModel, WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
 };
 pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum, ViewModel, raw};
 pub use query::builder::{

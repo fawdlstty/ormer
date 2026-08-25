@@ -242,7 +242,7 @@ impl Database {
         let schema_literal = mssql_escape_literal(schema_name);
         let table_literal = mssql_escape_literal(table_name);
         let columns_sql = format!(
-            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, c.COLUMN_DEFAULT, \
                     CASE WHEN pk.COLUMN_NAME IS NULL THEN 0 ELSE 1 END AS IS_PRIMARY, \
                     CASE WHEN sc.is_identity = 1 THEN 1 ELSE 0 END AS IS_IDENTITY \
              FROM INFORMATION_SCHEMA.COLUMNS c \
@@ -274,8 +274,9 @@ impl Database {
                 let name = row.get::<&str, _>(0).unwrap_or("").to_string();
                 let type_name = row.get::<&str, _>(1).unwrap_or("").to_string();
                 let nullable = row.get::<&str, _>(2).unwrap_or("") == "YES";
-                let primary_key = row.get::<i32, _>(3).unwrap_or(0) != 0;
-                let auto_increment = row.get::<i32, _>(4).unwrap_or(0) != 0;
+                let default = row.get::<&str, _>(3).map(str::to_string);
+                let primary_key = row.get::<i32, _>(4).unwrap_or(0) != 0;
+                let auto_increment = row.get::<i32, _>(5).unwrap_or(0) != 0;
                 DbFirstColumn {
                     name,
                     type_name,
@@ -283,6 +284,7 @@ impl Database {
                     primary_key,
                     auto_increment,
                     enum_variants: Vec::new(),
+                    default,
                 }
             })
             .collect();
@@ -686,22 +688,37 @@ impl Database {
 
         // 查询表的列信息
         let col_sql = format!(
-            "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE {table_filter} ORDER BY ORDINAL_POSITION"
+            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+                    CASE WHEN COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') = 1 THEN 1 ELSE 0 END, \
+                    CASE WHEN EXISTS ( \
+                        SELECT 1 \
+                        FROM sys.indexes i \
+                        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                        JOIN sys.columns sc ON sc.object_id = ic.object_id AND sc.column_id = ic.column_id \
+                        WHERE i.is_primary_key = 1 \
+                          AND i.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)) \
+                          AND sc.name = c.COLUMN_NAME \
+                    ) THEN 1 ELSE 0 END \
+             FROM INFORMATION_SCHEMA.COLUMNS c WHERE {table_filter} ORDER BY c.ORDINAL_POSITION"
         );
         let query = Query::new(&col_sql);
         let stream = query.query(&mut *client).trace().await?;
         let rows = stream.into_first_result().trace().await?;
 
         // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
+        let mut actual_columns: Vec<(String, String, bool, bool, bool)> = Vec::new();
         for row in rows {
             let name: String = row.get::<&str, _>(0).unwrap_or("").to_string();
             let col_type: String = row.get::<&str, _>(1).unwrap_or("").to_string();
             let nullable: String = row.get::<&str, _>(2).unwrap_or("").to_string();
+            let auto_increment = row.get::<i32, _>(3).unwrap_or(0) != 0;
+            let primary_key = row.get::<i32, _>(4).unwrap_or(0) != 0;
             actual_columns.push((
                 name.to_lowercase(),
                 col_type.to_lowercase(),
                 nullable == "YES",
+                primary_key,
+                auto_increment,
             ));
         }
 
@@ -725,7 +742,8 @@ impl Database {
                 ));
             }
 
-            let (actual_name, actual_type, _actual_nullable) = &actual_columns[i];
+            let (actual_name, actual_type, actual_nullable, actual_primary, actual_auto_increment) =
+                &actual_columns[i];
 
             // 检查列名
             if actual_name != &expected_col.name.to_lowercase() {
@@ -738,9 +756,30 @@ impl Database {
                 ));
             }
 
+            if expected_col.is_primary != *actual_primary {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    if expected_col.is_primary { "" } else { "not " },
+                    if *actual_primary { "" } else { "not " }
+                ));
+            }
+
+            if expected_col.is_auto_increment != *actual_auto_increment {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    expected_col.is_auto_increment,
+                    actual_auto_increment
+                ));
+            }
+
             // 提取预期的 SQL 类型
+            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
             let expected_sql_type = MSSQLTypeMapper::sql_type(
-                expected_col.rust_type,
+                effective_rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
                 false,
@@ -770,8 +809,28 @@ impl Database {
                     ));
                 }
             }
+
+            let expected_nullable = expected_col.is_nullable;
+            if !expected_col.is_primary && (*actual_nullable != expected_nullable) {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    if expected_nullable { "" } else { "NOT " },
+                    if *actual_nullable { "" } else { "NOT " }
+                ));
+            }
         }
 
+        drop(client);
+        let (schema_name, table_name) = T::TABLE_NAME
+            .rsplit_once('.')
+            .unwrap_or(("dbo", T::TABLE_NAME));
+        let actual_table = self.db_first_table(schema_name, table_name).await?;
+        crate::db_first::validate_model_constraints::<T>(
+            crate::abstract_layer::DbType::MSSQL,
+            &actual_table,
+        )?;
         Ok(())
     }
 

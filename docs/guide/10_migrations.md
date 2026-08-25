@@ -80,3 +80,7 @@ for migration in history {
 ```
 
 SQLite 不支持在建表后追加外键；`MigrationStep::AddForeignKey` 在 SQLite 上会返回错误。
+
+`migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
+
+模型中的 `#[compress(...)]` 也会参与表结构校验和迁移。PostgreSQL 会生成列级 `SET COMPRESSION`，MySQL 会生成表级 `COMPRESSION` 选项；MySQL 同一张表的压缩列必须使用同一种算法。

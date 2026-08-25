@@ -6,6 +6,8 @@
 
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{Database, Transaction};
+#[cfg(any(feature = "postgresql", feature = "mysql"))]
+use crate::model::CompressionAlgorithm;
 use crate::model::{ColumnSchema, WritableModel};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -113,6 +115,10 @@ impl MigrationStep {
                     DbType::MSSQL => Ok(format!(
                         "ALTER TABLE {table} ALTER COLUMN {column} {definition}"
                     )),
+                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+                    _ => Err(crate::ormer_error!(
+                        "ALTER COLUMN is not implemented for this backend"
+                    )),
                 }
             }
             Self::AddConstraint { table, definition } => {
@@ -134,6 +140,8 @@ impl MigrationStep {
                     DbType::Sqlite => " IF NOT EXISTS",
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => " IF NOT EXISTS",
+                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+                    _ => " IF NOT EXISTS",
                 };
                 Ok(format!(
                     "CREATE{unique} INDEX{if_not_exists} {name} ON {table} ({})",
@@ -325,6 +333,8 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             return Ok(plan);
         };
 
+        self.db.validate_hypertable_for_migration::<T>().await?;
+
         let actual_names: BTreeSet<&str> =
             actual.iter().map(|column| column.name.as_str()).collect();
         let expected_names: BTreeSet<&str> =
@@ -347,6 +357,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         // Additive changes are safe to infer when a non-null column can be
         // populated. A populated table without a model default needs an
         // explicit backfill because the ORM cannot invent its value.
+        let mut added_columns = BTreeSet::new();
         for column in T::COLUMN_SCHEMA {
             if !actual_names.contains(column.name) {
                 if column.is_primary {
@@ -355,7 +366,10 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         column.name
                     ));
                 }
-                if !column.is_nullable && self.db.table_row_count(table_name).await? > 0 {
+                if !column.is_nullable
+                    && column.default.is_none()
+                    && self.db.table_row_count(table_name).await? > 0
+                {
                     return Err(crate::ormer_error!(
                         "Cannot add NOT NULL column {} to populated table {}; \
                          write an explicit migration with a backfill",
@@ -366,14 +380,110 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                 plan.push(MigrationStep::AddColumn {
                     table: table_name.to_string(),
                     column: column.name.to_string(),
-                    definition: column_definition(db_type, column),
+                    definition: column_definition(db_type, column)?,
                 });
-                if column.is_indexed {
-                    plan.push(MigrationStep::CreateIndex {
-                        name: format!("idx_{}_{}", table_name.replace('.', "_"), column.name),
+                added_columns.insert(column.name);
+            }
+        }
+
+        if !added_columns.is_empty() {
+            let available_columns =
+                |name: &str| actual_names.contains(name) || added_columns.contains(name);
+
+            let mut indexes = BTreeMap::<i32, Vec<&ColumnSchema>>::new();
+            for column in T::COLUMN_SCHEMA {
+                if !column.is_indexed {
+                    continue;
+                }
+                if let Some(group) = column.index_group {
+                    indexes.entry(group).or_default().push(column);
+                } else if added_columns.contains(column.name) {
+                    indexes.entry(i32::MIN).or_default().push(column);
+                }
+            }
+
+            for (group, columns) in indexes {
+                if group != i32::MIN
+                    && !columns
+                        .iter()
+                        .any(|column| added_columns.contains(column.name))
+                {
+                    continue;
+                }
+                if !columns.iter().all(|column| available_columns(column.name)) {
+                    continue;
+                }
+                let name = columns
+                    .iter()
+                    .find_map(|column| column.index_name)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        if group == i32::MIN {
+                            format!("idx_{}_{}", table_name.replace('.', "_"), columns[0].name)
+                        } else {
+                            format!("idx_{}_{}", table_name.replace('.', "_"), group)
+                        }
+                    });
+                plan.push(index_migration_step(
+                    db_type, name, table_name, &columns, false,
+                ));
+            }
+
+            let mut unique_groups = BTreeMap::<i32, Vec<&ColumnSchema>>::new();
+            for column in T::COLUMN_SCHEMA {
+                if let Some(group) = column.unique_group {
+                    unique_groups.entry(group).or_default().push(column);
+                }
+            }
+            for (group, columns) in unique_groups {
+                if !columns
+                    .iter()
+                    .any(|column| added_columns.contains(column.name))
+                    || !columns.iter().all(|column| available_columns(column.name))
+                {
+                    continue;
+                }
+                let name = columns
+                    .iter()
+                    .find_map(|column| column.unique_name)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("uq_{}_{}", table_name.replace('.', "_"), group));
+                plan.push(index_migration_step(
+                    db_type, name, table_name, &columns, true,
+                ));
+            }
+
+            for column in T::COLUMN_SCHEMA {
+                if !added_columns.contains(column.name) {
+                    continue;
+                }
+                if let Some(foreign_key) = &column.foreign_key {
+                    let sqlite_backend = {
+                        #[cfg(feature = "sqlite")]
+                        {
+                            matches!(db_type, DbType::Sqlite)
+                        }
+                        #[cfg(not(feature = "sqlite"))]
+                        {
+                            false
+                        }
+                    };
+                    if sqlite_backend {
+                        return Err(crate::ormer_error!(
+                            "Cannot add foreign key column {} to SQLite table {}; write an explicit table-rebuild migration",
+                            column.name,
+                            table_name
+                        ));
+                    }
+                    plan.push(MigrationStep::AddForeignKey {
                         table: table_name.to_string(),
-                        columns: vec![column.name.to_string()],
-                        unique: false,
+                        column: column.name.to_string(),
+                        ref_table: crate::model::normalize_table_name_for_db(
+                            db_type,
+                            foreign_key.ref_table,
+                        )
+                        .to_string(),
+                        ref_column: foreign_key.get_ref_column().to_string(),
                     });
                 }
             }
@@ -402,8 +512,22 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             let expected_type = column_type_definition(db_type, expected);
             let type_changed = !types_equivalent(db_type, &actual.type_name, &expected_type);
             let nullable_changed = !expected.is_primary && actual.nullable != expected.is_nullable;
+            let compression_changed = {
+                #[cfg(feature = "postgresql")]
+                if matches!(db_type, DbType::PostgreSQL) {
+                    let expected_compression = crate::model::column_compression_algorithm(expected);
+                    actual.compression.as_deref()
+                        != expected_compression.map(CompressionAlgorithm::as_str)
+                } else {
+                    false
+                }
+                #[cfg(not(feature = "postgresql"))]
+                {
+                    false
+                }
+            };
 
-            if !type_changed && !nullable_changed {
+            if !type_changed && !nullable_changed && !compression_changed {
                 continue;
             }
 
@@ -437,7 +561,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                     let definition = if is_postgresql {
                         format!("TYPE {expected_type}")
                     } else {
-                        column_definition(db_type, expected)
+                        column_definition(db_type, expected)?
                     };
                     #[cfg(feature = "postgresql")]
                     let using =
@@ -463,11 +587,15 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                             }
                         }
                         #[cfg(feature = "mysql")]
-                        DbType::MySQL => column_definition(db_type, expected),
+                        DbType::MySQL => column_definition(db_type, expected)?,
                         #[cfg(feature = "mssql")]
-                        DbType::MSSQL => column_definition(db_type, expected),
+                        DbType::MSSQL => column_definition(db_type, expected)?,
                         #[cfg(feature = "sqlite")]
                         DbType::Sqlite => unreachable!("SQLite uses table rebuilds"),
+                        #[cfg(feature = "duckdb")]
+                        DbType::DuckDB => column_definition(db_type, expected)?,
+                        #[cfg(feature = "clickhouse")]
+                        DbType::ClickHouse => column_definition(db_type, expected)?,
                     };
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
@@ -475,6 +603,35 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         definition,
                         using: None,
                     });
+                }
+
+                #[cfg(feature = "postgresql")]
+                if compression_changed {
+                    let expected_compression = crate::model::column_compression_algorithm(expected);
+                    if let Some(step) = column_compression_migration_step(
+                        db_type,
+                        table_name,
+                        expected.name,
+                        expected_compression,
+                    ) {
+                        plan.push(step);
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "mysql")]
+        if matches!(db_type, DbType::MySQL) {
+            let expected_compression = crate::model::table_compression_algorithm::<T>()?;
+            let actual_compression = actual
+                .iter()
+                .find_map(|column| column.compression.as_deref())
+                .and_then(parse_compression_algorithm);
+            if actual_compression != expected_compression {
+                if let Some(step) =
+                    column_compression_migration_step(db_type, table_name, "", expected_compression)
+                {
+                    plan.push(step);
                 }
             }
         }
@@ -508,7 +665,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
     }
 }
 
-fn column_definition(db_type: DbType, column: &ColumnSchema) -> String {
+fn column_definition(db_type: DbType, column: &ColumnSchema) -> crate::Result<String> {
     let mut definition = db_type.sql_type(
         column.data_type.unwrap_or(column.rust_type),
         false,
@@ -516,6 +673,31 @@ fn column_definition(db_type: DbType, column: &ColumnSchema) -> String {
         column.is_nullable,
         column.enum_variants,
     );
+
+    #[cfg(feature = "postgresql")]
+    if let Some(compression) = crate::model::column_compression_algorithm(column) {
+        if matches!(db_type, DbType::PostgreSQL) {
+            if !matches!(
+                compression,
+                CompressionAlgorithm::Pglz | CompressionAlgorithm::Lz4
+            ) {
+                return Err(crate::ormer_error!(
+                    "PostgreSQL does not support compression algorithm {}",
+                    compression.as_str()
+                ));
+            }
+            let suffix = " NOT NULL";
+            let nullable = definition.ends_with(suffix);
+            if nullable {
+                definition.truncate(definition.len() - suffix.len());
+            }
+            definition.push_str(" COMPRESSION ");
+            definition.push_str(compression.as_str());
+            if nullable {
+                definition.push_str(suffix);
+            }
+        }
+    }
 
     if let Some(default) = column.default {
         definition.push_str(" DEFAULT ");
@@ -528,7 +710,119 @@ fn column_definition(db_type: DbType, column: &ColumnSchema) -> String {
         definition.push(')');
     }
 
-    definition
+    Ok(definition)
+}
+
+#[cfg(any(feature = "postgresql", feature = "mysql"))]
+fn column_compression_migration_step(
+    db_type: DbType,
+    table_name: &str,
+    column_name: &str,
+    compression: Option<CompressionAlgorithm>,
+) -> Option<MigrationStep> {
+    #[cfg(feature = "postgresql")]
+    if matches!(db_type, DbType::PostgreSQL) {
+        let method = compression
+            .map(CompressionAlgorithm::as_str)
+            .unwrap_or("default");
+        return Some(MigrationStep::Sql {
+            sql: format!(
+                "ALTER TABLE {} ALTER COLUMN {} SET COMPRESSION {}",
+                crate::model::quote_qualified_identifier(DbType::PostgreSQL, table_name),
+                crate::model::quote_identifier(DbType::PostgreSQL, column_name),
+                method,
+            ),
+        });
+    }
+
+    #[cfg(feature = "mysql")]
+    if matches!(db_type, DbType::MySQL) {
+        let method = compression
+            .map(CompressionAlgorithm::as_upper_str)
+            .unwrap_or("NONE");
+        return Some(MigrationStep::Sql {
+            sql: format!(
+                "ALTER TABLE {} COMPRESSION='{}'",
+                crate::model::quote_qualified_identifier(DbType::MySQL, table_name),
+                method,
+            ),
+        });
+    }
+
+    let _ = (db_type, table_name, column_name, compression);
+    None
+}
+
+#[cfg(feature = "mysql")]
+fn parse_compression_algorithm(value: &str) -> Option<CompressionAlgorithm> {
+    match value.to_ascii_lowercase().as_str() {
+        "pglz" => Some(CompressionAlgorithm::Pglz),
+        "lz4" => Some(CompressionAlgorithm::Lz4),
+        "zlib" => Some(CompressionAlgorithm::Zlib),
+        "zstd" => Some(CompressionAlgorithm::Zstd),
+        _ => None,
+    }
+}
+
+fn index_migration_step(
+    db_type: DbType,
+    name: String,
+    table: &str,
+    columns: &[&ColumnSchema],
+    unique: bool,
+) -> MigrationStep {
+    let has_order_or_predicate = columns
+        .iter()
+        .any(|column| column.index_order.is_some() || column.index_where.is_some());
+    if !has_order_or_predicate {
+        return MigrationStep::CreateIndex {
+            name,
+            table: table.to_string(),
+            columns: columns
+                .iter()
+                .map(|column| column.name.to_string())
+                .collect(),
+            unique,
+        };
+    }
+
+    let unique_sql = if unique { " UNIQUE" } else { "" };
+    let if_not_exists = match db_type {
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => "",
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => "",
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => " IF NOT EXISTS",
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => " IF NOT EXISTS",
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => " IF NOT EXISTS",
+    };
+    let columns_sql = columns
+        .iter()
+        .map(|column| {
+            let mut value = crate::model::quote_identifier(db_type, column.name);
+            if let Some(order) = column.index_order {
+                value.push(' ');
+                value.push_str(order);
+            }
+            value
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let predicate = columns
+        .iter()
+        .find_map(|column| column.index_where)
+        .map(|where_clause| format!(" WHERE {where_clause}"))
+        .unwrap_or_default();
+    MigrationStep::Sql {
+        sql: format!(
+            "CREATE{unique_sql} INDEX{if_not_exists} {} ON {} ({columns_sql}){predicate}",
+            crate::model::quote_identifier(db_type, &name),
+            crate::model::quote_qualified_identifier(db_type, table),
+        ),
+    }
 }
 
 fn column_type_definition(db_type: DbType, column: &ColumnSchema) -> String {
@@ -631,6 +925,8 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 _ => base.to_string(),
             }
         }
+        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        _ => upper,
     }
 }
 
@@ -1042,6 +1338,8 @@ impl Database {
             Database::MySQL(_) => DbType::MySQL,
             #[cfg(feature = "mssql")]
             Database::MSSQL(_) => DbType::MSSQL,
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(_) => DbType::DuckDB,
         }
     }
 
@@ -1176,6 +1474,17 @@ impl Database {
                  CREATE TABLE {MIGRATION_TABLE_NAME} \
                  (version BIGINT NOT NULL PRIMARY KEY, name NVARCHAR(255) NOT NULL, checksum NVARCHAR(32) NOT NULL, applied_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME())"
             ),
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => format!(
+                "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE_NAME} \
+                 (version BIGINT PRIMARY KEY, name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            ),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            _ => {
+                return Err(crate::ormer_error!(
+                    "migrations are not implemented for this backend"
+                ));
+            }
         };
         self.execute_sql(&sql).await?;
         Ok(())
@@ -1191,6 +1500,8 @@ impl Database {
             Database::MySQL(db) => db.migration_history().await,
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.migration_history().await,
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => db.migration_history().await,
         }
     }
 
@@ -1207,6 +1518,23 @@ impl Database {
             Database::MySQL(db) => db.schema_columns(table_name).await,
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => db.schema_columns(table_name).await,
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => db.schema_columns(table_name).await,
+        }
+    }
+
+    async fn validate_hypertable_for_migration<T: WritableModel>(&self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => db.validate_hypertable_for_migration::<T>().await,
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(_) => Ok(()),
+            #[cfg(feature = "mysql")]
+            Database::MySQL(_) => Ok(()),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(_) => Ok(()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(_) => Ok(()),
         }
     }
 }
@@ -1218,20 +1546,77 @@ pub(crate) struct SchemaColumn {
     pub(crate) type_name: String,
     pub(crate) nullable: bool,
     pub(crate) primary_key: bool,
+    #[allow(dead_code)]
+    pub(crate) compression: Option<String>,
 }
 
 /// Keep a deterministic map available to backend implementations without
 /// exposing driver-specific row types through the public API.
+#[allow(dead_code)]
 pub(crate) fn schema_column(
     name: impl Into<String>,
     type_name: impl Into<String>,
     nullable: bool,
     primary_key: bool,
 ) -> SchemaColumn {
+    schema_column_with_compression(name, type_name, nullable, primary_key, None)
+}
+
+pub(crate) fn schema_column_with_compression(
+    name: impl Into<String>,
+    type_name: impl Into<String>,
+    nullable: bool,
+    primary_key: bool,
+    compression: Option<String>,
+) -> SchemaColumn {
     SchemaColumn {
         name: name.into(),
         type_name: type_name.into(),
         nullable,
         primary_key,
+        compression,
+    }
+}
+
+#[cfg(all(test, feature = "postgresql"))]
+mod compression_tests {
+    use super::{CompressionAlgorithm, MigrationStep, column_compression_migration_step};
+    use crate::abstract_layer::DbType;
+
+    #[test]
+    fn postgres_compression_migration_renders_column_step() {
+        let step = column_compression_migration_step(
+            DbType::PostgreSQL,
+            "public.documents",
+            "payload",
+            Some(CompressionAlgorithm::Lz4),
+        )
+        .expect("compression migration step");
+        assert_eq!(
+            step.sql(DbType::PostgreSQL).unwrap(),
+            "ALTER TABLE public.documents ALTER COLUMN payload SET COMPRESSION lz4"
+        );
+        assert!(matches!(step, MigrationStep::Sql { .. }));
+    }
+}
+
+#[cfg(all(test, feature = "mysql"))]
+mod mysql_compression_tests {
+    use super::{CompressionAlgorithm, column_compression_migration_step};
+    use crate::abstract_layer::DbType;
+
+    #[test]
+    fn mysql_compression_migration_renders_table_step() {
+        let step = column_compression_migration_step(
+            DbType::MySQL,
+            "documents",
+            "",
+            Some(CompressionAlgorithm::Lz4),
+        )
+        .expect("compression migration step");
+        assert_eq!(
+            step.sql(DbType::MySQL).unwrap(),
+            "ALTER TABLE documents COMPRESSION='LZ4'"
+        );
     }
 }

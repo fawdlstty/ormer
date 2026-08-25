@@ -14,6 +14,12 @@ pub mod mysql_backend;
 #[cfg(feature = "mssql")]
 pub mod mssql_backend;
 
+#[cfg(feature = "duckdb")]
+pub mod duckdb_backend;
+
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse_backend;
+
 /// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
 pub mod common;
 
@@ -32,6 +38,12 @@ pub enum DbType {
     /// MSSQL 数据库
     #[cfg(feature = "mssql")]
     MSSQL,
+    /// DuckDB 数据库
+    #[cfg(feature = "duckdb")]
+    DuckDB,
+    /// ClickHouse 数据库
+    #[cfg(feature = "clickhouse")]
+    ClickHouse,
 }
 
 impl DbType {
@@ -79,6 +91,24 @@ impl DbType {
                 _is_nullable,
                 _enum_variants,
             ),
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => crate::abstract_layer::duckdb_backend::DuckDBTypeMapper::sql_type(
+                _rust_type,
+                _is_primary,
+                _is_auto_increment,
+                _is_nullable,
+                _enum_variants,
+            ),
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => {
+                crate::abstract_layer::clickhouse_backend::ClickHouseTypeMapper::sql_type(
+                    _rust_type,
+                    _is_primary,
+                    _is_auto_increment,
+                    _is_nullable,
+                    _enum_variants,
+                )
+            }
         }
     }
 }

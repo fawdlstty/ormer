@@ -8,6 +8,8 @@ struct DbTypeAttrs {
     postgresql: Option<String>,
     mysql: Option<String>,
     mssql: Option<String>,
+    duckdb: Option<String>,
+    clickhouse: Option<String>,
 }
 
 pub fn derive_db_value(input: DeriveInput) -> TokenStream {
@@ -45,6 +47,18 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
             ::ormer::DbType::MSSQL => #ty,
         }
     });
+    let duckdb_arm = db_types.duckdb.map(|ty| {
+        quote! {
+            #[cfg(feature = "duckdb")]
+            ::ormer::DbType::DuckDB => #ty,
+        }
+    });
+    let clickhouse_arm = db_types.clickhouse.map(|ty| {
+        quote! {
+            #[cfg(feature = "clickhouse")]
+            ::ormer::DbType::ClickHouse => #ty,
+        }
+    });
 
     quote! {
         impl ::ormer::model::DbValue for #name {
@@ -62,6 +76,8 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
                     #postgresql_arm
                     #mysql_arm
                     #mssql_arm
+                    #duckdb_arm
+                    #clickhouse_arm
                     _ => panic!("db_type mapping for {} is not configured", stringify!(#name)),
                 }
             }
@@ -158,6 +174,10 @@ fn extract_db_types(input: &DeriveInput) -> DbTypeAttrs {
                 db_types.mysql = Some(lit.value());
             } else if meta.path.is_ident("mssql") {
                 db_types.mssql = Some(lit.value());
+            } else if meta.path.is_ident("duckdb") {
+                db_types.duckdb = Some(lit.value());
+            } else if meta.path.is_ident("clickhouse") {
+                db_types.clickhouse = Some(lit.value());
             } else {
                 return Err(meta.error("unsupported #[db_type] argument"));
             }

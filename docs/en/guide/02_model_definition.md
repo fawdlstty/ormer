@@ -31,7 +31,8 @@ struct User {
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable time chunk interval
 - `#[hypertable]` - Marks a `String` field as a PostgreSQL/TimescaleDB string table route key
-- `#[compress]` - PostgreSQL column-level compression (generates `COMPRESSION pglz`)
+- `#[compress]` - Column compression using PostgreSQL `pglz` by default
+- `#[compress(lz4)]` - Select a compression algorithm; PostgreSQL emits column-level `COMPRESSION lz4`, while MySQL emits the table option `COMPRESSION='LZ4'`
 - `#[filter(filter_name, |m, ...| ...)]` - Model-level reusable filter; the name must start with `filter_`
 - `#[version(u64)]` - Adds an automatic `version` column for optimistic locking
 - `#[ormer_ignore]` - Excludes a field from database columns; useful for dynamic table route values
@@ -539,6 +540,8 @@ db.create_table::<User>().execute().await?;
 ```rust
 db.validate_table::<User>().await?;
 ```
+
+`validate_table` checks column count, order, names, types, nullability, primary-key, auto-increment, unique constraints, indexes, and foreign keys. PostgreSQL models also validate the TimescaleDB hypertable and time-chunk interval.
 
 ### Dropping Tables
 

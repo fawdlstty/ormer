@@ -405,6 +405,7 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
                     check: None,
                     hypertable: None,
                     compress: false,
+                    compression: None,
                 });
             }
         });

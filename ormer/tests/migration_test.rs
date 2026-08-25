@@ -20,6 +20,19 @@ struct MigrationUserV2 {
 }
 
 #[derive(Debug, ormer::Model)]
+#[table = "ormer_migration_users"]
+struct MigrationUserV3 {
+    #[primary(auto)]
+    id: i32,
+    name: String,
+    #[default("unknown")]
+    #[unique]
+    slug: String,
+    #[index]
+    tag: Option<String>,
+}
+
+#[derive(Debug, ormer::Model)]
 #[table = "ormer_migration_type_values"]
 struct MigrationIntegerValue {
     #[primary]
@@ -126,6 +139,46 @@ async fn table_plan_rejects_implicit_not_null_addition_on_populated_sqlite_table
         .await
         .expect_err("non-null column requires an explicit backfill");
     assert!(error.to_string().contains("explicit migration"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_plan_uses_defaults_and_adds_indexes_for_new_columns() -> ormer::Result<()> {
+    let db = database().await?;
+    db.migrate_table::<MigrationUserV1>().execute().await?;
+    db.execute_sql("INSERT INTO ormer_migration_users (name) VALUES ('existing')")
+        .await?;
+
+    let plan = db.migrate_table::<MigrationUserV3>().plan().await?;
+    assert!(
+        plan.steps()
+            .iter()
+            .any(|step| { matches!(step, MigrationStep::CreateIndex { unique: true, .. }) })
+    );
+    assert!(plan.steps().iter().any(|step| {
+        matches!(
+            step,
+            MigrationStep::CreateIndex { unique: false, columns, .. }
+                if columns == &vec!["tag".to_string()]
+        )
+    }));
+
+    db.migrate_table::<MigrationUserV3>().execute().await?;
+    let rows = db
+        .select_sql::<(String, String)>(
+            "SELECT name, slug FROM ormer_migration_users ORDER BY name",
+        )
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(rows, vec![("existing".to_string(), "unknown".to_string())]);
+    let error = db
+        .execute_sql(
+            "INSERT INTO ormer_migration_users (name, slug) \
+             VALUES ('second', 'unknown')",
+        )
+        .await
+        .expect_err("new unique index must be enforced");
+    assert!(!error.to_string().is_empty());
     Ok(())
 }
 

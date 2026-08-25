@@ -21,17 +21,223 @@ use crate::utils::{FutureTraceExt, ResultTraceExt};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
 
-async fn traced_sqlite_execute<P: turso::IntoParams>(
-    conn: &Arc<turso::Connection>,
+pub(crate) mod duckcompat {
+    use super::*;
+
+    #[derive(Debug)]
+    pub struct Error(pub String);
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+    impl std::error::Error for Error {}
+
+    #[derive(Clone, Debug)]
+    pub enum Value {
+        Null,
+        Integer(i64),
+        Real(f64),
+        Text(String),
+        Blob(Vec<u8>),
+    }
+
+    pub trait IntoParams {
+        fn into_values(self) -> Vec<Value>;
+    }
+    impl IntoParams for () {
+        fn into_values(self) -> Vec<Value> { Vec::new() }
+    }
+    impl IntoParams for Vec<Value> {
+        fn into_values(self) -> Vec<Value> { self }
+    }
+    impl<const N: usize> IntoParams for [&str; N] {
+        fn into_values(self) -> Vec<Value> {
+            self.into_iter().map(|v| Value::Text(v.to_string())).collect()
+        }
+    }
+    impl<const N: usize> IntoParams for [&String; N] {
+        fn into_values(self) -> Vec<Value> {
+            self.into_iter().map(|v| Value::Text(v.clone())).collect()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Row {
+        values: Vec<Value>,
+    }
+    impl Row {
+        pub fn get_value(&self, index: usize) -> Result<Value, Error> {
+            self.values
+                .get(index)
+                .cloned()
+                .ok_or_else(|| Error(format!("column index out of bounds: {index}")))
+        }
+        pub fn column_count(&self) -> usize { self.values.len() }
+    }
+
+    pub struct Rows {
+        rows: Vec<Row>,
+        cursor: usize,
+    }
+    impl Rows {
+        pub async fn next(&mut self) -> Result<Option<Row>, Error> {
+            if self.cursor >= self.rows.len() {
+                return Ok(None);
+            }
+            let row = self.rows[self.cursor].clone();
+            self.cursor += 1;
+            Ok(Some(row))
+        }
+    }
+
+    pub struct Connection {
+        conn: Arc<Mutex<duckdb::Connection>>,
+    }
+    unsafe impl Send for Connection {}
+    unsafe impl Sync for Connection {}
+
+    impl Connection {
+        fn new(conn: duckdb::Connection) -> Self {
+            Self { conn: Arc::new(Mutex::new(conn)) }
+        }
+
+        pub async fn execute<P: IntoParams>(&self, sql: &str, params: P) -> Result<u64, Error> {
+            let sql = sql.to_string();
+            let values = params.into_values();
+            let conn = Arc::clone(&self.conn);
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.lock().map_err(|e| Error(e.to_string()))?;
+                let params = values_to_duckdb_params(&values);
+                guard
+                    .execute(&sql, duckdb::params_from_iter(params.iter()))
+                    .map(|count| count as u64)
+                    .map_err(|e| Error(e.to_string()))
+            })
+            .await
+            .map_err(|e| Error(e.to_string()))?
+        }
+
+        pub async fn query<P: IntoParams>(&self, sql: &str, params: P) -> Result<Rows, Error> {
+            let sql = sql.to_string();
+            let values = params.into_values();
+            let conn = Arc::clone(&self.conn);
+            tokio::task::spawn_blocking(move || {
+                let guard = conn.lock().map_err(|e| Error(e.to_string()))?;
+                let params = values_to_duckdb_params(&values);
+                let mut stmt = guard.prepare(&sql).map_err(|e| Error(e.to_string()))?;
+                let column_count = stmt.column_count();
+                let mut rows = stmt
+                    .query(duckdb::params_from_iter(params.iter()))
+                    .map_err(|e| Error(e.to_string()))?;
+                let mut materialized = Vec::new();
+                while let Some(row) = rows.next().map_err(|e| Error(e.to_string()))? {
+                    let mut values = Vec::new();
+                    for idx in 0..column_count {
+                        let value = row.get_ref(idx).map_err(|e| Error(e.to_string()))?;
+                        values.push(value_ref_to_value(value));
+                    }
+                    materialized.push(Row { values });
+                }
+                Ok(Rows { rows: materialized, cursor: 0 })
+            })
+            .await
+            .map_err(|e| Error(e.to_string()))?
+        }
+
+        pub fn last_insert_rowid(&self) -> i64 { 0 }
+    }
+
+    pub struct Builder {
+        path: String,
+    }
+    impl Builder {
+        pub fn new_local(path: &str) -> Self { Self { path: path.to_string() } }
+        pub async fn build(self) -> Result<Database, Error> {
+            let conn = if self.path == ":memory:" {
+                duckdb::Connection::open_in_memory()
+            } else {
+                duckdb::Connection::open(&self.path)
+            }
+            .map_err(|e| Error(e.to_string()))?;
+            Ok(Database { conn: Arc::new(Connection::new(conn)) })
+        }
+    }
+    pub struct Database {
+        conn: Arc<Connection>,
+    }
+    impl Database {
+        pub fn connect(&self) -> Result<Arc<Connection>, Error> { Ok(Arc::clone(&self.conn)) }
+    }
+
+    fn values_to_duckdb_params(values: &[Value]) -> Vec<duckdb::types::Value> {
+        values.iter().map(|value| match value {
+            Value::Null => duckdb::types::Value::Null,
+            Value::Integer(v) => duckdb::types::Value::BigInt(*v),
+            Value::Real(v) => duckdb::types::Value::Double(*v),
+            Value::Text(v) => duckdb::types::Value::Text(v.clone()),
+            Value::Blob(v) => duckdb::types::Value::Blob(v.clone()),
+        }).collect()
+    }
+
+    fn value_ref_to_value(value: duckdb::types::ValueRef<'_>) -> Value {
+        use duckdb::types::ValueRef;
+        match value {
+            ValueRef::Null => Value::Null,
+            ValueRef::Boolean(v) => Value::Integer(if v { 1 } else { 0 }),
+            ValueRef::TinyInt(v) => Value::Integer(v as i64),
+            ValueRef::SmallInt(v) => Value::Integer(v as i64),
+            ValueRef::Int(v) => Value::Integer(v as i64),
+            ValueRef::BigInt(v) => Value::Integer(v),
+            ValueRef::HugeInt(v) => Value::Text(v.to_string()),
+            ValueRef::UHugeInt(v) => Value::Text(v.to_string()),
+            ValueRef::UTinyInt(v) => Value::Integer(v as i64),
+            ValueRef::USmallInt(v) => Value::Integer(v as i64),
+            ValueRef::UInt(v) => Value::Integer(v as i64),
+            ValueRef::UBigInt(v) => Value::Text(v.to_string()),
+            ValueRef::Float(v) => Value::Real(v as f64),
+            ValueRef::Double(v) => Value::Real(v),
+            ValueRef::Decimal(v) => Value::Text(v.to_string()),
+            ValueRef::Timestamp(_, v) => Value::Text(v.to_string()),
+            ValueRef::Text(v) => Value::Text(String::from_utf8_lossy(v).into_owned()),
+            ValueRef::Blob(v) | ValueRef::Geometry(v) => Value::Blob(v.to_vec()),
+            ValueRef::Date32(v) => Value::Integer(v as i64),
+            ValueRef::Time64(_, v) => Value::Integer(v),
+            ValueRef::Interval { months, days, nanos } => {
+                Value::Text(format!("{months} months {days} days {nanos} nanos"))
+            }
+            ValueRef::List(..) | ValueRef::Enum(..) | ValueRef::Struct(..)
+            | ValueRef::Array(..) | ValueRef::Map(..) | ValueRef::Union(..) => {
+                Value::Text(format!("{value:?}"))
+            }
+            _ => Value::Null,
+        }
+    }
+}
+
+fn values_to_duckdb_params(values: &[duckcompat::Value]) -> Vec<duckdb::types::Value> {
+    values.iter().map(|value| match value {
+        duckcompat::Value::Null => duckdb::types::Value::Null,
+        duckcompat::Value::Integer(v) => duckdb::types::Value::BigInt(*v),
+        duckcompat::Value::Real(v) => duckdb::types::Value::Double(*v),
+        duckcompat::Value::Text(v) => duckdb::types::Value::Text(v.clone()),
+        duckcompat::Value::Blob(v) => duckdb::types::Value::Blob(v.clone()),
+    }).collect()
+}
+
+async fn traced_duckdb_execute<P: duckcompat::IntoParams>(
+    conn: &Arc<duckcompat::Connection>,
     sql: &str,
     params: P,
     trace_params: &[Value],
 ) -> crate::Result<u64> {
     let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
-    if let Some(returning_sql) = sqlite_sql_with_returning_count(trace.sql()) {
+    if let Some(returning_sql) = duckdb_sql_with_returning_count(trace.sql()) {
         return match conn.query(&returning_sql, params).await {
             Ok(mut rows) => {
                 let mut count = 0;
@@ -41,7 +247,7 @@ async fn traced_sqlite_execute<P: turso::IntoParams>(
                 trace.finish_ok();
                 Ok(count)
             }
-            Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+            Err(error) => Err(trace.finish_external_error("duckcompat::Connection::query", error)),
         };
     }
 
@@ -50,28 +256,28 @@ async fn traced_sqlite_execute<P: turso::IntoParams>(
             trace.finish_ok();
             Ok(result)
         }
-        Err(error) => Err(trace.finish_external_error("turso::Connection::execute", error)),
+        Err(error) => Err(trace.finish_external_error("duckcompat::Connection::execute", error)),
     }
 }
 
-async fn traced_sqlite_query<P: turso::IntoParams>(
-    conn: &Arc<turso::Connection>,
+async fn traced_duckdb_query<P: duckcompat::IntoParams>(
+    conn: &Arc<duckcompat::Connection>,
     sql: &str,
     params: P,
     trace_params: &[Value],
-) -> crate::Result<turso::Rows> {
+) -> crate::Result<duckcompat::Rows> {
     let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
     match conn.query(trace.sql(), params).await {
         Ok(rows) => {
             trace.finish_ok();
             Ok(rows)
         }
-        Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+        Err(error) => Err(trace.finish_external_error("duckcompat::Connection::query", error)),
     }
 }
 
-async fn traced_sqlite_schema_execute(
-    conn: &Arc<turso::Connection>,
+async fn traced_duckdb_schema_execute(
+    conn: &Arc<duckcompat::Connection>,
     sql: &str,
 ) -> crate::Result<u64> {
     let trace = crate::sql_trace::start_sql_trace(sql, &[]);
@@ -83,24 +289,24 @@ async fn traced_sqlite_schema_execute(
         Err(error) => {
             let should_retry = is_turso_partial_index_unsupported(&error);
             if should_retry {
-                if let Some(fallback_sql) = sqlite_index_sql_without_where(trace.sql()) {
+                if let Some(fallback_sql) = duckdb_index_sql_without_where(trace.sql()) {
                     return match conn.execute(&fallback_sql, ()).await {
                         Ok(result) => {
                             trace.finish_ok();
                             Ok(result)
                         }
                         Err(error) => {
-                            Err(trace.finish_external_error("turso::Connection::execute", error))
+                            Err(trace.finish_external_error("duckcompat::Connection::execute", error))
                         }
                     };
                 }
             }
-            Err(trace.finish_external_error("turso::Connection::execute", error))
+            Err(trace.finish_external_error("duckcompat::Connection::execute", error))
         }
     }
 }
 
-fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
+fn duckdb_sql_with_returning_count(sql: &str) -> Option<String> {
     let sql = sql.trim_start();
     let is_dml = ["INSERT", "UPDATE", "REPLACE"].iter().any(|keyword| {
         sql.get(..keyword.len())
@@ -114,14 +320,14 @@ fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
     Some(format!("{sql} RETURNING 1"))
 }
 
-fn is_turso_partial_index_unsupported(error: &turso::Error) -> bool {
+fn is_turso_partial_index_unsupported(error: &duckcompat::Error) -> bool {
     error
         .to_string()
         .to_ascii_lowercase()
         .contains("partial indexes are not supported")
 }
 
-fn sqlite_index_sql_without_where(sql: &str) -> Option<String> {
+fn duckdb_index_sql_without_where(sql: &str) -> Option<String> {
     let sql = sql.trim();
     let lower_sql = sql.to_ascii_lowercase();
     if !lower_sql.starts_with("create index ") {
@@ -139,7 +345,7 @@ fn is_constraint_error(e: &crate::OrmerError) -> bool {
 }
 
 fn table_name_for<T: Model>() -> &'static str {
-    T::table_name_for_db(DbType::Sqlite)
+    T::table_name_for_db(DbType::DuckDB)
 }
 
 fn is_uuid_rust_type(rust_type: &str) -> bool {
@@ -148,7 +354,7 @@ fn is_uuid_rust_type(rust_type: &str) -> bool {
 
 fn convert_turso_model_value<T: Model>(
     column_index: usize,
-    value: &turso::Value,
+    value: &duckcompat::Value,
 ) -> crate::Result<Value> {
     let columns = T::column_schema();
     let column = columns
@@ -157,10 +363,10 @@ fn convert_turso_model_value<T: Model>(
 
     if is_uuid_rust_type(column.rust_type) {
         return match value {
-            turso::Value::Null => Ok(Value::Null),
-            turso::Value::Text(raw) => crate::model::uuid_from_text(raw).map(Value::Uuid),
+            duckcompat::Value::Null => Ok(Value::Null),
+            duckcompat::Value::Text(raw) => crate::model::uuid_from_text(raw).map(Value::Uuid),
             _ => Err(crate::ormer_error!(
-                "Failed to decode SQLite UUID column '{}' from non-text value",
+                "Failed to decode DuckDB UUID column '{}' from non-text value",
                 column.name
             )),
         };
@@ -175,10 +381,10 @@ use crate::impl_backend_join_executor_methods;
 use crate::impl_backend_related_executor_methods;
 use crate::impl_insert_conflict_methods;
 
-/// Sqlite 类型映射器
-pub struct SqliteTypeMapper;
+/// DuckDB 类型映射器
+pub struct DuckDBTypeMapper;
 
-impl DbBackendTypeMapper for SqliteTypeMapper {
+impl DbBackendTypeMapper for DuckDBTypeMapper {
     fn sql_type(
         rust_type: &str,
         is_primary: bool,
@@ -186,7 +392,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
         is_nullable: bool,
         enum_variants: Option<&[&str]>,
     ) -> String {
-        // SQLite 不支持原生 ENUM,降级为 TEXT
+        // DuckDB 不支持原生 ENUM,降级为 TEXT
         if enum_variants.is_some() {
             return common_helpers::sql_type_with_nullability("TEXT", is_nullable || is_primary);
         }
@@ -203,10 +409,11 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             }
         }
 
-        // 基础类型映射（SQLite 类型系统更简单）
+        // 基础类型映射（DuckDB 类型系统更简单）
         let base_type = match rust_type {
             // 整数类型
-            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "INTEGER",
+            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => "INTEGER",
+            "i64" | "u64" => "BIGINT",
             // 浮点类型
             "f32" | "f64" => "REAL",
             "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => "TEXT",
@@ -216,11 +423,11 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             "String" => "TEXT",
             // UUID 使用规范连字符字符串存储
             "Uuid" | "uuid::Uuid" => "TEXT",
-            // 布尔类型（SQLite 没有原生 bool，用 INTEGER 存储）
+            // 布尔类型（DuckDB 没有原生 bool，用 INTEGER 存储）
             "bool" => "INTEGER",
             // 字节数组
             "Vec<u8>" | "&[u8]" => "BLOB",
-            // 日期时间类型（SQLite 存储为 TEXT 或 INTEGER）
+            // 日期时间类型（DuckDB 存储为 TEXT 或 INTEGER）
             "DateTime"
             | "chrono::DateTime"
             | "chrono::DateTime<chrono::Utc>"
@@ -228,8 +435,8 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             | "chrono::NaiveDateTime" => "TEXT",
             "NaiveDate" | "chrono::NaiveDate" => "TEXT",
             "NaiveTime" | "chrono::NaiveTime" => "TEXT",
-            // JSON 类型（SQLite 存储为 TEXT）
-            "JsonValue" | "serde_json::Value" => "TEXT",
+            // JSON 类型（DuckDB 存储为 TEXT）
+            "JsonValue" | "serde_json::Value" => "JSON",
             // 默认使用 TEXT
             _ => "TEXT",
         };
@@ -238,12 +445,12 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
     }
 }
 
-/// Sqlite 数据库连接封装
+/// DuckDB 数据库连接封装
 pub struct Database {
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
 }
 
-// SAFETY: turso::Connection uses internal synchronization mechanisms
+// SAFETY: duckcompat::Connection uses internal synchronization mechanisms
 // that make it safe to share between threads. The turso library
 // doesn't explicitly implement Send, but the local connection mode
 // is safe to share because all operations are serialized through
@@ -266,10 +473,10 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
-            crate::abstract_layer::DbType::Sqlite,
+            crate::abstract_layer::DbType::DuckDB,
             self.table_name.as_deref(),
         )?;
-        Ok(SqlStatement::single(DbType::Sqlite, create_sql, Vec::new()))
+        Ok(SqlStatement::single(DbType::DuckDB, create_sql, Vec::new()))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -292,7 +499,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
                 .map(str::trim)
                 .filter(|sql| !sql.is_empty())
             {
-                traced_sqlite_schema_execute(&self.db.conn, sql).await?;
+                traced_duckdb_schema_execute(&self.db.conn, sql).await?;
             }
         }
         Ok(())
@@ -308,10 +515,10 @@ pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
 impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
-            DbType::Sqlite,
+            DbType::DuckDB,
             format!(
                 "DROP TABLE IF EXISTS {}",
-                common_helpers::quote_table_name::<T>(DbType::Sqlite)
+                common_helpers::quote_table_name::<T>(DbType::DuckDB)
             ),
             Vec::new(),
         ))
@@ -331,7 +538,7 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         for statement in sql.statements {
-            traced_sqlite_execute(&self.db.conn, &statement.sql, (), &[]).await?;
+            traced_duckdb_execute(&self.db.conn, &statement.sql, (), &[]).await?;
         }
         Ok(())
     }
@@ -351,17 +558,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             &refs,
             self.conflict.as_ref(),
         )?;
 
         Ok(SqlStatement::batch(
-            DbType::Sqlite,
+            DbType::DuckDB,
             statements
                 .into_iter()
                 .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
@@ -373,7 +580,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    /// 执行插入并返回插入的行数据（SQLite RETURNING 支持）
+    /// 执行插入并返回插入的行数据（DuckDB RETURNING 支持）
     pub async fn returning(mut self) -> crate::Result<Vec<I::Model>> {
         if self.models.as_refs().is_empty() {
             return Ok(Vec::new());
@@ -387,7 +594,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         for statement in &sql.statements {
             let all_params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows = traced_sqlite_query(
+            let mut rows = traced_duckdb_query(
                 &self.db.conn,
                 &sql_with_returning,
                 all_params,
@@ -429,7 +636,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
             rows_affected +=
-                traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params)
+                traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params)
                     .await?;
         }
         self.models.run_after_insert(hook_ctx).await?;
@@ -491,11 +698,11 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        common_helpers::validate_insert_model_table::<T>(DbType::Sqlite, self.source_table)?;
+        common_helpers::validate_insert_model_table::<T>(DbType::DuckDB, self.source_table)?;
         let statement =
-            common_helpers::build_partial_insert_statement::<T>(DbType::Sqlite, &self.assignments)?;
+            common_helpers::build_partial_insert_statement::<T>(DbType::DuckDB, &self.assignments)?;
         Ok(SqlStatement::batch(
-            DbType::Sqlite,
+            DbType::DuckDB,
             vec![SingleSqlStatement::new(statement.sql, statement.params)],
         ))
     }
@@ -523,7 +730,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let rows_affected =
-            traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+            traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
 
         if rows_affected == 0 {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
@@ -550,21 +757,21 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
         // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
             &I::Model::columns(),
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -578,11 +785,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         let refs = self.models.as_refs();
         let columns = I::Model::columns();
         let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
@@ -591,9 +798,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             .enumerate()
             .map(|(idx, c)| {
                 common_helpers::quote_assignment(
-                    DbType::Sqlite,
+                    DbType::DuckDB,
                     c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
                 )
             })
             .collect();
@@ -606,12 +813,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             // 先删除已有记录
             let pk_values = model.primary_key_values();
             let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.db.conn, &delete_sql, delete_params, &pk_values).await?;
+            traced_duckdb_execute(&self.db.conn, &delete_sql, delete_params, &pk_values).await?;
 
             // 然后插入新记录
             let all_values = model.field_values();
             let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.db.conn, &insert_sql, insert_params, &all_values).await?;
+            traced_duckdb_execute(&self.db.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -632,7 +839,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         }
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+        traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
         Ok(())
     }
 }
@@ -648,22 +855,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         let columns = I::Model::insert_columns();
         // turso 不支持 INSERT OR IGNORE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
         // 在执行阶段捕获约束冲突错误并忽略。
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
             &columns,
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -677,15 +884,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders_str = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let placeholders_str = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
 
         for model in refs.iter() {
             let values = model.insert_values();
             let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.db.conn, &sql, params, &values).await {
+            match traced_duckdb_execute(&self.db.conn, &sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -712,7 +919,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         }
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
-        match traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await
+        match traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await
         {
             Ok(_) => {}
             Err(e) if is_constraint_error(&e) => {
@@ -725,11 +932,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
 }
 
 impl Database {
-    /// 连接到 Sqlite 数据库 (本地模式)
+    /// 连接到 DuckDB 数据库 (本地模式)
     pub async fn connect(_db_type: super::DbType, path: &str) -> crate::Result<Self> {
-        let db = turso::Builder::new_local(path).build().trace().await?;
+        let db = duckcompat::Builder::new_local(path).build().trace().await?;
 
-        let conn = Arc::new(db.connect().trace_for("turso::Database::connect")?);
+        let conn = db.connect().trace_for("duckcompat::Database::connect")?;
 
         Ok(Self { conn })
     }
@@ -765,7 +972,7 @@ impl Database {
     ) -> crate::Result<Vec<DbFirstTable>> {
         if let Some(schema) = schema.filter(|schema| !schema.is_empty() && *schema != "main") {
             return Err(crate::ormer_error!(
-                "SQLite only supports the main schema for entity generation, got {schema}"
+                "DuckDB only supports the main schema for entity generation, got {schema}"
             ));
         }
 
@@ -773,9 +980,9 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT name FROM sqlite_master \
+                    "SELECT name FROM duckdb_master \
                      WHERE type = 'table' \
-                       AND name NOT LIKE 'sqlite_%' \
+                       AND name NOT LIKE 'duckdb_%' \
                        AND name != '__ormer_migrations' \
                      ORDER BY name",
                     (),
@@ -784,8 +991,8 @@ impl Database {
                 .await?;
             let mut table_names = Vec::new();
             while let Some(row) = rows.next().trace().await? {
-                if let turso::Value::Text(name) =
-                    row.get_value(0).trace_for("turso::Row::get_value")?
+                if let duckcompat::Value::Text(name) =
+                    row.get_value(0).trace_for("duckcompat::Row::get_value")?
                 {
                     table_names.push(name);
                 }
@@ -804,14 +1011,14 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    "SELECT sql FROM duckdb_master WHERE type = 'table' AND name = ?",
                     [table_name],
                 )
                 .trace()
                 .await?;
             match rows.next().trace().await? {
-                Some(row) => match row.get_value(0).trace_for("turso::Row::get_value")? {
-                    turso::Value::Text(sql) => sql,
+                Some(row) => match row.get_value(0).trace_for("duckcompat::Row::get_value")? {
+                    duckcompat::Value::Text(sql) => sql,
                     _ => String::new(),
                 },
                 None => String::new(),
@@ -826,22 +1033,22 @@ impl Database {
                 .trace()
                 .await?;
             while let Some(row) = rows.next().trace().await? {
-                let turso::Value::Text(name) =
-                    row.get_value(1).trace_for("turso::Row::get_value")?
+                let duckcompat::Value::Text(name) =
+                    row.get_value(1).trace_for("duckcompat::Row::get_value")?
                 else {
                     continue;
                 };
-                let type_name = match row.get_value(2).trace_for("turso::Row::get_value")? {
-                    turso::Value::Text(value) => value,
+                let type_name = match row.get_value(2).trace_for("duckcompat::Row::get_value")? {
+                    duckcompat::Value::Text(value) => value,
                     _ => String::new(),
                 };
                 let nullable = !matches!(
-                    row.get_value(3).trace_for("turso::Row::get_value")?,
-                    turso::Value::Integer(value) if value != 0
+                    row.get_value(3).trace_for("duckcompat::Row::get_value")?,
+                    duckcompat::Value::Integer(value) if value != 0
                 );
                 let primary_key = matches!(
-                    row.get_value(5).trace_for("turso::Row::get_value")?,
-                    turso::Value::Integer(value) if value != 0
+                    row.get_value(5).trace_for("duckcompat::Row::get_value")?,
+                    duckcompat::Value::Integer(value) if value != 0
                 );
                 let auto_increment = primary_key
                     && type_name.eq_ignore_ascii_case("INTEGER")
@@ -853,19 +1060,19 @@ impl Database {
                     primary_key,
                     auto_increment,
                     enum_variants: Vec::new(),
-                    default: match row.get_value(4).trace_for("turso::Row::get_value")? {
-                        turso::Value::Text(value) => Some(value),
-                        turso::Value::Integer(value) => Some(value.to_string()),
-                        turso::Value::Real(value) => Some(value.to_string()),
+                    default: match row.get_value(4).trace_for("duckcompat::Row::get_value")? {
+                        duckcompat::Value::Text(value) => Some(value),
+                        duckcompat::Value::Integer(value) => Some(value.to_string()),
+                        duckcompat::Value::Real(value) => Some(value.to_string()),
                         _ => None,
                     },
                 });
             }
         }
 
-        let mut indexes = self.sqlite_unique_indexes(&create_sql)?;
-        indexes.extend(self.sqlite_explicit_indexes(table_name).await?);
-        let foreign_keys = self.sqlite_foreign_keys(&create_sql)?;
+        let mut indexes = self.duckdb_unique_indexes(&create_sql)?;
+        indexes.extend(self.duckdb_explicit_indexes(table_name).await?);
+        let foreign_keys = self.duckdb_foreign_keys(&create_sql)?;
 
         Ok(DbFirstTable {
             schema: None,
@@ -876,11 +1083,11 @@ impl Database {
         })
     }
 
-    async fn sqlite_explicit_indexes(&self, table_name: &str) -> crate::Result<Vec<DbFirstIndex>> {
+    async fn duckdb_explicit_indexes(&self, table_name: &str) -> crate::Result<Vec<DbFirstIndex>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT name, sql FROM sqlite_master \
+                "SELECT name, sql FROM duckdb_master \
                  WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
                  ORDER BY name",
                 [table_name],
@@ -889,32 +1096,32 @@ impl Database {
             .await?;
         let mut indexes = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let name = match row.get_value(0).trace_for("turso::Row::get_value")? {
-                turso::Value::Text(value) => value,
+            let name = match row.get_value(0).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Text(value) => value,
                 _ => continue,
             };
-            let sql = match row.get_value(1).trace_for("turso::Row::get_value")? {
-                turso::Value::Text(value) => value,
+            let sql = match row.get_value(1).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Text(value) => value,
                 _ => continue,
             };
-            if let Some(index) = parse_sqlite_index_sql(&name, &sql) {
+            if let Some(index) = parse_duckdb_index_sql(&name, &sql) {
                 indexes.push(index);
             }
         }
         Ok(indexes)
     }
 
-    fn sqlite_unique_indexes(&self, create_sql: &str) -> crate::Result<Vec<DbFirstIndex>> {
-        Ok(parse_sqlite_unique_indexes(create_sql))
+    fn duckdb_unique_indexes(&self, create_sql: &str) -> crate::Result<Vec<DbFirstIndex>> {
+        Ok(parse_duckdb_unique_indexes(create_sql))
     }
 
-    fn sqlite_foreign_keys(&self, create_sql: &str) -> crate::Result<Vec<DbFirstForeignKey>> {
-        Ok(parse_sqlite_foreign_keys(create_sql))
+    fn duckdb_foreign_keys(&self, create_sql: &str) -> crate::Result<Vec<DbFirstForeignKey>> {
+        Ok(parse_duckdb_foreign_keys(create_sql))
     }
 
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
-        let sql = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?";
+        let sql = "SELECT COUNT(*) FROM duckdb_master WHERE type='table' AND name=?";
 
         let mut rows = self
             .conn
@@ -923,10 +1130,10 @@ impl Database {
             .await?;
 
         if let Some(row) = rows.next().trace().await? {
-            let count = row.get_value(0).trace_for("turso::Row::get_value")?;
+            let count = row.get_value(0).trace_for("duckcompat::Row::get_value")?;
 
             match count {
-                turso::Value::Integer(c) => Ok(c > 0),
+                duckcompat::Value::Integer(c) => Ok(c > 0),
                 _ => Ok(false),
             }
         } else {
@@ -939,28 +1146,28 @@ impl Database {
         // 查询表的列信息
         let sql = format!("PRAGMA table_info({})", table_name_for::<T>());
 
-        let mut rows = traced_sqlite_query(&self.conn, &sql, (), &[]).await?;
+        let mut rows = traced_duckdb_query(&self.conn, &sql, (), &[]).await?;
 
         // 收集实际的表结构
         let mut actual_columns: Vec<(String, String, bool, bool, Option<String>)> = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let name = row.get_value(1).trace_for("turso::Row::get_value")?;
-            let col_type = row.get_value(2).trace_for("turso::Row::get_value")?;
-            let notnull = row.get_value(3).trace_for("turso::Row::get_value")?;
-            let pk = row.get_value(5).trace_for("turso::Row::get_value")?;
-            let default = row.get_value(4).trace_for("turso::Row::get_value")?;
+            let name = row.get_value(1).trace_for("duckcompat::Row::get_value")?;
+            let col_type = row.get_value(2).trace_for("duckcompat::Row::get_value")?;
+            let notnull = row.get_value(3).trace_for("duckcompat::Row::get_value")?;
+            let pk = row.get_value(5).trace_for("duckcompat::Row::get_value")?;
+            let default = row.get_value(4).trace_for("duckcompat::Row::get_value")?;
 
             if let (
-                turso::Value::Text(name),
-                turso::Value::Text(col_type),
-                turso::Value::Integer(notnull),
-                turso::Value::Integer(pk),
+                duckcompat::Value::Text(name),
+                duckcompat::Value::Text(col_type),
+                duckcompat::Value::Integer(notnull),
+                duckcompat::Value::Integer(pk),
             ) = (name, col_type, notnull, pk)
             {
                 let default = match default {
-                    turso::Value::Text(value) => Some(value),
-                    turso::Value::Integer(value) => Some(value.to_string()),
-                    turso::Value::Real(value) => Some(value.to_string()),
+                    duckcompat::Value::Text(value) => Some(value),
+                    duckcompat::Value::Integer(value) => Some(value.to_string()),
+                    duckcompat::Value::Real(value) => Some(value.to_string()),
                     _ => None,
                 };
                 actual_columns.push((name, col_type, notnull != 0, pk != 0, default));
@@ -1016,7 +1223,7 @@ impl Database {
 
             // 检查列类型（只比较基础类型，不包含 NOT NULL 约束）
             let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
-            let expected_type = crate::abstract_layer::DbType::Sqlite.sql_type(
+            let expected_type = crate::abstract_layer::DbType::DuckDB.sql_type(
                 effective_rust_type,
                 expected_col.is_primary,
                 expected_col.is_auto_increment,
@@ -1043,7 +1250,7 @@ impl Database {
                 }
             } else {
                 // 非主键列，提取基础类型（去掉 NOT NULL）
-                let full_type = crate::abstract_layer::DbType::Sqlite.sql_type(
+                let full_type = crate::abstract_layer::DbType::DuckDB.sql_type(
                     effective_rust_type,
                     false,
                     expected_col.is_auto_increment,
@@ -1078,7 +1285,7 @@ impl Database {
 
             let expected_default = expected_col
                 .default
-                .map(|default| default.to_sql(crate::abstract_layer::DbType::Sqlite));
+                .map(|default| default.to_sql(crate::abstract_layer::DbType::DuckDB));
             if actual_default.as_deref() != expected_default.as_deref() {
                 return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Default value mismatch for '{}': expected {:?}, but actual is {:?}",
@@ -1228,7 +1435,7 @@ impl Database {
         for (column, expected) in expected_foreign_keys {
             let ref_column = expected.get_ref_column();
             let ref_table = crate::model::normalize_table_name_for_db(
-                crate::abstract_layer::DbType::Sqlite,
+                crate::abstract_layer::DbType::DuckDB,
                 expected.ref_table,
             );
             let found = actual.foreign_keys.iter().any(|foreign_key| {
@@ -1251,7 +1458,7 @@ impl Database {
 
     /// 检查 SQL 类型是否兼容
     fn types_compatible(&self, actual: &str, expected: &str) -> bool {
-        // 标准化类型名称（SQLite 类型别名）
+        // 标准化类型名称（DuckDB 类型别名）
         fn normalize(s: &str) -> String {
             match s.to_uppercase().as_str() {
                 "INT" | "INTEGER" | "MEDIUMINT" | "BIGINT" | "INT64" => "INTEGER".to_string(),
@@ -1332,10 +1539,10 @@ impl Database {
         let columns = T::insert_columns();
         let col_count = columns.len();
         let pk_columns = T::primary_key_columns();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<T>(DbType::DuckDB);
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
@@ -1344,9 +1551,9 @@ impl Database {
             .enumerate()
             .map(|(idx, c)| {
                 common_helpers::quote_assignment(
-                    DbType::Sqlite,
+                    DbType::DuckDB,
                     c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
                 )
             })
             .collect();
@@ -1358,11 +1565,11 @@ impl Database {
         for model in models.iter() {
             let pk_values = model.primary_key_values();
             let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.conn, &delete_sql, delete_params, &pk_values).await?;
+            traced_duckdb_execute(&self.conn, &delete_sql, delete_params, &pk_values).await?;
 
             let all_values = model.insert_values();
             let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.conn, &insert_sql, insert_params, &all_values).await?;
+            traced_duckdb_execute(&self.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         Ok(())
@@ -1377,17 +1584,17 @@ impl Database {
 
         let columns = T::insert_columns();
         let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<T>(DbType::DuckDB);
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
 
         for model in models.iter() {
             let values = model.insert_values();
             let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.conn, &insert_sql, params, &values).await {
+            match traced_duckdb_execute(&self.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -1449,7 +1656,7 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction> {
-        traced_sqlite_execute(&self.conn, "BEGIN", (), &[]).await?;
+        traced_duckdb_execute(&self.conn, "BEGIN", (), &[]).await?;
         Ok(Transaction {
             conn: self.conn.clone(),
             committed: false,
@@ -1468,7 +1675,7 @@ impl Database {
     /// 执行原生非查询 SQL 并返回影响的行数
     pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
         let sql = sql.into_raw_sql();
-        let (sql, params) = sql.render(DbType::Sqlite)?;
+        let (sql, params) = sql.render(DbType::DuckDB)?;
         self.exec_raw(&sql, params).await
     }
 
@@ -1479,16 +1686,16 @@ impl Database {
     {
         let turso_params = values_to_params(&params)?;
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, sql, (), &params).await?
+            traced_duckdb_query(&self.conn, sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
             let mut values = Vec::new();
             for i in 0..row.column_count() {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 values.push(convert_turso_value(&value)?);
             }
             results.push(V::from_row_values(&values)?);
@@ -1500,9 +1707,9 @@ impl Database {
     pub(crate) async fn exec_raw(&self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let turso_params = values_to_params(&params)?;
         if turso_params.is_empty() {
-            traced_sqlite_execute(&self.conn, sql, (), &params).await
+            traced_duckdb_execute(&self.conn, sql, (), &params).await
         } else {
-            traced_sqlite_execute(&self.conn, sql, turso_params, &params).await
+            traced_duckdb_execute(&self.conn, sql, turso_params, &params).await
         }
     }
 
@@ -1517,17 +1724,17 @@ impl Database {
             .await?;
         let mut versions = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let version = match row.get_value(0).trace_for("turso::Row::get_value")? {
-                turso::Value::Integer(version) if version >= 0 => version as u64,
+            let version = match row.get_value(0).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Integer(version) if version >= 0 => version as u64,
                 _ => continue,
             };
-            let name = match row.get_value(1).trace_for("turso::Row::get_value")? {
-                turso::Value::Text(name) => name,
+            let name = match row.get_value(1).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Text(name) => name,
                 _ => String::new(),
             };
-            let checksum = match row.get_value(2).trace_for("turso::Row::get_value")? {
-                turso::Value::Integer(checksum) if checksum >= 0 => checksum as u64,
-                turso::Value::Text(checksum) => checksum.parse::<u64>().unwrap_or(0),
+            let checksum = match row.get_value(2).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Integer(checksum) if checksum >= 0 => checksum as u64,
+                duckcompat::Value::Text(checksum) => checksum.parse::<u64>().unwrap_or(0),
                 _ => 0,
             };
             versions.push((version, name, checksum));
@@ -1542,15 +1749,15 @@ impl Database {
         let mut exists = self
             .conn
             .query(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                "SELECT COUNT(*) FROM duckdb_master WHERE type='table' AND name=?",
                 [table_name],
             )
             .trace()
             .await?;
         let exists = match exists.next().trace().await? {
             Some(row) => matches!(
-                row.get_value(0).trace_for("turso::Row::get_value")?,
-                turso::Value::Integer(count) if count > 0
+                row.get_value(0).trace_for("duckcompat::Row::get_value")?,
+                duckcompat::Value::Integer(count) if count > 0
             ),
             None => false,
         };
@@ -1566,21 +1773,21 @@ impl Database {
             .await?;
         let mut columns = Vec::new();
         while let Some(row) = rows.next().trace().await? {
-            let name = match row.get_value(1).trace_for("turso::Row::get_value")? {
-                turso::Value::Text(value) => value,
+            let name = match row.get_value(1).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Text(value) => value,
                 _ => continue,
             };
-            let type_name = match row.get_value(2).trace_for("turso::Row::get_value")? {
-                turso::Value::Text(value) => value,
+            let type_name = match row.get_value(2).trace_for("duckcompat::Row::get_value")? {
+                duckcompat::Value::Text(value) => value,
                 _ => String::new(),
             };
             let nullable = !matches!(
-                row.get_value(3).trace_for("turso::Row::get_value")?,
-                turso::Value::Integer(value) if value != 0
+                row.get_value(3).trace_for("duckcompat::Row::get_value")?,
+                duckcompat::Value::Integer(value) if value != 0
             );
             let primary_key = matches!(
-                row.get_value(5).trace_for("turso::Row::get_value")?,
-                turso::Value::Integer(value) if value != 0
+                row.get_value(5).trace_for("duckcompat::Row::get_value")?,
+                duckcompat::Value::Integer(value) if value != 0
             );
             columns.push(schema_column(name, type_name, nullable, primary_key));
         }
@@ -1589,15 +1796,15 @@ impl Database {
 
     /// 检查连接是否有效
     pub async fn is_valid(&self) -> bool {
-        traced_sqlite_execute(&self.conn, "SELECT 1", (), &[])
+        traced_duckdb_execute(&self.conn, "SELECT 1", (), &[])
             .await
             .is_ok()
     }
 }
 
-/// Sqlite 事务对象
+/// DuckDB 事务对象
 pub struct Transaction {
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     committed: bool,
     rolled_back: bool,
 }
@@ -1611,7 +1818,7 @@ impl Drop for Transaction {
         let conn = Arc::clone(&self.conn);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = traced_sqlite_execute(&conn, "ROLLBACK", (), &[]).await;
+                let _ = traced_duckdb_execute(&conn, "ROLLBACK", (), &[]).await;
             });
         }
     }
@@ -1631,17 +1838,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             &refs,
             self.conflict.as_ref(),
         )?;
 
         Ok(SqlStatement::batch(
-            DbType::Sqlite,
+            DbType::DuckDB,
             statements
                 .into_iter()
                 .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
@@ -1700,19 +1907,19 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
             &I::Model::columns(),
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -1726,11 +1933,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         let refs = self.models.as_refs();
         let columns = I::Model::columns();
         let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
         let pk_columns = I::Model::primary_key_columns();
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
 
@@ -1739,9 +1946,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             .enumerate()
             .map(|(idx, c)| {
                 common_helpers::quote_assignment(
-                    DbType::Sqlite,
+                    DbType::DuckDB,
                     c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
+                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
                 )
             })
             .collect();
@@ -1753,11 +1960,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         for model in refs.iter() {
             let pk_values = model.primary_key_values();
             let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.txn.conn, &delete_sql, delete_params, &pk_values).await?;
+            traced_duckdb_execute(&self.txn.conn, &delete_sql, delete_params, &pk_values).await?;
 
             let all_values = model.field_values();
             let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.txn.conn, &insert_sql, insert_params, &all_values).await?;
+            traced_duckdb_execute(&self.txn.conn, &insert_sql, insert_params, &all_values).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1776,20 +1983,20 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
+            return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
         let columns = I::Model::insert_columns();
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
             &columns,
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -1803,17 +2010,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         let refs = self.models.as_refs();
         let columns = I::Model::insert_columns();
         let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
+        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
+        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
+        let placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
         let insert_sql =
             format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
 
         for model in refs.iter() {
             let values = model.insert_values();
             let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.txn.conn, &insert_sql, params, &values).await {
+            match traced_duckdb_execute(&self.txn.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
                 Err(e) if is_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
@@ -1831,9 +2038,9 @@ impl Transaction {
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let turso_params = values_to_params(&params)?;
         if turso_params.is_empty() {
-            traced_sqlite_execute(&self.conn, sql, (), &params).await
+            traced_duckdb_execute(&self.conn, sql, (), &params).await
         } else {
-            traced_sqlite_execute(&self.conn, sql, turso_params, &params).await
+            traced_duckdb_execute(&self.conn, sql, turso_params, &params).await
         }
     }
 
@@ -1844,16 +2051,16 @@ impl Transaction {
     {
         let turso_params = values_to_params(&params)?;
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, sql, (), &params).await?
+            traced_duckdb_query(&self.conn, sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
             let mut values = Vec::new();
             for i in 0..row.column_count() {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 values.push(convert_turso_value(&value)?);
             }
             results.push(V::from_row_values(&values)?);
@@ -1869,7 +2076,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        traced_sqlite_execute(&self.conn, "COMMIT", (), &[]).await?;
+        traced_duckdb_execute(&self.conn, "COMMIT", (), &[]).await?;
         self.committed = true;
         Ok(())
     }
@@ -1881,7 +2088,7 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        traced_sqlite_execute(&self.conn, "ROLLBACK", (), &[]).await?;
+        traced_duckdb_execute(&self.conn, "ROLLBACK", (), &[]).await?;
         self.rolled_back = true;
         Ok(())
     }
@@ -1966,7 +2173,7 @@ impl Transaction {
 /// Select 查询执行器
 pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: std::marker::PhantomData<&'a T>,
 }
 
@@ -1983,7 +2190,7 @@ impl<'a, T: Model> Clone for SelectExecutor<'a, T> {
 /// LEFT JOIN 查询执行器
 pub struct LeftJoinedSelectExecutor<T: Model, J: Model> {
     select: LeftJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2000,7 +2207,7 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelectExecutor<T, J> {
 /// INNER JOIN 查询执行器
 pub struct InnerJoinedSelectExecutor<T: Model, J: Model> {
     select: InnerJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2017,7 +2224,7 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelectExecutor<T, J> {
 /// RIGHT JOIN 查询执行器
 pub struct RightJoinedSelectExecutor<T: Model, J: Model> {
     select: RightJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -2034,35 +2241,35 @@ impl<T: Model, J: Model> Clone for RightJoinedSelectExecutor<T, J> {
 /// Related 查询执行器（支持多表关联查询）
 pub struct RelatedSelectExecutor<T: Model, R: Model> {
     select: RelatedSelect<T, R>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, R)>,
 }
 
 /// MultiTable 查询执行器（支持3个表关联查询）
 pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
     select: MultiTableSelect<T, R1, R2>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, R1, R2)>,
 }
 
 /// FourTable 查询执行器（支持4个表关联查询）
 pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
     select: FourTableSelect<T, R1, R2, R3>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
 /// Mapped 查询执行器（字段投影查询）
 pub struct MappedSelectExecutor<'a, T: Model, V> {
     select: MappedSelect<T, V>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<&'a (T, V)>,
 }
 
 /// Grouped 查询执行器（分组聚合查询）
 pub struct GroupedSelectExecutor<'a, T: Model, V> {
     select: GroupedSelect<T, V>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<&'a (T, V)>,
 }
 
@@ -2338,28 +2545,28 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     pub fn stream(self) -> SelectStream<'a, T> {
         SelectStream {
             select: self.select,
-            conn: super::common::StreamConnection::Sqlite(self.conn),
+            conn: super::common::StreamConnection::DuckDB(self.conn),
             _marker: std::marker::PhantomData,
         }
     }
 }
 
 // 使用宏生成通用的 filter/order_by/range 方法
-impl_backend_executor_methods!(SelectExecutor, conn, Arc<turso::Connection>, Select);
+impl_backend_executor_methods!(SelectExecutor, conn, Arc<duckcompat::Connection>, Select);
 
 // LEFT JOIN Executor
 // 使用宏生成通用的 filter/range 方法
 impl_backend_join_executor_methods!(
     LeftJoinedSelectExecutor,
     conn,
-    Arc<turso::Connection>,
+    Arc<duckcompat::Connection>,
     LeftJoinedSelect
 );
 
 impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     /// 获取 SQL（用于调试）
     pub fn to_sql(&self) -> String {
-        self.select.to_sql_with_params(DbType::Sqlite).0
+        self.select.to_sql_with_params(DbType::DuckDB).0
     }
 
     /// 执行查询并收集结果
@@ -2372,13 +2579,13 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2387,7 +2594,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         while let Some(row) = rows.next().trace().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 t_data.insert(
                     col_name.to_string(),
                     convert_turso_model_value::<T>(i, &value)?,
@@ -2429,7 +2636,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
 impl_backend_join_executor_methods!(
     InnerJoinedSelectExecutor,
     conn,
-    Arc<turso::Connection>,
+    Arc<duckcompat::Connection>,
     InnerJoinedSelect
 );
 
@@ -2445,13 +2652,13 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, J)>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2460,7 +2667,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         while let Some(row) = rows.next().trace().await? {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 t_data.insert(
                     col_name.to_string(),
                     convert_turso_model_value::<T>(i, &value)?,
@@ -2471,7 +2678,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(idx).trace_for("duckcompat::Row::get_value")?;
                 j_data.insert(
                     col_name.to_string(),
                     convert_turso_model_value::<J>(i, &value)?,
@@ -2492,7 +2699,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
 impl_backend_join_executor_methods!(
     RightJoinedSelectExecutor,
     conn,
-    Arc<turso::Connection>,
+    Arc<duckcompat::Connection>,
     RightJoinedSelect
 );
 
@@ -2508,13 +2715,13 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(Option<T>, J)>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -2541,7 +2748,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
             let mut j_data = HashMap::new();
             for (i, col_name) in J::COLUMNS.iter().enumerate() {
                 let idx = t_col_count + i;
-                let value = row.get_value(idx).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(idx).trace_for("duckcompat::Row::get_value")?;
                 j_data.insert(
                     col_name.to_string(),
                     convert_turso_model_value::<J>(i, &value)?,
@@ -2577,7 +2784,7 @@ unsafe impl<'a, T: Model + Send> Send for FirstFuture<'a, T> {}
 /// Aggregate future for聚合函数执行
 pub struct AggregateFuture<T: Model, R> {
     aggregate_select: crate::query::builder::AggregateSelect<T, R>,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<(T, R)>,
 }
 
@@ -2591,28 +2798,28 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::Sqlite);
+            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::DuckDB);
 
             let turso_params = values_to_params(&params)?;
 
             let mut rows = if turso_params.is_empty() {
-                traced_sqlite_query(&self.conn, &sql, (), &params).await?
+                traced_duckdb_query(&self.conn, &sql, (), &params).await?
             } else {
-                traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+                traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
             };
 
             if let Some(row) = rows.next().trace().await? {
-                let value = row.get_value(0).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(0).trace_for("duckcompat::Row::get_value")?;
 
-                // 将turso::Value转换为ormer::Value
+                // 将duckcompat::Value转换为ormer::Value
                 let ormer_value = match value {
-                    turso::Value::Integer(i) => crate::model::Value::Integer(i),
-                    turso::Value::Real(r) => crate::model::Value::Real(r),
-                    turso::Value::Text(t) => crate::model::Value::Text(t),
-                    turso::Value::Blob(b) => {
+                    duckcompat::Value::Integer(i) => crate::model::Value::Integer(i),
+                    duckcompat::Value::Real(r) => crate::model::Value::Real(r),
+                    duckcompat::Value::Text(t) => crate::model::Value::Text(t),
+                    duckcompat::Value::Blob(b) => {
                         crate::model::Value::Text(String::from_utf8_lossy(&b).to_string())
                     }
-                    turso::Value::Null => crate::model::Value::Null,
+                    duckcompat::Value::Null => crate::model::Value::Null,
                 };
 
                 // 使用 FromValue 转换为目标类型
@@ -2723,7 +2930,7 @@ impl<T: Model + 'static + std::marker::Send, J: Model + 'static + std::marker::S
 impl_backend_related_executor_methods!(
     RelatedSelectExecutor,
     conn,
-    Arc<turso::Connection>,
+    Arc<duckcompat::Connection>,
     RelatedSelect
 );
 
@@ -2746,20 +2953,20 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
     }
 
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
 
         while let Some(row) = rows.next().trace().await? {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 convert_turso_model_value::<T>(i, &value)
             })?;
             results.push(model);
@@ -2790,21 +2997,21 @@ impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::S
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
     async fn collect_inner<C: FromIterator<T>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::DuckDB)?;
 
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
 
         while let Some(row) = rows.next().trace().await? {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                 convert_turso_model_value::<T>(i, &value)
             })?;
             results.push(model);
@@ -2814,8 +3021,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
-        Ok(SqlStatement::single(DbType::Sqlite, sql, params))
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::DuckDB)?;
+        Ok(SqlStatement::single(DbType::DuckDB, sql, params))
     }
 }
 
@@ -2823,7 +3030,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct DeleteExecutor<T: Model> {
     filters: Vec<FilterExpr>,
     versioned: bool,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<T>,
 }
 
@@ -2843,7 +3050,7 @@ impl<T: Model> DeleteExecutor<T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let (sql, params) = self.build_ormer_sql();
         Ok(SqlStatement::batch(
-            DbType::Sqlite,
+            DbType::DuckDB,
             vec![SingleSqlStatement::new(sql, params).with_optimistic_lock(self.versioned, None)],
         ))
     }
@@ -2860,7 +3067,7 @@ impl<T: Model> DeleteExecutor<T> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    /// 执行删除并返回被删除的行数据（SQLite RETURNING 支持）
+    /// 执行删除并返回被删除的行数据（DuckDB RETURNING 支持）
     pub async fn returning(self) -> crate::Result<Vec<T>> {
         let sql = self.to_sql()?;
         let statement = &sql.statements[0];
@@ -2868,7 +3075,7 @@ impl<T: Model> DeleteExecutor<T> {
 
         let sql_with_returning = format!("{} RETURNING *", statement.sql);
         let mut rows =
-            traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params).await?;
+            traced_duckdb_query(&self.conn, &sql_with_returning, params, &statement.params).await?;
 
         let mut results = Vec::new();
         while let Some(row) = rows.next().trace().await? {
@@ -2888,7 +3095,7 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     fn build_ormer_sql(&self) -> (String, Vec<Value>) {
-        common_helpers::build_delete_sql::<T>(DbType::Sqlite, &self.filters)
+        common_helpers::build_delete_sql::<T>(DbType::DuckDB, &self.filters)
             .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 }
@@ -2907,7 +3114,7 @@ impl<T: Model> SqlExecutor for DeleteExecutor<T> {
         let statement = &sql.statements[0];
         let params = values_to_params(&statement.params)?;
         let result =
-            traced_sqlite_execute(&self.conn, &statement.sql, params, &statement.params).await?;
+            traced_duckdb_execute(&self.conn, &statement.sql, params, &statement.params).await?;
         if statement.versioned && result == 0 {
             return Err(common_helpers::optimistic_lock_conflict::<T>());
         }
@@ -2929,7 +3136,7 @@ pub struct UpdateExecutor<T: Model> {
     sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
-    conn: Arc<turso::Connection>,
+    conn: Arc<duckcompat::Connection>,
     _marker: PhantomData<T>,
 }
 
@@ -2981,7 +3188,7 @@ impl<T: Model> UpdateExecutor<T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let statements = self.build_all_ormer_sql()?;
         Ok(SqlStatement::batch(
-            DbType::Sqlite,
+            DbType::DuckDB,
             statements
                 .into_iter()
                 .map(|statement| {
@@ -2997,7 +3204,7 @@ impl<T: Model> UpdateExecutor<T> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    /// 执行更新并返回被更新的行数据（SQLite RETURNING 支持）
+    /// 执行更新并返回被更新的行数据（DuckDB RETURNING 支持）
     pub async fn returning(self) -> crate::Result<Vec<T>> {
         let statements = self.to_sql()?;
         let mut results = Vec::new();
@@ -3005,7 +3212,7 @@ impl<T: Model> UpdateExecutor<T> {
             let params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
             let mut rows =
-                traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
+                traced_duckdb_query(&self.conn, &sql_with_returning, params, &statement.params)
                     .await?;
             while let Some(row) = rows.next().trace().await? {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
@@ -3028,7 +3235,7 @@ impl<T: Model> UpdateExecutor<T> {
 
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
             let (sql, params) =
-                common_helpers::build_update_sql::<T>(DbType::Sqlite, &self.sets, &self.filters)?;
+                common_helpers::build_update_sql::<T>(DbType::DuckDB, &self.sets, &self.filters)?;
             statements.push(common_helpers::ModelSqlStatement {
                 sql,
                 params,
@@ -3039,14 +3246,14 @@ impl<T: Model> UpdateExecutor<T> {
         }
 
         if let Some(batch_statements) = common_helpers::build_bulk_model_update_statements::<T>(
-            DbType::Sqlite,
+            DbType::DuckDB,
             &self.model_updates,
         )? {
             statements.extend(batch_statements);
         } else {
             for plan in &self.model_updates {
                 statements.push(common_helpers::build_model_update_sql::<T>(
-                    DbType::Sqlite,
+                    DbType::DuckDB,
                     plan,
                 )?);
             }
@@ -3068,7 +3275,7 @@ impl<T: Model> SqlExecutor for UpdateExecutor<T> {
         for statement in &sql.statements {
             let params = values_to_params(&statement.params)?;
             let affected =
-                traced_sqlite_execute(&self.conn, &statement.sql, params, &statement.params)
+                traced_duckdb_execute(&self.conn, &statement.sql, params, &statement.params)
                     .await?;
             if statement.versioned && affected == 0 {
                 return Err(common_helpers::optimistic_lock_conflict::<T>());
@@ -3094,47 +3301,49 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateE
 }
 
 /// 将 ormer Value 转换为 turso 参数
-fn value_to_turso_value(value: Value) -> turso::Value {
+fn value_to_turso_value(value: Value) -> duckcompat::Value {
     match value {
-        Value::Integer(v) => turso::Value::Integer(v),
-        Value::Text(v) => turso::Value::Text(v),
-        Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
-        Value::Real(v) => turso::Value::Real(v),
-        Value::Decimal(v) | Value::BigDecimal(v) => turso::Value::Text(v),
-        Value::Boolean(v) => turso::Value::Integer(if v { 1 } else { 0 }),
-        Value::Bytes(v) => turso::Value::Blob(v),
-        Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
-        Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
-        Value::Date(date) => turso::Value::Text(date.to_string()),
-        Value::Time(time) => turso::Value::Text(time.to_string()),
-        Value::Json(v) => turso::Value::Text(v.to_string()),
-        Value::Uuid(v) => turso::Value::Text(v.to_string()),
-        Value::BigInt(v) => turso::Value::Integer(v as i64),
+        Value::Integer(v) => duckcompat::Value::Integer(v),
+        Value::Text(v) => duckcompat::Value::Text(v),
+        Value::TextArray(v) => duckcompat::Value::Text(
+            serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()),
+        ),
+        Value::Real(v) => duckcompat::Value::Real(v),
+        Value::Decimal(v) | Value::BigDecimal(v) => duckcompat::Value::Text(v),
+        Value::Boolean(v) => duckcompat::Value::Integer(if v { 1 } else { 0 }),
+        Value::Bytes(v) => duckcompat::Value::Blob(v),
+        Value::Duration(v) => duckcompat::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
+        Value::DateTime(v) => duckcompat::Value::Text(v.to_rfc3339()),
+        Value::Date(date) => duckcompat::Value::Text(date.to_string()),
+        Value::Time(time) => duckcompat::Value::Text(time.to_string()),
+        Value::Json(v) => duckcompat::Value::Text(v.to_string()),
+        Value::Uuid(v) => duckcompat::Value::Text(v.to_string()),
+        Value::BigInt(v) => duckcompat::Value::Integer(v as i64),
         Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-            panic!("SQLite backend does not support PostgreSQL array values")
+            panic!("DuckDB backend does not support PostgreSQL array values")
         }
-        Value::Null => turso::Value::Null,
+        Value::Null => duckcompat::Value::Null,
     }
 }
 
-fn values_to_params(values: &[Value]) -> crate::Result<Vec<turso::Value>> {
+fn values_to_params(values: &[Value]) -> crate::Result<Vec<duckcompat::Value>> {
     Ok(values.iter().cloned().map(value_to_turso_value).collect())
 }
 
 /// 将 turso Value 转换为 ormer Value
-fn convert_turso_value(value: &turso::Value) -> crate::Result<Value> {
+fn convert_turso_value(value: &duckcompat::Value) -> crate::Result<Value> {
     match value {
-        turso::Value::Integer(v) => Ok(Value::Integer(*v)),
-        turso::Value::Text(v) => {
+        duckcompat::Value::Integer(v) => Ok(Value::Integer(*v)),
+        duckcompat::Value::Text(v) => {
             // 尝试解析为 DateTime
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
                 return Ok(Value::DateTime(dt.with_timezone(&chrono::Utc)));
             }
             Ok(Value::Text(v.clone()))
         }
-        turso::Value::Real(v) => Ok(Value::Real(*v)),
-        turso::Value::Null => Ok(Value::Null),
-        turso::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
+        duckcompat::Value::Real(v) => Ok(Value::Real(*v)),
+        duckcompat::Value::Null => Ok(Value::Null),
+        duckcompat::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
     }
 }
 
@@ -3202,7 +3411,7 @@ where
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 获取子查询的 SQL 和参数
     pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::Sqlite)
+        self.select.to_sql_with_params(DbType::DuckDB)
     }
 
     /// 执行查询并收集结果
@@ -3241,14 +3450,14 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
 
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -3258,7 +3467,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             let column_count = self.select.column_names().len();
             let typed_value =
                 common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
-                    let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                    let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                     convert_turso_value(&value)
                 })?;
             results.push(typed_value);
@@ -3353,14 +3562,14 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.build_sql(DbType::Sqlite);
+        let (sql, params) = self.select.build_sql(DbType::DuckDB);
 
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, &sql, (), &params).await?
+            traced_duckdb_query(&self.conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&self.conn, &sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
@@ -3370,7 +3579,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             let column_count = self.select.column_count();
             let typed_value =
                 common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
-                    let value = row.get_value(i).trace_for("turso::Row::get_value")?;
+                    let value = row.get_value(i).trace_for("duckcompat::Row::get_value")?;
                     convert_turso_value(&value)
                 })?;
             results.push(typed_value);
@@ -3380,7 +3589,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     }
 }
 
-/// SelectStream - 流式查询执行器 (SQLite/Turso)
+/// SelectStream - 流式查询执行器 (DuckDB/Turso)
 ///
 /// 该执行器用于创建流式查询，允许逐行读取数据而不是一次性加载所有结果到内存中。
 /// 适用于处理大量数据的场景，内存占用为 O(1)。
@@ -3397,7 +3606,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 ///
 /// # 连接管理
 ///
-/// 该执行器持有 `Arc<turso::Connection>` 的克隆，确保在流式查询期间连接保持活跃。
+/// 该执行器持有 `Arc<duckcompat::Connection>` 的克隆，确保在流式查询期间连接保持活跃。
 /// 当 `SelectStreamIterator` 被 drop 时，连接会自动释放（通过 Arc 的引用计数）。
 pub struct SelectStream<'a, T: Model> {
     select: Select<T>,
@@ -3408,21 +3617,21 @@ pub struct SelectStream<'a, T: Model> {
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
 
         // 从 StreamConnection 获取连接
-        let conn = self.conn.expect_sqlite().clone();
+        let conn = self.conn.expect_duckdb().clone();
 
         let turso_params = values_to_params(&params)?;
 
         let rows = if turso_params.is_empty() {
-            traced_sqlite_query(&conn, &sql, (), &params).await?
+            traced_duckdb_query(&conn, &sql, (), &params).await?
         } else {
-            traced_sqlite_query(&conn, &sql, turso_params, &params).await?
+            traced_duckdb_query(&conn, &sql, turso_params, &params).await?
         };
 
         Ok(SelectStreamIterator {
-            _conn: super::common::StreamConnection::Sqlite(conn),
+            _conn: super::common::StreamConnection::DuckDB(conn),
             rows,
             polluted: false,
             _marker: std::marker::PhantomData,
@@ -3430,7 +3639,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
     }
 }
 
-/// SelectStreamIterator - 流式查询迭代器 (SQLite/Turso)
+/// SelectStreamIterator - 流式查询迭代器 (DuckDB/Turso)
 ///
 /// 该迭代器用于逐行读取流式查询的结果。
 /// 每次调用 `next()` 方法会从数据库中获取下一行数据。
@@ -3443,18 +3652,18 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
 /// # 资源释放
 ///
 /// 当迭代器被 drop 时（无论是正常完成、提前终止还是发生错误），
-/// 底层的 turso::Rows 会自动关闭游标，连接会通过 Arc 的引用计数自动释放。
+/// 底层的 duckcompat::Rows 会自动关闭游标，连接会通过 Arc 的引用计数自动释放。
 pub struct SelectStreamIterator<'a, T: Model> {
     _conn: super::common::StreamConnection<'a>,
-    rows: turso::Rows,
+    rows: duckcompat::Rows,
     polluted: bool, // 标记是否发生解析错误，污染后不再尝试读取
     _marker: std::marker::PhantomData<&'a T>,
 }
 
 impl<'a, T: Model> Drop for SelectStreamIterator<'a, T> {
     fn drop(&mut self) {
-        // turso::Rows 会在 Drop 时自动关闭游标并释放相关资源
-        // StreamConnection 中的 Arc<turso::Connection> 会在最后一个引用释放时自动清理
+        // duckcompat::Rows 会在 Drop 时自动关闭游标并释放相关资源
+        // StreamConnection 中的 Arc<duckcompat::Connection> 会在最后一个引用释放时自动清理
         // 不需要显式操作，Rust 的 RAII 机制会确保资源正确释放
     }
 }
@@ -3467,7 +3676,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             return None;
         }
 
-        match self.rows.next().trace_for("turso::Rows::next").await {
+        match self.rows.next().trace_for("duckcompat::Rows::next").await {
             Ok(Some(row)) => {
                 // 解析行数据为 Model
                 let mut data = HashMap::new();
@@ -3485,7 +3694,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
                         Err(e) => {
                             self.polluted = true;
                             return Some(Err(crate::ormer_error!(
-                                "turso::Row::get_value failed: {e}"
+                                "duckcompat::Row::get_value failed: {e}"
                             )));
                         }
                     }
@@ -3502,7 +3711,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
     }
 }
 
-fn sqlite_table_items(create_sql: &str) -> Vec<String> {
+fn duckdb_table_items(create_sql: &str) -> Vec<String> {
     let Some(open_idx) = create_sql.find('(') else {
         return Vec::new();
     };
@@ -3608,7 +3817,7 @@ fn sqlite_table_items(create_sql: &str) -> Vec<String> {
     items
 }
 
-fn sqlite_parenthesized_list(segment: &str) -> Vec<String> {
+fn duckdb_parenthesized_list(segment: &str) -> Vec<String> {
     let Some(open_idx) = segment.find('(') else {
         return Vec::new();
     };
@@ -3617,12 +3826,12 @@ fn sqlite_parenthesized_list(segment: &str) -> Vec<String> {
     };
     segment[open_idx + 1..open_idx + 1 + close_idx]
         .split(',')
-        .map(|value| sqlite_strip_identifier(value.trim()))
+        .map(|value| duckdb_strip_identifier(value.trim()))
         .filter(|value| !value.is_empty())
         .collect()
 }
 
-fn sqlite_strip_identifier(value: &str) -> String {
+fn duckdb_strip_identifier(value: &str) -> String {
     let trimmed = value.trim();
     trimmed
         .strip_prefix('"')
@@ -3641,7 +3850,7 @@ fn sqlite_strip_identifier(value: &str) -> String {
         .to_string()
 }
 
-fn sqlite_parse_constraint_name(item: &str) -> (String, &str) {
+fn duckdb_parse_constraint_name(item: &str) -> (String, &str) {
     let trimmed = item.trim();
     let upper = trimmed.to_ascii_uppercase();
     if !upper.starts_with("CONSTRAINT ") {
@@ -3651,10 +3860,10 @@ fn sqlite_parse_constraint_name(item: &str) -> (String, &str) {
     let mut parts = rest.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("").trim().to_string();
     let tail = parts.next().unwrap_or("").trim_start();
-    (sqlite_strip_identifier(&name), tail)
+    (duckdb_strip_identifier(&name), tail)
 }
 
-fn sqlite_parse_action_clause(item: &str, keyword: &str) -> Option<String> {
+fn duckdb_parse_action_clause(item: &str, keyword: &str) -> Option<String> {
     let upper = item.to_ascii_uppercase();
     let start = upper.find(keyword)?;
     let rest = item[start + keyword.len()..].trim_start();
@@ -3673,7 +3882,7 @@ fn sqlite_parse_action_clause(item: &str, keyword: &str) -> Option<String> {
     }
 }
 
-fn parse_sqlite_index_sql(name: &str, sql: &str) -> Option<DbFirstIndex> {
+fn parse_duckdb_index_sql(name: &str, sql: &str) -> Option<DbFirstIndex> {
     let upper = sql.to_ascii_uppercase();
     let unique = upper.starts_with("CREATE UNIQUE INDEX");
     let on_idx = upper.find(" ON ")?;
@@ -3681,9 +3890,9 @@ fn parse_sqlite_index_sql(name: &str, sql: &str) -> Option<DbFirstIndex> {
     let index_name = before_on
         .split_whitespace()
         .last()
-        .map(sqlite_strip_identifier)
+        .map(duckdb_strip_identifier)
         .unwrap_or_else(|| name.to_string());
-    let columns = sqlite_parenthesized_list(&sql[on_idx..]);
+    let columns = duckdb_parenthesized_list(&sql[on_idx..]);
     if columns.is_empty() {
         return None;
     }
@@ -3700,19 +3909,19 @@ fn parse_sqlite_index_sql(name: &str, sql: &str) -> Option<DbFirstIndex> {
     })
 }
 
-fn parse_sqlite_unique_indexes(create_sql: &str) -> Vec<DbFirstIndex> {
+fn parse_duckdb_unique_indexes(create_sql: &str) -> Vec<DbFirstIndex> {
     let mut indexes = Vec::new();
-    for item in sqlite_table_items(create_sql) {
+    for item in duckdb_table_items(create_sql) {
         let upper = item.to_ascii_uppercase();
         if !upper.contains("UNIQUE") || upper.contains("FOREIGN KEY") {
             continue;
         }
-        let (name, rest) = sqlite_parse_constraint_name(&item);
+        let (name, rest) = duckdb_parse_constraint_name(&item);
         let rest_upper = rest.to_ascii_uppercase();
         let columns = if rest_upper.starts_with("UNIQUE") {
-            sqlite_parenthesized_list(rest)
+            duckdb_parenthesized_list(rest)
         } else if let Some(first) = item.split_whitespace().next() {
-            vec![sqlite_strip_identifier(first)]
+            vec![duckdb_strip_identifier(first)]
         } else {
             Vec::new()
         };
@@ -3734,30 +3943,30 @@ fn parse_sqlite_unique_indexes(create_sql: &str) -> Vec<DbFirstIndex> {
     indexes
 }
 
-fn parse_sqlite_foreign_keys(create_sql: &str) -> Vec<DbFirstForeignKey> {
+fn parse_duckdb_foreign_keys(create_sql: &str) -> Vec<DbFirstForeignKey> {
     let mut foreign_keys = Vec::new();
-    for item in sqlite_table_items(create_sql) {
+    for item in duckdb_table_items(create_sql) {
         let upper = item.to_ascii_uppercase();
         if !upper.contains("FOREIGN KEY") {
             continue;
         }
-        let (name, rest) = sqlite_parse_constraint_name(&item);
+        let (name, rest) = duckdb_parse_constraint_name(&item);
         let rest_upper = rest.to_ascii_uppercase();
         let Some(foreign_idx) = rest_upper.find("FOREIGN KEY") else {
             continue;
         };
-        let local_cols = sqlite_parenthesized_list(&rest[foreign_idx + "FOREIGN KEY".len()..]);
+        let local_cols = duckdb_parenthesized_list(&rest[foreign_idx + "FOREIGN KEY".len()..]);
         let Some(references_idx) = rest_upper.find("REFERENCES") else {
             continue;
         };
         let after_references = rest[references_idx + "REFERENCES".len()..].trim_start();
         let ref_table = after_references
             .split_once('(')
-            .map(|(table, _)| sqlite_strip_identifier(table.trim()))
+            .map(|(table, _)| duckdb_strip_identifier(table.trim()))
             .unwrap_or_default();
-        let ref_cols = sqlite_parenthesized_list(after_references);
-        let on_delete = sqlite_parse_action_clause(&item, "ON DELETE");
-        let on_update = sqlite_parse_action_clause(&item, "ON UPDATE");
+        let ref_cols = duckdb_parenthesized_list(after_references);
+        let on_delete = duckdb_parse_action_clause(&item, "ON DELETE");
+        let on_update = duckdb_parse_action_clause(&item, "ON UPDATE");
         for (column, ref_column) in local_cols.into_iter().zip(ref_cols.into_iter()) {
             foreign_keys.push(DbFirstForeignKey {
                 name: (!name.is_empty()).then_some(name.clone()),

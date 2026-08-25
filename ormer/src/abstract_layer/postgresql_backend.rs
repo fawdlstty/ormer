@@ -5,7 +5,7 @@ use crate::db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };
 use crate::hooks::{HookContext, HookOperation};
-use crate::migration::{SchemaColumn, schema_column};
+use crate::migration::{SchemaColumn, schema_column_with_compression};
 use crate::model::{
     DbBackendTypeMapper, DurationToInterval, Model, Row, Value, WritableModel,
     quote_qualified_identifier, split_schema_table_name,
@@ -1479,7 +1479,7 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
         if let Some((time_column, chunk_interval)) = T::hypertable_info() {
             let interval_str = chunk_interval.to_interval_string();
             let hypertable_sql = format!(
-                "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE)",
+                "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE)",
                 table_name, time_column, interval_str
             );
             statements.push(SingleSqlStatement::new(hypertable_sql, Vec::new()));
@@ -2105,6 +2105,7 @@ impl Database {
                 primary_key,
                 auto_increment,
                 enum_variants,
+                default,
             });
         }
         Ok(columns)
@@ -2367,15 +2368,58 @@ impl Database {
         Ok(count > 0)
     }
 
+    async fn check_hypertable_dimensions<T: Model>(
+        &self,
+        time_column: &str,
+        chunk_interval: std::time::Duration,
+    ) -> crate::Result<(i64, i64)> {
+        let sql = "SELECT to_regclass('timescaledb_information.dimensions') IS NOT NULL";
+        let row = self.client.query_one(sql, &[]).trace().await?;
+        let has_dimensions_view: bool = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+
+        if !has_dimensions_view {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {}, reason: TimescaleDB dimensions metadata is unavailable",
+                T::TABLE_NAME
+            ));
+        }
+
+        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
+        let expected_interval = to_postgres_interval(chunk_interval);
+        let sql = r#"
+            SELECT
+                COUNT(*)::BIGINT,
+                COUNT(*) FILTER (
+                    WHERE column_name = $3
+                      AND time_interval = $4::interval
+                )::BIGINT
+            FROM timescaledb_information.dimensions
+            WHERE hypertable_schema = $1 AND hypertable_name = $2
+        "#;
+        let row = self
+            .client
+            .query_one(
+                sql,
+                &[&schema_name, &table_name, &time_column, &expected_interval],
+            )
+            .trace()
+            .await?;
+        let dimension_count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+        let matching_dimension_count: i64 =
+            row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+
+        Ok((dimension_count, matching_dimension_count))
+    }
+
     async fn validate_table_hypertable<T: Model>(&self) -> crate::Result<()> {
-        let expected_hypertable = T::hypertable_info().is_some();
+        let expected_hypertable = T::hypertable_info();
         let actual_hypertable = self.check_table_is_hypertable::<T>().trace().await?;
 
-        if expected_hypertable != actual_hypertable {
+        if expected_hypertable.is_some() != actual_hypertable {
             return Err(crate::ormer_error!(
                 "Schema mismatch: table {}, reason: Hypertable mismatch: expected {}, but actual is {}",
                 T::TABLE_NAME,
-                if expected_hypertable {
+                if expected_hypertable.is_some() {
                     "hypertable"
                 } else {
                     "regular table"
@@ -2388,7 +2432,28 @@ impl Database {
             ));
         }
 
+        if let Some((time_column, chunk_interval)) = expected_hypertable {
+            let (dimension_count, matching_dimension_count) = self
+                .check_hypertable_dimensions::<T>(time_column, chunk_interval)
+                .await?;
+
+            if dimension_count != 1 || matching_dimension_count != 1 {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Hypertable dimension mismatch: expected one time dimension on column '{}' with chunk interval '{}', but actual dimensions={} matching_dimensions={}",
+                    T::TABLE_NAME,
+                    time_column,
+                    chunk_interval.to_interval_string(),
+                    dimension_count,
+                    matching_dimension_count
+                ));
+            }
+        }
+
         Ok(())
+    }
+
+    pub(crate) async fn validate_hypertable_for_migration<T: Model>(&self) -> crate::Result<()> {
+        self.validate_table_hypertable::<T>().await
     }
 
     /// 验证表结构是否与模型定义匹配（内部使用）
@@ -2396,10 +2461,37 @@ impl Database {
         // 查询表的列信息
         let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let sql = r#"
-            SELECT column_name, data_type, udt_name, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = $1 AND table_name = $2
-            ORDER BY ordinal_position
+            SELECT column_name, data_type, udt_name, is_nullable,
+                   EXISTS (
+                       SELECT 1
+                       FROM information_schema.table_constraints tc
+                       JOIN information_schema.key_column_usage kcu
+                         ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                        AND tc.table_name = kcu.table_name
+                       WHERE tc.constraint_type = 'PRIMARY KEY'
+                         AND kcu.table_schema = c.table_schema
+                         AND kcu.table_name = c.table_name
+                         AND kcu.column_name = c.column_name
+                   ) AS is_primary,
+                   COALESCE(column_default LIKE 'nextval(%', FALSE) AS is_auto_increment,
+                   CASE a.attcompression
+                       WHEN 'p' THEN 'pglz'
+                       WHEN 'l' THEN 'lz4'
+                       ELSE NULL
+                   END AS compression
+            FROM information_schema.columns c
+            JOIN pg_namespace ns
+              ON ns.nspname = c.table_schema
+            JOIN pg_class rel
+              ON rel.relnamespace = ns.oid AND rel.relname = c.table_name
+            JOIN pg_attribute a
+              ON a.attrelid = rel.oid
+             AND a.attname = c.column_name
+             AND a.attnum > 0
+             AND NOT a.attisdropped
+            WHERE c.table_schema = $1 AND c.table_name = $2
+            ORDER BY c.ordinal_position
         "#;
 
         let rows = self
@@ -2409,19 +2501,32 @@ impl Database {
             .await?;
 
         // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool)> = Vec::new();
+        let mut actual_columns: Vec<(String, String, bool, bool, bool, Option<String>)> =
+            Vec::new();
         for row in rows {
             let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
             let col_type: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
             let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
             let is_nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let is_primary: bool = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+            let is_auto_increment: bool =
+                row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
+            let compression: Option<String> =
+                row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
 
             let actual_type = if col_type == "USER-DEFINED" || col_type == "ARRAY" {
                 udt_name
             } else {
                 col_type
             };
-            actual_columns.push((name, actual_type, is_nullable == "YES"));
+            actual_columns.push((
+                name,
+                actual_type,
+                is_nullable == "YES",
+                is_primary,
+                is_auto_increment,
+                compression,
+            ));
         }
 
         // 比较列数量
@@ -2444,7 +2549,14 @@ impl Database {
                 ));
             }
 
-            let (actual_name, actual_type, actual_nullable) = &actual_columns[i];
+            let (
+                actual_name,
+                actual_type,
+                actual_nullable,
+                actual_primary,
+                actual_auto_increment,
+                actual_compression,
+            ) = &actual_columns[i];
 
             // 检查列名
             if actual_name != expected_col.name {
@@ -2454,6 +2566,26 @@ impl Database {
                     i,
                     expected_col.name,
                     actual_name
+                ));
+            }
+
+            if expected_col.is_primary != *actual_primary {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    if expected_col.is_primary { "" } else { "not " },
+                    if *actual_primary { "" } else { "not " }
+                ));
+            }
+
+            if expected_col.is_auto_increment != *actual_auto_increment {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    expected_col.is_auto_increment,
+                    actual_auto_increment
                 ));
             }
 
@@ -2529,8 +2661,25 @@ impl Database {
                     ));
                 }
             }
+
+            let expected_compression = crate::model::column_compression_algorithm(expected_col)
+                .map(|value| value.as_str());
+            if actual_compression.as_deref() != expected_compression {
+                return Err(crate::ormer_error!(
+                    "Schema mismatch: table {}, reason: Compression mismatch for '{}': expected {}, but actual is {}",
+                    T::TABLE_NAME,
+                    expected_col.name,
+                    expected_compression.unwrap_or("default"),
+                    actual_compression.as_deref().unwrap_or("default")
+                ));
+            }
         }
 
+        let actual_table = self.db_first_table(&schema_name, &table_name).await?;
+        crate::db_first::validate_model_constraints::<T>(
+            crate::abstract_layer::DbType::PostgreSQL,
+            &actual_table,
+        )?;
         Ok(())
     }
 
@@ -2829,8 +2978,22 @@ impl Database {
                               AND kcu.table_schema = c.table_schema
                               AND kcu.table_name = c.table_name
                               AND kcu.column_name = c.column_name
-                        ) AS is_primary
+                        ) AS is_primary,
+                        CASE a.attcompression
+                            WHEN 'p' THEN 'pglz'
+                            WHEN 'l' THEN 'lz4'
+                            ELSE NULL
+                        END AS compression
                  FROM information_schema.columns c
+                 JOIN pg_namespace ns
+                   ON ns.nspname = c.table_schema
+                 JOIN pg_class rel
+                   ON rel.relnamespace = ns.oid AND rel.relname = c.table_name
+                 JOIN pg_attribute a
+                   ON a.attrelid = rel.oid
+                  AND a.attname = c.column_name
+                  AND a.attnum > 0
+                  AND NOT a.attisdropped
                  WHERE c.table_schema = $1 AND c.table_name = $2
                  ORDER BY c.ordinal_position",
                 &[&schema_name, &table_name],
@@ -2843,11 +3006,14 @@ impl Database {
             let type_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
             let nullable: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
             let primary_key: bool = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
-            columns.push(schema_column(
+            let compression: Option<String> =
+                row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+            columns.push(schema_column_with_compression(
                 name,
                 type_name,
                 nullable == "YES",
                 primary_key,
+                compression,
             ));
         }
         Ok(Some(columns))
