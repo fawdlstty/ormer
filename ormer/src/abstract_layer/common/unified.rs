@@ -185,9 +185,6 @@ use super::super::mssql_backend;
 #[cfg(feature = "duckdb")]
 use super::super::duckdb_backend;
 
-#[cfg(feature = "clickhouse")]
-use super::super::clickhouse_backend;
-
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
     values
@@ -1045,6 +1042,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
     }
 
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
+    }
+
     pub async fn returning(self) -> crate::Result<Vec<I::Model>> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1114,6 +1115,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             #[cfg(feature = "duckdb")]
             InsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
         }
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -1307,6 +1312,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
         }
     }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
+    }
 }
 
 impl Database {
@@ -1490,7 +1499,9 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrUpdateExecutor::MSSQL(db.insert_or_update::<I>(models)),
             #[cfg(feature = "duckdb")]
-            Database::DuckDB(db) => InsertOrUpdateExecutor::DuckDB(db.insert_or_update::<I>(models)),
+            Database::DuckDB(db) => {
+                InsertOrUpdateExecutor::DuckDB(db.insert_or_update::<I>(models))
+            }
         }
     }
 
@@ -1517,7 +1528,9 @@ impl Database {
             #[cfg(feature = "mssql")]
             Database::MSSQL(db) => InsertOrIgnoreExecutor::MSSQL(db.insert_or_ignore::<I>(models)),
             #[cfg(feature = "duckdb")]
-            Database::DuckDB(db) => InsertOrIgnoreExecutor::DuckDB(db.insert_or_ignore::<I>(models)),
+            Database::DuckDB(db) => {
+                InsertOrIgnoreExecutor::DuckDB(db.insert_or_ignore::<I>(models))
+            }
         }
     }
 
@@ -1852,7 +1865,8 @@ impl Database {
         feature = "sqlite",
         feature = "postgresql",
         feature = "mysql",
-        feature = "mssql"
+        feature = "mssql",
+        feature = "duckdb"
     ))]
     pub fn create_pool(
         db_type: super::super::DbType,
@@ -2524,7 +2538,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "mssql")]
             SelectExecutor::MSSQL(exec) => LeftJoinedSelectExecutor::MSSQL(exec.left_join::<J>(f)),
             #[cfg(feature = "duckdb")]
-            SelectExecutor::DuckDB(exec) => LeftJoinedSelectExecutor::DuckDB(exec.left_join::<J>(f)),
+            SelectExecutor::DuckDB(exec) => {
+                LeftJoinedSelectExecutor::DuckDB(exec.left_join::<J>(f))
+            }
         }
     }
 
@@ -3038,6 +3054,10 @@ impl<'a, T: Model> ScopedDeleteExecutor<'a, T> {
         <Self as super::SqlExecutor>::execute(self).await
     }
 
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
+    }
+
     pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
@@ -3115,6 +3135,10 @@ impl<'a, T: Model> ScopedUpdateExecutor<'a, T> {
 
     pub async fn execute(self) -> crate::Result<u64> {
         <Self as super::SqlExecutor>::execute(self).await
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -3678,7 +3702,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             #[cfg(feature = "mssql")]
             TransactionInsertExecutor::MSSQL(exec) => TransactionInsertExecutor::MSSQL(exec.set(f)),
             #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => TransactionInsertExecutor::DuckDB(exec.set(f)),
+            TransactionInsertExecutor::DuckDB(exec) => {
+                TransactionInsertExecutor::DuckDB(exec.set(f))
+            }
         }
     }
 
@@ -3712,6 +3738,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             #[cfg(feature = "duckdb")]
             TransactionInsertExecutor::DuckDB(exec) => exec.execute().await,
         }
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -3759,6 +3789,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await,
         }
     }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
+    }
 }
 
 /// 事务中的插入或忽略执行器
@@ -3804,6 +3838,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             #[cfg(feature = "duckdb")]
             TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await,
         }
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -3866,8 +3904,17 @@ pub(crate) async fn apply_transaction_options(
             }
             Ok(())
         }
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => Err(crate::ormer_error!(
+        #[cfg(feature = "duckdb")]
+        super::super::DbType::DuckDB => {
+            if options.isolation.is_some() || options.read_only {
+                return Err(crate::ormer_error!(
+                    "DuckDB transaction options are not supported"
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(feature = "clickhouse")]
+        super::super::DbType::ClickHouse => Err(crate::ormer_error!(
             "transaction options are not implemented for this backend"
         )),
     }
@@ -4452,7 +4499,9 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             #[cfg(feature = "mssql")]
             GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => GroupedCollectFuture::DuckDB(exec.collect::<C>()),
+            GroupedSelectExecutor::DuckDB(exec) => {
+                GroupedCollectFuture::DuckDB(exec.collect::<C>())
+            }
         }
     }
 

@@ -692,29 +692,25 @@ impl SqlExpr {
                     ),
                 }
             }
-            SqlExpr::JsonContains { left, right } => {
-                let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
-                let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
-                match db_type {
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => format!("{}::jsonb @> {}::jsonb", left_sql, right_sql),
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => format!("JSON_CONTAINS({}, {})", left_sql, right_sql),
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => {
-                        format!(
-                            "json_type({}) IS NOT NULL AND json_type({}) IS NOT NULL",
-                            left_sql, right_sql
-                        )
-                    }
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => {
-                        format!("ISJSON({}) = 1 AND ISJSON({}) = 1", left_sql, right_sql)
-                    }
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!("json_valid({}) AND json_valid({})", left_sql, right_sql),
+            SqlExpr::JsonContains { left, right } => match db_type {
+                #[cfg(feature = "postgresql")]
+                DbType::PostgreSQL => {
+                    let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                    let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                    format!("{}::jsonb @> {}::jsonb", left_sql, right_sql)
                 }
-            }
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => {
+                    let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                    let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                    format!("JSON_CONTAINS({}, {})", left_sql, right_sql)
+                }
+                _ => {
+                    let _ = (left, right);
+                    "0 = 1 /* OrmerError::UnsupportedFeature: JSON containment predicates */"
+                        .to_string()
+                }
+            },
             SqlExpr::JsonSet { expr, path, value } => {
                 let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
                 let value_sql = value.to_sql(db_type, param_idx, params, table_prefix);
@@ -843,6 +839,143 @@ impl SqlExpr {
         let mut param_idx = 1;
         let mut params = Vec::new();
         self.to_sql(db_type, &mut param_idx, &mut params, None)
+    }
+
+    pub(crate) fn validate_for_db(&self, db_type: DbType) -> crate::Result<()> {
+        match self {
+            SqlExpr::Column(_) | SqlExpr::Value(_) => Ok(()),
+            SqlExpr::Binary { left, right, .. }
+            | SqlExpr::ArrayContains { left, right }
+            | SqlExpr::ArrayOverlaps { left, right } => {
+                left.validate_for_db(db_type)?;
+                right.validate_for_db(db_type)?;
+                Ok(())
+            }
+            SqlExpr::JsonContains { left, right } => {
+                left.validate_for_db(db_type)?;
+                right.validate_for_db(db_type)?;
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => Ok(()),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => Ok(()),
+                    _ => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "JSON containment predicates",
+                    }),
+                }
+            }
+            SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
+                for arg in args {
+                    arg.validate_for_db(db_type)?;
+                }
+                Ok(())
+            }
+            SqlExpr::Cast { expr, .. }
+            | SqlExpr::Collate { expr, .. }
+            | SqlExpr::JsonText { expr, .. }
+            | SqlExpr::JsonPathText { expr, .. }
+            | SqlExpr::ArrayLen { expr } => expr.validate_for_db(db_type),
+            SqlExpr::Aggregate {
+                expr,
+                filter,
+                order_by,
+                over,
+                ..
+            } => {
+                expr.validate_for_db(db_type)?;
+                if let Some(filter) = filter {
+                    validate_filter_for_db(filter, db_type)?;
+                }
+                for order in order_by {
+                    if let Some(expr) = order.cloned_expr() {
+                        expr.validate_for_db(db_type)?;
+                    }
+                }
+                if let Some(over) = over {
+                    for expr in &over.partition_by {
+                        expr.validate_for_db(db_type)?;
+                    }
+                    for order in &over.order_by {
+                        if let Some(expr) = order.cloned_expr() {
+                            expr.validate_for_db(db_type)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SqlExpr::CaseMatch {
+                expr,
+                branches,
+                else_expr,
+            } => {
+                expr.validate_for_db(db_type)?;
+                for (when, then) in branches {
+                    when.validate_for_db(db_type)?;
+                    then.validate_for_db(db_type)?;
+                }
+                else_expr.validate_for_db(db_type)
+            }
+            SqlExpr::JsonSet { expr, value, .. } => {
+                expr.validate_for_db(db_type)?;
+                value.validate_for_db(db_type)
+            }
+            SqlExpr::Raw(raw) => {
+                for segment in &raw.segments {
+                    if let RawExprSegment::Expr(expr) = segment {
+                        expr.validate_for_db(db_type)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_filter_for_db(
+    filter: &crate::query::filter::FilterExpr,
+    db_type: DbType,
+) -> crate::Result<()> {
+    use crate::query::filter::FilterExpr;
+
+    match filter {
+        FilterExpr::InvalidDynamicField { model, field } => Err(crate::ormer_error!(
+            "Field '{}' does not exist on model {}",
+            field,
+            model
+        )),
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            validate_filter_for_db(left, db_type)?;
+            validate_filter_for_db(right, db_type)
+        }
+        FilterExpr::RelationExists { filter, .. }
+        | FilterExpr::ThroughRelationExists { filter, .. } => {
+            if let Some(filter) = filter {
+                validate_filter_for_db(filter, db_type)?;
+            }
+            Ok(())
+        }
+        FilterExpr::ExprComparison { left, right, .. } => {
+            left.validate_for_db(db_type)?;
+            right.validate_for_db(db_type)
+        }
+        FilterExpr::ExprIn { expr, values } | FilterExpr::ExprNotIn { expr, values } => {
+            expr.validate_for_db(db_type)?;
+            for value in values {
+                value.validate_for_db(db_type)?;
+            }
+            Ok(())
+        }
+        FilterExpr::ExprBetween { expr, min, max } => {
+            expr.validate_for_db(db_type)?;
+            min.validate_for_db(db_type)?;
+            max.validate_for_db(db_type)
+        }
+        FilterExpr::ExprIsNull { expr }
+        | FilterExpr::ExprIsNotNull { expr }
+        | FilterExpr::ExprPredicate { expr } => expr.validate_for_db(db_type),
+        FilterExpr::TextSearch { expr, .. } => expr.validate_for_db(db_type),
+        _ => Ok(()),
     }
 }
 

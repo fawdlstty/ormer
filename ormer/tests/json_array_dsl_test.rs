@@ -14,17 +14,12 @@ struct JsonArrayUser {
 #[test]
 fn json_and_array_filter_dsl_renders_sql_and_params() {
     let (sql, params) = ormer::Select::<JsonArrayUser>::new()
-        .filter(|u| {
-            u.profile
-                .json_contains(serde_json::json!({ "role": "admin" }))
-        })
         .filter(|u| u.profile.json_path_text(["account", "role"]).eq("admin"))
         .filter(|u| u.tags.overlaps(["ops", "admin"]))
         .filter(|u| u.tags.contains_all(["ops"]))
         .filter(|u| u.tags.len().gt(1))
         .to_sql_with_params(DbType::Sqlite);
 
-    assert!(sql.contains("json_type(profile) IS NOT NULL"), "SQL: {sql}");
     assert!(
         sql.contains("json_extract(profile, '$.account.role') = ?"),
         "SQL: {sql}"
@@ -33,12 +28,30 @@ fn json_and_array_filter_dsl_renders_sql_and_params() {
         sql.contains("json_each(tags)") && sql.contains("json_array_length(tags) > ?"),
         "SQL: {sql}"
     );
-    assert_eq!(params.len(), 5);
-    assert!(matches!(params[0], Value::Json(_)));
-    assert_text_param(&params[1], "admin");
-    assert_text_array_param(&params[2], &["ops", "admin"]);
-    assert_text_array_param(&params[3], &["ops"]);
-    assert_integer_param(&params[4], 1);
+    assert_eq!(params.len(), 4);
+    assert_text_param(&params[0], "admin");
+    assert_text_array_param(&params[1], &["ops", "admin"]);
+    assert_text_array_param(&params[2], &["ops"]);
+    assert_integer_param(&params[3], 1);
+}
+
+#[test]
+fn json_contains_rejects_backends_without_containment_semantics() {
+    let error = ormer::Select::<JsonArrayUser>::new()
+        .filter(|u| {
+            u.profile
+                .json_contains(serde_json::json!({ "role": "admin" }))
+        })
+        .try_to_sql_with_params(DbType::Sqlite)
+        .expect_err("SQLite must reject unsupported JSON containment");
+
+    assert!(matches!(
+        error,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: DbType::Sqlite,
+            feature: "JSON containment predicates",
+        }
+    ));
 }
 
 fn assert_text_param(value: &Value, expected: &str) {

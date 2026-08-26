@@ -6,7 +6,7 @@ use crate::model::{
 use crate::query::expr::{
     AliasedExpr, IntoSqlExpr, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
 };
-use crate::query::filter::{FilterExpr, OrderBy, OrderDirection};
+use crate::query::filter::{DynamicSubquery, FilterExpr, OrderBy, OrderDirection};
 #[cfg(feature = "postgresql")]
 use crate::query::filter::{infer_filter_value_rust_type, infer_model_value_rust_type};
 use crate::query::filter_formatter::FilterFormatter;
@@ -565,30 +565,13 @@ fn invalid_dynamic_field(model: &'static str, field: impl Into<String>) -> Filte
     FilterExpr::InvalidDynamicField { model, field }
 }
 
-fn validate_filter_expr(filter: &FilterExpr) -> crate::Result<()> {
-    match filter {
-        FilterExpr::InvalidDynamicField { model, field } => Err(crate::ormer_error!(
-            "{}",
-            invalid_dynamic_field_error(model, field)
-        )),
-        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
-            validate_filter_expr(left)?;
-            validate_filter_expr(right)
-        }
-        FilterExpr::RelationExists { filter, .. }
-        | FilterExpr::ThroughRelationExists { filter, .. } => {
-            if let Some(filter) = filter {
-                validate_filter_expr(filter)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+fn validate_filter_expr(filter: &FilterExpr, db_type: DbType) -> crate::Result<()> {
+    crate::query::expr::validate_filter_for_db(filter, db_type)
 }
 
-fn validate_filters(filters: &[FilterExpr]) -> crate::Result<()> {
+fn validate_filters(filters: &[FilterExpr], db_type: DbType) -> crate::Result<()> {
     for filter in filters {
-        validate_filter_expr(filter)?;
+        validate_filter_expr(filter, db_type)?;
     }
     Ok(())
 }
@@ -602,8 +585,12 @@ fn validate_order_by(order_by: &[OrderBy]) -> crate::Result<()> {
     Ok(())
 }
 
-fn validate_select_parts(filters: &[FilterExpr], order_by: &[OrderBy]) -> crate::Result<()> {
-    validate_filters(filters)?;
+fn validate_select_parts(
+    filters: &[FilterExpr],
+    order_by: &[OrderBy],
+    db_type: DbType,
+) -> crate::Result<()> {
+    validate_filters(filters, db_type)?;
     validate_order_by(order_by)
 }
 
@@ -890,17 +877,20 @@ fn append_range_clause(
     db_type: DbType,
 ) {
     if is_mssql_db(db_type) {
-        if let Some(end) = range_end {
+        if range_start.is_some() || range_end.is_some() {
             if !has_order_by {
                 sql.push_str(" ORDER BY (SELECT NULL)");
             }
-            write!(
-                sql,
-                " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
-                range_start.unwrap_or(0),
-                range_limit(range_start, end)
-            )
-            .expect("Failed to write OFFSET/FETCH clause");
+            write!(sql, " OFFSET {} ROWS", range_start.unwrap_or(0))
+                .expect("Failed to write OFFSET clause");
+            if let Some(end) = range_end {
+                write!(
+                    sql,
+                    " FETCH NEXT {} ROWS ONLY",
+                    range_limit(range_start, end)
+                )
+                .expect("Failed to write FETCH clause");
+            }
         }
     } else {
         append_limit_offset_clause(sql, range_start, range_end);
@@ -1252,6 +1242,17 @@ fn collect_filter_param_rust_types<T: Model>(
             subquery_params, ..
         } => {
             rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
+        }
+        FilterExpr::InSubqueryDynamic { subquery, .. }
+        | FilterExpr::NotInSubqueryDynamic { subquery, .. }
+        | FilterExpr::ExistsDynamic { subquery }
+        | FilterExpr::NotExistsDynamic { subquery } => {
+            rust_types.extend(
+                subquery
+                    .params(crate::abstract_layer::DbType::PostgreSQL)
+                    .iter()
+                    .map(infer_model_value_rust_type),
+            );
         }
         FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
             collect_filter_param_rust_types::<T>(left, rust_types);
@@ -2921,12 +2922,15 @@ impl<T: Model> Select<T> {
     ///     })
     ///     .collect::<Vec<_>>().await?;
     /// ```
-    pub fn exists(self) -> WhereExpr {
-        let (sql, params) = self.to_exists_sql_with_params();
+    pub fn exists(self) -> WhereExpr
+    where
+        T: Send + Sync + 'static,
+    {
         WhereExpr {
-            inner: FilterExpr::Exists {
-                subquery_sql: sql,
-                subquery_params: params,
+            inner: FilterExpr::ExistsDynamic {
+                subquery: DynamicSubquery::new(move |db_type| {
+                    self.to_exists_sql_with_params_for(db_type)
+                }),
             },
             ..WhereExpr::defaults()
         }
@@ -2935,21 +2939,22 @@ impl<T: Model> Select<T> {
     /// 将此查询转换为 NOT EXISTS 子查询表达式
     ///
     /// 生成 SQL: `NOT EXISTS (SELECT 1 FROM table WHERE ...)`
-    pub fn not_exists(self) -> WhereExpr {
-        let (sql, params) = self.to_exists_sql_with_params();
+    pub fn not_exists(self) -> WhereExpr
+    where
+        T: Send + Sync + 'static,
+    {
         WhereExpr {
-            inner: FilterExpr::NotExists {
-                subquery_sql: sql,
-                subquery_params: params,
+            inner: FilterExpr::NotExistsDynamic {
+                subquery: DynamicSubquery::new(move |db_type| {
+                    self.to_exists_sql_with_params_for(db_type)
+                }),
             },
             ..WhereExpr::defaults()
         }
     }
 
     /// 生成 EXISTS 子查询专用 SQL（SELECT 1 FROM ...）
-    fn to_exists_sql_with_params(&self) -> (String, Vec<crate::model::Value>) {
-        let db_type = default_db_type();
-
+    fn to_exists_sql_with_params_for(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let mut sql = String::new();
         let mut params = Vec::new();
 
@@ -2983,7 +2988,7 @@ impl<T: Model> Select<T> {
         &self,
         db_type: DbType,
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
-        validate_select_parts(&self.effective_filters(), &self.order_by)?;
+        validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
         Ok(self.to_sql_with_params(db_type))
     }
 
@@ -4984,14 +4989,14 @@ impl<T: ColumnValueType> IsNotInValues<T> for SubqueryParam {
 }
 
 // 为 MappedSelect 实现 IsInValues（子查询）
-impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
+impl<T: Model + Send + Sync + 'static, V: ColumnValueType + Send + Sync + 'static> IsInValues<V>
+    for MappedSelect<T, V>
+{
     fn to_in_expr(self, column: String) -> WhereExpr {
-        let (sql, params) = self.to_sql_with_params(default_db_type());
         WhereExpr {
-            inner: FilterExpr::InSubquery {
+            inner: FilterExpr::InSubqueryDynamic {
                 column,
-                subquery_sql: sql,
-                subquery_params: params,
+                subquery: DynamicSubquery::new(move |db_type| self.to_sql_with_params(db_type)),
             },
             ..WhereExpr::defaults()
         }
@@ -4999,14 +5004,14 @@ impl<T: Model, V: ColumnValueType> IsInValues<V> for MappedSelect<T, V> {
 }
 
 // 为 MappedSelect 实现 IsNotInValues（子查询）
-impl<T: Model, V: ColumnValueType> IsNotInValues<V> for MappedSelect<T, V> {
+impl<T: Model + Send + Sync + 'static, V: ColumnValueType + Send + Sync + 'static> IsNotInValues<V>
+    for MappedSelect<T, V>
+{
     fn to_not_in_expr(self, column: String) -> WhereExpr {
-        let (sql, params) = self.to_sql_with_params(default_db_type());
         WhereExpr {
-            inner: FilterExpr::NotInSubquery {
+            inner: FilterExpr::NotInSubqueryDynamic {
                 column,
-                subquery_sql: sql,
-                subquery_params: params,
+                subquery: DynamicSubquery::new(move |db_type| self.to_sql_with_params(db_type)),
             },
             ..WhereExpr::defaults()
         }

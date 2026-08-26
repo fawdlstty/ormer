@@ -5,9 +5,14 @@ use crate::model::{
 };
 use crate::query::filter::FilterExpr;
 use crate::query::filter_formatter::FilterFormatter;
-#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "sqlite",
+    feature = "mysql",
+    feature = "duckdb"
+))]
 use crate::query::insert::InsertConflictAction;
-#[cfg(any(feature = "postgresql", feature = "sqlite"))]
+#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "duckdb"))]
 use crate::query::insert::InsertConflictTarget;
 use crate::query::insert::{InsertAssignment, InsertConflict, InsertValue};
 use crate::query::update::{UpdateAssignment, UpdateExpr, UpdateValue};
@@ -457,7 +462,12 @@ fn build_sqlite_bulk_model_update_sql<T: Model>(
     })
 }
 
-#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "duckdb"
+))]
 fn bulk_source_columns<'a>(
     pk_columns: &'a [&'static str],
     set_columns: &'a [String],
@@ -469,7 +479,12 @@ fn bulk_source_columns<'a>(
         .collect()
 }
 
-#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "duckdb"
+))]
 fn push_bulk_source_row_values<T: Model>(
     params: &mut Vec<Value>,
     param_columns: &mut Vec<String>,
@@ -529,7 +544,7 @@ fn postgres_casted_placeholder_list<T: Model>(
         .map(|parts| parts.join(", "))
 }
 
-#[cfg(any(feature = "postgresql", feature = "mssql"))]
+#[cfg(any(feature = "postgresql", feature = "mssql", feature = "duckdb"))]
 fn build_values_source_bulk_model_update_sql<T: Model>(
     db_type: DbType,
     plans: &[ModelUpdatePlan],
@@ -588,6 +603,14 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
                 "UPDATE target SET {assignments} FROM {table} AS target JOIN (VALUES {values_sql}) AS source ({source_column_list}) ON {predicates}"
             )
         }
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            let assignments = source_assignments_sql(db_type, set_columns, None);
+            let predicates = source_pk_predicates_sql(db_type, pk_columns);
+            format!(
+                "UPDATE {table} AS target SET {assignments} FROM (VALUES {values_sql}) AS source ({source_column_list}) WHERE {predicates}"
+            )
+        }
         #[cfg(any(feature = "sqlite", feature = "mysql"))]
         _ => {
             return Err(crate::ormer_error!(
@@ -605,7 +628,12 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
     })
 }
 
-#[cfg(any(feature = "postgresql", feature = "mssql", feature = "mysql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "mssql",
+    feature = "mysql",
+    feature = "duckdb"
+))]
 fn source_assignments_sql(
     db_type: DbType,
     set_columns: &[String],
@@ -627,7 +655,12 @@ fn source_assignments_sql(
         .join(", ")
 }
 
-#[cfg(any(feature = "postgresql", feature = "mssql", feature = "mysql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "mssql",
+    feature = "mysql",
+    feature = "duckdb"
+))]
 fn source_pk_predicates_sql(db_type: DbType, pk_columns: &[&'static str]) -> String {
     pk_columns
         .iter()
@@ -715,8 +748,12 @@ fn build_bulk_model_update_sql<T: Model>(
         DbType::MSSQL => {
             build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
         }
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => Err(crate::ormer_error!(
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
+        }
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => Err(crate::ormer_error!(
             "bulk model update is not implemented for this backend"
         )),
     }
@@ -870,6 +907,46 @@ pub fn quote_mysql_values_assignment(db_type: DbType, column: &str) -> String {
         column,
         &format!("VALUES({})", quote_identifier(db_type, column)),
     )
+}
+
+pub fn append_standard_upsert_clause<T: Model>(
+    db_type: DbType,
+    sql: &mut String,
+    columns: &[&str],
+) -> crate::Result<()> {
+    let primary_key_columns = T::primary_key_columns();
+    if primary_key_columns.is_empty() {
+        return Err(crate::ormer_error!(
+            "insert_or_update requires at least one primary key column"
+        ));
+    }
+
+    sql.push_str(" ON CONFLICT (");
+    sql.push_str(&quote_column_list(db_type, primary_key_columns));
+    sql.push_str(") DO UPDATE SET ");
+
+    let mut first = true;
+    for column in columns {
+        if primary_key_columns.contains(column) {
+            continue;
+        }
+        if !first {
+            sql.push_str(", ");
+        }
+        sql.push_str(&quote_assignment(
+            db_type,
+            column,
+            &quote_column_with_prefix(db_type, "excluded", column),
+        ));
+        first = false;
+    }
+
+    if first {
+        sql.truncate(sql.len() - " DO UPDATE SET ".len());
+        sql.push_str(" DO NOTHING");
+    }
+
+    Ok(())
 }
 
 pub fn sql_type_with_nullability(base_type: &str, is_nullable: bool) -> String {
@@ -1385,6 +1462,11 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
         }
         #[cfg(feature = "mysql")]
         DbType::MySQL => sql,
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            let pk_col = quote_column_list(DbType::DuckDB, &[_pk_col]);
+            format!("{sql} RETURNING {pk_col}")
+        }
         #[cfg(feature = "mssql")]
         DbType::MSSQL => {
             let output = format!(
@@ -1403,8 +1485,8 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
                 format!("{sql}{output}")
             }
         }
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => sql,
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => sql,
     }
 }
 
@@ -1601,7 +1683,12 @@ pub fn build_insert_statement_with_conflict<T: Model>(
         models,
         BatchInsertValuesMode::WithoutAutoIncrement,
     );
-    #[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+    #[cfg(any(
+        feature = "postgresql",
+        feature = "sqlite",
+        feature = "mysql",
+        feature = "duckdb"
+    ))]
     let (mut sql, mut values) = (sql, values);
 
     if let Some(conflict) = conflict
@@ -1613,7 +1700,12 @@ pub fn build_insert_statement_with_conflict<T: Model>(
                 "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
             ));
         }
-        #[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+        #[cfg(any(
+            feature = "postgresql",
+            feature = "sqlite",
+            feature = "mysql",
+            feature = "duckdb"
+        ))]
         append_insert_conflict_clause::<T>(db_type, &mut sql, &mut values, conflict)?;
     }
 
@@ -1669,7 +1761,12 @@ pub fn build_insert_statements_with_conflict<T: Model>(
         .collect()
 }
 
-#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "mysql"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "sqlite",
+    feature = "mysql",
+    feature = "duckdb"
+))]
 fn append_insert_conflict_clause<T: Model>(
     db_type: DbType,
     sql: &mut String,
@@ -1687,18 +1784,22 @@ fn append_insert_conflict_clause<T: Model>(
         }
         #[cfg(feature = "mysql")]
         DbType::MySQL => append_mysql_insert_conflict_clause(sql, params, conflict),
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            append_standard_insert_conflict_clause::<T>(DbType::DuckDB, sql, params, conflict)
+        }
         #[cfg(feature = "mssql")]
         DbType::MSSQL => Err(crate::ormer_error!(
             "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
         )),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => Err(crate::ormer_error!(
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => Err(crate::ormer_error!(
             "insert conflict handling is not implemented for this backend"
         )),
     }
 }
 
-#[cfg(any(feature = "postgresql", feature = "sqlite"))]
+#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "duckdb"))]
 fn append_standard_insert_conflict_clause<T: Model>(
     db_type: DbType,
     sql: &mut String,
@@ -1753,7 +1854,7 @@ fn append_standard_insert_conflict_clause<T: Model>(
     Ok(())
 }
 
-#[cfg(any(feature = "postgresql", feature = "sqlite"))]
+#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "duckdb"))]
 fn append_standard_conflict_target(
     db_type: DbType,
     sql: &mut String,

@@ -138,9 +138,21 @@ impl FilterFormatter {
                 subquery_params,
             } => {
                 use std::fmt::Write;
+                let subquery_sql =
+                    rebase_subquery_sql(subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql)
                     .unwrap_or_else(|e| panic!("Failed to write subquery IN clause: {}", e));
                 self.append_subquery_params(subquery_params, param_idx, params);
+            }
+            FilterExpr::InSubqueryDynamic { column, subquery } => {
+                use std::fmt::Write;
+                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let subquery_sql =
+                    rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
+                write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql).unwrap_or_else(
+                    |e| panic!("Failed to write dynamic subquery IN clause: {}", e),
+                );
+                self.append_subquery_params(&subquery_params, param_idx, params);
             }
             FilterExpr::NotInSubquery {
                 column,
@@ -148,6 +160,8 @@ impl FilterFormatter {
                 subquery_params,
             } => {
                 use std::fmt::Write;
+                let subquery_sql =
+                    rebase_subquery_sql(subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(
                     sql,
                     "{} NOT IN ({})",
@@ -157,15 +171,35 @@ impl FilterFormatter {
                 .unwrap_or_else(|e| panic!("Failed to write subquery NOT IN clause: {}", e));
                 self.append_subquery_params(subquery_params, param_idx, params);
             }
+            FilterExpr::NotInSubqueryDynamic { column, subquery } => {
+                use std::fmt::Write;
+                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let subquery_sql =
+                    rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
+                write!(
+                    sql,
+                    "{} NOT IN ({})",
+                    self.quoted_column(column),
+                    subquery_sql
+                )
+                .unwrap_or_else(|e| {
+                    panic!("Failed to write dynamic subquery NOT IN clause: {}", e)
+                });
+                self.append_subquery_params(&subquery_params, param_idx, params);
+            }
             FilterExpr::And(left, right) => {
+                sql.push('(');
                 self.format_recursive(left, sql, param_idx, params);
                 sql.push_str(" AND ");
                 self.format_recursive(right, sql, param_idx, params);
+                sql.push(')');
             }
             FilterExpr::Or(left, right) => {
+                sql.push('(');
                 self.format_recursive(left, sql, param_idx, params);
                 sql.push_str(" OR ");
                 self.format_recursive(right, sql, param_idx, params);
+                sql.push(')');
             }
             FilterExpr::IsNull { column } => {
                 use std::fmt::Write;
@@ -204,18 +238,40 @@ impl FilterFormatter {
                 subquery_params,
             } => {
                 use std::fmt::Write;
+                let subquery_sql =
+                    rebase_subquery_sql(subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "EXISTS ({})", subquery_sql)
                     .unwrap_or_else(|e| panic!("Failed to write EXISTS clause: {}", e));
                 self.append_subquery_params(subquery_params, param_idx, params);
+            }
+            FilterExpr::ExistsDynamic { subquery } => {
+                use std::fmt::Write;
+                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let subquery_sql =
+                    rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
+                write!(sql, "EXISTS ({})", subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write dynamic EXISTS clause: {}", e));
+                self.append_subquery_params(&subquery_params, param_idx, params);
             }
             FilterExpr::NotExists {
                 subquery_sql,
                 subquery_params,
             } => {
                 use std::fmt::Write;
+                let subquery_sql =
+                    rebase_subquery_sql(subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "NOT EXISTS ({})", subquery_sql)
                     .unwrap_or_else(|e| panic!("Failed to write NOT EXISTS clause: {}", e));
                 self.append_subquery_params(subquery_params, param_idx, params);
+            }
+            FilterExpr::NotExistsDynamic { subquery } => {
+                use std::fmt::Write;
+                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let subquery_sql =
+                    rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
+                write!(sql, "NOT EXISTS ({})", subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write dynamic NOT EXISTS clause: {}", e));
+                self.append_subquery_params(&subquery_params, param_idx, params);
             }
             FilterExpr::RelationExists {
                 owner_table,
@@ -612,4 +668,82 @@ impl FilterFormatter {
 
         format!("{} {} {}", full_col_name, operator, param_placeholder)
     }
+}
+
+fn rebase_subquery_sql(sql: &str, db_type: DbType, offset: usize) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.char_indices().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut question_index = 0usize;
+
+    while let Some((_index, ch)) = chars.next() {
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            result.push(ch);
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            result.push(ch);
+            continue;
+        }
+        if in_single_quote || in_double_quote {
+            result.push(ch);
+            continue;
+        }
+
+        #[cfg(feature = "postgresql")]
+        if matches!(db_type, DbType::PostgreSQL) && ch == '$' {
+            let start = _index + 1;
+            let mut end = start;
+            while let Some((next_index, next)) = chars.peek().copied() {
+                if !next.is_ascii_digit() {
+                    break;
+                }
+                end = next_index + next.len_utf8();
+                chars.next();
+            }
+            if end > start {
+                let number = sql[start..end].parse::<usize>().unwrap_or(0);
+                result.push_str(&format!("${}", number + offset));
+                continue;
+            }
+        }
+
+        #[cfg(feature = "mssql")]
+        if matches!(db_type, DbType::MSSQL) && ch == '@' {
+            if let Some((_, 'P')) = chars.peek().copied() {
+                chars.next();
+                let start = chars.peek().map(|(next, _)| *next).unwrap_or(sql.len());
+                let mut end = start;
+                while let Some((next_index, next)) = chars.peek().copied() {
+                    if !next.is_ascii_digit() {
+                        break;
+                    }
+                    end = next_index + next.len_utf8();
+                    chars.next();
+                }
+                if end > start {
+                    let number = sql[start..end].parse::<usize>().unwrap_or(0);
+                    result.push_str(&format!("@P{}", number + offset));
+                    continue;
+                }
+                result.push_str("@P");
+                continue;
+            }
+        }
+
+        if ch == '?' {
+            question_index += 1;
+            result.push_str(&crate::abstract_layer::common::common_helpers::placeholder(
+                db_type,
+                offset + question_index,
+            ));
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
 }

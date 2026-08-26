@@ -115,10 +115,28 @@ impl MigrationStep {
                     DbType::MSSQL => Ok(format!(
                         "ALTER TABLE {table} ALTER COLUMN {column} {definition}"
                     )),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => Err(crate::ormer_error!(
-                        "ALTER COLUMN is not implemented for this backend"
-                    )),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => {
+                        if using.is_some() {
+                            return Err(crate::ormer_error!(
+                                "DuckDB does not support USING expressions in ALTER COLUMN"
+                            ));
+                        }
+                        Ok(format!(
+                            "ALTER TABLE {table} ALTER COLUMN {column} {definition}"
+                        ))
+                    }
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => {
+                        if using.is_some() {
+                            return Err(crate::ormer_error!(
+                                "ClickHouse does not support USING expressions in ALTER COLUMN"
+                            ));
+                        }
+                        Ok(format!(
+                            "ALTER TABLE {table} MODIFY COLUMN {column} {definition}"
+                        ))
+                    }
                 }
             }
             Self::AddConstraint { table, definition } => {
@@ -544,30 +562,31 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                 continue;
             }
 
-            #[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
+            #[cfg(any(
+                feature = "postgresql",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb"
+            ))]
             {
-                let is_postgresql = {
-                    #[cfg(feature = "postgresql")]
-                    {
-                        matches!(db_type, DbType::PostgreSQL)
-                    }
-                    #[cfg(not(feature = "postgresql"))]
-                    {
-                        false
-                    }
-                };
-
                 if type_changed {
-                    let definition = if is_postgresql {
-                        format!("TYPE {expected_type}")
-                    } else {
-                        column_definition(db_type, expected)?
+                    let (definition, using) = match db_type {
+                        #[cfg(feature = "postgresql")]
+                        DbType::PostgreSQL => (
+                            format!("TYPE {expected_type}"),
+                            postgresql_using_expression(db_type, actual, expected, &expected_type),
+                        ),
+                        #[cfg(feature = "mysql")]
+                        DbType::MySQL => (column_definition(db_type, expected)?, None),
+                        #[cfg(feature = "mssql")]
+                        DbType::MSSQL => (column_definition(db_type, expected)?, None),
+                        #[cfg(feature = "duckdb")]
+                        DbType::DuckDB => (format!("SET DATA TYPE {expected_type}"), None),
+                        #[cfg(feature = "sqlite")]
+                        DbType::Sqlite => unreachable!("SQLite uses table rebuilds"),
+                        #[cfg(feature = "clickhouse")]
+                        DbType::ClickHouse => (column_definition(db_type, expected)?, None),
                     };
-                    #[cfg(feature = "postgresql")]
-                    let using =
-                        postgresql_using_expression(db_type, actual, expected, &expected_type);
-                    #[cfg(not(feature = "postgresql"))]
-                    let using = None;
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
                         column: expected.name.to_string(),
@@ -593,7 +612,13 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         #[cfg(feature = "sqlite")]
                         DbType::Sqlite => unreachable!("SQLite uses table rebuilds"),
                         #[cfg(feature = "duckdb")]
-                        DbType::DuckDB => column_definition(db_type, expected)?,
+                        DbType::DuckDB => {
+                            if expected.is_nullable {
+                                "DROP NOT NULL".to_string()
+                            } else {
+                                "SET NOT NULL".to_string()
+                            }
+                        }
                         #[cfg(feature = "clickhouse")]
                         DbType::ClickHouse => column_definition(db_type, expected)?,
                     };
@@ -1479,8 +1504,8 @@ impl Database {
                 "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE_NAME} \
                  (version BIGINT PRIMARY KEY, name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             ),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-            _ => {
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => {
                 return Err(crate::ormer_error!(
                     "migrations are not implemented for this backend"
                 ));
@@ -1597,6 +1622,57 @@ mod compression_tests {
             "ALTER TABLE public.documents ALTER COLUMN payload SET COMPRESSION lz4"
         );
         assert!(matches!(step, MigrationStep::Sql { .. }));
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_tests {
+    use super::MigrationStep;
+    use crate::abstract_layer::DbType;
+
+    #[test]
+    fn duckdb_alter_column_renders_type_and_nullability_changes() {
+        let type_change = MigrationStep::AlterColumn {
+            table: "events".to_string(),
+            column: "kind".to_string(),
+            definition: "SET DATA TYPE BIGINT".to_string(),
+            using: None,
+        };
+        assert_eq!(
+            type_change.sql(DbType::DuckDB).unwrap(),
+            "ALTER TABLE events ALTER COLUMN kind SET DATA TYPE BIGINT"
+        );
+
+        let nullable_change = MigrationStep::AlterColumn {
+            table: "events".to_string(),
+            column: "kind".to_string(),
+            definition: "SET NOT NULL".to_string(),
+            using: None,
+        };
+        assert_eq!(
+            nullable_change.sql(DbType::DuckDB).unwrap(),
+            "ALTER TABLE events ALTER COLUMN kind SET NOT NULL"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "clickhouse"))]
+mod clickhouse_tests {
+    use super::MigrationStep;
+    use crate::abstract_layer::DbType;
+
+    #[test]
+    fn clickhouse_alter_column_renders_modify_column() {
+        let step = MigrationStep::AlterColumn {
+            table: "events".to_string(),
+            column: "kind".to_string(),
+            definition: "Nullable(String)".to_string(),
+            using: None,
+        };
+        assert_eq!(
+            step.sql(DbType::ClickHouse).unwrap(),
+            "ALTER TABLE events MODIFY COLUMN kind Nullable(String)"
+        );
     }
 }
 

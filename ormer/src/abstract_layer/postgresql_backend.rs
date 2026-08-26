@@ -1167,6 +1167,17 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         } => {
             rust_types.extend(subquery_params.iter().map(infer_model_value_rust_type));
         }
+        FilterExpr::InSubqueryDynamic { subquery, .. }
+        | FilterExpr::NotInSubqueryDynamic { subquery, .. }
+        | FilterExpr::ExistsDynamic { subquery }
+        | FilterExpr::NotExistsDynamic { subquery } => {
+            rust_types.extend(
+                subquery
+                    .params(crate::abstract_layer::DbType::PostgreSQL)
+                    .iter()
+                    .map(infer_model_value_rust_type),
+            );
+        }
         FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
             pg_collect_filter_param_rust_types::<T>(left, rust_types);
             pg_collect_filter_param_rust_types::<T>(right, rust_types);

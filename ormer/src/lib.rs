@@ -23,6 +23,10 @@ compile_error!(
 );
 
 pub use abstract_layer::DbType;
+#[cfg(feature = "clickhouse")]
+pub use abstract_layer::clickhouse_backend::Database as ClickHouseDatabase;
+#[cfg(feature = "clickhouse")]
+pub use clickhouse;
 pub use db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };
@@ -44,15 +48,16 @@ pub use abstract_layer::{
     BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, ConnectionPool,
     CreateTableExecutor, Database, DbExecutor, DeleteExecutor, DerivedTableCollectFuture,
     DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
-    DropTableExecutor, InsertGraphExecutor, InsertPartialExecutor, IsolationLevel,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor, RawCollectFuture,
-    RawSelectExecutor, RelationNestedLoader, ReplicatedConnectionPool, ReplicatedDatabase,
-    ReplicatedDatabaseBuilder, ReplicatedPoolBuilder, SaveExecutor, ScopedDeleteExecutor,
-    ScopedUpdateExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
-    SqlStatement, Transaction, TransactionFuture, TransactionInsertOrIgnoreExecutor,
-    TransactionOptions, TransactionRawCollectFuture, TransactionRawSelectExecutor,
-    TransactionSaveExecutor, UpdateGraphExecutor,
+    DropTableExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertPartialExecutor,
+    IsolationLevel, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
+    NestedInclude, PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor,
+    RawCollectFuture, RawSelectExecutor, RelationNestedLoader, ReplicatedConnectionPool,
+    ReplicatedDatabase, ReplicatedDatabaseBuilder, ReplicatedPoolBuilder, SaveExecutor,
+    ScopedDeleteExecutor, ScopedUpdateExecutor, SelectStream, SelectStreamIterator,
+    SingleSqlStatement, SqlExecutor, SqlStatement, Transaction, TransactionFuture,
+    TransactionInsertOrIgnoreExecutor, TransactionOptions, TransactionRawCollectFuture,
+    TransactionRawSelectExecutor, TransactionSaveExecutor, UpdateGraphExecutor,
+    WithoutHooksExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
@@ -64,6 +69,10 @@ pub use model::{
     RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
     TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel, Tracked, Value,
     ViewModel, WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
+};
+#[cfg(feature = "clickhouse")]
+pub use model::{
+    generate_clickhouse_create_table_sql, generate_clickhouse_create_table_sql_with_name,
 };
 pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum, ViewModel, raw};
 pub use query::builder::{

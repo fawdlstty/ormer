@@ -45,7 +45,8 @@ PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀�
 let code = db.generate_entities(None).await?;
 ```
 
-PostgreSQL 可传 `Some("public")`，MSSQL 可传 `Some("dbo")`；未指定时使用后端默认 schema。
+PostgreSQL 可传 `Some("public")`，MSSQL 可传 `Some("dbo")`；ClickHouse 使用数据库名作为 schema；
+未指定时使用后端默认 schema。DuckDB 和 ClickHouse 会根据实际列类型生成对应的 Rust 字段类型。
 
 ## 乐观锁版本列
 

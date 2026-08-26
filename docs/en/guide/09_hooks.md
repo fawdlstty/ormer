@@ -67,7 +67,7 @@ An error from `BeforeInsert` prevents SQL execution. An error from `AfterInsert`
 
 ## Updates and Deletes
 
-An update or delete without a model cannot identify a hook subject. Use `execute_with_hooks` to supply that model. Use `execute_models_with_hooks` for batches; each context carries its batch index.
+An ordinary update or delete `execute()` runs SQL without a model hook subject. Use `execute_with_hooks` to supply the model. Use `execute_models_with_hooks` for batches; each context carries its batch index.
 
 ```rust
 db.update::<User>()
@@ -82,6 +82,10 @@ db.delete::<User>()
 ```
 
 For an insert inside a transaction, `ctx.in_transaction()` is `true`. Hook failures are returned as `Result` and do not commit the transaction; the caller chooses `commit()` or `rollback()`.
+
+Write hooks are enabled by default. Use `without_hooks()` only for the current execution chain; it does not affect other tasks or connections.
+
+The current release does not provide a cross-connection database change listener. Raw SQL and writes from another connection or process do not construct models or trigger `WriteHook`.
 
 ## SQL Trace
 

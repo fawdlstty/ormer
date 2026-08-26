@@ -16,6 +16,7 @@ pub use stream_connection::StreamConnection;
 
 /// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
 mod unified;
+pub use crate::hooks::WithoutHooksExecutor;
 pub use unified::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
     CollectFuture, CreateTableExecutor, Database, DeleteExecutor, DerivedTableCollectFuture,

@@ -81,6 +81,17 @@ for migration in history {
 
 SQLite 不支持在建表后追加外键；`MigrationStep::AddForeignKey` 在 SQLite 上会返回错误。
 
+ClickHouse 使用 `ClickHouseDatabase` 的原生迁移入口：
+
+```rust
+let db = ormer::ClickHouseDatabase::connect("http://localhost:8123?database=default")?;
+let pending = db.pending_migrations(&migrations).await?;
+let applied = db.apply_migrations(&migrations).await?;
+```
+
+ClickHouse 使用 `MergeTree` 保存迁移历史，不提供事务或自动回滚；迁移步骤逐条执行，
+失败时已经执行的步骤会保留。统一 `Database::connect` 仍不会把 ClickHouse 伪装成事务型 ORM 后端。
+
 `migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
 
 模型中的 `#[compress(...)]` 也会参与表结构校验和迁移。PostgreSQL 会生成列级 `SET COMPRESSION`，MySQL 会生成表级 `COMPRESSION` 选项；MySQL 同一张表的压缩列必须使用同一种算法。

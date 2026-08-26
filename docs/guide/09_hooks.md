@@ -67,7 +67,7 @@ db.insert(&mut users).execute().await?;
 
 ## 更新和删除
 
-更新和删除没有模型输入时无法确定 Hook 的作用对象，因此使用 `execute_with_hooks` 显式提供模型。批量场景使用 `execute_models_with_hooks`，HookContext 会带上批量索引。
+更新和删除的普通 `execute()` 默认执行纯 SQL；需要模型级 Hook 时使用 `execute_with_hooks` 显式提供模型。批量场景使用 `execute_models_with_hooks`，HookContext 会带上批量索引。
 
 ```rust
 db.update::<User>()
@@ -82,6 +82,10 @@ db.delete::<User>()
 ```
 
 在事务中执行插入时，`ctx.in_transaction()` 为 `true`。Hook 错误会作为 `Result` 返回，不会自动提交事务；调用方应根据业务语义选择 `commit()` 或 `rollback()`。
+
+所有写入 Hook 默认开启。仅需跳过当前执行链时使用 `without_hooks()`；它不会影响其他任务或连接。
+
+当前版本没有跨连接的数据库变更监听器。原生 SQL、其他连接或其他进程的写入不会构造模型并触发 `WriteHook`。
 
 ## SQL Trace
 

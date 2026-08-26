@@ -169,6 +169,60 @@ async fn test_hooks_with_database_insert() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
+async fn test_without_hooks_skips_write_hooks() {
+    let _guard = HOOKS_TEST_MUTEX.lock().await;
+    reset_counters();
+
+    let db = Database::connect(DbType::Sqlite, ":memory:").await.unwrap();
+    db.create_table::<HookTestUser>().execute().await.unwrap();
+
+    let mut user = HookTestUser {
+        id: 0,
+        name: "No Hooks".to_string(),
+        email: "no-hooks@example.com".to_string(),
+    };
+
+    user.id = db
+        .insert(&mut user)
+        .without_hooks()
+        .execute()
+        .await
+        .unwrap();
+
+    assert_eq!(BEFORE_INSERT_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(AFTER_INSERT_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db.select::<HookTestUser>()
+            .collect::<Vec<_>>()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    user.name = "No Hooks Updated".to_string();
+    db.update::<HookTestUser>()
+        .set_model(&user)
+        .without_hooks()
+        .execute()
+        .await
+        .unwrap();
+
+    db.delete::<HookTestUser>()
+        .filter(|fields| fields.id.eq(user.id))
+        .without_hooks()
+        .execute()
+        .await
+        .unwrap();
+
+    assert_eq!(BEFORE_UPDATE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(AFTER_UPDATE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(BEFORE_DELETE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(AFTER_DELETE_COUNT.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
 async fn test_hooks_with_database_batch_insert() {
     // 测试批量插入时的钩子
     let _guard = HOOKS_TEST_MUTEX.lock().await;
@@ -234,6 +288,44 @@ async fn test_hooks_with_update_and_delete_executors() {
     assert_eq!(deleted, 1);
     assert_eq!(BEFORE_DELETE_COUNT.load(Ordering::SeqCst), 1);
     assert_eq!(AFTER_DELETE_COUNT.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_without_hooks_skips_current_write_chain() {
+    let _guard = HOOKS_TEST_MUTEX.lock().await;
+    reset_counters();
+
+    let db = Database::connect(DbType::Sqlite, ":memory:").await.unwrap();
+    db.create_table::<HookTestUser>().execute().await.unwrap();
+
+    let mut user = HookTestUser {
+        id: 0,
+        name: "Without Hooks".to_string(),
+        email: "without-hooks@example.com".to_string(),
+    };
+
+    db.insert(&mut user).execute().await.unwrap();
+    assert_eq!(BEFORE_INSERT_COUNT.load(Ordering::SeqCst), 1);
+    assert_eq!(AFTER_INSERT_COUNT.load(Ordering::SeqCst), 1);
+
+    db.update::<HookTestUser>()
+        .set_model(&user)
+        .without_hooks()
+        .execute()
+        .await
+        .unwrap();
+    db.delete::<HookTestUser>()
+        .model(&user)
+        .without_hooks()
+        .execute()
+        .await
+        .unwrap();
+
+    assert_eq!(BEFORE_UPDATE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(AFTER_UPDATE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(BEFORE_DELETE_COUNT.load(Ordering::SeqCst), 0);
+    assert_eq!(AFTER_DELETE_COUNT.load(Ordering::SeqCst), 0);
 }
 
 #[cfg(feature = "sqlite")]

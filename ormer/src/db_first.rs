@@ -616,9 +616,111 @@ fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> String {
         DbType::MySQL => mysql_rust_type(&lower),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => mssql_rust_type(&lower),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => "String".to_string(),
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => duckdb_rust_type(raw),
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => clickhouse_rust_type(raw),
     }
+}
+
+#[cfg(feature = "duckdb")]
+fn duckdb_rust_type(type_name: &str) -> String {
+    let type_name = type_name.trim();
+    if let Some(element_type) = type_name.strip_suffix("[]").or_else(|| {
+        type_name
+            .strip_prefix("LIST<")
+            .and_then(|value| value.strip_suffix('>'))
+    }) {
+        let element_type = duckdb_rust_type(element_type);
+        return format!("Vec<{element_type}>");
+    }
+
+    let base = type_name
+        .split_once('(')
+        .map_or(type_name, |(base, _)| base)
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "tinyint" | "smallint" | "integer" | "int" | "int4" | "usmallint" | "uinteger" => "i32",
+        "bigint" | "int8" | "int64" | "ubigint" => "i64",
+        "hugeint" => "i128",
+        "uhugeint" => "u128",
+        "float" | "real" | "double" | "double precision" => "f64",
+        "decimal" | "numeric" => "rust_decimal::Decimal",
+        "boolean" | "bool" => "bool",
+        "blob" | "bytea" => "Vec<u8>",
+        "date" => "chrono::NaiveDate",
+        "time" | "time without time zone" => "chrono::NaiveTime",
+        "timestamp"
+        | "datetime"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "timestamptz" => "chrono::NaiveDateTime",
+        "interval" => "std::time::Duration",
+        "json" => "serde_json::Value",
+        "varchar" | "character varying" | "char" | "text" | "string" => "String",
+        _ => "String",
+    }
+    .to_string()
+}
+
+#[cfg(feature = "clickhouse")]
+fn clickhouse_rust_type(type_name: &str) -> String {
+    let type_name = type_name.trim();
+    let type_name = unwrap_clickhouse_type(type_name, "Nullable").unwrap_or(type_name);
+    if let Some(inner) = unwrap_clickhouse_type(type_name, "Array") {
+        let inner_type = clickhouse_rust_type(inner);
+        if unwrap_clickhouse_type(inner, "Nullable").is_some() {
+            return format!("Vec<Option<{inner_type}>>");
+        }
+        return format!("Vec<{inner_type}>");
+    }
+    if type_name
+        .get(..type_name.find('(').unwrap_or(type_name.len()))
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("enum8") || name.eq_ignore_ascii_case("enum16")
+        })
+    {
+        return "String".to_string();
+    }
+    let base = type_name
+        .split_once('(')
+        .map_or(type_name, |(base, _)| base)
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "int8" => "i8",
+        "int16" => "i16",
+        "int32" => "i32",
+        "int64" => "i64",
+        "int128" | "int256" => "i128",
+        "uint8" => "u8",
+        "uint16" => "u16",
+        "uint32" => "u32",
+        "uint64" => "u64",
+        "uint128" | "uint256" => "u128",
+        "float32" => "f32",
+        "float64" => "f64",
+        "decimal32" | "decimal64" | "decimal128" | "decimal256" => "rust_decimal::Decimal",
+        "date32" | "date" => "chrono::NaiveDate",
+        "datetime" | "datetime64" => "chrono::NaiveDateTime",
+        "uuid" => "uuid::Uuid",
+        "json" | "object" => "serde_json::Value",
+        _ => "String",
+    }
+    .to_string()
+}
+
+#[cfg(feature = "clickhouse")]
+fn unwrap_clickhouse_type<'a>(type_name: &'a str, wrapper: &str) -> Option<&'a str> {
+    let prefix = format!("{wrapper}(");
+    if type_name.len() <= prefix.len()
+        || !type_name[..prefix.len()].eq_ignore_ascii_case(&prefix)
+        || !type_name.ends_with(')')
+    {
+        return None;
+    }
+    Some(&type_name[prefix.len()..type_name.len() - 1])
 }
 
 #[cfg(feature = "sqlite")]
@@ -708,6 +810,80 @@ fn mssql_rust_type(type_name: &str) -> String {
         _ => "String",
     }
     .to_string()
+}
+
+#[cfg(all(test, feature = "clickhouse"))]
+mod clickhouse_tests {
+    use super::rust_type_for_column;
+    use crate::abstract_layer::DbType;
+    use crate::db_first::DbFirstColumn;
+
+    fn column(type_name: &str) -> DbFirstColumn {
+        DbFirstColumn {
+            name: "value".to_string(),
+            type_name: type_name.to_string(),
+            nullable: false,
+            primary_key: false,
+            auto_increment: false,
+            enum_variants: Vec::new(),
+            default: None,
+        }
+    }
+
+    #[test]
+    fn maps_clickhouse_types_for_entity_generation() {
+        assert_eq!(
+            rust_type_for_column(DbType::ClickHouse, &column("Nullable(Array(Int64))")),
+            "Vec<i64>"
+        );
+        assert_eq!(
+            rust_type_for_column(DbType::ClickHouse, &column("DateTime64(3)")),
+            "chrono::NaiveDateTime"
+        );
+        assert_eq!(
+            rust_type_for_column(DbType::ClickHouse, &column("Decimal128(38)")),
+            "rust_decimal::Decimal"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "duckdb"))]
+mod duckdb_tests {
+    use super::rust_type_for_column;
+    use crate::abstract_layer::DbType;
+    use crate::db_first::DbFirstColumn;
+
+    fn column(type_name: &str) -> DbFirstColumn {
+        DbFirstColumn {
+            name: "value".to_string(),
+            type_name: type_name.to_string(),
+            nullable: false,
+            primary_key: false,
+            auto_increment: false,
+            enum_variants: Vec::new(),
+            default: None,
+        }
+    }
+
+    #[test]
+    fn maps_duckdb_types_for_entity_generation() {
+        assert_eq!(
+            rust_type_for_column(DbType::DuckDB, &column("BIGINT")),
+            "i64"
+        );
+        assert_eq!(
+            rust_type_for_column(DbType::DuckDB, &column("VARCHAR[]")),
+            "Vec<String>"
+        );
+        assert_eq!(
+            rust_type_for_column(DbType::DuckDB, &column("DECIMAL(18, 2)")),
+            "rust_decimal::Decimal"
+        );
+        assert_eq!(
+            rust_type_for_column(DbType::DuckDB, &column("TIMESTAMP")),
+            "chrono::NaiveDateTime"
+        );
+    }
 }
 
 fn enum_name_for_column(

@@ -1,4 +1,6 @@
 use crate::query::expr::SqlExpr;
+use std::fmt;
+use std::sync::Arc;
 
 /// 过滤表达式
 #[derive(Debug, Clone)]
@@ -50,10 +52,24 @@ pub enum FilterExpr {
         subquery_sql: String,
         subquery_params: Vec<crate::model::Value>,
     },
+    /// EXISTS subquery rendered with the final backend dialect.
+    ExistsDynamic { subquery: DynamicSubquery },
     /// NOT EXISTS 子查询: NOT EXISTS (SELECT 1 FROM ... WHERE ...)
     NotExists {
         subquery_sql: String,
         subquery_params: Vec<crate::model::Value>,
+    },
+    /// NOT EXISTS subquery rendered with the final backend dialect.
+    NotExistsDynamic { subquery: DynamicSubquery },
+    /// IN subquery rendered with the final backend dialect.
+    InSubqueryDynamic {
+        column: String,
+        subquery: DynamicSubquery,
+    },
+    /// NOT IN subquery rendered with the final backend dialect.
+    NotInSubqueryDynamic {
+        column: String,
+        subquery: DynamicSubquery,
     },
     /// 关系存在性查询: EXISTS (SELECT 1 FROM target WHERE target.fk = owner.pk AND ...)
     RelationExists {
@@ -104,6 +120,37 @@ pub enum FilterExpr {
 
 /// 值类型（用于过滤）
 pub type Value = crate::model::Value;
+
+/// A subquery whose SQL is rendered after the target backend is known.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct DynamicSubquery {
+    render: Arc<dyn Fn(crate::abstract_layer::DbType) -> (String, Vec<Value>) + Send + Sync>,
+}
+
+impl fmt::Debug for DynamicSubquery {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DynamicSubquery(..)")
+    }
+}
+
+impl DynamicSubquery {
+    pub(crate) fn new(
+        render: impl Fn(crate::abstract_layer::DbType) -> (String, Vec<Value>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            render: Arc::new(render),
+        }
+    }
+
+    pub(crate) fn render(&self, db_type: crate::abstract_layer::DbType) -> (String, Vec<Value>) {
+        (self.render)(db_type)
+    }
+
+    pub(crate) fn params(&self, db_type: crate::abstract_layer::DbType) -> Vec<Value> {
+        (self.render)(db_type).1
+    }
+}
 
 #[cfg(feature = "postgresql")]
 pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {

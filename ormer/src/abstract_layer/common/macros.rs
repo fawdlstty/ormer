@@ -574,7 +574,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.without_filter(name)),
                     #[cfg(feature = "duckdb")]
-                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.without_filter(name)),
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.without_filter(name))
+                    }
                 }
             }
 
@@ -712,7 +714,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "mssql")]
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_dynamic(f)),
                     #[cfg(feature = "duckdb")]
-                    $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by_dynamic(f)),
+                    $executor_name::DuckDB(exec) => {
+                        $executor_name::DuckDB(exec.order_by_dynamic(f))
+                    }
                 }
             }
 
@@ -1000,6 +1004,10 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
+            pub fn without_hooks(self) -> $crate::WithoutHooksExecutor<Self> {
+                $crate::WithoutHooksExecutor(self)
+            }
+
             /// Execute the configured delete and run hooks around it.
             ///
             /// `AfterDelete` runs only when the statement affects at least one
@@ -1010,9 +1018,11 @@ macro_rules! impl_unified_delete_executor {
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
                 let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete);
-                $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                if ctx.hooks_enabled() {
+                    $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                }
                 let affected = self.model(model).execute().await?;
-                if affected > 0 {
+                if affected > 0 && ctx.hooks_enabled() {
                     $crate::AfterDelete::after_delete(model, &mut ctx).await?;
                 }
                 Ok(affected)
@@ -1026,7 +1036,9 @@ macro_rules! impl_unified_delete_executor {
                 for (index, model) in models.iter().enumerate() {
                     let mut ctx =
                         $crate::HookContext::new($crate::HookOperation::Delete).for_batch(index);
-                    $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                    if ctx.hooks_enabled() {
+                        $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
+                    }
                 }
 
                 let affected = self.execute().await?;
@@ -1034,7 +1046,9 @@ macro_rules! impl_unified_delete_executor {
                     for (index, model) in models.iter().enumerate() {
                         let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete)
                             .for_batch(index);
-                        $crate::AfterDelete::after_delete(model, &mut ctx).await?;
+                        if ctx.hooks_enabled() {
+                            $crate::AfterDelete::after_delete(model, &mut ctx).await?;
+                        }
                     }
                 }
                 Ok(affected)
@@ -1232,6 +1246,10 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
+            pub fn without_hooks(self) -> $crate::WithoutHooksExecutor<Self> {
+                $crate::WithoutHooksExecutor(self)
+            }
+
             /// Execute the configured update and run hooks around it.
             ///
             /// The model supplied here is also the model observed by hooks;
@@ -1242,9 +1260,11 @@ macro_rules! impl_unified_update_executor {
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
                 let mut ctx = $crate::HookContext::new($crate::HookOperation::Update);
-                $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                if ctx.hooks_enabled() {
+                    $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                }
                 let affected = self.execute().await?;
-                if affected > 0 {
+                if affected > 0 && ctx.hooks_enabled() {
                     $crate::AfterUpdate::after_update(model, &mut ctx).await?;
                 }
                 Ok(affected)
@@ -1258,7 +1278,9 @@ macro_rules! impl_unified_update_executor {
                 for (index, model) in models.iter_mut().enumerate() {
                     let mut ctx =
                         $crate::HookContext::new($crate::HookOperation::Update).for_batch(index);
-                    $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                    if ctx.hooks_enabled() {
+                        $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
+                    }
                 }
 
                 let affected = self.execute().await?;
@@ -1266,7 +1288,9 @@ macro_rules! impl_unified_update_executor {
                     for (index, model) in models.iter().enumerate() {
                         let mut ctx = $crate::HookContext::new($crate::HookOperation::Update)
                             .for_batch(index);
-                        $crate::AfterUpdate::after_update(model, &mut ctx).await?;
+                        if ctx.hooks_enabled() {
+                            $crate::AfterUpdate::after_update(model, &mut ctx).await?;
+                        }
                     }
                 }
                 Ok(affected)

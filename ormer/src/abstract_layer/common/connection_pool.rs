@@ -6,15 +6,15 @@ use crate::model::{FromRowValues, Model, RelationSelection, WritableModel};
 use crate::query::builder::{ContextFilter, NamedFilterQuery, WhereExpr};
 use crate::query::insert::InsertConflict;
 use crate::raw_sql::{IntoRawSql, RawSql};
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 use std::sync::Arc;
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 use tokio::sync::Mutex;
 
 #[cfg(feature = "postgresql")]
@@ -177,6 +177,32 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
                         .collect(),
                 ))
             }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(_) => {
+                if common_helpers::auto_increment_column::<I::Model>().is_some() {
+                    let (sql, all_values) =
+                        common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<I::Model>(
+                            DbType::DuckDB,
+                            &refs,
+                            self.conflict.as_ref(),
+                        )?;
+                    return Ok(SqlStatement::single(DbType::DuckDB, sql, all_values));
+                }
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    DbType::DuckDB,
+                    &refs,
+                    self.conflict.as_ref(),
+                )?;
+                Ok(SqlStatement::batch(
+                    DbType::DuckDB,
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
+            }
         }
     }
 
@@ -187,6 +213,10 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
         I: Send + Sync,
     {
         <Self as SqlExecutor>::execute(self).await
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -222,6 +252,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsert
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
+                db.insert(self.models)
+                    .with_conflict(self.conflict)
+                    .execute()
+                    .await
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
                 db.insert(self.models)
                     .with_conflict(self.conflict)
                     .execute()
@@ -347,11 +384,42 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
                 Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
             }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(_) => {
+                let columns = I::Model::insert_columns();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+                    DbType::DuckDB,
+                    "INSERT INTO",
+                    <I::Model as Model>::table_name_for_db(DbType::DuckDB),
+                    &columns,
+                    &refs,
+                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+                );
+                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
+                let mut first = true;
+                for col_name in columns.iter() {
+                    if primary_key_columns.contains(col_name) {
+                        continue;
+                    }
+                    if !first {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(&format!("{col_name} = excluded.{col_name}"));
+                    first = false;
+                }
+                Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+            }
         }
     }
 
     pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -373,6 +441,8 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
             ConnectionWrapper::MySQL(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => db.insert_or_update_impl::<I::Model>(&refs).await,
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
         }
     }
 }
@@ -459,11 +529,31 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
                 Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
             }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(_) => {
+                let columns = I::Model::insert_columns();
+                let primary_key_columns = I::Model::primary_key_columns();
+                let primary_key = primary_key_columns.join(", ");
+                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+                    DbType::DuckDB,
+                    "INSERT INTO",
+                    <I::Model as Model>::table_name_for_db(DbType::DuckDB),
+                    &columns,
+                    &refs,
+                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+                );
+                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
+                Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+            }
         }
     }
 
     pub async fn execute(self) -> crate::Result<()> {
         <Self as SqlExecutor>::execute(self).await
+    }
+
+    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
+        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -477,6 +567,8 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
         ConnectionWrapper::MySQL(_) => DbType::MySQL,
         #[cfg(feature = "mssql")]
         ConnectionWrapper::MSSQL(_) => DbType::MSSQL,
+        #[cfg(feature = "duckdb")]
+        ConnectionWrapper::DuckDB(_) => DbType::DuckDB,
     }
 }
 
@@ -501,6 +593,8 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
                 .insert_or_ignore_impl::<I::Model>(&refs)
                 .await
                 .map(|_| ()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
         }
     }
 }
@@ -518,6 +612,9 @@ use super::super::mysql_backend;
 #[cfg(feature = "mssql")]
 use super::super::mssql_backend;
 
+#[cfg(feature = "duckdb")]
+use super::super::duckdb_backend;
+
 /// 连接包装器 - 包装各后端的 Database 实例
 #[allow(clippy::upper_case_acronyms)]
 enum ConnectionWrapper {
@@ -529,12 +626,14 @@ enum ConnectionWrapper {
     MySQL(mysql_backend::Database),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::Database),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::Database),
 }
 
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 impl ConnectionWrapper {
     /// 检查连接是否有效
-    #[cfg(any(feature = "sqlite", feature = "mssql"))]
+    #[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
     async fn is_valid(&self) -> bool {
         match self {
             #[cfg(feature = "sqlite")]
@@ -545,6 +644,8 @@ impl ConnectionWrapper {
             ConnectionWrapper::MySQL(db) => db.is_valid().await,
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => db.is_valid(),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => db.is_valid().await,
         }
     }
 }
@@ -553,7 +654,7 @@ impl ConnectionWrapper {
 ///
 /// 注意：对于 SQLite 后端，由于其嵌入式特性不支持多线程共享连接，
 /// 建议设置 max_size=1。如需并发支持，可考虑启用 MVCC 模式。
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 pub struct ManualPool {
     /// 空闲连接队列
     idle_connections: Mutex<VecDeque<ConnectionWrapper>>,
@@ -567,7 +668,7 @@ pub struct ManualPool {
     connection_string: String,
 }
 
-#[cfg(any(feature = "sqlite", feature = "mssql"))]
+#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
 impl ManualPool {
     /// 创建新的连接池
     fn new(db_type: DbType, connection_string: String, config: PoolConfig) -> Arc<Self> {
@@ -610,8 +711,18 @@ impl ManualPool {
                 Ok(ConnectionWrapper::MSSQL(db))
             }
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-            _ => Err(crate::ormer_error!(
-                "connection pools for DuckDB and ClickHouse are not implemented"
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => {
+                let db = crate::utils::FutureTraceExt::trace(duckdb_backend::Database::connect(
+                    self.db_type,
+                    &self.connection_string,
+                ))
+                .await?;
+                Ok(ConnectionWrapper::DuckDB(db))
+            }
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => Err(crate::ormer_error!(
+                "connection pools for ClickHouse are not implemented"
             )),
         }
     }
@@ -702,6 +813,21 @@ impl Default for PoolConfig {
     }
 }
 
+fn validate_pool_config(config: &PoolConfig) -> crate::Result<()> {
+    if config.max_size == 0 {
+        return Err(crate::OrmerError::invalid_operation(
+            "connection pool max_size must be greater than 0",
+        ));
+    }
+    if config.min_size > config.max_size {
+        return Err(crate::OrmerError::invalid_operation(format!(
+            "connection pool min_size ({}) must not exceed max_size ({})",
+            config.min_size, config.max_size
+        )));
+    }
+    Ok(())
+}
+
 /// 连接池构建器
 pub struct PoolBuilder {
     db_type: DbType,
@@ -727,6 +853,8 @@ impl PoolBuilder {
 
     /// 构建连接池
     pub async fn build(self) -> crate::Result<ConnectionPool> {
+        validate_pool_config(&self.config)?;
+
         // 注意：SQLite 后端建议设置 max_size=1，因为其嵌入式特性不支持多线程共享连接
         // 如需并发支持，可考虑启用 MVCC 模式（PRAGMA journal_mode = 'mvcc'）
 
@@ -772,9 +900,18 @@ impl PoolBuilder {
                 }
                 Ok(ConnectionPool::MSSQL(pool))
             }
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-            _ => Err(crate::ormer_error!(
-                "connection pools for DuckDB and ClickHouse are not implemented"
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => {
+                let pool =
+                    ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                if self.config.min_size > 0 {
+                    pool.maintain_min_connections().await;
+                }
+                Ok(ConnectionPool::DuckDB(pool))
+            }
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => Err(crate::ormer_error!(
+                "connection pools for ClickHouse are not implemented"
             )),
         }
     }
@@ -826,6 +963,8 @@ impl ReplicatedPoolBuilder {
     }
 
     pub async fn connect(self) -> crate::Result<ReplicatedConnectionPool> {
+        validate_pool_config(&self.config)?;
+
         let Some(write_connection) = self.write_connection else {
             return Err(crate::ormer_error!(
                 "replicated connection pool requires a write connection"
@@ -890,6 +1029,8 @@ pub enum ConnectionPool {
     MySQL(mysql_async::Pool),
     #[cfg(feature = "mssql")]
     MSSQL(Arc<ManualPool>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(Arc<ManualPool>),
 }
 
 impl ConnectionPool {
@@ -907,6 +1048,8 @@ impl ConnectionPool {
             ConnectionPool::MySQL(_) => DbType::MySQL,
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(_) => DbType::MSSQL,
+            #[cfg(feature = "duckdb")]
+            ConnectionPool::DuckDB(_) => DbType::DuckDB,
         }
     }
 
@@ -953,6 +1096,15 @@ impl ConnectionPool {
                     _marker: PhantomData,
                 })
             }
+            #[cfg(feature = "duckdb")]
+            ConnectionPool::DuckDB(pool) => {
+                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                Ok(PooledConnection {
+                    inner: PooledConnectionInner::DuckDB(pool.clone()),
+                    connection: Some(conn),
+                    _marker: PhantomData,
+                })
+            }
         }
     }
 }
@@ -969,6 +1121,8 @@ enum PooledConnectionInner {
     MySQL,
     #[cfg(feature = "mssql")]
     MSSQL(Arc<ManualPool>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(Arc<ManualPool>),
 }
 
 impl PooledConnectionInner {
@@ -988,6 +1142,8 @@ impl PooledConnectionInner {
             }
             #[cfg(feature = "mssql")]
             PooledConnectionInner::MSSQL(pool) => pool.return_connection(conn).await,
+            #[cfg(feature = "duckdb")]
+            PooledConnectionInner::DuckDB(pool) => pool.return_connection(conn).await,
         }
     }
 }
@@ -1024,6 +1180,11 @@ impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
                 let (sql, params) = raw_sql.render(DbType::MSSQL)?;
+                db.select_raw::<T, C>(&sql, params).await
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                let (sql, params) = raw_sql.render(DbType::DuckDB)?;
                 db.select_raw::<T, C>(&sql, params).await
             }
         }
@@ -1089,6 +1250,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => CreateTableExecutor::MySQL(db.create_table::<T>()),
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => CreateTableExecutor::MSSQL(db.create_table::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => CreateTableExecutor::DuckDB(db.create_table::<T>()),
         }
     }
 
@@ -1103,6 +1266,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => db.validate_table::<T>().await,
         }
     }
 
@@ -1162,6 +1327,10 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => super::unified::SelectExecutor::MySQL(db.select::<T>()),
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => super::unified::SelectExecutor::MSSQL(db.select::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                super::unified::SelectExecutor::DuckDB(db.select::<T>())
+            }
         }
     }
 
@@ -1192,6 +1361,10 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => super::unified::DeleteExecutor::MySQL(db.delete::<T>()),
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => super::unified::DeleteExecutor::MSSQL(db.delete::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                super::unified::DeleteExecutor::DuckDB(db.delete::<T>())
+            }
         }
     }
 
@@ -1210,6 +1383,10 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => super::unified::UpdateExecutor::MySQL(db.update::<T>()),
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => super::unified::UpdateExecutor::MSSQL(db.update::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                super::unified::UpdateExecutor::DuckDB(db.update::<T>())
+            }
         }
     }
 
@@ -1234,6 +1411,10 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
                 super::unified::RelatedSelectExecutor::MSSQL(db.related::<T, R>())
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                super::unified::RelatedSelectExecutor::DuckDB(db.related::<T, R>())
             }
         }
     }
@@ -1260,6 +1441,11 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => {
                 let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::MSSQL(txn))
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
+                Ok(super::unified::Transaction::DuckDB(txn))
             }
         }
     }
@@ -1312,6 +1498,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MySQL(db) => DropTableExecutor::MySQL(db.drop_table::<T>()),
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => DropTableExecutor::MSSQL(db.drop_table::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => DropTableExecutor::DuckDB(db.drop_table::<T>()),
         }
     }
 
@@ -1345,6 +1533,11 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
                 let (sql, params) = raw_sql.render(DbType::MSSQL)?;
+                db.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                let (sql, params) = raw_sql.render(DbType::DuckDB)?;
                 db.exec_raw(&sql, params).await
             }
         }
@@ -1453,6 +1646,10 @@ impl<'a> DbExecutor for PooledConnection<'a> {
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
                 super::unified::GroupedSelectExecutor::MSSQL(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                super::unified::GroupedSelectExecutor::DuckDB(db.select_column::<T, V>())
             }
         }
     }

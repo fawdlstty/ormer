@@ -45,20 +45,37 @@ pub(crate) mod duckcompat {
         Real(f64),
         Text(String),
         Blob(Vec<u8>),
+        List(Vec<Value>),
+        Array(Vec<Value>),
+        TypedArray(ArrayType, Vec<Value>),
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum ArrayType {
+        Text,
+        Integer,
+        BigInt,
+        NullableBigInt,
     }
 
     pub trait IntoParams {
         fn into_values(self) -> Vec<Value>;
     }
     impl IntoParams for () {
-        fn into_values(self) -> Vec<Value> { Vec::new() }
+        fn into_values(self) -> Vec<Value> {
+            Vec::new()
+        }
     }
     impl IntoParams for Vec<Value> {
-        fn into_values(self) -> Vec<Value> { self }
+        fn into_values(self) -> Vec<Value> {
+            self
+        }
     }
     impl<const N: usize> IntoParams for [&str; N] {
         fn into_values(self) -> Vec<Value> {
-            self.into_iter().map(|v| Value::Text(v.to_string())).collect()
+            self.into_iter()
+                .map(|v| Value::Text(v.to_string()))
+                .collect()
         }
     }
     impl<const N: usize> IntoParams for [&String; N] {
@@ -78,7 +95,9 @@ pub(crate) mod duckcompat {
                 .cloned()
                 .ok_or_else(|| Error(format!("column index out of bounds: {index}")))
         }
-        pub fn column_count(&self) -> usize { self.values.len() }
+        pub fn column_count(&self) -> usize {
+            self.values.len()
+        }
     }
 
     pub struct Rows {
@@ -104,7 +123,9 @@ pub(crate) mod duckcompat {
 
     impl Connection {
         fn new(conn: duckdb::Connection) -> Self {
-            Self { conn: Arc::new(Mutex::new(conn)) }
+            Self {
+                conn: Arc::new(Mutex::new(conn)),
+            }
         }
 
         pub async fn execute<P: IntoParams>(&self, sql: &str, params: P) -> Result<u64, Error> {
@@ -113,6 +134,7 @@ pub(crate) mod duckcompat {
             let conn = Arc::clone(&self.conn);
             tokio::task::spawn_blocking(move || {
                 let guard = conn.lock().map_err(|e| Error(e.to_string()))?;
+                let (sql, values) = inline_array_parameters(&sql, values)?;
                 let params = values_to_duckdb_params(&values);
                 guard
                     .execute(&sql, duckdb::params_from_iter(params.iter()))
@@ -129,12 +151,16 @@ pub(crate) mod duckcompat {
             let conn = Arc::clone(&self.conn);
             tokio::task::spawn_blocking(move || {
                 let guard = conn.lock().map_err(|e| Error(e.to_string()))?;
+                let (sql, values) = inline_array_parameters(&sql, values)?;
                 let params = values_to_duckdb_params(&values);
                 let mut stmt = guard.prepare(&sql).map_err(|e| Error(e.to_string()))?;
-                let column_count = stmt.column_count();
                 let mut rows = stmt
                     .query(duckdb::params_from_iter(params.iter()))
                     .map_err(|e| Error(e.to_string()))?;
+                let column_count = rows
+                    .as_ref()
+                    .map(|statement| statement.column_count())
+                    .unwrap_or(0);
                 let mut materialized = Vec::new();
                 while let Some(row) = rows.next().map_err(|e| Error(e.to_string()))? {
                     let mut values = Vec::new();
@@ -144,20 +170,25 @@ pub(crate) mod duckcompat {
                     }
                     materialized.push(Row { values });
                 }
-                Ok(Rows { rows: materialized, cursor: 0 })
+                Ok(Rows {
+                    rows: materialized,
+                    cursor: 0,
+                })
             })
             .await
             .map_err(|e| Error(e.to_string()))?
         }
-
-        pub fn last_insert_rowid(&self) -> i64 { 0 }
     }
 
     pub struct Builder {
         path: String,
     }
     impl Builder {
-        pub fn new_local(path: &str) -> Self { Self { path: path.to_string() } }
+        pub fn new_local(path: &str) -> Self {
+            Self {
+                path: path.to_string(),
+            }
+        }
         pub async fn build(self) -> Result<Database, Error> {
             let conn = if self.path == ":memory:" {
                 duckdb::Connection::open_in_memory()
@@ -165,69 +196,211 @@ pub(crate) mod duckcompat {
                 duckdb::Connection::open(&self.path)
             }
             .map_err(|e| Error(e.to_string()))?;
-            Ok(Database { conn: Arc::new(Connection::new(conn)) })
+            Ok(Database {
+                conn: Arc::new(Connection::new(conn)),
+            })
         }
     }
     pub struct Database {
         conn: Arc<Connection>,
     }
     impl Database {
-        pub fn connect(&self) -> Result<Arc<Connection>, Error> { Ok(Arc::clone(&self.conn)) }
+        pub fn connect(&self) -> Result<Arc<Connection>, Error> {
+            Ok(Arc::clone(&self.conn))
+        }
     }
 
     fn values_to_duckdb_params(values: &[Value]) -> Vec<duckdb::types::Value> {
-        values.iter().map(|value| match value {
+        values.iter().map(value_to_duckdb_value).collect()
+    }
+
+    fn value_to_duckdb_value(value: &Value) -> duckdb::types::Value {
+        match value {
             Value::Null => duckdb::types::Value::Null,
             Value::Integer(v) => duckdb::types::Value::BigInt(*v),
             Value::Real(v) => duckdb::types::Value::Double(*v),
             Value::Text(v) => duckdb::types::Value::Text(v.clone()),
             Value::Blob(v) => duckdb::types::Value::Blob(v.clone()),
-        }).collect()
+            Value::List(values) => {
+                duckdb::types::Value::List(values.iter().map(value_to_duckdb_value).collect())
+            }
+            Value::Array(values) => {
+                duckdb::types::Value::Array(values.iter().map(value_to_duckdb_value).collect())
+            }
+            Value::TypedArray(_, values) => {
+                duckdb::types::Value::Array(values.iter().map(value_to_duckdb_value).collect())
+            }
+        }
     }
 
     fn value_ref_to_value(value: duckdb::types::ValueRef<'_>) -> Value {
-        use duckdb::types::ValueRef;
+        duckdb_value_to_value(value.to_owned())
+    }
+
+    fn duckdb_value_to_value(value: duckdb::types::Value) -> Value {
+        use duckdb::types::Value as DuckValue;
         match value {
-            ValueRef::Null => Value::Null,
-            ValueRef::Boolean(v) => Value::Integer(if v { 1 } else { 0 }),
-            ValueRef::TinyInt(v) => Value::Integer(v as i64),
-            ValueRef::SmallInt(v) => Value::Integer(v as i64),
-            ValueRef::Int(v) => Value::Integer(v as i64),
-            ValueRef::BigInt(v) => Value::Integer(v),
-            ValueRef::HugeInt(v) => Value::Text(v.to_string()),
-            ValueRef::UHugeInt(v) => Value::Text(v.to_string()),
-            ValueRef::UTinyInt(v) => Value::Integer(v as i64),
-            ValueRef::USmallInt(v) => Value::Integer(v as i64),
-            ValueRef::UInt(v) => Value::Integer(v as i64),
-            ValueRef::UBigInt(v) => Value::Text(v.to_string()),
-            ValueRef::Float(v) => Value::Real(v as f64),
-            ValueRef::Double(v) => Value::Real(v),
-            ValueRef::Decimal(v) => Value::Text(v.to_string()),
-            ValueRef::Timestamp(_, v) => Value::Text(v.to_string()),
-            ValueRef::Text(v) => Value::Text(String::from_utf8_lossy(v).into_owned()),
-            ValueRef::Blob(v) | ValueRef::Geometry(v) => Value::Blob(v.to_vec()),
-            ValueRef::Date32(v) => Value::Integer(v as i64),
-            ValueRef::Time64(_, v) => Value::Integer(v),
-            ValueRef::Interval { months, days, nanos } => {
-                Value::Text(format!("{months} months {days} days {nanos} nanos"))
+            DuckValue::Null => Value::Null,
+            DuckValue::Boolean(v) => Value::Integer(if v { 1 } else { 0 }),
+            DuckValue::TinyInt(v) => Value::Integer(v as i64),
+            DuckValue::SmallInt(v) => Value::Integer(v as i64),
+            DuckValue::Int(v) => Value::Integer(v as i64),
+            DuckValue::BigInt(v) => Value::Integer(v),
+            DuckValue::HugeInt(v) => Value::Text(v.to_string()),
+            DuckValue::UHugeInt(v) => Value::Text(v.to_string()),
+            DuckValue::UTinyInt(v) => Value::Integer(v as i64),
+            DuckValue::USmallInt(v) => Value::Integer(v as i64),
+            DuckValue::UInt(v) => Value::Integer(v as i64),
+            DuckValue::UBigInt(v) => Value::Text(v.to_string()),
+            DuckValue::Float(v) => Value::Real(v as f64),
+            DuckValue::Double(v) => Value::Real(v),
+            DuckValue::Decimal(v) => Value::Text(v.to_string()),
+            DuckValue::Timestamp(_, v) => Value::Text(v.to_string()),
+            DuckValue::Text(v) => Value::Text(v),
+            DuckValue::Blob(v) | DuckValue::Geometry(v) => Value::Blob(v),
+            DuckValue::Date32(v) => Value::Integer(v as i64),
+            DuckValue::Time64(_, v) => Value::Integer(v),
+            DuckValue::Interval {
+                months,
+                days,
+                nanos,
+            } => Value::Text(format!("{months} months {days} days {nanos} nanos")),
+            DuckValue::List(values) => {
+                Value::List(values.into_iter().map(duckdb_value_to_value).collect())
             }
-            ValueRef::List(..) | ValueRef::Enum(..) | ValueRef::Struct(..)
-            | ValueRef::Array(..) | ValueRef::Map(..) | ValueRef::Union(..) => {
+            DuckValue::Array(values) => {
+                Value::Array(values.into_iter().map(duckdb_value_to_value).collect())
+            }
+            DuckValue::Enum(value) => Value::Text(value),
+            DuckValue::Struct(..) | DuckValue::Map(..) | DuckValue::Union(..) => {
                 Value::Text(format!("{value:?}"))
             }
-            _ => Value::Null,
+            _ => Value::Text(format!("{value:?}")),
         }
     }
-}
 
-fn values_to_duckdb_params(values: &[duckcompat::Value]) -> Vec<duckdb::types::Value> {
-    values.iter().map(|value| match value {
-        duckcompat::Value::Null => duckdb::types::Value::Null,
-        duckcompat::Value::Integer(v) => duckdb::types::Value::BigInt(*v),
-        duckcompat::Value::Real(v) => duckdb::types::Value::Double(*v),
-        duckcompat::Value::Text(v) => duckdb::types::Value::Text(v.clone()),
-        duckcompat::Value::Blob(v) => duckdb::types::Value::Blob(v.clone()),
-    }).collect()
+    fn inline_array_parameters(
+        sql: &str,
+        values: Vec<Value>,
+    ) -> Result<(String, Vec<Value>), Error> {
+        let mut output = String::with_capacity(sql.len());
+        let mut remaining = values.into_iter();
+        let mut bound_values = Vec::new();
+        let bytes = sql.as_bytes();
+        let mut index = 0;
+        let mut quote = None;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if let Some(delimiter) = quote {
+                output.push(byte as char);
+                if byte == delimiter {
+                    if bytes.get(index + 1) == Some(&delimiter) {
+                        output.push(delimiter as char);
+                        index += 2;
+                        continue;
+                    }
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                quote = Some(byte);
+                output.push(byte as char);
+                index += 1;
+                continue;
+            }
+
+            if byte == b'?' {
+                let value = remaining
+                    .next()
+                    .ok_or_else(|| Error("missing DuckDB parameter".to_string()))?;
+                if is_array_value(&value) {
+                    output.push_str(&array_literal(&value)?);
+                } else {
+                    output.push('?');
+                    bound_values.push(value);
+                }
+                index += 1;
+                continue;
+            }
+
+            output.push(byte as char);
+            index += 1;
+        }
+
+        if remaining.next().is_some() {
+            return Err(Error("unused DuckDB parameter".to_string()));
+        }
+        Ok((output, bound_values))
+    }
+
+    fn is_array_value(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::List(_) | Value::Array(_) | Value::TypedArray(_, _)
+        )
+    }
+
+    fn array_literal(value: &Value) -> Result<String, Error> {
+        let (values, element_type) = match value {
+            Value::List(values) | Value::Array(values) => (values, array_element_type(values)),
+            Value::TypedArray(kind, values) => (values, kind.sql_type()),
+            _ => return Err(Error("expected DuckDB array parameter".to_string())),
+        };
+        let elements = values
+            .iter()
+            .map(sql_array_element)
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        Ok(format!("[{elements}]::{element_type}[]"))
+    }
+
+    fn array_element_type(values: &[Value]) -> &'static str {
+        values
+            .iter()
+            .find(|value| !matches!(value, Value::Null))
+            .map(|value| match value {
+                Value::Integer(_) => "BIGINT",
+                Value::Real(_) => "DOUBLE",
+                Value::Text(_) => "VARCHAR",
+                Value::Blob(_) => "BLOB",
+                Value::List(_) | Value::Array(_) | Value::TypedArray(_, _) | Value::Null => {
+                    "VARCHAR"
+                }
+            })
+            .unwrap_or("VARCHAR")
+    }
+
+    fn sql_array_element(value: &Value) -> Result<String, Error> {
+        match value {
+            Value::Null => Ok("NULL".to_string()),
+            Value::Integer(value) => Ok(value.to_string()),
+            Value::Real(value) if value.is_finite() => Ok(value.to_string()),
+            Value::Real(_) => Err(Error("non-finite DuckDB array parameter".to_string())),
+            Value::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
+            Value::Blob(value) => Ok(format!("X'{}'", hex_bytes(value))),
+            Value::List(_) | Value::Array(_) | Value::TypedArray(_, _) => {
+                Err(Error("nested DuckDB arrays are not supported".to_string()))
+            }
+        }
+    }
+
+    impl ArrayType {
+        fn sql_type(self) -> &'static str {
+            match self {
+                Self::Text => "VARCHAR",
+                Self::Integer => "INTEGER",
+                Self::BigInt | Self::NullableBigInt => "BIGINT",
+            }
+        }
+    }
+
+    fn hex_bytes(value: &[u8]) -> String {
+        value.iter().map(|byte| format!("{byte:02X}")).collect()
+    }
 }
 
 async fn traced_duckdb_execute<P: duckcompat::IntoParams>(
@@ -296,13 +469,23 @@ async fn traced_duckdb_schema_execute(
                             Ok(result)
                         }
                         Err(error) => {
-                            Err(trace.finish_external_error("duckcompat::Connection::execute", error))
+                            Err(trace
+                                .finish_external_error("duckcompat::Connection::execute", error))
                         }
                     };
                 }
             }
             Err(trace.finish_external_error("duckcompat::Connection::execute", error))
         }
+    }
+}
+
+fn replace_or_append_returning(sql: &str, projection: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    if let Some(pos) = lower.find(" returning ") {
+        format!("{} RETURNING {projection}", &sql[..pos])
+    } else {
+        format!("{sql} RETURNING {projection}")
     }
 }
 
@@ -337,13 +520,6 @@ fn duckdb_index_sql_without_where(sql: &str) -> Option<String> {
     Some(sql[..where_pos].trim_end().to_string())
 }
 
-/// 判断错误是否为约束冲突错误（如主键/唯一键重复）
-/// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
-fn is_constraint_error(e: &crate::OrmerError) -> bool {
-    let msg = e.to_string();
-    msg.contains("UNIQUE constraint failed") || msg.contains("constraint")
-}
-
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::DuckDB)
 }
@@ -372,6 +548,81 @@ fn convert_turso_model_value<T: Model>(
         };
     }
 
+    if matches!(column.rust_type, "JsonValue" | "serde_json::Value") {
+        return match value {
+            duckcompat::Value::Null => Ok(Value::Null),
+            duckcompat::Value::Text(raw) => {
+                serde_json::from_str(raw).map(Value::Json).map_err(|error| {
+                    crate::ormer_error!(
+                        "Failed to decode DuckDB JSON column '{}' from text: {}",
+                        column.name,
+                        error
+                    )
+                })
+            }
+            _ => Err(crate::ormer_error!(
+                "Failed to decode DuckDB JSON column '{}' from non-text value",
+                column.name
+            )),
+        };
+    }
+
+    if matches!(column.rust_type, "Duration" | "std::time::Duration") {
+        return match value {
+            duckcompat::Value::Null => Ok(Value::Null),
+            duckcompat::Value::Integer(micros) if *micros >= 0 => Ok(Value::Duration(
+                std::time::Duration::from_micros(*micros as u64),
+            )),
+            duckcompat::Value::Integer(micros) => Err(crate::ormer_error!(
+                "DuckDB Duration column '{}' contains a negative value: {}",
+                column.name,
+                micros
+            )),
+            _ => Err(crate::ormer_error!(
+                "Failed to decode DuckDB Duration column '{}' from non-integer value",
+                column.name
+            )),
+        };
+    }
+
+    if matches!(
+        column.rust_type,
+        "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>"
+    ) {
+        if let duckcompat::Value::List(values)
+        | duckcompat::Value::Array(values)
+        | duckcompat::Value::TypedArray(_, values) = value
+        {
+            return convert_duckdb_array_value_for_type(values, "Vec<i32>");
+        }
+    }
+
+    if matches!(
+        column.rust_type,
+        "Vec<i64>"
+            | "std::vec::Vec<i64>"
+            | "alloc::vec::Vec<i64>"
+            | "Vec<Option<i64>>"
+            | "std::vec::Vec<Option<i64>>"
+            | "alloc::vec::Vec<Option<i64>>"
+            | "Vec<String>"
+            | "std::vec::Vec<String>"
+            | "alloc::vec::Vec<String>"
+    ) {
+        if let duckcompat::Value::List(values)
+        | duckcompat::Value::Array(values)
+        | duckcompat::Value::TypedArray(_, values) = value
+        {
+            let rust_type = match column.rust_type {
+                "std::vec::Vec<i64>" | "alloc::vec::Vec<i64>" => "Vec<i64>",
+                "std::vec::Vec<Option<i64>>" | "alloc::vec::Vec<Option<i64>>" => "Vec<Option<i64>>",
+                "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => "Vec<String>",
+                rust_type => rust_type,
+            };
+            return convert_duckdb_array_value_for_type(values, rust_type);
+        }
+    }
+
     convert_turso_value(value)
 }
 
@@ -388,58 +639,56 @@ impl DbBackendTypeMapper for DuckDBTypeMapper {
     fn sql_type(
         rust_type: &str,
         is_primary: bool,
-        is_auto_increment: bool,
+        _is_auto_increment: bool,
         is_nullable: bool,
         enum_variants: Option<&[&str]>,
     ) -> String {
-        // DuckDB 不支持原生 ENUM,降级为 TEXT
-        if enum_variants.is_some() {
-            return common_helpers::sql_type_with_nullability("TEXT", is_nullable || is_primary);
-        }
-
-        // 首先处理主键类型
-        if is_primary {
-            if is_uuid_rust_type(rust_type) {
-                return "TEXT PRIMARY KEY".to_string();
+        // DuckDB 不支持原生 ENUM，降级为 TEXT。
+        // 基础类型映射（DuckDB 类型系统更简单）。
+        let base_type = if enum_variants.is_some() {
+            "TEXT"
+        } else {
+            match rust_type {
+                // 整数类型
+                "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => "INTEGER",
+                "i64" | "u64" => "BIGINT",
+                "Vec<i32>" => "INTEGER[]",
+                "Vec<i64>" | "Vec<Option<i64>>" => "BIGINT[]",
+                "Vec<String>" => "VARCHAR[]",
+                // 浮点类型
+                "f32" | "f64" => "REAL",
+                "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
+                    "TEXT"
+                }
+                // 时长类型
+                "Duration" | "std::time::Duration" => "INTEGER",
+                // 字符串类型
+                "String" => "TEXT",
+                // UUID 使用规范连字符字符串
+                "Uuid" | "uuid::Uuid" => "TEXT",
+                // 布尔类型（DuckDB 没有原生 bool，用 INTEGER 存储）
+                "bool" => "INTEGER",
+                // 字节数组
+                "Vec<u8>" | "&[u8]" => "BLOB",
+                // 日期时间类型（DuckDB 存储为 TEXT 或 INTEGER）
+                "DateTime"
+                | "chrono::DateTime"
+                | "chrono::DateTime<chrono::Utc>"
+                | "NaiveDateTime"
+                | "chrono::NaiveDateTime" => "TEXT",
+                "NaiveDate" | "chrono::NaiveDate" => "TEXT",
+                "NaiveTime" | "chrono::NaiveTime" => "TEXT",
+                // JSON 类型（DuckDB 存储为 TEXT）
+                "JsonValue" | "serde_json::Value" => "JSON",
+                // 默认使用 TEXT
+                _ => "TEXT",
             }
-            if is_auto_increment {
-                return "INTEGER PRIMARY KEY AUTOINCREMENT".to_string();
-            } else {
-                return "INTEGER PRIMARY KEY".to_string();
-            }
-        }
-
-        // 基础类型映射（DuckDB 类型系统更简单）
-        let base_type = match rust_type {
-            // 整数类型
-            "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => "INTEGER",
-            "i64" | "u64" => "BIGINT",
-            // 浮点类型
-            "f32" | "f64" => "REAL",
-            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => "TEXT",
-            // 时长类型
-            "Duration" | "std::time::Duration" => "INTEGER",
-            // 字符串类型
-            "String" => "TEXT",
-            // UUID 使用规范连字符字符串存储
-            "Uuid" | "uuid::Uuid" => "TEXT",
-            // 布尔类型（DuckDB 没有原生 bool，用 INTEGER 存储）
-            "bool" => "INTEGER",
-            // 字节数组
-            "Vec<u8>" | "&[u8]" => "BLOB",
-            // 日期时间类型（DuckDB 存储为 TEXT 或 INTEGER）
-            "DateTime"
-            | "chrono::DateTime"
-            | "chrono::DateTime<chrono::Utc>"
-            | "NaiveDateTime"
-            | "chrono::NaiveDateTime" => "TEXT",
-            "NaiveDate" | "chrono::NaiveDate" => "TEXT",
-            "NaiveTime" | "chrono::NaiveTime" => "TEXT",
-            // JSON 类型（DuckDB 存储为 TEXT）
-            "JsonValue" | "serde_json::Value" => "JSON",
-            // 默认使用 TEXT
-            _ => "TEXT",
         };
+
+        // 保留模型主键的实际标量类型，尤其是文本主键和 i64 自增主键。
+        if is_primary {
+            return format!("{base_type} PRIMARY KEY");
+        }
 
         common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
@@ -561,11 +810,23 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::DuckDB,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
+        let statements = if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, params) =
+                common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<
+                    I::Model,
+                >(DbType::DuckDB, &refs, self.conflict.as_ref())?;
+            vec![common_helpers::InsertSqlStatement {
+                sql,
+                params,
+                row_count: refs.len(),
+            }]
+        } else {
+            common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                DbType::DuckDB,
+                &refs,
+                self.conflict.as_ref(),
+            )?
+        };
 
         Ok(SqlStatement::batch(
             DbType::DuckDB,
@@ -593,7 +854,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let mut results = Vec::new();
         for statement in &sql.statements {
             let all_params = values_to_params(&statement.params)?;
-            let sql_with_returning = format!("{} RETURNING *", statement.sql);
+            let sql_with_returning = replace_or_append_returning(&statement.sql, "*");
             let mut rows = traced_duckdb_query(
                 &self.db.conn,
                 &sql_with_returning,
@@ -632,29 +893,42 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
 
-        let mut rows_affected = 0;
-        for statement in &sql.statements {
-            let params = values_to_params(&statement.params)?;
-            rows_affected +=
-                traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params)
-                    .await?;
-        }
-        self.models.run_after_insert(hook_ctx).await?;
-
-        // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::column_schema()
             .iter()
             .any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            if rows_affected == 0 {
+        let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let params = values_to_params(&statement.params)?;
+            let mut rows =
+                traced_duckdb_query(&self.db.conn, &statement.sql, params, &statement.params)
+                    .await?;
+            let Some(row) = rows.next().trace().await? else {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+            };
+            let value = row.get_value(0)?;
+            let id = match value {
+                duckcompat::Value::Integer(value) => value,
+                duckcompat::Value::Real(value) => value as i64,
+                duckcompat::Value::Text(value) => value.parse::<i64>().map_err(|_| {
+                    crate::ormer_error!("Invalid DuckDB auto-increment key: {value}")
+                })?,
+                _ => {
+                    return Err(crate::ormer_error!(
+                        "Invalid DuckDB auto-increment key value"
+                    ));
+                }
+            };
+            common_helpers::convert_auto_increment_key::<Self::Output>(id)?
+        } else {
+            for statement in &sql.statements {
+                let params = values_to_params(&statement.params)?;
+                traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params)
+                    .await?;
             }
-            let last_id = self.db.conn.last_insert_rowid();
-            let result = common_helpers::convert_auto_increment_key::<Self::Output>(last_id)?;
-            return Ok(result);
-        }
-
-        Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+            <I::Model as Model>::AutoIncrementKeyType::default()
+        };
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(result)
     }
 }
 
@@ -700,7 +974,10 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         common_helpers::validate_insert_model_table::<T>(DbType::DuckDB, self.source_table)?;
         let statement =
-            common_helpers::build_partial_insert_statement::<T>(DbType::DuckDB, &self.assignments)?;
+            common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
+                DbType::DuckDB,
+                &self.assignments,
+            )?;
         Ok(SqlStatement::batch(
             DbType::DuckDB,
             vec![SingleSqlStatement::new(statement.sql, statement.params)],
@@ -728,20 +1005,22 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
         }
 
         let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-        let rows_affected =
-            traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
-
-        if rows_affected == 0 {
-            return Ok(<T as Model>::AutoIncrementKeyType::default());
-        }
-
         let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
-            let last_id = self.db.conn.last_insert_rowid();
-            return common_helpers::convert_auto_increment_key::<Self::Output>(last_id);
+            let params = values_to_params(&statement.params)?;
+            let mut rows =
+                traced_duckdb_query(&self.db.conn, &statement.sql, params, &statement.params)
+                    .await?;
+            let Some(row) = rows.next().trace().await? else {
+                return Ok(<T as Model>::AutoIncrementKeyType::default());
+            };
+            let value = row.get_value(0)?;
+            let id = duckdb_auto_increment_id(value)?;
+            return common_helpers::convert_auto_increment_key::<Self::Output>(id);
         }
 
+        let params = values_to_params(&statement.params)?;
+        traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
         Ok(<T as Model>::AutoIncrementKeyType::default())
     }
 }
@@ -760,9 +1039,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
-        // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::DuckDB,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::DuckDB),
@@ -770,59 +1047,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
+        common_helpers::append_standard_upsert_clause::<I::Model>(
+            DbType::DuckDB,
+            &mut sql,
+            &I::Model::columns(),
+        )?;
 
         Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
-            return Ok(());
-        }
-
-        let hook_ctx = HookContext::new(HookOperation::Insert);
-        self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
-        let pk_columns = I::Model::primary_key_columns();
-
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::DuckDB,
-                    c,
-                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in refs.iter() {
-            // 先删除已有记录
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_duckdb_execute(&self.db.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            // 然后插入新记录
-            let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_duckdb_execute(&self.db.conn, &insert_sql, insert_params, &all_values).await?;
-        }
-
-        self.models.run_after_insert(hook_ctx).await?;
-        Ok(())
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 }
 
@@ -833,13 +1068,18 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-        traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+        }
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -859,9 +1099,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         }
 
         let columns = I::Model::insert_columns();
-        // turso 不支持 INSERT OR IGNORE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
-        // 在执行阶段捕获约束冲突错误并忽略。
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::DuckDB,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::DuckDB),
@@ -869,40 +1107,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
+        sql.push_str(" ON CONFLICT DO NOTHING");
 
         Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
-            return Ok(());
-        }
-
-        let hook_ctx = HookContext::new(HookOperation::Insert);
-        self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let placeholders_str = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
-
-        for model in refs.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_duckdb_execute(&self.db.conn, &sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        self.models.run_after_insert(hook_ctx).await?;
-        Ok(())
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 }
 
@@ -913,20 +1124,18 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-        match traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await
-        {
-            Ok(_) => {}
-            Err(e) if is_constraint_error(&e) => {
-                // 忽略约束冲突（重复主键/唯一键）
-            }
-            Err(e) => return Err(e),
+
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_duckdb_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
         }
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -980,11 +1189,11 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT name FROM duckdb_master \
-                     WHERE type = 'table' \
-                       AND name NOT LIKE 'duckdb_%' \
-                       AND name != '__ormer_migrations' \
-                     ORDER BY name",
+                    "SELECT table_name FROM information_schema.tables \
+                     WHERE table_schema = 'main' \
+                       AND table_type = 'BASE TABLE' \
+                       AND table_name != '__ormer_migrations' \
+                     ORDER BY table_name",
                     (),
                 )
                 .trace()
@@ -1011,7 +1220,8 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT sql FROM duckdb_master WHERE type = 'table' AND name = ?",
+                    "SELECT sql FROM duckdb_tables() \
+                     WHERE schema_name = 'main' AND table_name = ?",
                     [table_name],
                 )
                 .trace()
@@ -1051,8 +1261,24 @@ impl Database {
                     duckcompat::Value::Integer(value) if value != 0
                 );
                 let auto_increment = primary_key
-                    && type_name.eq_ignore_ascii_case("INTEGER")
-                    && create_sql_lower.contains("autoincrement");
+                    && matches!(
+                        type_name
+                            .split_once('(')
+                            .map_or(type_name.as_str(), |(base, _)| base)
+                            .trim()
+                            .to_ascii_uppercase()
+                            .as_str(),
+                        "TINYINT"
+                            | "SMALLINT"
+                            | "INTEGER"
+                            | "INT"
+                            | "BIGINT"
+                            | "HUGEINT"
+                            | "UBIGINT"
+                            | "UHUGEINT"
+                    )
+                    && (create_sql_lower.contains("autoincrement")
+                        || create_sql_lower.contains("nextval("));
                 columns.push(DbFirstColumn {
                     name,
                     type_name,
@@ -1087,9 +1313,9 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT name, sql FROM duckdb_master \
-                 WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
-                 ORDER BY name",
+                "SELECT index_name, sql FROM duckdb_indexes() \
+                 WHERE schema_name = 'main' AND table_name = ? AND sql IS NOT NULL \
+                 ORDER BY index_name",
                 [table_name],
             )
             .trace()
@@ -1121,7 +1347,10 @@ impl Database {
 
     /// 检查表是否存在
     async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
-        let sql = "SELECT COUNT(*) FROM duckdb_master WHERE type='table' AND name=?";
+        let sql = "SELECT COUNT(*) FROM information_schema.tables \
+                   WHERE table_schema = 'main' \
+                     AND table_type = 'BASE TABLE' \
+                     AND table_name = ?";
 
         let mut rows = self
             .conn
@@ -1231,35 +1460,12 @@ impl Database {
                 expected_col.enum_variants,
             );
 
-            // 对于类型比较，我们需要提取基础类型（不包含约束）
-            let type_to_compare = if expected_col.is_primary {
-                // 主键的基础类型，不包含任何约束
-                match effective_rust_type {
-                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                        "INTEGER".to_string()
-                    }
-                    "f32" | "f64" => "REAL".to_string(),
-                    "Decimal"
-                    | "rust_decimal::Decimal"
-                    | "BigDecimal"
-                    | "bigdecimal::BigDecimal" => "TEXT".to_string(),
-                    "String" => "TEXT".to_string(),
-                    "bool" => "INTEGER".to_string(),
-                    "Vec<u8>" | "&[u8]" => "BLOB".to_string(),
-                    _ => "TEXT".to_string(),
-                }
-            } else {
-                // 非主键列，提取基础类型（去掉 NOT NULL）
-                let full_type = crate::abstract_layer::DbType::DuckDB.sql_type(
-                    effective_rust_type,
-                    false,
-                    expected_col.is_auto_increment,
-                    expected_col.is_nullable,
-                    expected_col.enum_variants,
-                );
-                // 去掉 " NOT NULL" 后缀
-                full_type.replace(" NOT NULL", "")
-            };
+            // 从统一类型映射中提取基础类型，避免把 INTEGER 与 BIGINT 混为一谈。
+            let type_to_compare = expected_type
+                .strip_suffix(" PRIMARY KEY")
+                .or_else(|| expected_type.strip_suffix(" NOT NULL"))
+                .unwrap_or(&expected_type)
+                .to_string();
 
             if !self.types_compatible(actual_type, &type_to_compare) {
                 return Err(crate::ormer_error!(
@@ -1286,7 +1492,13 @@ impl Database {
             let expected_default = expected_col
                 .default
                 .map(|default| default.to_sql(crate::abstract_layer::DbType::DuckDB));
-            if actual_default.as_deref() != expected_default.as_deref() {
+            let duckdb_auto_increment_default = expected_col.is_auto_increment
+                && actual_default
+                    .as_deref()
+                    .is_some_and(|default| default.to_ascii_lowercase().contains("nextval"));
+            if !duckdb_auto_increment_default
+                && actual_default.as_deref() != expected_default.as_deref()
+            {
                 return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Default value mismatch for '{}': expected {:?}, but actual is {:?}",
                     T::TABLE_NAME,
@@ -1461,7 +1673,8 @@ impl Database {
         // 标准化类型名称（DuckDB 类型别名）
         fn normalize(s: &str) -> String {
             match s.to_uppercase().as_str() {
-                "INT" | "INTEGER" | "MEDIUMINT" | "BIGINT" | "INT64" => "INTEGER".to_string(),
+                "INT" | "INTEGER" | "MEDIUMINT" | "INT4" => "INTEGER".to_string(),
+                "BIGINT" | "INT8" | "LONG" | "INT64" => "BIGINT".to_string(),
                 "VARCHAR" | "CHARACTER" | "NCHAR" | "NVARCHAR" | "TEXT" | "CLOB" => {
                     "TEXT".to_string()
                 }
@@ -1530,78 +1743,47 @@ impl Database {
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    /// turso 不支持 ON CONFLICT，因此通过 DELETE + INSERT 实现 upsert 语义。
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
         let columns = T::insert_columns();
-        let col_count = columns.len();
-        let pk_columns = T::primary_key_columns();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::DuckDB);
 
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::DuckDB,
-                    c,
-                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::DuckDB,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::DuckDB),
+            &columns,
+            models,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
-
-        for model in models.iter() {
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_duckdb_execute(&self.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            let all_values = model.insert_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_duckdb_execute(&self.conn, &insert_sql, insert_params, &all_values).await?;
-        }
+        common_helpers::append_standard_upsert_clause::<T>(DbType::DuckDB, &mut sql, &columns)?;
+        let params = values_to_params(&all_values)?;
+        traced_duckdb_execute(&self.conn, &sql, params, &all_values).await?;
 
         Ok(())
     }
 
     /// 批量插入或忽略记录（遇到重复键时忽略）
-    /// turso 不支持 ON CONFLICT，因此通过捕获约束错误实现忽略语义。
     pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
         let columns = T::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::DuckDB);
 
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
-
-        for model in models.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_duckdb_execute(&self.conn, &insert_sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::DuckDB,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::DuckDB),
+            &columns,
+            models,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+        );
+        sql.push_str(" ON CONFLICT DO NOTHING");
+        let params = values_to_params(&all_values)?;
+        traced_duckdb_execute(&self.conn, &sql, params, &all_values).await?;
 
         Ok(())
     }
@@ -1749,7 +1931,10 @@ impl Database {
         let mut exists = self
             .conn
             .query(
-                "SELECT COUNT(*) FROM duckdb_master WHERE type='table' AND name=?",
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' \
+                   AND table_type = 'BASE TABLE' \
+                   AND table_name = ?",
                 [table_name],
             )
             .trace()
@@ -1841,11 +2026,23 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::DuckDB,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
+        let statements = if common_helpers::auto_increment_column::<I::Model>().is_some() {
+            let (sql, params) =
+                common_helpers::build_insert_statement_with_conflict_and_auto_increment_returning::<
+                    I::Model,
+                >(DbType::DuckDB, &refs, self.conflict.as_ref())?;
+            vec![common_helpers::InsertSqlStatement {
+                sql,
+                params,
+                row_count: refs.len(),
+            }]
+        } else {
+            common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                DbType::DuckDB,
+                &refs,
+                self.conflict.as_ref(),
+            )?
+        };
 
         Ok(SqlStatement::batch(
             DbType::DuckDB,
@@ -1865,34 +2062,37 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
 
-        let mut rows_affected = 0;
-        for statement in &sql.statements {
-            let all_params = values_to_params(&statement.params)?;
-            rows_affected += self
-                .txn
-                .conn
-                .execute(&statement.sql, all_params)
-                .trace()
-                .await?;
-        }
-        self.models.run_after_insert(hook_ctx).await?;
-
-        // 获取自增ID（如果有自增主键）
         let has_auto_increment = I::Model::column_schema()
             .iter()
             .any(|c| c.is_auto_increment);
-        if has_auto_increment {
-            if rows_affected == 0 {
+        let result = if has_auto_increment {
+            let statement = &sql.statements[0];
+            let params = values_to_params(&statement.params)?;
+            let mut rows =
+                traced_duckdb_query(&self.txn.conn, &statement.sql, params, &statement.params)
+                    .await?;
+            let Some(row) = rows.next().trace().await? else {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
-            }
-            let last_id = self.txn.conn.last_insert_rowid();
-            let result = common_helpers::convert_auto_increment_key::<
-                <I::Model as Model>::AutoIncrementKeyType,
-            >(last_id)?;
-            Ok(result)
+            };
+            let id = duckdb_auto_increment_id(row.get_value(0)?)?;
+            common_helpers::convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
+                id,
+            )?
         } else {
-            Ok(<I::Model as Model>::AutoIncrementKeyType::default())
-        }
+            for statement in &sql.statements {
+                let all_params = values_to_params(&statement.params)?;
+                traced_duckdb_execute(
+                    &self.txn.conn,
+                    &statement.sql,
+                    all_params,
+                    &statement.params,
+                )
+                .await?;
+            }
+            <I::Model as Model>::AutoIncrementKeyType::default()
+        };
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(result)
     }
 }
 
@@ -1910,7 +2110,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::DuckDB,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::DuckDB),
@@ -1918,55 +2118,40 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             &refs,
             common_helpers::BatchInsertValuesMode::All,
         );
+        common_helpers::append_standard_upsert_clause::<I::Model>(
+            DbType::DuckDB,
+            &mut sql,
+            &I::Model::columns(),
+        )?;
 
         Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
+    for TransactionInsertOrUpdateExecutor<'a, I>
+{
+    type Output = ();
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        TransactionInsertOrUpdateExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if sql.statements.is_empty() {
             return Ok(());
         }
-
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
-        let pk_columns = I::Model::primary_key_columns();
-
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::DuckDB,
-                    c,
-                    &common_helpers::placeholder(DbType::DuckDB, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in refs.iter() {
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_duckdb_execute(&self.txn.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_duckdb_execute(&self.txn.conn, &insert_sql, insert_params, &all_values).await?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_duckdb_execute(&self.txn.conn, &statement.sql, params, &statement.params)
+                .await?;
         }
-
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -1987,7 +2172,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         }
 
         let columns = I::Model::insert_columns();
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::DuckDB,
             "INSERT INTO",
             <I::Model as Model>::table_name_for_db(DbType::DuckDB),
@@ -1995,40 +2180,36 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
+        sql.push_str(" ON CONFLICT DO NOTHING");
 
         Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
+    for TransactionInsertOrIgnoreExecutor<'a, I>
+{
+    type Output = ();
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        TransactionInsertOrIgnoreExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if sql.statements.is_empty() {
             return Ok(());
         }
-
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::DuckDB);
-
-        let columns_str = common_helpers::quote_column_list(DbType::DuckDB, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::DuckDB, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
-
-        for model in refs.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_duckdb_execute(&self.txn.conn, &insert_sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_duckdb_execute(&self.txn.conn, &statement.sql, params, &statement.params)
+                .await?;
         }
-
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -2820,6 +3001,11 @@ impl<
                         crate::model::Value::Text(String::from_utf8_lossy(&b).to_string())
                     }
                     duckcompat::Value::Null => crate::model::Value::Null,
+                    duckcompat::Value::List(values)
+                    | duckcompat::Value::Array(values)
+                    | duckcompat::Value::TypedArray(_, values) => {
+                        convert_duckdb_array_value(&values)?
+                    }
                 };
 
                 // 使用 FromValue 转换为目标类型
@@ -3305,23 +3491,43 @@ fn value_to_turso_value(value: Value) -> duckcompat::Value {
     match value {
         Value::Integer(v) => duckcompat::Value::Integer(v),
         Value::Text(v) => duckcompat::Value::Text(v),
-        Value::TextArray(v) => duckcompat::Value::Text(
-            serde_json::to_string(&v).unwrap_or_else(|_| "[]".to_string()),
+        Value::TextArray(v) => duckcompat::Value::TypedArray(
+            duckcompat::ArrayType::Text,
+            v.into_iter().map(duckcompat::Value::Text).collect(),
         ),
         Value::Real(v) => duckcompat::Value::Real(v),
         Value::Decimal(v) | Value::BigDecimal(v) => duckcompat::Value::Text(v),
         Value::Boolean(v) => duckcompat::Value::Integer(if v { 1 } else { 0 }),
         Value::Bytes(v) => duckcompat::Value::Blob(v),
-        Value::Duration(v) => duckcompat::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
+        Value::Duration(v) => {
+            duckcompat::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64)
+        }
         Value::DateTime(v) => duckcompat::Value::Text(v.to_rfc3339()),
         Value::Date(date) => duckcompat::Value::Text(date.to_string()),
         Value::Time(time) => duckcompat::Value::Text(time.to_string()),
         Value::Json(v) => duckcompat::Value::Text(v.to_string()),
         Value::Uuid(v) => duckcompat::Value::Text(v.to_string()),
         Value::BigInt(v) => duckcompat::Value::Integer(v as i64),
-        Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-            panic!("DuckDB backend does not support PostgreSQL array values")
-        }
+        Value::IntegerArray(v) => duckcompat::Value::TypedArray(
+            duckcompat::ArrayType::Integer,
+            v.into_iter()
+                .map(|value| duckcompat::Value::Integer(value as i64))
+                .collect(),
+        ),
+        Value::BigIntArray(v) => duckcompat::Value::TypedArray(
+            duckcompat::ArrayType::BigInt,
+            v.into_iter().map(duckcompat::Value::Integer).collect(),
+        ),
+        Value::NullableBigIntArray(v) => duckcompat::Value::TypedArray(
+            duckcompat::ArrayType::NullableBigInt,
+            v.into_iter()
+                .map(|value| {
+                    value
+                        .map(duckcompat::Value::Integer)
+                        .unwrap_or(duckcompat::Value::Null)
+                })
+                .collect(),
+        ),
         Value::Null => duckcompat::Value::Null,
     }
 }
@@ -3330,21 +3536,146 @@ fn values_to_params(values: &[Value]) -> crate::Result<Vec<duckcompat::Value>> {
     Ok(values.iter().cloned().map(value_to_turso_value).collect())
 }
 
+fn duckdb_auto_increment_id(value: duckcompat::Value) -> crate::Result<i64> {
+    match value {
+        duckcompat::Value::Integer(value) => Ok(value),
+        duckcompat::Value::Real(value) => Ok(value as i64),
+        duckcompat::Value::Text(value) => value
+            .parse::<i64>()
+            .map_err(|_| crate::ormer_error!("Invalid DuckDB auto-increment key: {value}")),
+        _ => Err(crate::ormer_error!(
+            "Invalid DuckDB auto-increment key value"
+        )),
+    }
+}
+
 /// 将 turso Value 转换为 ormer Value
 fn convert_turso_value(value: &duckcompat::Value) -> crate::Result<Value> {
     match value {
         duckcompat::Value::Integer(v) => Ok(Value::Integer(*v)),
-        duckcompat::Value::Text(v) => {
-            // 尝试解析为 DateTime
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
-                return Ok(Value::DateTime(dt.with_timezone(&chrono::Utc)));
-            }
-            Ok(Value::Text(v.clone()))
-        }
+        duckcompat::Value::Text(v) => Ok(Value::Text(v.clone())),
         duckcompat::Value::Real(v) => Ok(Value::Real(*v)),
         duckcompat::Value::Null => Ok(Value::Null),
         duckcompat::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
+        duckcompat::Value::List(values)
+        | duckcompat::Value::Array(values)
+        | duckcompat::Value::TypedArray(_, values) => convert_duckdb_array_value(values),
     }
+}
+
+fn convert_duckdb_array_value_for_type(
+    values: &[duckcompat::Value],
+    rust_type: &str,
+) -> crate::Result<Value> {
+    match rust_type {
+        "Vec<i32>" => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Integer(value) => i32::try_from(*value).map_err(|_| {
+                        crate::ormer_error!("DuckDB integer array value is outside the i32 range")
+                    }),
+                    _ => Err(crate::ormer_error!(
+                        "DuckDB integer array contains a non-integer value"
+                    )),
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Value::IntegerArray(values))
+        }
+        "Vec<String>" => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Text(value) => Ok(value.clone()),
+                    duckcompat::Value::Null => Ok(String::new()),
+                    _ => Err(crate::ormer_error!(
+                        "DuckDB text array contains a non-text value"
+                    )),
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Value::TextArray(values))
+        }
+        "Vec<i64>" => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Integer(value) => Ok(*value),
+                    _ => Err(crate::ormer_error!(
+                        "DuckDB integer array contains a non-integer value"
+                    )),
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Value::BigIntArray(values))
+        }
+        "Vec<Option<i64>>" => {
+            let values = values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Integer(value) => Ok(Some(*value)),
+                    duckcompat::Value::Null => Ok(None),
+                    _ => Err(crate::ormer_error!(
+                        "DuckDB nullable integer array contains an invalid value"
+                    )),
+                })
+                .collect::<crate::Result<Vec<_>>>()?;
+            Ok(Value::NullableBigIntArray(values))
+        }
+        _ => Err(crate::ormer_error!(
+            "Unsupported DuckDB array element type: {rust_type}"
+        )),
+    }
+}
+
+fn convert_duckdb_array_value(values: &[duckcompat::Value]) -> crate::Result<Value> {
+    if values
+        .iter()
+        .all(|value| matches!(value, duckcompat::Value::Text(_)))
+    {
+        return Ok(Value::TextArray(
+            values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Text(value) => Ok(value.clone()),
+                    _ => unreachable!(),
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+        ));
+    }
+
+    if values
+        .iter()
+        .all(|value| matches!(value, duckcompat::Value::Integer(_)))
+    {
+        return Ok(Value::BigIntArray(
+            values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Integer(value) => Ok(*value),
+                    _ => unreachable!(),
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+        ));
+    }
+
+    if values.iter().all(|value| {
+        matches!(
+            value,
+            duckcompat::Value::Integer(_) | duckcompat::Value::Null
+        )
+    }) {
+        return Ok(Value::NullableBigIntArray(
+            values
+                .iter()
+                .map(|value| match value {
+                    duckcompat::Value::Integer(value) => Ok(Some(*value)),
+                    duckcompat::Value::Null => Ok(None),
+                    _ => unreachable!(),
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+        ));
+    }
+
+    Err(crate::ormer_error!("Unsupported DuckDB list element type"))
 }
 
 /// Mapped Select Collect future

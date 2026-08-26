@@ -154,3 +154,19 @@ fn test_exists_uses_select_1() {
     assert!(!outer_sql.contains("EXISTS (SELECT id"));
     assert!(!outer_sql.contains("EXISTS (SELECT *"));
 }
+
+#[cfg(feature = "postgresql")]
+#[test]
+fn test_exists_uses_requested_backend_dialect() {
+    let subquery = ormer::Select::<ExistsTestRole>::new().filter(|r| r.name.eq("admin"));
+    let where_expr = subquery.exists();
+
+    let (sql, params) = ormer::Select::<ExistsTestUser>::new()
+        .filter(|_| where_expr.clone())
+        .try_to_sql_with_params(ormer::DbType::PostgreSQL)
+        .unwrap();
+
+    assert!(sql.contains("EXISTS (SELECT 1 FROM test_exists_roles_1"));
+    assert!(sql.contains("name = $1"));
+    assert_eq!(params.len(), 1);
+}

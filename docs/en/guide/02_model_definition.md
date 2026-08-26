@@ -45,7 +45,9 @@ PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; 
 let code = db.generate_entities(None).await?;
 ```
 
-Pass `Some("public")` for PostgreSQL or `Some("dbo")` for MSSQL when needed; omitted schemas use the backend default.
+Pass `Some("public")` for PostgreSQL or `Some("dbo")` for MSSQL when needed; for ClickHouse,
+the value selects the database. Omitted schemas use the backend default. DuckDB and ClickHouse
+infer Rust field types from the actual column types.
 
 ## Optimistic Lock Version
 

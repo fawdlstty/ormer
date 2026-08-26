@@ -1,7 +1,196 @@
 /// 钩子系统模块
 /// 提供数据操作生命周期中的回调机制
-use crate::model::Model;
+use crate::model::{Insertable, Model};
+use std::future::Future;
 use std::marker::PhantomData;
+
+tokio::task_local! {
+    static HOOKS_DISABLED: bool;
+}
+
+pub(crate) fn hooks_enabled() -> bool {
+    !HOOKS_DISABLED
+        .try_with(|disabled| *disabled)
+        .unwrap_or(false)
+}
+
+pub(crate) async fn without_hooks_scope<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    HOOKS_DISABLED.scope(true, future).await
+}
+
+/// Internal execution trait used by `WithoutHooksExecutor`.
+#[doc(hidden)]
+#[async_trait::async_trait(?Send)]
+pub trait HookExecutable: Sized {
+    type Output;
+
+    async fn execute(self) -> crate::Result<Self::Output>;
+}
+
+/// An execution chain that skips write hooks for this operation only.
+#[doc(hidden)]
+pub struct WithoutHooksExecutor<E>(pub(crate) E);
+
+impl<E> WithoutHooksExecutor<E>
+where
+    E: HookExecutable,
+{
+    pub async fn execute(self) -> crate::Result<E::Output> {
+        without_hooks_scope(self.0.execute()).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::InsertExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::InsertExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::InsertOrUpdateExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::InsertOrUpdateExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::InsertOrIgnoreExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::InsertOrIgnoreExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::TransactionInsertExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertOrUpdateExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::TransactionInsertOrUpdateExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertOrIgnoreExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::TransactionInsertOrIgnoreExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, T: Model> HookExecutable for crate::abstract_layer::DeleteExecutor<'a, T> {
+    type Output = u64;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::DeleteExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, T: Model> HookExecutable for crate::abstract_layer::UpdateExecutor<'a, T> {
+    type Output = u64;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::UpdateExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, T: Model> HookExecutable for crate::abstract_layer::ScopedDeleteExecutor<'a, T> {
+    type Output = u64;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::ScopedDeleteExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, T: Model> HookExecutable for crate::abstract_layer::ScopedUpdateExecutor<'a, T> {
+    type Output = u64;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::ScopedUpdateExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable
+    for crate::abstract_layer::common::connection_pool::PooledInsertExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = <I::Model as Model>::AutoIncrementKeyType;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::common::connection_pool::PooledInsertExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable
+    for crate::abstract_layer::common::connection_pool::PooledInsertOrUpdateExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::common::connection_pool::PooledInsertOrUpdateExecutor::execute(self)
+            .await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl<'a, I> HookExecutable
+    for crate::abstract_layer::common::connection_pool::PooledInsertOrIgnoreExecutor<'a, I>
+where
+    I: Insertable + Send + Sync,
+{
+    type Output = ();
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::common::connection_pool::PooledInsertOrIgnoreExecutor::execute(self)
+            .await
+    }
+}
 
 /// The operation currently being executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +248,11 @@ impl<'a> HookContext<'a> {
         self.in_transaction = true;
         self
     }
+
+    #[doc(hidden)]
+    pub fn hooks_enabled(&self) -> bool {
+        hooks_enabled()
+    }
 }
 
 macro_rules! define_lifecycle_hook {
@@ -78,6 +272,9 @@ macro_rules! define_lifecycle_hook {
         #[async_trait::async_trait]
         impl<M: $public + $($bound)+> $hidden for M {
             async fn $call(&mut self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
+                if !ctx.hooks_enabled() {
+                    return Ok(());
+                }
                 self.$method(ctx).await
             }
         }
@@ -98,6 +295,9 @@ macro_rules! define_lifecycle_hook {
         #[async_trait::async_trait]
         impl<M: $public + $($bound)+> $hidden for M {
             async fn $call(&self, ctx: &mut HookContext<'_>) -> crate::Result<()> {
+                if !ctx.hooks_enabled() {
+                    return Ok(());
+                }
                 self.$method(ctx).await
             }
         }

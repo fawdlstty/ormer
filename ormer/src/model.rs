@@ -2338,11 +2338,17 @@ where
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
     ) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         let mut ctx = ctx;
         (**self).before_insert(&mut ctx).await
     }
 
     async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         let mut ctx = ctx;
         (**self).after_insert(&mut ctx).await
     }
@@ -2382,6 +2388,9 @@ where
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
     ) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -2390,6 +2399,9 @@ where
     }
 
     async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -2432,6 +2444,9 @@ where
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
     ) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -2440,6 +2455,9 @@ where
     }
 
     async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -2493,6 +2511,9 @@ where
         &mut self,
         ctx: crate::hooks::HookContext<'static>,
     ) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter_mut().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.before_insert(&mut row_ctx).await?;
@@ -2501,6 +2522,9 @@ where
     }
 
     async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
+        if !ctx.hooks_enabled() {
+            return Ok(());
+        }
         for (index, model) in self.iter().enumerate() {
             let mut row_ctx = ctx.for_batch(index);
             model.after_insert(&mut row_ctx).await?;
@@ -2558,6 +2582,14 @@ macro_rules! impl_insertable_for_ref_collections {
 
 pub fn quote_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
+}
+
+pub(crate) fn duckdb_auto_increment_sequence_name(table_name: &str, column_name: &str) -> String {
+    format!(
+        "__ormer_seq_{}_{}",
+        table_name.replace('.', "_"),
+        column_name
+    )
 }
 
 fn needs_identifier_quote(identifier: &str) -> bool {
@@ -2663,24 +2695,106 @@ pub fn generate_create_table_sql<T: WritableModel>(
     generate_create_table_sql_with_name::<T>(db_type, None)
 }
 
+/// Generate ClickHouse CREATE TABLE SQL with an explicit engine clause.
+///
+/// `engine` is the expression after `ENGINE =`, for example
+/// `MergeTree ORDER BY (id)`. ClickHouse requires an engine for every table,
+/// so the generic create-table helper intentionally remains unsupported for
+/// this backend unless this function is used.
+#[cfg(feature = "clickhouse")]
+pub fn generate_clickhouse_create_table_sql<T: WritableModel>(
+    engine: &str,
+) -> crate::Result<String> {
+    generate_clickhouse_create_table_sql_with_name::<T>(engine, None)
+}
+
+/// Generate ClickHouse CREATE TABLE SQL with an explicit engine and table name.
+#[cfg(feature = "clickhouse")]
+pub fn generate_clickhouse_create_table_sql_with_name<T: WritableModel>(
+    engine: &str,
+    table_name: Option<&str>,
+) -> crate::Result<String> {
+    generate_create_table_sql_with_engine::<T>(
+        crate::abstract_layer::DbType::ClickHouse,
+        table_name,
+        Some(engine),
+    )
+}
+
 /// 生成 CREATE TABLE SQL 语句，支持自定义表名
 pub fn generate_create_table_sql_with_name<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
+    generate_create_table_sql_with_engine::<T>(db_type, table_name, None)
+}
+
+fn generate_create_table_sql_with_engine<T: WritableModel>(
+    db_type: crate::abstract_layer::DbType,
+    table_name: Option<&str>,
+    mut clickhouse_engine: Option<&str>,
+) -> crate::Result<String> {
     #[cfg(feature = "clickhouse")]
-    if matches!(db_type, crate::abstract_layer::DbType::ClickHouse) {
-        return Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "CREATE TABLE without explicit ClickHouse engine settings",
-        });
+    let is_clickhouse = matches!(db_type, crate::abstract_layer::DbType::ClickHouse);
+    #[cfg(not(feature = "clickhouse"))]
+    let is_clickhouse = false;
+
+    if is_clickhouse {
+        let Some(engine) = clickhouse_engine
+            .map(str::trim)
+            .filter(|engine| !engine.is_empty())
+        else {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "CREATE TABLE without explicit ClickHouse engine settings",
+            });
+        };
+        if engine.contains(';') {
+            return Err(crate::ormer_error!(
+                "ClickHouse engine clause must not contain ';'"
+            ));
+        }
+        clickhouse_engine = Some(engine);
+    } else if clickhouse_engine.is_some() {
+        return Err(crate::ormer_error!(
+            "ClickHouse engine settings can only be used with ClickHouse"
+        ));
     }
 
     let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
     let quoted_table_name = quote_qualified_identifier(db_type, table_name);
-    let mut sql = format!("CREATE TABLE IF NOT EXISTS {} (", quoted_table_name);
 
     let column_schema = T::column_schema();
+    let is_duckdb = {
+        #[cfg(feature = "duckdb")]
+        {
+            matches!(db_type, crate::abstract_layer::DbType::DuckDB)
+        }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            false
+        }
+    };
+    let auto_increment_column = column_schema
+        .iter()
+        .find(|column| column.is_primary && column.is_auto_increment);
+    let mut sql = if is_duckdb {
+        if let Some(column) = auto_increment_column {
+            let sequence_name = duckdb_auto_increment_sequence_name(table_name, column.name);
+            format!(
+                "CREATE SEQUENCE IF NOT EXISTS {}; ",
+                quote_identifier(db_type, &sequence_name)
+            )
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    sql.push_str(&format!(
+        "CREATE TABLE IF NOT EXISTS {} (",
+        quoted_table_name
+    ));
     for (i, column) in column_schema.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
@@ -2698,7 +2812,7 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
             )
         } else {
             let effective_rust_type = column.data_type.unwrap_or(column.rust_type);
-            if is_composite_primary && column.is_primary {
+            if !is_clickhouse && is_composite_primary && column.is_primary {
                 db_type.sql_type(
                     effective_rust_type,
                     false, // 不在列级别标记为主键
@@ -2709,7 +2823,7 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
             } else {
                 db_type.sql_type(
                     effective_rust_type,
-                    column.is_primary,
+                    column.is_primary && !is_clickhouse,
                     column.is_auto_increment,
                     column.is_nullable,
                     column.enum_variants,
@@ -2765,13 +2879,18 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
             ));
         }
 
-        if let Some(default) = column.default {
+        if is_duckdb && auto_increment_column.is_some_and(|auto| auto.name == column.name) {
+            let sequence_name = duckdb_auto_increment_sequence_name(table_name, column.name);
+            sql.push_str(" DEFAULT nextval(");
+            sql.push_str(&quote_sql_literal(&sequence_name));
+            sql.push(')');
+        } else if let Some(default) = column.default {
             sql.push_str(" DEFAULT ");
             sql.push_str(&default.to_sql(db_type));
         }
 
         // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
-        if column.unique_group.is_some() {
+        if !is_clickhouse && column.unique_group.is_some() {
             // 检查这个 group 中是否有多个字段
             let group_count = column_schema
                 .iter()
@@ -2786,37 +2905,47 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
             }
         }
 
-        if let Some(check) = column.check {
-            sql.push(' ');
-            if let Some(name) = check.name {
-                sql.push_str(&format!("CONSTRAINT {} ", quote_identifier(db_type, name)));
+        if !is_clickhouse {
+            if let Some(check) = column.check {
+                sql.push(' ');
+                if let Some(name) = check.name {
+                    sql.push_str(&format!("CONSTRAINT {} ", quote_identifier(db_type, name)));
+                }
+                sql.push_str(&format!("CHECK ({})", check.expr));
             }
-            sql.push_str(&format!("CHECK ({})", check.expr));
         }
     }
 
-    // 添加外键约束
-    let foreign_key_constraints = generate_foreign_key_constraints::<T>(db_type);
-    if !foreign_key_constraints.is_empty() {
-        sql.push_str(", ");
-        sql.push_str(&foreign_key_constraints.join(", "));
-    }
+    if !is_clickhouse {
+        // 添加外键约束
+        let foreign_key_constraints = generate_foreign_key_constraints::<T>(db_type);
+        if !foreign_key_constraints.is_empty() {
+            sql.push_str(", ");
+            sql.push_str(&foreign_key_constraints.join(", "));
+        }
 
-    // 添加复合主键约束（如果有多个主键字段）
-    let composite_primary_constraint = generate_composite_primary_key_constraint::<T>(db_type);
-    if !composite_primary_constraint.is_empty() {
-        sql.push_str(", ");
-        sql.push_str(&composite_primary_constraint);
-    }
+        // 添加复合主键约束（如果有多个主键字段）
+        let composite_primary_constraint = generate_composite_primary_key_constraint::<T>(db_type);
+        if !composite_primary_constraint.is_empty() {
+            sql.push_str(", ");
+            sql.push_str(&composite_primary_constraint);
+        }
 
-    // 添加联合 UNIQUE 约束
-    let unique_constraints = generate_unique_constraints::<T>(db_type);
-    if !unique_constraints.is_empty() {
-        sql.push_str(", ");
-        sql.push_str(&unique_constraints.join(", "));
+        // 添加联合 UNIQUE 约束
+        let unique_constraints = generate_unique_constraints::<T>(db_type);
+        if !unique_constraints.is_empty() {
+            sql.push_str(", ");
+            sql.push_str(&unique_constraints.join(", "));
+        }
     }
 
     sql.push(')');
+
+    if is_clickhouse {
+        sql.push_str(" ENGINE = ");
+        sql.push_str(clickhouse_engine.expect("validated ClickHouse engine"));
+        return Ok(sql);
+    }
 
     #[cfg(feature = "mysql")]
     if matches!(db_type, crate::abstract_layer::DbType::MySQL) {

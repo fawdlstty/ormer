@@ -11,6 +11,15 @@ let pool = Database::create_pool(DbType::PostgreSQL, "postgresql://user:pass@loc
     .await?;
 ```
 
+DuckDB 也支持同一连接池 API：
+
+```rust
+let pool = Database::create_pool(DbType::DuckDB, "app.duckdb")
+    .range(0..1)
+    .build()
+    .await?;
+```
+
 ## 使用连接池
 
 ```rust

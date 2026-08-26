@@ -11,6 +11,15 @@ let pool = Database::create_pool(DbType::PostgreSQL, "postgresql://user:pass@loc
     .await?;
 ```
 
+DuckDB also supports the same connection pool API:
+
+```rust
+let pool = Database::create_pool(DbType::DuckDB, "app.duckdb")
+    .range(0..1)
+    .build()
+    .await?;
+```
+
 ## Use Pool
 
 ```rust

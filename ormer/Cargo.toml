@@ -29,6 +29,7 @@ tokio = { version = "1.52.1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde"] }
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
 rust_decimal = "1"
 bigdecimal = "0.4"
 # clickhouse HTTP client (optional; execution remains explicitly gated)
@@ -66,7 +67,7 @@ postgresql = ["dep:tokio-postgres", "dep:postgres-types", "dep:bb8", "dep:bb8-po
 mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 duckdb = ["sqlite", "dep:duckdb"]
-clickhouse = ["dep:clickhouse"]
+clickhouse = ["sqlite", "dep:clickhouse", "dep:serde"]
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..
