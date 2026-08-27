@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "ormer"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "async-trait",
  "bb8",
