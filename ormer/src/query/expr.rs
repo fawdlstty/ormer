@@ -653,8 +653,16 @@ impl SqlExpr {
                     }
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!("JSON_VALUE({}, {})", expr_sql, quote_json_path(key)),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!(
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => {
+                        format!(
+                            "JSONExtractString({}, '{}')",
+                            expr_sql,
+                            key.replace('\'', "''")
+                        )
+                    }
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!(
                         "json_extract_string({}, {})",
                         expr_sql,
                         quote_json_path(key)
@@ -684,8 +692,19 @@ impl SqlExpr {
                     DbType::MSSQL => {
                         format!("JSON_VALUE({}, {})", expr_sql, quote_json_path_parts(path))
                     }
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!(
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!(
+                        "JSONExtractString({}{})",
+                        expr_sql,
+                        path.iter().fold(String::new(), |mut sql, key| {
+                            sql.push_str(", '");
+                            sql.push_str(&key.replace('\'', "''"));
+                            sql.push('\'');
+                            sql
+                        })
+                    ),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!(
                         "json_extract({}, {})",
                         expr_sql,
                         quote_json_path_parts(path)
@@ -755,8 +774,12 @@ impl SqlExpr {
                             value_sql
                         )
                     }
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!(
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => {
+                        "0 = 1 /* OrmerError::UnsupportedFeature: JSON updates */".to_string()
+                    }
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!(
                         "json_merge_patch({}, json_object({}, {}))",
                         expr_sql,
                         quote_json_path_parts(path),
@@ -782,8 +805,10 @@ impl SqlExpr {
                         "EXISTS (SELECT 1 FROM OPENJSON({}) l INNER JOIN OPENJSON({}) r ON l.value = r.value)",
                         left_sql, right_sql
                     ),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!("list_has_all({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("hasAll({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("list_has_all({}, {})", left_sql, right_sql),
                 }
             }
             SqlExpr::ArrayOverlaps { left, right } => {
@@ -804,8 +829,10 @@ impl SqlExpr {
                         "EXISTS (SELECT 1 FROM OPENJSON({}) l INNER JOIN OPENJSON({}) r ON l.value = r.value)",
                         left_sql, right_sql
                     ),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!("list_has_any({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("hasAny({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("list_has_any({}, {})", left_sql, right_sql),
                 }
             }
             SqlExpr::ArrayLen { expr } => {
@@ -819,8 +846,10 @@ impl SqlExpr {
                     DbType::Sqlite => format!("json_array_length({})", expr_sql),
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!("(SELECT COUNT(*) FROM OPENJSON({}))", expr_sql),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-                    _ => format!("length({})", expr_sql),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("length({})", expr_sql),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("length({})", expr_sql),
                 }
             }
             SqlExpr::Row(exprs) => {
@@ -870,6 +899,13 @@ impl SqlExpr {
                     arg.validate_for_db(db_type)?;
                 }
                 Ok(())
+            }
+            #[cfg(feature = "clickhouse")]
+            SqlExpr::JsonSet { .. } if matches!(db_type, DbType::ClickHouse) => {
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "JSON updates",
+                })
             }
             SqlExpr::Cast { expr, .. }
             | SqlExpr::Collate { expr, .. }

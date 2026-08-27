@@ -42,12 +42,12 @@ type MssqlClient = Client<tokio_util::compat::Compat<TcpStream>>;
 fn build_traced_mssql_query<'a>(
     trace: &'a crate::sql_trace::SqlTraceExecution,
     params: &'a [Value],
-) -> Query<'a> {
+) -> crate::Result<Query<'a>> {
     let mut query = Query::new(trace.sql());
     for param in params {
-        bind_value(&mut query, param);
+        bind_value(&mut query, param)?;
     }
-    query
+    Ok(query)
 }
 
 async fn traced_mssql_execute(
@@ -56,7 +56,7 @@ async fn traced_mssql_execute(
     params: &[Value],
 ) -> crate::Result<u64> {
     let trace = crate::sql_trace::start_sql_trace(sql, params);
-    let query = build_traced_mssql_query(&trace, params);
+    let query = build_traced_mssql_query(&trace, params)?;
     match query.execute(client).await {
         Ok(result) => {
             trace.finish_ok();
@@ -72,7 +72,7 @@ async fn traced_mssql_query(
     params: &[Value],
 ) -> crate::Result<Vec<tiberius::Row>> {
     let trace = crate::sql_trace::start_sql_trace(sql, params);
-    let query = build_traced_mssql_query(&trace, params);
+    let query = build_traced_mssql_query(&trace, params)?;
     match query.query(client).await {
         Ok(stream) => {
             trace.finish_ok();
@@ -80,6 +80,17 @@ async fn traced_mssql_query(
         }
         Err(error) => Err(trace.finish_external_error("tiberius::Query::query", error)),
     }
+}
+
+fn decode_mssql_model_rows<T: Model>(rows: Vec<tiberius::Row>) -> crate::Result<Vec<T>> {
+    let mut results = Vec::new();
+    for row in rows {
+        let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+            extract_value_from_row(&row, i)
+        })?;
+        results.push(model);
+    }
+    Ok(results)
 }
 
 /// MSSQL 类型映射器
@@ -516,7 +527,7 @@ impl Database {
             );
             let mut query = Query::new(&sql_with_output);
             for param in &all_values {
-                bind_value(&mut query, param);
+                bind_value(&mut query, param)?;
             }
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
@@ -526,7 +537,7 @@ impl Database {
         } else {
             let mut query = Query::new(&sql);
             for param in &all_values {
-                bind_value(&mut query, param);
+                bind_value(&mut query, param)?;
             }
             query.execute(&mut *client).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
@@ -544,7 +555,7 @@ impl Database {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
         for param in &all_values {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         query.execute(&mut *client).trace().await?;
         Ok(())
@@ -560,7 +571,7 @@ impl Database {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
         for param in &all_values {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
@@ -1088,13 +1099,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
 
-        if self
+        if let Some(conflict) = self
             .conflict
             .as_ref()
-            .is_some_and(|conflict| conflict.is_configured())
+            .filter(|conflict| conflict.is_configured())
         {
-            return Err(crate::ormer_error!(
-                "MSSQL does not support configurable insert conflict handling"
+            let statement =
+                common_helpers::build_mssql_insert_conflict_statement::<I::Model>(&refs, conflict)?;
+            return Ok(SqlStatement::single(
+                DbType::MSSQL,
+                statement.sql,
+                statement.params,
             ));
         }
 
@@ -1127,10 +1142,26 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         <Self as SqlExecutor>::execute(self).await
     }
 
-    pub async fn returning(self) -> crate::Result<Vec<I::Model>> {
-        Err(crate::ormer_error!(
-            "MSSQL does not support RETURNING clause"
-        ))
+    pub async fn returning(mut self) -> crate::Result<Vec<I::Model>> {
+        if self.models.as_refs().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+
+        let sql = self.to_sql()?;
+        let mut client = self.pool.lock().await;
+        let mut results = Vec::new();
+        for statement in &sql.statements {
+            let returning_sql =
+                common_helpers::mssql_insert_returning_sql::<I::Model>(&statement.sql);
+            let rows = traced_mssql_query(&mut client, &returning_sql, &statement.params).await?;
+            results.extend(decode_mssql_model_rows::<I::Model>(rows)?);
+        }
+
+        self.models.run_after_insert(hook_ctx).await?;
+        Ok(results)
     }
 }
 
@@ -1156,7 +1187,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             let statement = &sql.statements[0];
             let mut query = Query::new(&statement.sql);
             for param in &statement.params {
-                bind_value(&mut query, param);
+                bind_value(&mut query, param)?;
             }
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
@@ -1166,7 +1197,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             for statement in &sql.statements {
                 let mut query = Query::new(&statement.sql);
                 for param in &statement.params {
-                    bind_value(&mut query, param);
+                    bind_value(&mut query, param)?;
                 }
                 query.execute(&mut *client).trace().await?;
             }
@@ -1256,7 +1287,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&statement.sql);
         for param in &statement.params {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
 
         if has_auto_increment {
@@ -1313,7 +1344,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&statement.sql);
         for param in &statement.params {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         let result = query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
@@ -1354,7 +1385,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&sql);
         for param in &all_values {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         let result = query.execute(&mut *client).trace().await?;
         Ok(result.total() as u64)
@@ -1378,7 +1409,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&statement.sql);
         for param in &statement.params {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         let result = query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
@@ -1617,13 +1648,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
 
-        if self
+        if let Some(conflict) = self
             .conflict
             .as_ref()
-            .is_some_and(|conflict| conflict.is_configured())
+            .filter(|conflict| conflict.is_configured())
         {
-            return Err(crate::ormer_error!(
-                "MSSQL does not support configurable insert conflict handling"
+            let statement =
+                common_helpers::build_mssql_insert_conflict_statement::<I::Model>(&refs, conflict)?;
+            return Ok(SqlStatement::single(
+                DbType::MSSQL,
+                statement.sql,
+                statement.params,
             ));
         }
 
@@ -1681,7 +1716,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
             let statement = &sql.statements[0];
             let mut query = Query::new(&statement.sql);
             for param in &statement.params {
-                bind_value(&mut query, param);
+                bind_value(&mut query, param)?;
             }
             let stream = query.query(&mut *client).trace().await?;
             let row = stream.into_row().trace().await?;
@@ -1693,7 +1728,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
             for statement in &sql.statements {
                 let mut query = Query::new(&statement.sql);
                 for param in &statement.params {
-                    bind_value(&mut query, param);
+                    bind_value(&mut query, param)?;
                 }
                 query.execute(&mut *client).trace().await?;
             }
@@ -1749,7 +1784,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&statement.sql);
         for param in &statement.params {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
@@ -1800,7 +1835,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         let mut client = self.pool.lock().await;
         let mut query = Query::new(&statement.sql);
         for param in &statement.params {
-            bind_value(&mut query, param);
+            bind_value(&mut query, param)?;
         }
         query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
@@ -2220,9 +2255,19 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     pub async fn returning(self) -> crate::Result<Vec<T>> {
-        Err(crate::ormer_error!(
-            "MSSQL does not support RETURNING clause"
-        ))
+        let sql = self.to_sql()?;
+        let mut client = self.pool.lock().await;
+        let mut results = Vec::new();
+        for statement in &sql.statements {
+            let returning_sql = common_helpers::mssql_delete_returning_sql::<T>(&statement.sql);
+            let rows = traced_mssql_query(&mut client, &returning_sql, &statement.params).await?;
+            let statement_results = decode_mssql_model_rows::<T>(rows)?;
+            if statement.versioned && statement_results.is_empty() {
+                return Err(common_helpers::optimistic_lock_conflict::<T>());
+            }
+            results.extend(statement_results);
+        }
+        Ok(results)
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
@@ -2315,9 +2360,19 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     pub async fn returning(self) -> crate::Result<Vec<T>> {
-        Err(crate::ormer_error!(
-            "MSSQL does not support RETURNING clause"
-        ))
+        let sql = self.to_sql()?;
+        let mut client = self.pool.lock().await;
+        let mut results = Vec::new();
+        for statement in &sql.statements {
+            let returning_sql = common_helpers::mssql_update_returning_sql::<T>(&statement.sql);
+            let rows = traced_mssql_query(&mut client, &returning_sql, &statement.params).await?;
+            let statement_results = decode_mssql_model_rows::<T>(rows)?;
+            if statement.versioned && statement_results.is_empty() {
+                return Err(common_helpers::optimistic_lock_conflict::<T>());
+            }
+            results.extend(statement_results);
+        }
+        Ok(results)
     }
 
     fn build_all_sql(&self) -> crate::Result<Vec<common_helpers::ModelSqlStatement>> {
@@ -2910,28 +2965,82 @@ fn decimal_text_to_mssql_numeric(value: &str) -> Numeric {
 }
 
 // 辅助函数：将 Value 绑定到 Query
-fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) {
+fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) -> crate::Result<()> {
     match value {
-        Value::Null => query.bind(Option::<&str>::None),
-        Value::Boolean(v) => query.bind(*v),
-        Value::Integer(v) => query.bind(*v),
-        Value::BigInt(v) => query.bind(*v as i64),
-        Value::Real(v) => query.bind(*v),
-        Value::Decimal(v) | Value::BigDecimal(v) => query.bind(decimal_text_to_mssql_numeric(v)),
+        Value::Null => {
+            query.bind(Option::<&str>::None);
+        }
+        Value::Boolean(v) => {
+            query.bind(*v);
+        }
+        Value::Integer(v) => {
+            query.bind(*v);
+        }
+        Value::BigInt(v) => {
+            query.bind(*v as i64);
+        }
+        Value::Real(v) => {
+            query.bind(*v);
+        }
+        Value::Decimal(v) | Value::BigDecimal(v) => {
+            query.bind(decimal_text_to_mssql_numeric(v));
+        }
         Value::Duration(v) => {
             let micros = v.as_micros().min(i64::MAX as u128) as i64;
-            query.bind(micros)
+            query.bind(micros);
         }
-        Value::Text(v) => query.bind(v.as_str()),
-        Value::TextArray(v) => query.bind(crate::model::stringify_string_vec(v)),
-        Value::Bytes(v) => query.bind(v.as_slice()),
-        Value::DateTime(v) => query.bind(v.naive_utc()),
-        Value::Date(v) => query.bind(*v),
-        Value::Time(v) => query.bind(*v),
-        Value::Json(v) => query.bind(v.to_string()),
-        Value::Uuid(v) => query.bind(*v),
+        Value::Text(v) => {
+            query.bind(v.as_str());
+        }
+        Value::TextArray(v) => {
+            query.bind(crate::model::stringify_string_vec(v));
+        }
+        Value::Bytes(v) => {
+            query.bind(v.as_slice());
+        }
+        Value::DateTime(v) => {
+            query.bind(v.naive_utc());
+        }
+        Value::Date(v) => {
+            query.bind(*v);
+        }
+        Value::Time(v) => {
+            query.bind(*v);
+        }
+        Value::Json(v) => {
+            query.bind(v.to_string());
+        }
+        Value::Uuid(v) => {
+            query.bind(*v);
+        }
         Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-            panic!("MSSQL backend does not support PostgreSQL array values")
+            return Err(common_helpers::unsupported_postgresql_array_value(
+                DbType::MSSQL,
+            ));
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_value;
+    use crate::OrmerError;
+    use crate::abstract_layer::DbType;
+    use crate::model::Value;
+    use tiberius::Query;
+
+    #[test]
+    fn mssql_rejects_postgresql_array_values_without_panic() {
+        let mut query = Query::new("SELECT @P1");
+        let error = bind_value(&mut query, &Value::BigIntArray(vec![1, 2]))
+            .expect_err("MSSQL must reject PostgreSQL array values");
+        assert!(matches!(
+            error,
+            OrmerError::UnsupportedFeature {
+                backend: DbType::MSSQL,
+                feature: "PostgreSQL array values",
+            }
+        ));
     }
 }

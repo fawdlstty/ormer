@@ -23,10 +23,6 @@ compile_error!(
 );
 
 pub use abstract_layer::DbType;
-#[cfg(feature = "clickhouse")]
-pub use abstract_layer::clickhouse_backend::Database as ClickHouseDatabase;
-#[cfg(feature = "clickhouse")]
-pub use clickhouse;
 pub use db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };

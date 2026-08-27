@@ -51,6 +51,18 @@ impl RawSql {
         self
     }
 
+    pub fn with_params<I>(mut self, params: I) -> Self
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        self.params.extend(
+            params
+                .into_iter()
+                .map(|value| RawSqlParam { name: None, value }),
+        );
+        self
+    }
+
     pub fn bind_named(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
         self.params.push(RawSqlParam {
             name: Some(name.into()),

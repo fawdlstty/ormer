@@ -459,24 +459,7 @@ async fn traced_duckdb_schema_execute(
             trace.finish_ok();
             Ok(result)
         }
-        Err(error) => {
-            let should_retry = is_turso_partial_index_unsupported(&error);
-            if should_retry {
-                if let Some(fallback_sql) = duckdb_index_sql_without_where(trace.sql()) {
-                    return match conn.execute(&fallback_sql, ()).await {
-                        Ok(result) => {
-                            trace.finish_ok();
-                            Ok(result)
-                        }
-                        Err(error) => {
-                            Err(trace
-                                .finish_external_error("duckcompat::Connection::execute", error))
-                        }
-                    };
-                }
-            }
-            Err(trace.finish_external_error("duckcompat::Connection::execute", error))
-        }
+        Err(error) => Err(trace.finish_external_error("duckcompat::Connection::execute", error)),
     }
 }
 
@@ -501,23 +484,6 @@ fn duckdb_sql_with_returning_count(sql: &str) -> Option<String> {
 
     let sql = sql.trim_end().strip_suffix(';').unwrap_or(sql).trim_end();
     Some(format!("{sql} RETURNING 1"))
-}
-
-fn is_turso_partial_index_unsupported(error: &duckcompat::Error) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("partial indexes are not supported")
-}
-
-fn duckdb_index_sql_without_where(sql: &str) -> Option<String> {
-    let sql = sql.trim();
-    let lower_sql = sql.to_ascii_lowercase();
-    if !lower_sql.starts_with("create index ") {
-        return None;
-    }
-    let where_pos = lower_sql.rfind(" where ")?;
-    Some(sql[..where_pos].trim_end().to_string())
 }
 
 fn table_name_for<T: Model>() -> &'static str {

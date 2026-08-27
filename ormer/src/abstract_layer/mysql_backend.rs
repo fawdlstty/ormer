@@ -32,6 +32,13 @@ use std::marker::PhantomData;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
 
+fn mysql_returning_unsupported() -> crate::OrmerError {
+    crate::OrmerError::UnsupportedFeature {
+        backend: DbType::MySQL,
+        feature: "DML RETURNING",
+    }
+}
+
 async fn traced_mysql_query(
     conn: &mut mysql_async::Conn,
     sql: &str,
@@ -190,23 +197,23 @@ fn mysql_fk_action(action: &str) -> Option<&'static str> {
     }
 }
 
-fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Value {
+fn mysql_value_from_ormer_value(value: &crate::model::Value) -> crate::Result<mysql_async::Value> {
     match value {
-        crate::model::Value::Integer(v) => mysql_async::Value::Int(*v),
-        crate::model::Value::Text(v) => mysql_async::Value::Bytes(v.as_bytes().to_vec()),
-        crate::model::Value::TextArray(v) => {
-            mysql_async::Value::Bytes(crate::model::stringify_string_vec(v).into_bytes())
-        }
-        crate::model::Value::Real(v) => mysql_async::Value::Double(*v),
+        crate::model::Value::Integer(v) => Ok(mysql_async::Value::Int(*v)),
+        crate::model::Value::Text(v) => Ok(mysql_async::Value::Bytes(v.as_bytes().to_vec())),
+        crate::model::Value::TextArray(v) => Ok(mysql_async::Value::Bytes(
+            crate::model::stringify_string_vec(v).into_bytes(),
+        )),
+        crate::model::Value::Real(v) => Ok(mysql_async::Value::Double(*v)),
         crate::model::Value::Decimal(v) | crate::model::Value::BigDecimal(v) => {
-            mysql_async::Value::Bytes(v.clone().into_bytes())
+            Ok(mysql_async::Value::Bytes(v.clone().into_bytes()))
         }
-        crate::model::Value::Boolean(v) => mysql_async::Value::Int(if *v { 1 } else { 0 }),
-        crate::model::Value::Duration(v) => {
-            mysql_async::Value::Int(v.as_micros().min(i64::MAX as u128) as i64)
-        }
-        crate::model::Value::Bytes(v) => mysql_async::Value::Bytes(v.clone()),
-        crate::model::Value::DateTime(v) => mysql_async::Value::Date(
+        crate::model::Value::Boolean(v) => Ok(mysql_async::Value::Int(if *v { 1 } else { 0 })),
+        crate::model::Value::Duration(v) => Ok(mysql_async::Value::Int(
+            v.as_micros().min(i64::MAX as u128) as i64,
+        )),
+        crate::model::Value::Bytes(v) => Ok(mysql_async::Value::Bytes(v.clone())),
+        crate::model::Value::DateTime(v) => Ok(mysql_async::Value::Date(
             v.year() as u16,
             v.month() as u8,
             v.day() as u8,
@@ -214,27 +221,33 @@ fn mysql_value_from_ormer_value(value: &crate::model::Value) -> mysql_async::Val
             v.minute() as u8,
             v.second() as u8,
             v.timestamp_subsec_micros(),
-        ),
-        crate::model::Value::Date(v) => {
-            mysql_async::Value::Date(v.year() as u16, v.month() as u8, v.day() as u8, 0, 0, 0, 0)
-        }
-        crate::model::Value::Time(v) => mysql_async::Value::Time(
+        )),
+        crate::model::Value::Date(v) => Ok(mysql_async::Value::Date(
+            v.year() as u16,
+            v.month() as u8,
+            v.day() as u8,
+            0,
+            0,
+            0,
+            0,
+        )),
+        crate::model::Value::Time(v) => Ok(mysql_async::Value::Time(
             false,
             0,
             v.hour() as u8,
             v.minute() as u8,
             v.second() as u8,
             v.nanosecond() / 1_000,
-        ),
-        crate::model::Value::Json(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
-        crate::model::Value::Uuid(v) => mysql_async::Value::Bytes(v.to_string().into_bytes()),
-        crate::model::Value::BigInt(v) => mysql_async::Value::Int(*v as i64),
+        )),
+        crate::model::Value::Json(v) => Ok(mysql_async::Value::Bytes(v.to_string().into_bytes())),
+        crate::model::Value::Uuid(v) => Ok(mysql_async::Value::Bytes(v.to_string().into_bytes())),
+        crate::model::Value::BigInt(v) => Ok(mysql_async::Value::Int(*v as i64)),
         crate::model::Value::IntegerArray(_)
         | crate::model::Value::BigIntArray(_)
-        | crate::model::Value::NullableBigIntArray(_) => {
-            panic!("MySQL backend does not support PostgreSQL array values")
-        }
-        crate::model::Value::Null => mysql_async::Value::NULL,
+        | crate::model::Value::NullableBigIntArray(_) => Err(
+            common_helpers::unsupported_postgresql_array_value(DbType::MySQL),
+        ),
+        crate::model::Value::Null => Ok(mysql_async::Value::NULL),
     }
 }
 
@@ -449,9 +462,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     }
 
     pub async fn returning(self) -> crate::Result<Vec<I::Model>> {
-        Err(crate::ormer_error!(
-            "MySQL does not support RETURNING clause"
-        ))
+        Err(mysql_returning_unsupported())
     }
 }
 
@@ -2006,8 +2017,7 @@ impl<
             let mut conn = self.pool.get_conn().trace().await?;
 
             // 将ormer::Value转换为mysql_async::Params
-            let mysql_params: Vec<mysql_async::Value> =
-                params.iter().map(mysql_value_from_ormer_value).collect();
+            let mysql_params = values_to_params(&params)?;
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
                 traced_mysql_query(&mut conn, &sql).await?
@@ -2031,7 +2041,9 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use super::parse_mysql_table_compression;
+    use super::{mysql_value_from_ormer_value, parse_mysql_table_compression};
+    use crate::abstract_layer::DbType;
+    use crate::{OrmerError, Value};
 
     #[test]
     fn parses_mysql_table_compression_options() {
@@ -2045,6 +2057,19 @@ mod tests {
         );
         assert_eq!(parse_mysql_table_compression("COMPRESSION=none"), None);
         assert_eq!(parse_mysql_table_compression("ROW_FORMAT=DYNAMIC"), None);
+    }
+
+    #[test]
+    fn mysql_rejects_postgresql_array_values_without_panic() {
+        let error = mysql_value_from_ormer_value(&Value::IntegerArray(vec![1, 2]))
+            .expect_err("MySQL must reject PostgreSQL array values");
+        assert!(matches!(
+            error,
+            OrmerError::UnsupportedFeature {
+                backend: DbType::MySQL,
+                feature: "PostgreSQL array values",
+            }
+        ));
     }
 }
 
@@ -2341,7 +2366,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
             let mysql_params: Vec<mysql_async::Value> = params
                 .into_iter()
                 .map(|v| mysql_value_from_ormer_value(&v))
-                .collect();
+                .collect::<crate::Result<_>>()?;
 
             let mut exec_result = conn.exec_iter(&sql, mysql_params).trace().await?;
 
@@ -2495,9 +2520,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     pub async fn returning(self) -> crate::Result<Vec<T>> {
-        Err(crate::ormer_error!(
-            "MySQL does not support RETURNING clause"
-        ))
+        Err(mysql_returning_unsupported())
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
@@ -2614,9 +2637,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     pub async fn returning(self) -> crate::Result<Vec<T>> {
-        Err(crate::ormer_error!(
-            "MySQL does not support RETURNING clause"
-        ))
+        Err(mysql_returning_unsupported())
     }
 
     fn build_all_sql(&self) -> crate::Result<Vec<common_helpers::ModelSqlStatement>> {
@@ -2697,7 +2718,7 @@ fn values_to_params(values: &[crate::model::Value]) -> crate::Result<Vec<mysql_a
     let mut params: Vec<mysql_async::Value> = Vec::new();
 
     for value in values {
-        params.push(mysql_value_from_ormer_value(value));
+        params.push(mysql_value_from_ormer_value(value)?);
     }
 
     Ok(params)
@@ -2737,8 +2758,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
         // 将参数转换为 mysql_async::Value
-        let mysql_params: Vec<mysql_async::Value> =
-            params.iter().map(mysql_value_from_ormer_value).collect();
+        let mysql_params = values_to_params(&params)?;
 
         // 获取连接
         let conn = self.pool.get_conn().trace().await?;
@@ -2831,8 +2851,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-        let mysql_params: Vec<mysql_async::Value> =
-            params.iter().map(mysql_value_from_ormer_value).collect();
+        let mysql_params = values_to_params(&params)?;
 
         let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2884,8 +2903,7 @@ impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2>
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
 
-        let mysql_params: Vec<mysql_async::Value> =
-            params.iter().map(mysql_value_from_ormer_value).collect();
+        let mysql_params = values_to_params(&params)?;
 
         let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2938,8 +2956,7 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
         let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
         let mut conn = self.pool.get_conn().trace().await?;
 
-        let mysql_params: Vec<mysql_async::Value> =
-            params.iter().map(mysql_value_from_ormer_value).collect();
+        let mysql_params = values_to_params(&params)?;
 
         let rows: Vec<mysql_async::Row> =
             traced_mysql_exec(&mut conn, &sql, mysql_params, &params).await?;
@@ -3693,8 +3710,10 @@ impl<
             let mut conn = self.executor.pool.get_conn().trace().await?;
 
             // 将ormer::Value转换为mysql_async::Params
-            let mysql_params: Vec<mysql_async::Value> =
-                params.iter().map(mysql_value_from_ormer_value).collect();
+            let mysql_params: Vec<mysql_async::Value> = params
+                .iter()
+                .map(mysql_value_from_ormer_value)
+                .collect::<crate::Result<_>>()?;
 
             let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
                 traced_mysql_query(&mut conn, &sql).await?

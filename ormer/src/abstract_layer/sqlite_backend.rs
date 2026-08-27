@@ -80,23 +80,7 @@ async fn traced_sqlite_schema_execute(
             trace.finish_ok();
             Ok(result)
         }
-        Err(error) => {
-            let should_retry = is_turso_partial_index_unsupported(&error);
-            if should_retry {
-                if let Some(fallback_sql) = sqlite_index_sql_without_where(trace.sql()) {
-                    return match conn.execute(&fallback_sql, ()).await {
-                        Ok(result) => {
-                            trace.finish_ok();
-                            Ok(result)
-                        }
-                        Err(error) => {
-                            Err(trace.finish_external_error("turso::Connection::execute", error))
-                        }
-                    };
-                }
-            }
-            Err(trace.finish_external_error("turso::Connection::execute", error))
-        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::execute", error)),
     }
 }
 
@@ -112,23 +96,6 @@ fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
 
     let sql = sql.trim_end().strip_suffix(';').unwrap_or(sql).trim_end();
     Some(format!("{sql} RETURNING 1"))
-}
-
-fn is_turso_partial_index_unsupported(error: &turso::Error) -> bool {
-    error
-        .to_string()
-        .to_ascii_lowercase()
-        .contains("partial indexes are not supported")
-}
-
-fn sqlite_index_sql_without_where(sql: &str) -> Option<String> {
-    let sql = sql.trim();
-    let lower_sql = sql.to_ascii_lowercase();
-    if !lower_sql.starts_with("create index ") {
-        return None;
-    }
-    let where_pos = lower_sql.rfind(" where ")?;
-    Some(sql[..where_pos].trim_end().to_string())
 }
 
 /// 判断错误是否为约束冲突错误（如主键/唯一键重复）
@@ -3094,31 +3061,33 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateE
 }
 
 /// 将 ormer Value 转换为 turso 参数
-fn value_to_turso_value(value: Value) -> turso::Value {
+fn value_to_turso_value(value: Value) -> crate::Result<turso::Value> {
     match value {
-        Value::Integer(v) => turso::Value::Integer(v),
-        Value::Text(v) => turso::Value::Text(v),
-        Value::TextArray(v) => turso::Value::Text(crate::model::stringify_string_vec(&v)),
-        Value::Real(v) => turso::Value::Real(v),
-        Value::Decimal(v) | Value::BigDecimal(v) => turso::Value::Text(v),
-        Value::Boolean(v) => turso::Value::Integer(if v { 1 } else { 0 }),
-        Value::Bytes(v) => turso::Value::Blob(v),
-        Value::Duration(v) => turso::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64),
-        Value::DateTime(v) => turso::Value::Text(v.to_rfc3339()),
-        Value::Date(date) => turso::Value::Text(date.to_string()),
-        Value::Time(time) => turso::Value::Text(time.to_string()),
-        Value::Json(v) => turso::Value::Text(v.to_string()),
-        Value::Uuid(v) => turso::Value::Text(v.to_string()),
-        Value::BigInt(v) => turso::Value::Integer(v as i64),
-        Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => {
-            panic!("SQLite backend does not support PostgreSQL array values")
-        }
-        Value::Null => turso::Value::Null,
+        Value::Integer(v) => Ok(turso::Value::Integer(v)),
+        Value::Text(v) => Ok(turso::Value::Text(v)),
+        Value::TextArray(v) => Ok(turso::Value::Text(crate::model::stringify_string_vec(&v))),
+        Value::Real(v) => Ok(turso::Value::Real(v)),
+        Value::Decimal(v) | Value::BigDecimal(v) => Ok(turso::Value::Text(v)),
+        Value::Boolean(v) => Ok(turso::Value::Integer(if v { 1 } else { 0 })),
+        Value::Bytes(v) => Ok(turso::Value::Blob(v)),
+        Value::Duration(v) => Ok(turso::Value::Integer(
+            v.as_micros().min(i64::MAX as u128) as i64
+        )),
+        Value::DateTime(v) => Ok(turso::Value::Text(v.to_rfc3339())),
+        Value::Date(date) => Ok(turso::Value::Text(date.to_string())),
+        Value::Time(time) => Ok(turso::Value::Text(time.to_string())),
+        Value::Json(v) => Ok(turso::Value::Text(v.to_string())),
+        Value::Uuid(v) => Ok(turso::Value::Text(v.to_string())),
+        Value::BigInt(v) => Ok(turso::Value::Integer(v as i64)),
+        Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => Err(
+            common_helpers::unsupported_postgresql_array_value(DbType::Sqlite),
+        ),
+        Value::Null => Ok(turso::Value::Null),
     }
 }
 
 fn values_to_params(values: &[Value]) -> crate::Result<Vec<turso::Value>> {
-    Ok(values.iter().cloned().map(value_to_turso_value).collect())
+    values.iter().cloned().map(value_to_turso_value).collect()
 }
 
 /// 将 turso Value 转换为 ormer Value

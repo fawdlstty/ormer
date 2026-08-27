@@ -60,20 +60,22 @@ struct QuotedColumnModel {
 
 #[cfg(feature = "sqlite")]
 #[test]
-fn sqlite_create_table_sql_includes_metadata() {
-    let sql = ormer::generate_create_table_sql::<SchemaMetaChild>(ormer::DbType::Sqlite).unwrap();
+fn sqlite_create_table_sql_rejects_partial_index_metadata() {
+    let error = ormer::generate_create_table_sql::<SchemaMetaChild>(ormer::DbType::Sqlite)
+        .expect_err("SQLite must reject partial index metadata");
+    assert!(matches!(
+        error,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: ormer::DbType::Sqlite,
+            feature: "partial index WHERE clauses",
+        }
+    ));
 
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS schema_meta_children_1"));
-    assert!(!sql.contains("auth.schema_meta_children_1"));
-    assert!(sql.contains("display_name TEXT NOT NULL DEFAULT ''"));
-    assert!(
-        sql.contains("CONSTRAINT uq_schema_meta_children_1_display_name UNIQUE (display_name)")
-    );
-    assert!(sql.contains("CONSTRAINT fk_schema_meta_children_1_parent_id FOREIGN KEY (parent_id) REFERENCES schema_meta_parents_1 (id) ON DELETE CASCADE ON UPDATE RESTRICT"));
-    assert!(sql.contains("CONSTRAINT"));
-    assert!(sql.contains("CHECK (length(display_name) > 0)"));
-    assert!(sql.contains("DEFAULT CURRENT_TIMESTAMP"));
-    assert!(sql.contains("CREATE INDEX IF NOT EXISTS idx_schema_meta_children_1_display_name ON schema_meta_children_1 (display_name DESC) WHERE deleted_at IS NULL"));
+    let name_column = <SchemaMetaChild as ormer::Model>::column_schema()
+        .into_iter()
+        .find(|column| column.name == "display_name")
+        .expect("display_name column");
+    assert_eq!(name_column.index_where, Some("deleted_at IS NULL"));
 }
 
 #[cfg(feature = "sqlite")]
@@ -134,7 +136,8 @@ async fn sqlite_quoted_column_crud_roundtrip() -> Result<(), Box<dyn std::error:
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn sqlite_metadata_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+async fn sqlite_metadata_roundtrip_rejects_partial_index() -> Result<(), Box<dyn std::error::Error>>
+{
     let config = _test_common::sqlite_config();
     let db = _test_common::create_db_connection(&config).await?;
 
@@ -142,10 +145,19 @@ async fn sqlite_metadata_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     db.drop_table::<SchemaMetaParent>().execute().await.ok();
 
     db.create_table::<SchemaMetaParent>().execute().await?;
-    db.create_table::<SchemaMetaChild>().execute().await?;
-    db.validate_table::<SchemaMetaChild>().await?;
+    let error = db
+        .create_table::<SchemaMetaChild>()
+        .execute()
+        .await
+        .expect_err("SQLite create_table must reject partial index metadata");
+    assert!(matches!(
+        error,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: ormer::DbType::Sqlite,
+            feature: "partial index WHERE clauses",
+        }
+    ));
 
-    db.drop_table::<SchemaMetaChild>().execute().await?;
     db.drop_table::<SchemaMetaParent>().execute().await?;
 
     Ok(())

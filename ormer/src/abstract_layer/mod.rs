@@ -18,7 +18,7 @@ pub mod mssql_backend;
 pub mod duckdb_backend;
 
 #[cfg(feature = "clickhouse")]
-pub mod clickhouse_backend;
+pub(crate) mod clickhouse_backend;
 
 /// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
 pub mod common;

@@ -19,11 +19,13 @@ db.insert(&User {
 
 ### Insert with RETURNING
 
-Insert and return all inserted rows (PostgreSQL, SQLite):
+Insert and return all inserted rows (PostgreSQL, SQLite, MSSQL):
 
 ```rust
 let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
 ```
+
+`update().returning()` and `delete().returning()` support the same backends. MySQL does not support DML returning and returns `UnsupportedFeature`; use `execute()` first, then `find_by_id` or `select` when returned rows are needed.
 
 ### Batch Insert
 

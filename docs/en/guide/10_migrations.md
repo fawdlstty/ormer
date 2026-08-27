@@ -81,18 +81,24 @@ for migration in history {
 
 SQLite cannot add a foreign key after table creation; `MigrationStep::AddForeignKey` returns an error on SQLite.
 
-ClickHouse uses the native migration methods on `ClickHouseDatabase`:
+ClickHouse also uses the unified `Database` migration entry point:
 
 ```rust
-let db = ormer::ClickHouseDatabase::connect("http://localhost:8123?database=default")?;
-let pending = db.pending_migrations(&migrations).await?;
-let applied = db.apply_migrations(&migrations).await?;
+let db = ormer::Database::connect(
+    ormer::DbType::ClickHouse,
+    "http://localhost:8123?database=default",
+)
+.await?;
+
+let runner = db.migrations(&migrations);
+let pending = runner.pending().await?;
+let applied = runner.execute().await?;
 ```
 
 ClickHouse stores migration history in a `MergeTree` table and does not provide
 transactions or automatic rollback. Steps execute one at a time, so completed
-steps remain applied if a later step fails. The unified `Database::connect`
-entry point remains intentionally unavailable for ClickHouse.
+steps remain applied if a later step fails. Use `MigrationStep::Sql` for
+ClickHouse CREATE TABLE DDL that must specify an engine.
 
 `migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
 

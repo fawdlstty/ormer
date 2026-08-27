@@ -19,11 +19,13 @@ db.insert(&User {
 
 ### 插入并返回 (RETURNING)
 
-插入后返回所有插入的行数据（支持 PostgreSQL、SQLite）：
+插入后返回所有插入的行数据（支持 PostgreSQL、SQLite、MSSQL）：
 
 ```rust
 let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
 ```
+
+`update().returning()` 和 `delete().returning()` 支持同样的后端；MySQL 不支持 DML returning，会返回 `UnsupportedFeature`。需要 MySQL 返回数据时，先用 `execute()` 写入，再用 `find_by_id` 或 `select` 查询。
 
 ### 批量插入
 

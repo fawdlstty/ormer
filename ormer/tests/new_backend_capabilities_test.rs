@@ -13,13 +13,6 @@ struct ClickHouseCapabilityUser {
     nickname: Option<String>,
 }
 
-#[cfg(feature = "clickhouse")]
-#[derive(ormer::clickhouse::Row, serde::Serialize, serde::Deserialize)]
-struct ClickHouseNativeRow {
-    id: u64,
-    name: String,
-}
-
 #[test]
 #[cfg(feature = "duckdb")]
 fn duckdb_exposes_dialect_type_mapping() {
@@ -118,9 +111,9 @@ async fn duckdb_connection_pool_supports_crud_and_transactions()
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "clickhouse")]
-fn clickhouse_create_table_requires_and_renders_engine() {
+async fn clickhouse_create_table_without_engine_is_capability_gated() {
     let error = ormer::generate_create_table_sql::<ClickHouseCapabilityUser>(DbType::ClickHouse)
         .expect_err("ClickHouse tables require an explicit engine");
     assert!(matches!(
@@ -131,81 +124,49 @@ fn clickhouse_create_table_requires_and_renders_engine() {
         }
     ));
 
-    let sql = ormer::generate_clickhouse_create_table_sql::<ClickHouseCapabilityUser>(
-        "MergeTree ORDER BY (id)",
-    )
-    .unwrap();
-    assert!(sql.contains("CREATE TABLE IF NOT EXISTS clickhouse_capability_users"));
-    assert!(sql.contains("id Int64"));
-    assert!(sql.contains("name String"));
-    assert!(sql.contains("nickname Nullable(String)"));
-    assert!(sql.ends_with("ENGINE = MergeTree ORDER BY (id)"));
-
-    let named_sql =
-        ormer::generate_clickhouse_create_table_sql_with_name::<ClickHouseCapabilityUser>(
-            "MergeTree ORDER BY id",
-            Some("clickhouse_capability_users_archive"),
-        )
-        .unwrap();
-    assert!(named_sql.contains("clickhouse_capability_users_archive"));
-}
-
-#[test]
-#[cfg(feature = "clickhouse")]
-fn clickhouse_engine_clause_rejects_statement_terminators() {
-    let error = ormer::generate_clickhouse_create_table_sql::<ClickHouseCapabilityUser>(
-        "MergeTree ORDER BY (id); DROP TABLE users",
-    )
-    .expect_err("engine input must be a single clause");
-    assert!(matches!(error, OrmerError::Other { .. }));
-}
-
-#[test]
-#[cfg(feature = "clickhouse")]
-fn clickhouse_native_database_accepts_http_connection_string() {
-    ormer::ClickHouseDatabase::connect("http://localhost:8123?database=default&compression=1")
+    let db = ormer::Database::connect(DbType::ClickHouse, "http://localhost:8123")
+        .await
         .expect("ClickHouse client construction should not require a live server");
-}
-
-#[test]
-#[cfg(feature = "clickhouse")]
-fn clickhouse_native_typed_api_accepts_owned_rows() {
-    fn assert_api<
-        T: ormer::clickhouse::RowOwned + ormer::clickhouse::RowRead + ormer::clickhouse::RowWrite,
-    >() {
-    }
-
-    assert_api::<ClickHouseNativeRow>();
-    let db = ormer::ClickHouseDatabase::connect("http://localhost:8123")
-        .expect("ClickHouse client construction should not require a live server");
-    let _ = db.select::<ClickHouseNativeRow>("SELECT 1 AS id, 'Alice' AS name");
-    let _ = db.select_one::<ClickHouseNativeRow>("SELECT 1 AS id, 'Alice' AS name");
-    let _ = db.select_optional::<ClickHouseNativeRow>("SELECT 1 AS id, 'Alice' AS name");
-    let _ = db.select_stream::<ClickHouseNativeRow>("SELECT 1 AS id, 'Alice' AS name");
-    let _ = db.select_json_stream("SELECT 1 AS id");
-    let _ = db.insert_rows(
-        "clickhouse_capability_users",
-        [ClickHouseNativeRow {
-            id: 1,
-            name: "Alice".to_string(),
-        }],
-    );
-}
-
-#[tokio::test]
-#[cfg(feature = "clickhouse")]
-async fn clickhouse_connect_reports_unsupported_until_async_adapter_is_ready() {
-    let error = match ormer::Database::connect(DbType::ClickHouse, "http://localhost:8123").await {
-        Ok(_) => panic!("ClickHouse execution is intentionally capability-gated"),
-        Err(error) => error,
-    };
+    let error = db
+        .create_table::<ClickHouseCapabilityUser>()
+        .execute()
+        .await
+        .expect_err("ClickHouse create_table without engine metadata must be gated");
     assert!(matches!(
         error,
         OrmerError::UnsupportedFeature {
             backend: DbType::ClickHouse,
-            feature: "Database::connect",
+            feature: "CREATE TABLE without explicit ClickHouse engine settings",
         }
     ));
+}
+
+#[tokio::test]
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_unified_database_accepts_http_connection_string_and_raw_sql() {
+    let db = ormer::Database::connect(
+        DbType::ClickHouse,
+        "http://localhost:8123?database=default&compression=none",
+    )
+    .await
+    .expect("ClickHouse client construction should not require a live server");
+
+    assert!(matches!(&db, ormer::Database::ClickHouse(_)));
+
+    let select = db
+        .select_sql::<(i64, String)>(ormer::sql("SELECT 1 AS id, 'Alice' AS name"))
+        .collect::<Vec<(i64, String)>>();
+    drop(select);
+
+    let insert = db.execute_sql(ormer::sql(
+        "INSERT INTO clickhouse_capability_users (id, name) VALUES (1, 'Alice')",
+    ));
+    drop(insert);
+
+    let optimize = db.execute_sql(ormer::sql(
+        "OPTIMIZE TABLE clickhouse_capability_users FINAL",
+    ));
+    drop(optimize);
 }
 
 #[cfg(feature = "duckdb")]

@@ -203,6 +203,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
                         .collect(),
                 ))
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "Model insert on ClickHouse",
+            }),
         }
     }
 
@@ -264,6 +269,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsert
                     .execute()
                     .await
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "Model insert on ClickHouse",
+            }),
         }
     }
 }
@@ -411,6 +421,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 }
                 Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "conflict writes on ClickHouse",
+            }),
         }
     }
 
@@ -443,6 +458,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
             ConnectionWrapper::MSSQL(db) => db.insert_or_update_impl::<I::Model>(&refs).await,
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "conflict writes on ClickHouse",
+            }),
         }
     }
 }
@@ -545,6 +565,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
                 Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "conflict writes on ClickHouse",
+            }),
         }
     }
 
@@ -569,6 +594,8 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
         ConnectionWrapper::MSSQL(_) => DbType::MSSQL,
         #[cfg(feature = "duckdb")]
         ConnectionWrapper::DuckDB(_) => DbType::DuckDB,
+        #[cfg(feature = "clickhouse")]
+        ConnectionWrapper::ClickHouse(_) => DbType::ClickHouse,
     }
 }
 
@@ -595,6 +622,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
                 .map(|_| ()),
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "conflict writes on ClickHouse",
+            }),
         }
     }
 }
@@ -615,6 +647,9 @@ use super::super::mssql_backend;
 #[cfg(feature = "duckdb")]
 use super::super::duckdb_backend;
 
+#[cfg(feature = "clickhouse")]
+use super::super::clickhouse_backend;
+
 /// 连接包装器 - 包装各后端的 Database 实例
 #[allow(clippy::upper_case_acronyms)]
 enum ConnectionWrapper {
@@ -628,12 +663,24 @@ enum ConnectionWrapper {
     MSSQL(mssql_backend::Database),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::Database),
+    #[cfg(feature = "clickhouse")]
+    ClickHouse(clickhouse_backend::Database),
 }
 
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
+))]
 impl ConnectionWrapper {
     /// 检查连接是否有效
-    #[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse"
+    ))]
     async fn is_valid(&self) -> bool {
         match self {
             #[cfg(feature = "sqlite")]
@@ -646,6 +693,8 @@ impl ConnectionWrapper {
             ConnectionWrapper::MSSQL(db) => db.is_valid(),
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.is_valid().await,
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(db) => db.is_valid().await,
         }
     }
 }
@@ -654,7 +703,12 @@ impl ConnectionWrapper {
 ///
 /// 注意：对于 SQLite 后端，由于其嵌入式特性不支持多线程共享连接，
 /// 建议设置 max_size=1。如需并发支持，可考虑启用 MVCC 模式。
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
+))]
 pub struct ManualPool {
     /// 空闲连接队列
     idle_connections: Mutex<VecDeque<ConnectionWrapper>>,
@@ -668,7 +722,12 @@ pub struct ManualPool {
     connection_string: String,
 }
 
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse"
+))]
 impl ManualPool {
     /// 创建新的连接池
     fn new(db_type: DbType, connection_string: String, config: PoolConfig) -> Arc<Self> {
@@ -721,9 +780,10 @@ impl ManualPool {
                 Ok(ConnectionWrapper::DuckDB(db))
             }
             #[cfg(feature = "clickhouse")]
-            DbType::ClickHouse => Err(crate::ormer_error!(
-                "connection pools for ClickHouse are not implemented"
-            )),
+            DbType::ClickHouse => {
+                let db = clickhouse_backend::Database::connect(&self.connection_string)?;
+                Ok(ConnectionWrapper::ClickHouse(db))
+            }
         }
     }
 
@@ -910,9 +970,14 @@ impl PoolBuilder {
                 Ok(ConnectionPool::DuckDB(pool))
             }
             #[cfg(feature = "clickhouse")]
-            DbType::ClickHouse => Err(crate::ormer_error!(
-                "connection pools for ClickHouse are not implemented"
-            )),
+            DbType::ClickHouse => {
+                let pool =
+                    ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                if self.config.min_size > 0 {
+                    pool.maintain_min_connections().await;
+                }
+                Ok(ConnectionPool::ClickHouse(pool))
+            }
         }
     }
 }
@@ -1031,6 +1096,8 @@ pub enum ConnectionPool {
     MSSQL(Arc<ManualPool>),
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<ManualPool>),
+    #[cfg(feature = "clickhouse")]
+    ClickHouse(Arc<ManualPool>),
 }
 
 impl ConnectionPool {
@@ -1050,6 +1117,8 @@ impl ConnectionPool {
             ConnectionPool::MSSQL(_) => DbType::MSSQL,
             #[cfg(feature = "duckdb")]
             ConnectionPool::DuckDB(_) => DbType::DuckDB,
+            #[cfg(feature = "clickhouse")]
+            ConnectionPool::ClickHouse(_) => DbType::ClickHouse,
         }
     }
 
@@ -1105,6 +1174,15 @@ impl ConnectionPool {
                     _marker: PhantomData,
                 })
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionPool::ClickHouse(pool) => {
+                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                Ok(PooledConnection {
+                    inner: PooledConnectionInner::ClickHouse(pool.clone()),
+                    connection: Some(conn),
+                    _marker: PhantomData,
+                })
+            }
         }
     }
 }
@@ -1123,6 +1201,8 @@ enum PooledConnectionInner {
     MSSQL(Arc<ManualPool>),
     #[cfg(feature = "duckdb")]
     DuckDB(Arc<ManualPool>),
+    #[cfg(feature = "clickhouse")]
+    ClickHouse(Arc<ManualPool>),
 }
 
 impl PooledConnectionInner {
@@ -1144,6 +1224,8 @@ impl PooledConnectionInner {
             PooledConnectionInner::MSSQL(pool) => pool.return_connection(conn).await,
             #[cfg(feature = "duckdb")]
             PooledConnectionInner::DuckDB(pool) => pool.return_connection(conn).await,
+            #[cfg(feature = "clickhouse")]
+            PooledConnectionInner::ClickHouse(pool) => pool.return_connection(conn).await,
         }
     }
 }
@@ -1186,6 +1268,15 @@ impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
             ConnectionWrapper::DuckDB(db) => {
                 let (sql, params) = raw_sql.render(DbType::DuckDB)?;
                 db.select_raw::<T, C>(&sql, params).await
+            }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(db) => {
+                let rows = db
+                    .select_values(raw_sql, <T as FromRowValues>::row_columns())
+                    .await?;
+                rows.into_iter()
+                    .map(|values| <T as FromRowValues>::from_row_values(&values))
+                    .collect()
             }
         }
     }
@@ -1252,6 +1343,12 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => CreateTableExecutor::MSSQL(db.create_table::<T>()),
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => CreateTableExecutor::DuckDB(db.create_table::<T>()),
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => CreateTableExecutor::Unsupported {
+                backend: DbType::ClickHouse,
+                feature: "CREATE TABLE without explicit ClickHouse engine settings",
+                _marker: PhantomData,
+            },
         }
     }
 
@@ -1268,6 +1365,11 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.validate_table::<T>().await,
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "validate_table",
+            }),
         }
     }
 
@@ -1331,6 +1433,12 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::SelectExecutor::DuckDB(db.select::<T>())
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => super::unified::SelectExecutor::Unsupported {
+                backend: DbType::ClickHouse,
+                feature: "Model select on ClickHouse; use select_sql",
+                _marker: PhantomData,
+            },
         }
     }
 
@@ -1365,6 +1473,12 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::DeleteExecutor::DuckDB(db.delete::<T>())
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => super::unified::DeleteExecutor::Unsupported {
+                backend: DbType::ClickHouse,
+                feature: "row delete on ClickHouse",
+                _marker: PhantomData,
+            },
         }
     }
 
@@ -1387,6 +1501,12 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::UpdateExecutor::DuckDB(db.update::<T>())
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => super::unified::UpdateExecutor::Unsupported {
+                backend: DbType::ClickHouse,
+                feature: "row update on ClickHouse; use execute_sql",
+                _marker: PhantomData,
+            },
         }
     }
 
@@ -1415,6 +1535,14 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::RelatedSelectExecutor::DuckDB(db.related::<T, R>())
+            }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => {
+                super::unified::RelatedSelectExecutor::Unsupported {
+                    backend: DbType::ClickHouse,
+                    feature: "relation select on ClickHouse",
+                    _marker: PhantomData,
+                }
             }
         }
     }
@@ -1447,6 +1575,11 @@ impl<'a> PooledConnection<'a> {
                 let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::DuckDB(txn))
             }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::ClickHouse,
+                feature: "transactions on ClickHouse",
+            }),
         }
     }
 
@@ -1471,7 +1604,10 @@ impl<'a> PooledConnection<'a> {
         ) -> super::unified::TransactionFuture<'tx, R>,
     {
         let mut txn = self.begin().await?;
-        super::unified::apply_transaction_options(&mut txn, options).await?;
+        if let Err(err) = super::unified::apply_transaction_options(&mut txn, options).await {
+            let _ = txn.rollback().await;
+            return Err(err);
+        }
 
         match f(&mut txn).await {
             Ok(value) => {
@@ -1500,6 +1636,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => DropTableExecutor::MSSQL(db.drop_table::<T>()),
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => DropTableExecutor::DuckDB(db.drop_table::<T>()),
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(db) => DropTableExecutor::ClickHouse(db, PhantomData),
         }
     }
 
@@ -1539,6 +1677,11 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => {
                 let (sql, params) = raw_sql.render(DbType::DuckDB)?;
                 db.exec_raw(&sql, params).await
+            }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(db) => {
+                db.execute_sql(raw_sql).await?;
+                Ok(0)
             }
         }
     }
@@ -1650,6 +1793,14 @@ impl<'a> DbExecutor for PooledConnection<'a> {
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::GroupedSelectExecutor::DuckDB(db.select_column::<T, V>())
+            }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => {
+                super::unified::GroupedSelectExecutor::Unsupported {
+                    backend: DbType::ClickHouse,
+                    feature: "Model select_column on ClickHouse; use select_sql",
+                    _marker: PhantomData,
+                }
             }
         }
     }

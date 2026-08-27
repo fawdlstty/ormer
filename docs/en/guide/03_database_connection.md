@@ -7,7 +7,7 @@
 - MySQL
 - MSSQL
 - DuckDB (local connections, CRUD, transactions, raw SQL, streams, schema introspection, and connection pools)
-- ClickHouse (HTTP client, raw SQL, JSON queries, typed and streaming queries, health checks, engine-aware table creation, table drops, and schema introspection)
+- ClickHouse (HTTP client, unified raw SQL, typed raw queries, health checks, table drops, schema introspection, and migrations)
 
 ## Enable Features
 
@@ -44,19 +44,14 @@ ormer = { version = "0.2", features = ["sqlite"] }
 DuckDB can be used through `Database::connect(DbType::DuckDB, "app.duckdb")`.
 `Vec<i32>`, `Vec<i64>`, `Vec<Option<i64>>`, and `Vec<String>` fields map to
 DuckDB lists.
-ClickHouse uses the dedicated `ClickHouseDatabase` because the ClickHouse HTTP
-interface does not provide the transaction and dynamic `FromRowValues` row
-decoding contract required by the unified ORM executors. `ClickHouseDatabase`
-supports `execute_sql`, `select_json`, `select`, `select_one`, `select_optional`,
-`select_stream`, `select_json_stream`, `insert_rows`, `is_valid`,
-`create_table::<T>(engine)`, `drop_table::<T>()`, `generate_entities(schema)`, and native versioned migration
-methods `migration_history`, `pending_migrations`, and `apply_migrations`. `select`,
-`select_one`, and `insert_rows` use static row types derived with
-`ormer::clickhouse::Row` and Serde. Add `serde = { version = "1", features = ["derive"] }`
-to the application dependencies. Every ClickHouse table must specify an engine such
-as `MergeTree ORDER BY (id)`. ClickHouse DDL is not transactional, so native
-migrations execute one step at a time and do not automatically roll back earlier
-steps when a later step fails.
+ClickHouse is also used through `Database::connect(DbType::ClickHouse, "...")`.
+Use `execute_sql` and `select_sql<T>` for native operations. Transactions,
+relation writes, row updates, conflict writes, and `create_table::<T>()` without
+engine metadata return `UnsupportedFeature`. Every ClickHouse table must specify
+an engine such as `MergeTree ORDER BY (id)`; use `execute_sql(ormer::sql(...))`
+or `MigrationStep::Sql` for DDL that needs an engine. ClickHouse DDL is not
+transactional, so migration steps execute one at a time and do not automatically
+roll back earlier steps when a later step fails.
 
 ## Example
 
@@ -80,34 +75,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-ClickHouse native typed rows:
+ClickHouse unified raw SQL:
 
 ```rust
-#[derive(ormer::clickhouse::Row, serde::Serialize, serde::Deserialize)]
-struct Event {
-    id: u64,
+use ormer::{Database, DbType, ViewModel};
+
+#[derive(Debug, ViewModel)]
+struct EventStat {
+    id: i64,
     name: String,
 }
 
-let events: Vec<Event> = db.select("SELECT id, name FROM events").await?;
-db.insert_rows("events", [Event {
-    id: 1,
-    name: "created".to_string(),
-}])
-.await?;
-```
-
-ClickHouse native operation:
-
-```rust
-use ormer::ClickHouseDatabase;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ClickHouseDatabase::connect("http://localhost:8123?database=default")?;
-    db.execute_sql("SELECT 1").await?;
-    let rows = db.select_json("SELECT 1 AS id").await?;
-    assert_eq!(rows[0]["id"], 1);
+    let db = Database::connect(
+        DbType::ClickHouse,
+        "http://localhost:8123?database=default",
+    )
+    .await?;
+
+    db.execute_sql(ormer::sql(
+        "CREATE TABLE IF NOT EXISTS events (id Int64, name String) ENGINE = MergeTree ORDER BY (id)",
+    ))
+    .await?;
+    db.execute_sql(ormer::sql(
+        "INSERT INTO events (id, name) VALUES (1, 'created')",
+    ))
+    .await?;
+
+    let rows = db
+        .select_sql::<EventStat>(ormer::sql("SELECT id, name FROM events ORDER BY id"))
+        .collect::<Vec<EventStat>>()
+        .await?;
+    assert_eq!(rows[0].name, "created");
+
     Ok(())
 }
 ```

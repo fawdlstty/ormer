@@ -3109,6 +3109,24 @@ fn render_index_sql(
             "MySQL does not support partial index WHERE clauses"
         ));
     }
+    if where_clause.is_some() {
+        #[cfg(feature = "sqlite")]
+        if matches!(db_type, crate::abstract_layer::DbType::Sqlite) {
+            return Err(
+                crate::abstract_layer::common::common_helpers::unsupported_partial_index_where(
+                    db_type,
+                ),
+            );
+        }
+        #[cfg(feature = "duckdb")]
+        if matches!(db_type, crate::abstract_layer::DbType::DuckDB) {
+            return Err(
+                crate::abstract_layer::common::common_helpers::unsupported_partial_index_where(
+                    db_type,
+                ),
+            );
+        }
+    }
 
     let columns_sql = columns
         .iter()
@@ -3446,6 +3464,10 @@ where
 
 /// FromRowValues trait - 用于从一行中的多个值构建类型(如元组、Model)
 pub trait FromRowValues: Sized {
+    fn row_columns() -> Option<&'static [&'static str]> {
+        None
+    }
+
     fn from_row_values(values: &[Value]) -> crate::Result<Self>;
 }
 
@@ -3459,6 +3481,10 @@ where
 }
 
 impl<T: ViewModel> FromRowValues for T {
+    fn row_columns() -> Option<&'static [&'static str]> {
+        Some(Self::COLUMNS)
+    }
+
     fn from_row_values(values: &[Value]) -> crate::Result<Self> {
         T::from_row_values(values)
     }

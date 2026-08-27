@@ -9,10 +9,16 @@ use crate::query::filter_formatter::FilterFormatter;
     feature = "postgresql",
     feature = "sqlite",
     feature = "mysql",
-    feature = "duckdb"
+    feature = "duckdb",
+    feature = "mssql"
 ))]
 use crate::query::insert::InsertConflictAction;
-#[cfg(any(feature = "postgresql", feature = "sqlite", feature = "duckdb"))]
+#[cfg(any(
+    feature = "postgresql",
+    feature = "sqlite",
+    feature = "duckdb",
+    feature = "mssql"
+))]
 use crate::query::insert::InsertConflictTarget;
 use crate::query::insert::{InsertAssignment, InsertConflict, InsertValue};
 use crate::query::update::{UpdateAssignment, UpdateExpr, UpdateValue};
@@ -806,6 +812,20 @@ pub fn optimistic_lock_conflict<T: Model>() -> crate::OrmerError {
     }
 }
 
+pub fn unsupported_postgresql_array_value(db_type: DbType) -> crate::OrmerError {
+    crate::OrmerError::UnsupportedFeature {
+        backend: db_type,
+        feature: "PostgreSQL array values",
+    }
+}
+
+pub fn unsupported_partial_index_where(db_type: DbType) -> crate::OrmerError {
+    crate::OrmerError::UnsupportedFeature {
+        backend: db_type,
+        feature: "partial index WHERE clauses",
+    }
+}
+
 pub fn format_update_assignment(
     db_type: DbType,
     assignment: &UpdateAssignment,
@@ -1490,6 +1510,112 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
     }
 }
 
+#[cfg(feature = "mssql")]
+fn mssql_output_projection<T: Model>(source: &str) -> String {
+    T::COLUMNS
+        .iter()
+        .map(|column| quote_column_with_prefix(DbType::MSSQL, source, column))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(feature = "mssql")]
+fn first_marker_pos(sql: &str, markers: &[&str]) -> Option<usize> {
+    let lower = sql.to_ascii_lowercase();
+    markers
+        .iter()
+        .filter_map(|marker| lower.find(&marker.to_ascii_lowercase()))
+        .min()
+}
+
+#[cfg(feature = "mssql")]
+fn replace_mssql_output_clause(
+    sql: &str,
+    projection: &str,
+    tail_markers: &[&str],
+) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    let output_pos = lower.find(" output ")?;
+    let tail_pos = tail_markers
+        .iter()
+        .filter_map(|marker| {
+            lower[output_pos + " output ".len()..].find(&marker.to_ascii_lowercase())
+        })
+        .map(|pos| output_pos + " output ".len() + pos)
+        .min()?;
+    Some(format!(
+        "{} OUTPUT {}{}",
+        &sql[..output_pos],
+        projection,
+        &sql[tail_pos..]
+    ))
+}
+
+#[cfg(feature = "mssql")]
+fn insert_mssql_output_clause(sql: &str, projection: &str, tail_markers: &[&str]) -> String {
+    if let Some(rewritten) = replace_mssql_output_clause(sql, projection, tail_markers) {
+        return rewritten;
+    }
+
+    let Some(tail_pos) = first_marker_pos(sql, tail_markers) else {
+        return format!("{sql} OUTPUT {projection}");
+    };
+
+    format!(
+        "{} OUTPUT {}{}",
+        &sql[..tail_pos],
+        projection,
+        &sql[tail_pos..]
+    )
+}
+
+#[cfg(feature = "mssql")]
+pub fn mssql_insert_returning_sql<T: Model>(sql: &str) -> String {
+    if sql.trim_start().to_ascii_lowercase().starts_with("merge ") {
+        return insert_mssql_terminal_output_clause(sql, &mssql_output_projection::<T>("inserted"));
+    }
+
+    insert_mssql_output_clause(
+        sql,
+        &mssql_output_projection::<T>("inserted"),
+        &[" default values", " values "],
+    )
+}
+
+#[cfg(feature = "mssql")]
+pub fn mssql_update_returning_sql<T: Model>(sql: &str) -> String {
+    insert_mssql_output_clause(
+        sql,
+        &mssql_output_projection::<T>("inserted"),
+        &[" from ", " where "],
+    )
+}
+
+#[cfg(feature = "mssql")]
+pub fn mssql_delete_returning_sql<T: Model>(sql: &str) -> String {
+    insert_mssql_output_clause(sql, &mssql_output_projection::<T>("deleted"), &[" where "])
+}
+
+#[cfg(feature = "mssql")]
+fn insert_mssql_terminal_output_clause(sql: &str, projection: &str) -> String {
+    if let Some(rewritten) = replace_mssql_output_clause(sql, projection, &[";"]) {
+        return rewritten;
+    }
+
+    let trimmed_len = sql.trim_end().len();
+    if sql[..trimmed_len].ends_with(';') {
+        let semicolon_pos = sql[..trimmed_len].len() - 1;
+        return format!(
+            "{} OUTPUT {}{}",
+            &sql[..semicolon_pos],
+            projection,
+            &sql[semicolon_pos..]
+        );
+    }
+
+    format!("{sql} OUTPUT {projection}")
+}
+
 pub fn build_insert_statement<T: Model>(db_type: DbType, models: &[&T]) -> (String, Vec<Value>) {
     let columns = T::insert_columns();
     build_batch_insert_statement::<T>(
@@ -1696,9 +1822,8 @@ pub fn build_insert_statement_with_conflict<T: Model>(
     {
         #[cfg(feature = "mssql")]
         if matches!(db_type, DbType::MSSQL) {
-            return Err(crate::ormer_error!(
-                "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
-            ));
+            let statement = build_mssql_insert_conflict_statement::<T>(models, conflict)?;
+            return Ok((statement.sql, statement.params));
         }
         #[cfg(any(
             feature = "postgresql",
@@ -1981,6 +2106,157 @@ pub fn build_insert_statement_with_conflict_and_auto_increment_returning<T: Mode
 }
 
 #[cfg(feature = "mssql")]
+fn mssql_insert_conflict_unsupported(feature: &'static str) -> crate::OrmerError {
+    crate::OrmerError::UnsupportedFeature {
+        backend: DbType::MSSQL,
+        feature,
+    }
+}
+
+#[cfg(feature = "mssql")]
+pub fn build_mssql_insert_conflict_statement<T: Model>(
+    models: &[&T],
+    conflict: &InsertConflict,
+) -> crate::Result<InsertSqlStatement> {
+    let action = conflict.action.ok_or_else(|| {
+        crate::ormer_error!("insert conflict handling requires do_nothing, do_update, or set")
+    })?;
+
+    if conflict.target_filter.is_some() {
+        return Err(mssql_insert_conflict_unsupported(
+            "partial insert conflict targets",
+        ));
+    }
+    if conflict.update_filter.is_some() {
+        return Err(mssql_insert_conflict_unsupported(
+            "conditional insert conflict updates",
+        ));
+    }
+
+    let target_columns = match &conflict.target {
+        Some(InsertConflictTarget::Columns(columns)) if !columns.is_empty() => columns,
+        Some(InsertConflictTarget::Columns(_)) => {
+            return Err(crate::ormer_error!(
+                "on_conflict requires at least one conflict target column"
+            ));
+        }
+        Some(InsertConflictTarget::Constraint(_)) => {
+            return Err(mssql_insert_conflict_unsupported(
+                "named insert conflict constraints",
+            ));
+        }
+        None => {
+            return Err(mssql_insert_conflict_unsupported(
+                "insert conflict without column targets",
+            ));
+        }
+    };
+
+    let insert_columns = T::insert_columns();
+    if insert_columns.is_empty() {
+        return Err(mssql_insert_conflict_unsupported(
+            "insert conflict for default-only inserts",
+        ));
+    }
+
+    let insert_column_set = insert_columns.iter().copied().collect::<HashSet<_>>();
+    let auto_increment_columns = T::column_schema()
+        .iter()
+        .filter(|column| column.is_auto_increment)
+        .map(|column| column.name)
+        .collect::<HashSet<_>>();
+    for column in target_columns {
+        if !insert_column_set.contains(column) && auto_increment_columns.contains(column) {
+            return Err(mssql_insert_conflict_unsupported(
+                "insert conflict on auto-increment columns",
+            ));
+        }
+        if !insert_column_set.contains(column) {
+            return Err(crate::ormer_error!(
+                "Column {} not found on model {}",
+                column,
+                T::TABLE_NAME
+            ));
+        }
+    }
+
+    if matches!(action, InsertConflictAction::DoNothing) && !conflict.assignments.is_empty() {
+        return Err(crate::ormer_error!(
+            "do_nothing cannot be combined with set assignments"
+        ));
+    }
+    if matches!(action, InsertConflictAction::DoUpdate) && conflict.assignments.is_empty() {
+        return Err(crate::ormer_error!(
+            "do_update conflict handling requires at least one set assignment"
+        ));
+    }
+    if conflict.assignments.iter().any(|assignment| {
+        auto_increment_columns.contains(
+            T::column_name_for_field(&assignment.column).unwrap_or(assignment.column.as_str()),
+        )
+    }) {
+        return Err(mssql_insert_conflict_unsupported(
+            "updating auto-increment columns",
+        ));
+    }
+
+    let table_name = routed_table_name_for_models(DbType::MSSQL, models)?;
+    let columns = quote_column_list(DbType::MSSQL, &insert_columns);
+    let mut sql = format!(
+        "MERGE INTO {} AS target USING (VALUES ",
+        quote_qualified_identifier(DbType::MSSQL, &table_name)
+    );
+    let mut params = Vec::new();
+
+    for (idx, model) in models.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(", ");
+        }
+        let placeholders = placeholder_list(DbType::MSSQL, params.len() + 1, insert_columns.len());
+        sql.push_str(&format!("({placeholders})"));
+        params.extend(model.insert_values());
+    }
+
+    sql.push_str(&format!(") AS source ({columns}) ON "));
+    for (idx, column) in target_columns.iter().enumerate() {
+        if idx > 0 {
+            sql.push_str(" AND ");
+        }
+        sql.push_str(&format!(
+            "{} = {}",
+            quote_column_with_prefix(DbType::MSSQL, "target", column),
+            quote_column_with_prefix(DbType::MSSQL, "source", column)
+        ));
+    }
+
+    match action {
+        InsertConflictAction::DoNothing => {}
+        InsertConflictAction::DoUpdate => {
+            sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+            for (index, assignment) in conflict.assignments.iter().enumerate() {
+                if index > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format_upsert_update_assignment(
+                    DbType::MSSQL,
+                    assignment,
+                    &mut params,
+                ));
+            }
+        }
+    }
+
+    append_mssql_merge_insert_clause_for_columns(&mut sql, &insert_columns);
+    append_mssql_merge_auto_increment_output::<T>(&mut sql);
+
+    Ok(InsertSqlStatement {
+        sql,
+        params,
+        row_count: models.len(),
+    })
+}
+
+#[cfg(feature = "mssql")]
 pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>) {
     let columns = quote_column_list(DbType::MSSQL, T::COLUMNS);
     let col_count = T::COLUMNS.len();
@@ -2037,17 +2313,37 @@ pub fn append_mssql_merge_update_clause<T: Model>(sql: &mut String) {
 
 #[cfg(feature = "mssql")]
 pub fn append_mssql_merge_insert_clause<T: Model>(sql: &mut String) {
-    let columns = quote_column_list(DbType::MSSQL, T::COLUMNS);
+    append_mssql_merge_insert_clause_for_columns(sql, T::COLUMNS);
+}
+
+#[cfg(feature = "mssql")]
+fn append_mssql_merge_insert_clause_for_columns(sql: &mut String, columns: &[&str]) {
+    let columns_sql = quote_column_list(DbType::MSSQL, columns);
     sql.push_str(&format!(
-        " WHEN NOT MATCHED THEN INSERT ({columns}) VALUES ("
+        " WHEN NOT MATCHED THEN INSERT ({columns_sql}) VALUES ("
     ));
-    for (i, col_name) in T::COLUMNS.iter().enumerate() {
+    for (i, col_name) in columns.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
         sql.push_str(&quote_column_with_prefix(DbType::MSSQL, "source", col_name));
     }
     sql.push_str(");");
+}
+
+#[cfg(feature = "mssql")]
+fn append_mssql_merge_auto_increment_output<T: Model>(sql: &mut String) {
+    let Some(pk_col) = auto_increment_column::<T>() else {
+        return;
+    };
+
+    if sql.ends_with(';') {
+        sql.pop();
+    }
+    sql.push_str(&format!(
+        " OUTPUT {};",
+        quote_column_with_prefix(DbType::MSSQL, "inserted", pk_col)
+    ));
 }
 
 /// 收集批量插入的所有模型值

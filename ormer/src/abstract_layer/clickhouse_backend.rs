@@ -24,7 +24,7 @@ impl Database {
     /// The optional `database` query parameter is copied to the client
     /// configuration because the ClickHouse client replaces URL query
     /// parameters with request settings.
-    pub fn connect(connection_string: &str) -> crate::Result<Self> {
+    pub(crate) fn connect(connection_string: &str) -> crate::Result<Self> {
         let options = parse_connection_string(connection_string)?;
         let mut client = clickhouse::Client::default().with_url(options.url);
         if let Some(database) = options.database {
@@ -55,8 +55,19 @@ impl Database {
         Ok(Self { client })
     }
 
+    pub(crate) async fn select_values(
+        &self,
+        sql: impl IntoRawSql,
+        columns: Option<&[&str]>,
+    ) -> crate::Result<Vec<Vec<crate::model::Value>>> {
+        let rows = self.select_json(sql).await?;
+        rows.into_iter()
+            .map(|row| clickhouse_row_values(&row, columns))
+            .collect()
+    }
+
     /// Execute a raw ClickHouse statement without bound parameters.
-    pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<()> {
+    pub(crate) async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<()> {
         let sql = sql.into_raw_sql();
         let (sql, params) = sql.render(crate::abstract_layer::DbType::ClickHouse)?;
 
@@ -79,7 +90,10 @@ impl Database {
     /// This backend-native dynamic API stays separate from the unified ORM
     /// executors because ClickHouse row decoding requires a static
     /// `clickhouse::Row` type.
-    pub async fn select_json(&self, sql: impl IntoRawSql) -> crate::Result<Vec<serde_json::Value>> {
+    pub(crate) async fn select_json(
+        &self,
+        sql: impl IntoRawSql,
+    ) -> crate::Result<Vec<serde_json::Value>> {
         let sql = sql.into_raw_sql();
         let (sql, params) = sql.render(crate::abstract_layer::DbType::ClickHouse)?;
 
@@ -111,7 +125,7 @@ impl Database {
 
     /// Execute a SELECT query and decode rows using ClickHouse's native
     /// RowBinary decoder.
-    pub async fn select<T>(&self, sql: impl IntoRawSql) -> crate::Result<Vec<T>>
+    pub(crate) async fn select<T>(&self, sql: impl IntoRawSql) -> crate::Result<Vec<T>>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
     {
@@ -133,7 +147,7 @@ impl Database {
     }
 
     /// Execute a SELECT query and return a streaming RowBinary cursor.
-    pub fn select_stream<T>(
+    pub(crate) fn select_stream<T>(
         &self,
         sql: impl IntoRawSql,
     ) -> crate::Result<clickhouse::query::RowCursor<T>>
@@ -152,7 +166,7 @@ impl Database {
     }
 
     /// Execute a SELECT query and return a streaming JSONEachRow cursor.
-    pub fn select_json_stream(
+    pub(crate) fn select_json_stream(
         &self,
         sql: impl IntoRawSql,
     ) -> crate::Result<clickhouse::query::BytesCursor> {
@@ -168,7 +182,7 @@ impl Database {
     }
 
     /// Execute a SELECT query and return at most one row.
-    pub async fn select_optional<T>(&self, sql: impl IntoRawSql) -> crate::Result<Option<T>>
+    pub(crate) async fn select_optional<T>(&self, sql: impl IntoRawSql) -> crate::Result<Option<T>>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
     {
@@ -185,7 +199,7 @@ impl Database {
 
     /// Execute a SELECT query and decode one row using ClickHouse's native
     /// RowBinary decoder.
-    pub async fn select_one<T>(&self, sql: impl IntoRawSql) -> crate::Result<T>
+    pub(crate) async fn select_one<T>(&self, sql: impl IntoRawSql) -> crate::Result<T>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
     {
@@ -207,7 +221,7 @@ impl Database {
     }
 
     /// Insert typed rows using ClickHouse's native RowBinary protocol.
-    pub async fn insert_rows<T, I>(&self, table: &str, rows: I) -> crate::Result<()>
+    pub(crate) async fn insert_rows<T, I>(&self, table: &str, rows: I) -> crate::Result<()>
     where
         T: clickhouse::RowOwned + clickhouse::RowWrite,
         I: IntoIterator<Item = T>,
@@ -235,12 +249,12 @@ impl Database {
     }
 
     /// Check whether the ClickHouse endpoint accepts a trivial query.
-    pub async fn is_valid(&self) -> bool {
+    pub(crate) async fn is_valid(&self) -> bool {
         self.select_json("SELECT 1").await.is_ok()
     }
 
     /// Generate and execute a ClickHouse CREATE TABLE statement.
-    pub async fn create_table<T: crate::model::WritableModel>(
+    pub(crate) async fn create_table<T: crate::model::WritableModel>(
         &self,
         engine: &str,
     ) -> crate::Result<()> {
@@ -249,7 +263,7 @@ impl Database {
     }
 
     /// Drop a model table if it exists.
-    pub async fn drop_table<T: crate::model::WritableModel>(&self) -> crate::Result<()> {
+    pub(crate) async fn drop_table<T: crate::model::WritableModel>(&self) -> crate::Result<()> {
         let table = crate::model::quote_qualified_identifier(
             crate::abstract_layer::DbType::ClickHouse,
             T::table_name_for_db(crate::abstract_layer::DbType::ClickHouse),
@@ -264,7 +278,7 @@ impl Database {
     ///
     /// ClickHouse databases are treated as the schema selector. When omitted,
     /// the database configured on this client is used.
-    pub async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
+    pub(crate) async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
         let tables = self.db_first_tables(schema).await?;
         Ok(crate::db_first::generate_entities(
             crate::abstract_layer::DbType::ClickHouse,
@@ -350,7 +364,7 @@ impl Database {
     }
 
     /// Read the native ClickHouse migration history table.
-    pub async fn migration_history(&self) -> crate::Result<Vec<MigrationInfo>> {
+    pub(crate) async fn migration_history(&self) -> crate::Result<Vec<MigrationInfo>> {
         self.ensure_migration_table().await?;
         let table = crate::model::quote_identifier(
             crate::abstract_layer::DbType::ClickHouse,
@@ -365,7 +379,7 @@ impl Database {
     }
 
     /// Return migrations that are not present in ClickHouse's history table.
-    pub async fn pending_migrations<M: Migration>(
+    pub(crate) async fn pending_migrations<M: Migration>(
         &self,
         migrations: &[M],
     ) -> crate::Result<Vec<MigrationInfo>> {
@@ -408,7 +422,10 @@ impl Database {
     ///
     /// ClickHouse DDL is not transactional. If a later step fails, earlier
     /// steps remain applied and the migration is not recorded as complete.
-    pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> crate::Result<usize> {
+    pub(crate) async fn apply_migrations<M: Migration>(
+        &self,
+        migrations: &[M],
+    ) -> crate::Result<usize> {
         let pending = self.pending_migrations(migrations).await?;
         if pending.is_empty() {
             return Ok(0);
@@ -457,6 +474,149 @@ impl Database {
              ENGINE = MergeTree ORDER BY version"
         )))
         .await
+    }
+}
+
+fn clickhouse_row_values(
+    row: &serde_json::Value,
+    columns: Option<&[&str]>,
+) -> crate::Result<Vec<crate::model::Value>> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| crate::ormer_error!("ClickHouse row is not a JSON object"))?;
+    let Some(columns) = columns else {
+        if object.len() == 1 {
+            return Ok(vec![clickhouse_json_value(
+                object.values().next().expect("length checked"),
+            )?]);
+        }
+        return Err(crate::ormer_error!(
+            "ClickHouse raw SQL requires a single-column result or a ViewModel/Model target"
+        ));
+    };
+
+    columns
+        .iter()
+        .map(|column| {
+            object
+                .get(*column)
+                .map(clickhouse_json_value)
+                .transpose()?
+                .ok_or_else(|| crate::ormer_error!("Missing ClickHouse column: {column}"))
+        })
+        .collect()
+}
+
+fn clickhouse_json_value(value: &serde_json::Value) -> crate::Result<crate::model::Value> {
+    use crate::model::Value;
+    use serde_json::Value as Json;
+
+    match value {
+        Json::Null => Ok(Value::Null),
+        Json::Bool(value) => Ok(Value::Boolean(*value)),
+        Json::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                Ok(Value::BigInt(value as i128))
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Real(value))
+            } else {
+                Ok(Value::Decimal(value.to_string()))
+            }
+        }
+        Json::String(value) => Ok(Value::Text(value.clone())),
+        Json::Array(values) => {
+            let values = values
+                .iter()
+                .map(clickhouse_json_value)
+                .collect::<crate::Result<Vec<_>>>()?;
+            let contains_null = values.iter().any(|value| matches!(value, Value::Null));
+            if values
+                .iter()
+                .all(|value| matches!(value, Value::Integer(_) | Value::BigInt(_) | Value::Null))
+            {
+                let integers = values
+                    .iter()
+                    .map(|value| match value {
+                        Value::Integer(value) => Ok(Some(i64::from(*value))),
+                        Value::BigInt(value) => i64::try_from(*value).map(Some).map_err(|_| {
+                            crate::ormer_error!(
+                                "ClickHouse integer array value is out of i64 range"
+                            )
+                        }),
+                        Value::Null => Ok(None),
+                        _ => unreachable!("integer array checked"),
+                    })
+                    .collect::<crate::Result<Vec<Option<i64>>>>()?;
+                if !contains_null
+                    && integers
+                        .iter()
+                        .all(|value| i32::try_from(value.expect("non-null checked")).is_ok())
+                {
+                    return Ok(Value::IntegerArray(
+                        integers
+                            .into_iter()
+                            .map(|value| value.expect("non-null checked") as i32)
+                            .collect(),
+                    ));
+                }
+                return Ok(Value::NullableBigIntArray(integers));
+            }
+            if values.iter().all(|value| matches!(value, Value::Text(_))) {
+                return Ok(Value::TextArray(
+                    values
+                        .into_iter()
+                        .map(|value| match value {
+                            Value::Text(value) => value,
+                            _ => unreachable!(" text array checked"),
+                        })
+                        .collect(),
+                ));
+            }
+            Ok(Value::Json(serde_json::Value::Array(
+                values.into_iter().map(model_value_to_json).collect(),
+            )))
+        }
+        Json::Object(value) => Ok(Value::Json(serde_json::Value::Object(value.clone()))),
+    }
+}
+
+fn model_value_to_json(value: crate::model::Value) -> serde_json::Value {
+    use crate::model::Value;
+
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Integer(value) => serde_json::Value::from(value),
+        Value::BigInt(value) => serde_json::Value::String(value.to_string()),
+        Value::Duration(value) => serde_json::Value::from(value.as_micros() as u64),
+        Value::Text(value) => serde_json::Value::from(value),
+        Value::TextArray(value) => {
+            serde_json::Value::Array(value.into_iter().map(serde_json::Value::from).collect())
+        }
+        Value::Real(value) => serde_json::Value::from(value),
+        Value::Decimal(value) | Value::BigDecimal(value) => serde_json::Value::from(value),
+        Value::Boolean(value) => serde_json::Value::from(value),
+        Value::Bytes(value) => {
+            serde_json::Value::Array(value.into_iter().map(serde_json::Value::from).collect())
+        }
+        Value::IntegerArray(value) => {
+            serde_json::Value::Array(value.into_iter().map(serde_json::Value::from).collect())
+        }
+        Value::BigIntArray(value) => {
+            serde_json::Value::Array(value.into_iter().map(serde_json::Value::from).collect())
+        }
+        Value::NullableBigIntArray(value) => serde_json::Value::Array(
+            value
+                .into_iter()
+                .map(|value| value.map_or(serde_json::Value::Null, serde_json::Value::from))
+                .collect(),
+        ),
+        Value::DateTime(value) => serde_json::Value::from(value.to_rfc3339()),
+        Value::Date(value) => serde_json::Value::from(value.to_string()),
+        Value::Time(value) => serde_json::Value::from(value.to_string()),
+        Value::Json(value) => value,
+        Value::Uuid(value) => serde_json::Value::from(value.to_string()),
     }
 }
 
