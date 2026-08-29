@@ -173,6 +173,50 @@ macro_rules! __ormer_backend_select_methods {
             }
         }
 
+        pub fn fields<F, G>(self, f: F) -> Self
+        where
+            F: FnOnce(T::Where) -> G,
+            G: $crate::query::builder::GroupByColumns,
+        {
+            Self {
+                select: self.select.fields(f),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn query(self, query: impl Into<String>) -> Self {
+            Self {
+                select: self.select.query(query),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn mode(self, mode: $crate::query::filter::FullTextMode) -> Self {
+            Self {
+                select: self.select.mode(mode),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn language(self, language: impl Into<String>) -> Self {
+            Self {
+                select: self.select.language(language),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn rank(self, rank: $crate::query::filter::FullTextRank) -> Self {
+            Self {
+                select: self.select.rank(rank),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
             Self {
                 select: self.select.with_table_route(route),
@@ -504,7 +548,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.filter(f))
+                    }
                 }
             }
 
@@ -531,7 +577,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.append_filter_expr(expr))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.append_filter_expr(expr))
+                    }
                 }
             }
 
@@ -561,7 +609,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.with_context_filters(filters))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.with_context_filters(filters))
+                    }
                 }
             }
 
@@ -584,7 +634,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.without_filter(name))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.without_filter(name))
+                    }
                 }
             }
 
@@ -606,7 +658,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter_dynamic(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.filter_dynamic(f))
+                    }
                 }
             }
 
@@ -637,7 +691,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.route_table(key, value))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.route_table(key, value))
+                    }
                 }
             }
 
@@ -664,7 +720,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.with_table_route(route))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.with_table_route(route))
+                    }
                 }
             }
 
@@ -687,7 +745,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.order_by(f))
+                    }
                 }
             }
 
@@ -710,7 +770,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by_desc(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.order_by_desc(f))
+                    }
                 }
             }
 
@@ -736,7 +798,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.order_by_dynamic(f))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.order_by_dynamic(f))
+                    }
                 }
             }
 
@@ -759,7 +823,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.cursor_by(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.cursor_by(f))
+                    }
                 }
             }
 
@@ -781,7 +847,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.after(cursor)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.after(cursor))
+                    }
                 }
             }
 
@@ -803,7 +871,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.before(cursor)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.before(cursor))
+                    }
                 }
             }
 
@@ -822,7 +892,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.limit(limit)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.limit(limit))
+                    }
                 }
             }
 
@@ -841,7 +913,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.range(range))
+                    }
                 }
             }
 
@@ -872,7 +946,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.descendants(f, root_id))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.descendants(f, root_id))
+                    }
                 }
             }
 
@@ -903,7 +979,9 @@ macro_rules! impl_unified_select_executor_methods {
                         $executor_name::DuckDB(exec.ancestors(f, leaf_id))
                     }
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.ancestors(f, leaf_id))
+                    }
                 }
             }
 
@@ -923,9 +1001,10 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.fetch_page().await,
                     #[cfg(feature = "clickhouse")]
-                    $executor_name::Unsupported {
-                        backend, feature, ..
-                    } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
+                    $executor_name::ClickHouse(db, select) => {
+                        $crate::abstract_layer::common::unified::clickhouse_fetch_page(db, select)
+                            .await
+                    }
                 }
             }
 
@@ -943,7 +1022,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.distinct()),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.distinct())
+                    }
                 }
             }
 
@@ -964,7 +1045,9 @@ macro_rules! impl_unified_select_executor_methods {
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.ignore(f)),
                     #[cfg(feature = "clickhouse")]
-                    unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                    $executor_name::ClickHouse(db, select) => {
+                        $executor_name::ClickHouse(db, select.ignore(f))
+                    }
                 }
             }
         }
@@ -1434,6 +1517,13 @@ macro_rules! impl_unified_collect_future {
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(future.into_future()),
+                    #[cfg(feature = "clickhouse")]
+                    $future_name::ClickHouse(db, select, _) => Box::pin(async move {
+                        $crate::abstract_layer::common::unified::clickhouse_select_models(
+                            db, select,
+                        )
+                        .await
+                    }),
                     #[cfg(feature = "clickhouse")]
                     $future_name::Unsupported {
                         backend, feature, ..

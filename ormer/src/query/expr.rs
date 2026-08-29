@@ -1,6 +1,6 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers::placeholder;
-use crate::model::{Value, quote_column_reference, quote_identifier};
+use crate::model::{Value, quote_column_reference, quote_identifier, quote_sql_literal};
 use std::marker::PhantomData;
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,15 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         path: Vec<String>,
     },
+    JsonPathValue {
+        expr: Box<SqlExpr>,
+        path: Vec<String>,
+        value_type: JsonScalarKind,
+    },
+    JsonPathExists {
+        expr: Box<SqlExpr>,
+        path: Vec<String>,
+    },
     JsonContains {
         left: Box<SqlExpr>,
         right: Box<SqlExpr>,
@@ -52,6 +61,10 @@ pub enum SqlExpr {
         expr: Box<SqlExpr>,
         path: Vec<String>,
         value: Box<SqlExpr>,
+    },
+    JsonRemove {
+        expr: Box<SqlExpr>,
+        path: Vec<String>,
     },
     ArrayContains {
         left: Box<SqlExpr>,
@@ -64,13 +77,174 @@ pub enum SqlExpr {
     ArrayLen {
         expr: Box<SqlExpr>,
     },
+    WindowFunction {
+        function: &'static str,
+        args: Vec<SqlExpr>,
+        over: WindowSpec,
+    },
+    DateTrunc {
+        expr: Box<SqlExpr>,
+        unit: TimeUnit,
+    },
+    DatePart {
+        expr: Box<SqlExpr>,
+        part: TimePart,
+    },
+    AtTimeZone {
+        expr: Box<SqlExpr>,
+        timezone: String,
+    },
+    DateAdd {
+        expr: Box<SqlExpr>,
+        unit: TimeUnit,
+        amount: Box<SqlExpr>,
+        negative: bool,
+    },
+    DateDiff {
+        left: Box<SqlExpr>,
+        right: Box<SqlExpr>,
+        part: TimePart,
+    },
+    Now,
     Row(Vec<SqlExpr>),
     Raw(RawSqlExpr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimePart {
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl TimeUnit {
+    fn pg_name(self) -> &'static str {
+        match self {
+            Self::Second => "second",
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    fn clickhouse_interval(self) -> &'static str {
+        match self {
+            Self::Second => "toIntervalSecond",
+            Self::Minute => "toIntervalMinute",
+            Self::Hour => "toIntervalHour",
+            Self::Day => "toIntervalDay",
+            Self::Week => "toIntervalWeek",
+            Self::Month => "toIntervalMonth",
+            Self::Year => "toIntervalYear",
+        }
+    }
+
+    fn sqlite_format(self) -> &'static str {
+        match self {
+            Self::Second => "%Y-%m-%d %H:%M:%S",
+            Self::Minute => "%Y-%m-%d %H:%M:00",
+            Self::Hour => "%Y-%m-%d %H:00:00",
+            Self::Day => "%Y-%m-%d 00:00:00",
+            Self::Week => "%Y-%m-%d 00:00:00",
+            Self::Month => "%Y-%m-01 00:00:00",
+            Self::Year => "%Y-01-01 00:00:00",
+        }
+    }
+}
+
+impl TimePart {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Second => "second",
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Year => "year",
+        }
+    }
+
+    fn name_upper(self) -> &'static str {
+        match self {
+            Self::Second => "SECOND",
+            Self::Minute => "MINUTE",
+            Self::Hour => "HOUR",
+            Self::Day => "DAY",
+            Self::Week => "WEEK",
+            Self::Month => "MONTH",
+            Self::Year => "YEAR",
+        }
+    }
+
+    fn sqlite_format(self) -> &'static str {
+        match self {
+            Self::Second => "%S",
+            Self::Minute => "%M",
+            Self::Hour => "%H",
+            Self::Day => "%d",
+            Self::Week => "%W",
+            Self::Month => "%m",
+            Self::Year => "%Y",
+        }
+    }
+
+    fn epoch_divisor(self) -> f64 {
+        match self {
+            Self::Second => 1.0,
+            Self::Minute => 60.0,
+            Self::Hour => 3600.0,
+            Self::Day => 86400.0,
+            Self::Week => 604800.0,
+            Self::Month => 2629746.0,
+            Self::Year => 31556952.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RawSqlExpr {
     segments: Vec<RawExprSegment>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonScalarKind {
+    Boolean,
+    Integer,
+    Real,
+    String,
+    Json,
+}
+
+impl JsonScalarKind {
+    fn sql_type(self) -> &'static str {
+        match self {
+            Self::Boolean => "BOOLEAN",
+            Self::Integer => "BIGINT",
+            Self::Real => "DOUBLE PRECISION",
+            Self::String => "TEXT",
+            Self::Json => "JSONB",
+        }
+    }
+
 }
 
 #[derive(Debug, Clone)]
@@ -122,10 +296,74 @@ pub trait IntoTypedExpr {
     fn into_typed_expr(self) -> TypedExpr<Self::Output>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TypedExpr<T, S = ()> {
     pub(crate) expr: SqlExpr,
     _marker: PhantomData<(T, S)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NowExpr;
+
+#[derive(Debug, Clone, Copy)]
+pub struct IntervalExpr {
+    amount: i64,
+    unit: TimeUnit,
+}
+
+impl std::ops::Add<IntervalExpr> for NowExpr {
+    type Output = TypedExpr<chrono::NaiveDateTime>;
+
+    fn add(self, rhs: IntervalExpr) -> Self::Output {
+        TypedExpr::new(SqlExpr::DateAdd {
+            expr: Box::new(SqlExpr::Now),
+            unit: rhs.unit,
+            amount: Box::new(SqlExpr::Value(Value::BigInt(rhs.amount.into()))),
+            negative: false,
+        })
+    }
+}
+
+impl std::ops::Sub<IntervalExpr> for NowExpr {
+    type Output = TypedExpr<chrono::NaiveDateTime>;
+
+    fn sub(self, rhs: IntervalExpr) -> Self::Output {
+        TypedExpr::new(SqlExpr::DateAdd {
+            expr: Box::new(SqlExpr::Now),
+            unit: rhs.unit,
+            amount: Box::new(SqlExpr::Value(Value::BigInt(rhs.amount.into()))),
+            negative: true,
+        })
+    }
+}
+
+pub fn now() -> NowExpr {
+    NowExpr
+}
+
+pub fn days(amount: i64) -> IntervalExpr {
+    IntervalExpr { amount, unit: TimeUnit::Day }
+}
+
+pub fn hours(amount: i64) -> IntervalExpr {
+    IntervalExpr { amount, unit: TimeUnit::Hour }
+}
+
+pub fn minutes(amount: i64) -> IntervalExpr {
+    IntervalExpr { amount, unit: TimeUnit::Minute }
+}
+
+pub fn seconds(amount: i64) -> IntervalExpr {
+    IntervalExpr { amount, unit: TimeUnit::Second }
+}
+
+impl<T, S> Clone for TypedExpr<T, S> {
+    fn clone(&self) -> Self {
+        Self {
+            expr: self.expr.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +502,18 @@ impl<T, S> IntoSqlExpr for TypedExpr<T, S> {
 impl IntoSqlExpr for SqlExpr {
     fn into_sql_expr(self) -> SqlExpr {
         self
+    }
+}
+
+impl IntoSqlExpr for NowExpr {
+    fn into_sql_expr(self) -> SqlExpr {
+        SqlExpr::Now
+    }
+}
+
+impl IntoSqlExpr for IntervalExpr {
+    fn into_sql_expr(self) -> SqlExpr {
+        SqlExpr::Value(Value::BigInt(self.amount.into()))
     }
 }
 
@@ -573,11 +823,35 @@ impl SqlExpr {
                 }
                 sql.push(')');
                 if let Some(filter) = filter {
-                    let filter_sql = crate::query::filter_formatter::FilterFormatter::new(db_type)
-                        .format(filter, param_idx, params);
-                    sql.push_str(" FILTER (WHERE ");
-                    sql.push_str(&filter_sql);
-                    sql.push(')');
+                    if aggregate_filter_native(db_type) {
+                        let filter_sql =
+                            crate::query::filter_formatter::FilterFormatter::new(db_type)
+                                .format(filter, param_idx, params);
+                        sql.push_str(" FILTER (WHERE ");
+                        sql.push_str(&filter_sql);
+                        sql.push(')');
+                    } else {
+                        sql.clear();
+                        sql.push_str(name);
+                        sql.push('(');
+                        let condition =
+                            crate::query::filter_formatter::FilterFormatter::new(db_type)
+                                .format(filter, param_idx, params);
+                        let argument = expr.to_sql(db_type, param_idx, params, table_prefix);
+                        if *name == "COUNT" {
+                            sql.clear();
+                            sql.push_str("COUNT(CASE WHEN ");
+                            sql.push_str(&condition);
+                            sql.push_str(" THEN 1 END)");
+                        } else {
+                            sql.push_str("CASE WHEN ");
+                            sql.push_str(&condition);
+                            sql.push_str(" THEN ");
+                            sql.push_str(&argument);
+                            sql.push_str(" END");
+                            sql.push(')');
+                        }
+                    }
                 }
                 if let Some(over) = over {
                     sql.push_str(" OVER (");
@@ -711,6 +985,149 @@ impl SqlExpr {
                     ),
                 }
             }
+            SqlExpr::JsonPathValue {
+                expr,
+                path,
+                value_type,
+            } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        if *value_type == JsonScalarKind::String {
+                            format!("{} #>> {}", expr_sql, quote_pg_text_path(path))
+                        } else {
+                            format!(
+                                "({} #> {})::{}",
+                                expr_sql,
+                                quote_pg_text_path(path),
+                                value_type.sql_type()
+                            )
+                        }
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => match value_type {
+                        JsonScalarKind::String => format!(
+                            "JSON_UNQUOTE(JSON_EXTRACT({}, {}))",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        ),
+                        JsonScalarKind::Integer => format!(
+                            "CAST(JSON_EXTRACT({}, {}) AS SIGNED)",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        ),
+                        JsonScalarKind::Real => format!(
+                            "CAST(JSON_EXTRACT({}, {}) AS DOUBLE)",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        ),
+                        JsonScalarKind::Boolean | JsonScalarKind::Json => {
+                            format!("JSON_EXTRACT({}, {})", expr_sql, quote_json_path_parts(path))
+                        }
+                    },
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        format!(
+                            "json_extract({}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        )
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => match value_type {
+                        JsonScalarKind::Boolean => format!("JSON_QUERY({}, {})", expr_sql, quote_json_path_parts(path)),
+                        JsonScalarKind::String => {
+                            format!("JSON_VALUE({}, {})", expr_sql, quote_json_path_parts(path))
+                        }
+                        _ => format!(
+                            "TRY_CAST(JSON_VALUE({}, {}) AS {})",
+                            expr_sql,
+                            quote_json_path_parts(path),
+                            value_type.sql_type()
+                        ),
+                    },
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => {
+                        let kind = match value_type {
+                            JsonScalarKind::Boolean => "Bool",
+                            JsonScalarKind::Integer => "Int64",
+                            JsonScalarKind::Real => "Float64",
+                            JsonScalarKind::String => "String",
+                            JsonScalarKind::Json => "String",
+                        };
+                        format!(
+                            "JSONExtract({}{}, '{}')",
+                            expr_sql,
+                            path.iter().fold(String::new(), |mut sql, key| {
+                                sql.push_str(", '");
+                                sql.push_str(&key.replace('\'', "''"));
+                                sql.push('\'');
+                                sql
+                            }),
+                            kind
+                        )
+                    }
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => match value_type {
+                        JsonScalarKind::String => format!(
+                            "json_extract_string({}, {})",
+                            expr_sql,
+                            quote_json_path_parts(path)
+                        ),
+                        _ => format!(
+                            "CAST(json_extract({}, {}) AS {})",
+                            expr_sql,
+                            quote_json_path_parts(path),
+                            value_type.sql_type()
+                        ),
+                    },
+                }
+            }
+            SqlExpr::JsonPathExists { expr, path } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        format!("({} #> {}) IS NOT NULL", expr_sql, quote_pg_text_path(path))
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!(
+                        "JSON_CONTAINS_PATH({}, 'one', {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!(
+                        "json_type({}, {}) IS NOT NULL",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!(
+                        "JSON_PATH_EXISTS({}, {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!(
+                        "JSONHas({}{})",
+                        expr_sql,
+                        path.iter().fold(String::new(), |mut sql, key| {
+                            sql.push_str(", '");
+                            sql.push_str(&key.replace('\'', "''"));
+                            sql.push('\'');
+                            sql
+                        })
+                    ),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!(
+                        "json_exists({}, {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                }
+            }
             SqlExpr::JsonContains { left, right } => match db_type {
                 #[cfg(feature = "postgresql")]
                 DbType::PostgreSQL => {
@@ -811,6 +1228,43 @@ impl SqlExpr {
                     DbType::DuckDB => format!("list_has_all({}, {})", left_sql, right_sql),
                 }
             }
+            SqlExpr::JsonRemove { expr, path } => {
+                let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        format!("{} #- {}", expr_sql, quote_pg_text_path(path))
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!(
+                        "JSON_REMOVE({}, {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!(
+                        "json_remove({}, {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!(
+                        "JSON_MODIFY({}, {}, NULL)",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => {
+                        "0 = 1 /* OrmerError::UnsupportedFeature: JSON updates */".to_string()
+                    }
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!(
+                        "json_remove({}, {})",
+                        expr_sql,
+                        quote_json_path_parts(path)
+                    ),
+                }
+            }
             SqlExpr::ArrayOverlaps { left, right } => {
                 let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
                 let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
@@ -852,6 +1306,175 @@ impl SqlExpr {
                     DbType::DuckDB => format!("length({})", expr_sql),
                 }
             }
+            SqlExpr::WindowFunction {
+                function,
+                args,
+                over,
+            } => {
+                let arguments = args
+                    .iter()
+                    .map(|arg| arg.to_sql(db_type, param_idx, params, table_prefix))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut sql = format!("{function}({arguments}) OVER (");
+                let mut parts = Vec::new();
+                if !over.partition_by.is_empty() {
+                    parts.push(format!(
+                        "PARTITION BY {}",
+                        over.partition_by
+                            .iter()
+                            .map(|expr| expr.to_sql(db_type, param_idx, params, table_prefix))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if !over.order_by.is_empty() {
+                    parts.push(format!(
+                        "ORDER BY {}",
+                        over.order_by
+                            .iter()
+                            .map(|order| {
+                                order.to_sql_with_params(
+                                    db_type,
+                                    param_idx,
+                                    params,
+                                    table_prefix,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                sql.push_str(&parts.join(" "));
+                sql.push(')');
+                sql
+            }
+            SqlExpr::DateTrunc { expr, unit } => {
+                let value = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("date_trunc('{}', {})", unit.pg_name(), value),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => match unit {
+                        TimeUnit::Second => format!("DATE_FORMAT({value}, '%Y-%m-%d %H:%i:%s')"),
+                        TimeUnit::Minute => format!("DATE_FORMAT({value}, '%Y-%m-%d %H:%i:00')"),
+                        TimeUnit::Hour => format!("DATE_FORMAT({value}, '%Y-%m-%d %H:00:00')"),
+                        TimeUnit::Day => format!("DATE({value})"),
+                        TimeUnit::Week => format!("DATE_SUB(DATE({value}), INTERVAL WEEKDAY({value}) DAY)"),
+                        TimeUnit::Month => format!("DATE_FORMAT({value}, '%Y-%m-01')"),
+                        TimeUnit::Year => format!("DATE_FORMAT({value}, '%Y-01-01')"),
+                    },
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!("strftime({}, {})", quote_sql_literal(unit.sqlite_format()), value),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("DATETRUNC({}, {})", unit.pg_name(), value),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("dateTrunc('{}', {})", unit.pg_name(), value),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("date_trunc('{}', {})", unit.pg_name(), value),
+                }
+            }
+            SqlExpr::DatePart { expr, part } => {
+                let value = expr.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("date_part('{}', {})", part.name(), value),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("EXTRACT({} FROM {})", part.name_upper(), value),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!("CAST(strftime({}, {}) AS INTEGER)", quote_sql_literal(part.sqlite_format()), value),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("DATEPART({}, {})", part.name_upper(), value),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("to{}({})", part.name_upper(), value),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("date_part('{}', {})", part.name(), value),
+                }
+            }
+            SqlExpr::AtTimeZone { expr, timezone } => {
+                let value = expr.to_sql(db_type, param_idx, params, table_prefix);
+                let zone = timezone.replace('\'', "''");
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{value} AT TIME ZONE '{zone}'"),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("{value} AT TIME ZONE '{zone}'"),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("CONVERT_TZ({value}, 'UTC', '{zone}')"),
+                    #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "clickhouse"))]
+                    _ => "CAST(NULL AS TEXT) /* OrmerError::UnsupportedFeature: timezone conversion */".to_string(),
+                }
+            }
+            SqlExpr::DateAdd {
+                expr,
+                unit,
+                amount,
+                negative,
+            } => {
+                let value = expr.to_sql(db_type, param_idx, params, table_prefix);
+                let mut delta = amount.to_sql(db_type, param_idx, params, table_prefix);
+                if *negative {
+                    delta = format!("-({delta})");
+                }
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name()),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("DATE_ADD({}, INTERVAL {} {})", value, delta, unit.pg_name()),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => format!("datetime({}, printf('%+d seconds', {}))", value, delta),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("DATEADD({}, {}, {})", unit.pg_name(), delta, value),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!(
+                        "dateAdd('{}', {}({}), {})",
+                        unit.pg_name(),
+                        unit.clickhouse_interval(),
+                        delta,
+                        value
+                    ),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name()),
+                }
+            }
+            SqlExpr::DateDiff { left, right, part } => {
+                let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        let divisor = part.epoch_divisor();
+                        format!("date_part('epoch', {left_sql} - {right_sql}) / {divisor}")
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => format!("TIMESTAMPDIFF({}, {}, {})", part.name_upper(), left_sql, right_sql),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => {
+                        let divisor = part.epoch_divisor() * 86400.0;
+                        format!("CAST((julianday({left_sql}) - julianday({right_sql})) * {divisor} AS INTEGER)")
+                    }
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => format!("DATEDIFF({}, {}, {})", part.name_upper(), left_sql, right_sql),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => format!("dateDiff('{}', {}, {})", part.name(), left_sql, right_sql),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => format!("date_diff('{}', {}, {})", part.name(), left_sql, right_sql),
+                }
+            }
+            SqlExpr::Now => match db_type {
+                #[cfg(feature = "postgresql")]
+                DbType::PostgreSQL => "NOW()".to_string(),
+                #[cfg(feature = "mysql")]
+                DbType::MySQL => "CURRENT_TIMESTAMP(6)".to_string(),
+                #[cfg(feature = "sqlite")]
+                DbType::Sqlite => "datetime('now')".to_string(),
+                #[cfg(feature = "mssql")]
+                DbType::MSSQL => "SYSDATETIMEOFFSET()".to_string(),
+                #[cfg(feature = "clickhouse")]
+                DbType::ClickHouse => "now()".to_string(),
+                #[cfg(feature = "duckdb")]
+                DbType::DuckDB => "now()".to_string(),
+            },
             SqlExpr::Row(exprs) => {
                 let values = exprs
                     .iter()
@@ -900,8 +1523,33 @@ impl SqlExpr {
                 }
                 Ok(())
             }
+            SqlExpr::WindowFunction { args, over, .. } => {
+                for arg in args {
+                    arg.validate_for_db(db_type)?;
+                }
+                for expr in &over.partition_by {
+                    expr.validate_for_db(db_type)?;
+                }
+                for order in &over.order_by {
+                    if let Some(expr) = order.cloned_expr() {
+                        expr.validate_for_db(db_type)?;
+                    }
+                }
+                Ok(())
+            }
+            SqlExpr::DateTrunc { expr, .. }
+            | SqlExpr::DatePart { expr, .. }
+            | SqlExpr::AtTimeZone { expr, .. } => expr.validate_for_db(db_type),
+            SqlExpr::DateAdd { amount, .. } => amount.validate_for_db(db_type),
+            SqlExpr::DateDiff { left, right, .. } => {
+                left.validate_for_db(db_type)?;
+                right.validate_for_db(db_type)
+            }
+            SqlExpr::Now => Ok(()),
             #[cfg(feature = "clickhouse")]
-            SqlExpr::JsonSet { .. } if matches!(db_type, DbType::ClickHouse) => {
+            SqlExpr::JsonSet { .. } | SqlExpr::JsonRemove { .. }
+                if matches!(db_type, DbType::ClickHouse) =>
+            {
                 Err(crate::OrmerError::UnsupportedFeature {
                     backend: db_type,
                     feature: "JSON updates",
@@ -911,6 +1559,8 @@ impl SqlExpr {
             | SqlExpr::Collate { expr, .. }
             | SqlExpr::JsonText { expr, .. }
             | SqlExpr::JsonPathText { expr, .. }
+            | SqlExpr::JsonPathValue { expr, .. }
+            | SqlExpr::JsonPathExists { expr, .. }
             | SqlExpr::ArrayLen { expr } => expr.validate_for_db(db_type),
             SqlExpr::Aggregate {
                 expr,
@@ -956,6 +1606,7 @@ impl SqlExpr {
                 expr.validate_for_db(db_type)?;
                 value.validate_for_db(db_type)
             }
+            SqlExpr::JsonRemove { expr, .. } => expr.validate_for_db(db_type),
             SqlExpr::Raw(raw) => {
                 for segment in &raw.segments {
                     if let RawExprSegment::Expr(expr) = segment {
@@ -1011,7 +1662,33 @@ pub(crate) fn validate_filter_for_db(
         | FilterExpr::ExprIsNotNull { expr }
         | FilterExpr::ExprPredicate { expr } => expr.validate_for_db(db_type),
         FilterExpr::TextSearch { expr, .. } => expr.validate_for_db(db_type),
+        FilterExpr::FullTextSearch(search) => {
+            for expr in &search.exprs {
+                expr.validate_for_db(db_type)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
+    }
+}
+
+pub(crate) fn aggregate_filter_native(db_type: DbType) -> bool {
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => true,
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => true,
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => true,
+        #[cfg(any(
+            feature = "mysql",
+            feature = "mssql",
+            feature = "clickhouse",
+            feature = "postgresql",
+            feature = "sqlite",
+            feature = "duckdb"
+        ))]
+        _ => false,
     }
 }
 

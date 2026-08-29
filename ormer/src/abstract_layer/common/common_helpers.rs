@@ -46,6 +46,10 @@ pub fn placeholder_list(db_type: DbType, start_idx: usize, count: usize) -> Stri
         .join(", ")
 }
 
+pub(crate) fn rebase_placeholder_sql(sql: &str, db_type: DbType, offset: usize) -> String {
+    crate::query::filter_formatter::rebase_subquery_sql(sql, db_type, offset)
+}
+
 pub fn quote_table_name<T: Model>(db_type: DbType) -> String {
     quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
 }
@@ -2038,14 +2042,16 @@ fn append_mysql_insert_conflict_clause(
     conflict: &InsertConflict,
 ) -> crate::Result<()> {
     if conflict.target.is_some() {
-        return Err(crate::ormer_error!(
-            "MySQL ON DUPLICATE KEY cannot target a specific unique key or constraint"
-        ));
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: DbType::MySQL,
+            feature: "MySQL ON DUPLICATE KEY conflict target",
+        });
     }
     if conflict.target_filter.is_some() {
-        return Err(crate::ormer_error!(
-            "MySQL ON DUPLICATE KEY cannot target a partial unique index"
-        ));
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: DbType::MySQL,
+            feature: "MySQL partial conflict targets",
+        });
     }
 
     let action = conflict.action.ok_or_else(|| {
@@ -2062,9 +2068,10 @@ fn append_mysql_insert_conflict_clause(
         }
         InsertConflictAction::DoUpdate => {
             if conflict.update_filter.is_some() {
-                return Err(crate::ormer_error!(
-                    "MySQL ON DUPLICATE KEY UPDATE does not support DO UPDATE WHERE"
-                ));
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: DbType::MySQL,
+                    feature: "MySQL conditional conflict updates",
+                });
             }
             if conflict.assignments.is_empty() {
                 return Err(crate::ormer_error!(

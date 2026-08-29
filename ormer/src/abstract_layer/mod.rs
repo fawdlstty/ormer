@@ -47,6 +47,15 @@ pub enum DbType {
 }
 
 impl DbType {
+    /// Whether the backend provides transactional migration execution.
+    pub fn is_transactional(&self) -> bool {
+        #[cfg(feature = "clickhouse")]
+        if matches!(self, DbType::ClickHouse) {
+            return false;
+        }
+        true
+    }
+
     /// 根据 Rust 类型和数据库类型获取 SQL 类型
     pub fn sql_type(
         &self,

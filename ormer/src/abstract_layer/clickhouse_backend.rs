@@ -462,7 +462,7 @@ impl Database {
         Ok(pending.len())
     }
 
-    async fn ensure_migration_table(&self) -> crate::Result<()> {
+    pub(crate) async fn ensure_migration_table(&self) -> crate::Result<()> {
         let table = crate::model::quote_identifier(
             crate::abstract_layer::DbType::ClickHouse,
             MIGRATION_TABLE_NAME,

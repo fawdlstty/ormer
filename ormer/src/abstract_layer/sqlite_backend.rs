@@ -100,9 +100,13 @@ fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
 
 /// 判断错误是否为约束冲突错误（如主键/唯一键重复）
 /// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
-fn is_constraint_error(e: &crate::OrmerError) -> bool {
+fn is_unique_constraint_error(e: &crate::OrmerError) -> bool {
     let msg = e.to_string();
-    msg.contains("UNIQUE constraint failed") || msg.contains("constraint")
+    msg.contains("UNIQUE constraint failed")
+}
+
+fn sqlite_simulated_sql(sql: String, label: &str) -> String {
+    format!("/* ormer-sqlite-simulated:{label} */ {sql}")
 }
 
 fn table_name_for<T: Model>() -> &'static str {
@@ -531,7 +535,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             common_helpers::BatchInsertValuesMode::All,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(
+            DbType::Sqlite,
+            sqlite_simulated_sql(sql, "delete+insert upsert"),
+            all_values,
+        ))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -630,7 +638,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::single(
+            DbType::Sqlite,
+            sqlite_simulated_sql(sql, "error-capture ignore"),
+            all_values,
+        ))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -654,7 +666,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             let params = values_to_params(&values)?;
             match traced_sqlite_execute(&self.db.conn, &sql, params, &values).await {
                 Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
+                Err(e) if is_unique_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
                 }
                 Err(e) => return Err(e),
@@ -682,7 +694,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         match traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await
         {
             Ok(_) => {}
-            Err(e) if is_constraint_error(&e) => {
+            Err(e) if is_unique_constraint_error(&e) => {
                 // 忽略约束冲突（重复主键/唯一键）
             }
             Err(e) => return Err(e),
@@ -1356,7 +1368,7 @@ impl Database {
             let params = values_to_params(&values)?;
             match traced_sqlite_execute(&self.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
+                Err(e) if is_unique_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
                 }
                 Err(e) => return Err(e),
@@ -1782,7 +1794,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             let params = values_to_params(&values)?;
             match traced_sqlite_execute(&self.txn.conn, &insert_sql, params, &values).await {
                 Ok(_) => {}
-                Err(e) if is_constraint_error(&e) => {
+                Err(e) if is_unique_constraint_error(&e) => {
                     // 忽略约束冲突（重复主键/唯一键）
                 }
                 Err(e) => return Err(e),
@@ -2339,7 +2351,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
@@ -3322,7 +3334,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.build_sql(DbType::Sqlite);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
 
         let turso_params = values_to_params(&params)?;
 
@@ -3377,7 +3389,7 @@ pub struct SelectStream<'a, T: Model> {
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
 
         // 从 StreamConnection 获取连接
         let conn = self.conn.expect_sqlite().clone();

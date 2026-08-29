@@ -205,6 +205,286 @@ pub struct ColumnSchema {
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
     pub compress: bool,                          // 是否启用数据库级压缩
     pub compression: Option<CompressionAlgorithm>, // 压缩算法
+    pub index_method: Option<&'static str>,      // fulltext、gin 等索引方法
+    pub index_expression: Option<&'static str>,  // 函数索引或全文向量表达式
+    pub index_columns: Option<&'static str>,     // 复合索引列清单
+}
+
+/// 数据库专用表级 DDL 选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableOptions {
+    pub mysql_engine: Option<&'static str>,
+    pub mysql_charset: Option<&'static str>,
+    pub mysql_collation: Option<&'static str>,
+    pub postgresql_storage: Option<&'static str>,
+    pub postgresql_fillfactor: Option<u8>,
+    pub mssql_filegroup: Option<&'static str>,
+    pub clickhouse_engine: Option<&'static str>,
+    pub clickhouse_order_by: Option<&'static str>,
+    pub clickhouse_partition_by: Option<&'static str>,
+    pub clickhouse_ttl: Option<&'static str>,
+    pub clickhouse_settings: Option<&'static str>,
+}
+
+impl Default for TableOptions {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl TableOptions {
+    pub const fn empty() -> Self {
+        Self {
+            mysql_engine: None,
+            mysql_charset: None,
+            mysql_collation: None,
+            postgresql_storage: None,
+            postgresql_fillfactor: None,
+            mssql_filegroup: None,
+            clickhouse_engine: None,
+            clickhouse_order_by: None,
+            clickhouse_partition_by: None,
+            clickhouse_ttl: None,
+            clickhouse_settings: None,
+        }
+    }
+}
+
+/// Build model-declared MySQL table options.
+#[cfg(feature = "mysql")]
+pub const fn mysql_table_options(
+    engine: Option<&'static str>,
+    charset: Option<&'static str>,
+    collation: Option<&'static str>,
+) -> Option<TableOptions> {
+    Some(TableOptions {
+        mysql_engine: engine,
+        mysql_charset: charset,
+        mysql_collation: collation,
+        ..TableOptions::empty()
+    })
+}
+
+/// Build model-declared MySQL table options.
+///
+/// The deprecated marker is intentional: a configured `#[mysql(...)]`
+/// attribute must warn when the MySQL backend feature is disabled.
+#[cfg(not(feature = "mysql"))]
+#[deprecated(note = "#[mysql(...)] is ignored because the ormer `mysql` feature is disabled")]
+pub const fn mysql_table_options(
+    engine: Option<&'static str>,
+    charset: Option<&'static str>,
+    collation: Option<&'static str>,
+) -> Option<TableOptions> {
+    let _ = (engine, charset, collation);
+    None
+}
+
+/// Build model-declared PostgreSQL table options.
+#[cfg(feature = "postgresql")]
+pub const fn postgresql_table_options(
+    storage: Option<&'static str>,
+    fillfactor: Option<u8>,
+) -> Option<TableOptions> {
+    Some(TableOptions {
+        postgresql_storage: storage,
+        postgresql_fillfactor: fillfactor,
+        ..TableOptions::empty()
+    })
+}
+
+/// Build model-declared PostgreSQL table options.
+///
+/// A configured `#[postgresql(...)]` attribute warns without compiling out
+/// the model when the PostgreSQL backend feature is disabled.
+#[cfg(not(feature = "postgresql"))]
+#[deprecated(note = "#[postgresql(...)] is ignored because the ormer `postgresql` feature is disabled")]
+pub const fn postgresql_table_options(
+    storage: Option<&'static str>,
+    fillfactor: Option<u8>,
+) -> Option<TableOptions> {
+    let _ = (storage, fillfactor);
+    None
+}
+
+/// Build model-declared MSSQL table options.
+#[cfg(feature = "mssql")]
+pub const fn mssql_table_options(filegroup: Option<&'static str>) -> Option<TableOptions> {
+    Some(TableOptions {
+        mssql_filegroup: filegroup,
+        ..TableOptions::empty()
+    })
+}
+
+/// Build model-declared MSSQL table options.
+///
+/// A configured `#[mssql(...)]` attribute warns without compiling out
+/// the model when the MSSQL backend feature is disabled.
+#[cfg(not(feature = "mssql"))]
+#[deprecated(note = "#[mssql(...)] is ignored because the ormer `mssql` feature is disabled")]
+pub const fn mssql_table_options(filegroup: Option<&'static str>) -> Option<TableOptions> {
+    let _ = filegroup;
+    None
+}
+
+/// Build model-declared ClickHouse table options.
+#[cfg(feature = "clickhouse")]
+pub const fn clickhouse_table_options(
+    engine: Option<&'static str>,
+    order_by: Option<&'static str>,
+    partition_by: Option<&'static str>,
+    ttl: Option<&'static str>,
+    settings: Option<&'static str>,
+) -> Option<TableOptions> {
+    Some(TableOptions {
+        clickhouse_engine: engine,
+        clickhouse_order_by: order_by,
+        clickhouse_partition_by: partition_by,
+        clickhouse_ttl: ttl,
+        clickhouse_settings: settings,
+        ..TableOptions::empty()
+    })
+}
+
+/// Build model-declared ClickHouse table options.
+///
+/// A configured `#[clickhouse(...)]` attribute warns without compiling out
+/// the model when the ClickHouse backend feature is disabled.
+#[cfg(not(feature = "clickhouse"))]
+#[deprecated(note = "#[clickhouse(...)] is ignored because the ormer `clickhouse` feature is disabled")]
+pub const fn clickhouse_table_options(
+    engine: Option<&'static str>,
+    order_by: Option<&'static str>,
+    partition_by: Option<&'static str>,
+    ttl: Option<&'static str>,
+    settings: Option<&'static str>,
+) -> Option<TableOptions> {
+    let _ = (engine, order_by, partition_by, ttl, settings);
+    None
+}
+
+/// Merge dialect-specific model table options into one DDL metadata value.
+pub const fn merge_table_options(
+    mysql: Option<TableOptions>,
+    postgresql: Option<TableOptions>,
+    mssql: Option<TableOptions>,
+    clickhouse: Option<TableOptions>,
+) -> Option<TableOptions> {
+    let mut options = TableOptions::empty();
+    if let Some(value) = mysql {
+        options.mysql_engine = value.mysql_engine;
+        options.mysql_charset = value.mysql_charset;
+        options.mysql_collation = value.mysql_collation;
+    }
+    if let Some(value) = postgresql {
+        options.postgresql_storage = value.postgresql_storage;
+        options.postgresql_fillfactor = value.postgresql_fillfactor;
+    }
+    if let Some(value) = mssql {
+        options.mssql_filegroup = value.mssql_filegroup;
+    }
+    if let Some(value) = clickhouse {
+        options.clickhouse_engine = value.clickhouse_engine;
+        options.clickhouse_order_by = value.clickhouse_order_by;
+        options.clickhouse_partition_by = value.clickhouse_partition_by;
+        options.clickhouse_ttl = value.clickhouse_ttl;
+        options.clickhouse_settings = value.clickhouse_settings;
+    }
+
+    if options.mysql_engine.is_some()
+        || options.mysql_charset.is_some()
+        || options.mysql_collation.is_some()
+        || options.postgresql_storage.is_some()
+        || options.postgresql_fillfactor.is_some()
+        || options.mssql_filegroup.is_some()
+        || options.clickhouse_engine.is_some()
+        || options.clickhouse_order_by.is_some()
+        || options.clickhouse_partition_by.is_some()
+        || options.clickhouse_ttl.is_some()
+        || options.clickhouse_settings.is_some()
+    {
+        Some(options)
+    } else {
+        None
+    }
+}
+
+impl TableOptions {
+    fn append_mysql_options(&self, sql: &mut String) {
+        let mut parts = Vec::new();
+        if let Some(engine) = self.mysql_engine {
+            parts.push(format!("ENGINE={}", quote_sql_literal(engine)));
+        }
+        if let Some(charset) = self.mysql_charset {
+            parts.push(format!("DEFAULT CHARSET={}", quote_sql_literal(charset)));
+        }
+        if let Some(collation) = self.mysql_collation {
+            parts.push(format!("COLLATE={}", quote_sql_literal(collation)));
+        }
+        if !parts.is_empty() {
+            sql.push(' ');
+            sql.push_str(&parts.join(" "));
+        }
+    }
+
+    fn append_postgresql_options(&self, sql: &mut String) -> crate::Result<()> {
+        let mut parts = Vec::new();
+        if let Some(storage) = self.postgresql_storage {
+            parts.push(format!("storage = {}", quote_sql_literal(storage)));
+        }
+        if let Some(fillfactor) = self.postgresql_fillfactor {
+            parts.push(format!("fillfactor = {fillfactor}"));
+        }
+        if parts.is_empty() {
+            return Ok(());
+        }
+        sql.push_str(" WITH (");
+        sql.push_str(&parts.join(", "));
+        sql.push(')');
+        Ok(())
+    }
+
+    fn append_mssql_options(&self, sql: &mut String) -> crate::Result<()> {
+        if let Some(filegroup) = self.mssql_filegroup {
+            if filegroup.contains('\'') {
+                return Err(crate::ormer_error!(
+                    "MSSQL filegroup must not contain a single quote"
+                ));
+            }
+            sql.push_str(" ON ");
+            sql.push_str(filegroup);
+        }
+        Ok(())
+    }
+
+    fn clickhouse_engine_clause(&self) -> Option<&'static str> {
+        self.clickhouse_engine
+            .map(str::trim)
+            .filter(|engine| !engine.is_empty())
+    }
+
+    fn append_clickhouse_options(&self, sql: &mut String) -> crate::Result<()> {
+        for (label, clause) in [
+            ("ORDER BY", self.clickhouse_order_by),
+            ("PARTITION BY", self.clickhouse_partition_by),
+            ("TTL", self.clickhouse_ttl),
+            ("SETTINGS", self.clickhouse_settings),
+        ] {
+            let Some(clause) = clause.map(str::trim).filter(|clause| !clause.is_empty()) else {
+                continue;
+            };
+            if clause.contains(';') {
+                return Err(crate::ormer_error!(
+                    "ClickHouse {label} clause must not contain ';'"
+                ));
+            }
+            sql.push(' ');
+            sql.push_str(label);
+            sql.push(' ');
+            sql.push_str(clause);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1040,6 +1320,7 @@ pub trait ViewModel: Sized {
     const TABLE_NAME: &'static str;
     const COLUMNS: &'static [&'static str];
     const COLUMN_SCHEMA: &'static [ColumnSchema];
+    const TABLE_OPTIONS: Option<TableOptions> = None;
 
     /// 获取指定数据库后端实际使用的表名。
     fn table_name_for_db(db_type: crate::abstract_layer::DbType) -> &'static str {
@@ -1090,6 +1371,7 @@ pub trait Model: Sized {
     const TABLE_NAME: &'static str;
     const COLUMNS: &'static [&'static str];
     const COLUMN_SCHEMA: &'static [ColumnSchema];
+    const TABLE_OPTIONS: Option<TableOptions> = None;
     const RELATIONS: &'static [RelationInfo] = &[];
 
     /// 获取指定数据库后端实际使用的表名。
@@ -1162,6 +1444,10 @@ pub trait Model: Sized {
 
     fn version_info() -> Option<VersionInfo> {
         None
+    }
+
+    fn table_options() -> Option<TableOptions> {
+        Self::TABLE_OPTIONS
     }
 
     fn query() -> Self::QueryBuilder;
@@ -2739,10 +3025,15 @@ fn generate_create_table_sql_with_engine<T: WritableModel>(
     #[cfg(not(feature = "clickhouse"))]
     let is_clickhouse = false;
 
+    let table_options = T::table_options();
     if is_clickhouse {
+        let model_engine = table_options
+            .as_ref()
+            .and_then(TableOptions::clickhouse_engine_clause);
         let Some(engine) = clickhouse_engine
             .map(str::trim)
             .filter(|engine| !engine.is_empty())
+            .or(model_engine)
         else {
             return Err(crate::OrmerError::UnsupportedFeature {
                 backend: db_type,
@@ -2944,11 +3235,31 @@ fn generate_create_table_sql_with_engine<T: WritableModel>(
     if is_clickhouse {
         sql.push_str(" ENGINE = ");
         sql.push_str(clickhouse_engine.expect("validated ClickHouse engine"));
+        if let Some(options) = &table_options {
+            options.append_clickhouse_options(&mut sql)?;
+        }
         return Ok(sql);
+    }
+
+    #[cfg(feature = "mssql")]
+    if matches!(db_type, crate::abstract_layer::DbType::MSSQL)
+        && let Some(options) = &table_options
+    {
+        options.append_mssql_options(&mut sql)?;
+    }
+
+    #[cfg(feature = "postgresql")]
+    if matches!(db_type, crate::abstract_layer::DbType::PostgreSQL)
+        && let Some(options) = &table_options
+    {
+        options.append_postgresql_options(&mut sql)?;
     }
 
     #[cfg(feature = "mysql")]
     if matches!(db_type, crate::abstract_layer::DbType::MySQL) {
+        if let Some(options) = &table_options {
+            options.append_mysql_options(&mut sql);
+        }
         if let Some(compression) = table_compression_algorithm::<T>()? {
             sql.push_str(" COMPRESSION='");
             sql.push_str(compression.as_upper_str());
@@ -3046,11 +3357,36 @@ fn generate_indexes_with_name<T: WritableModel>(
 
     // 检查是否为 MySQL 数据库（通过调试字符串）
     let is_mysql = format!("{:?}", db_type).contains("MySQL");
+    let column_schema = T::column_schema();
+    #[cfg(feature = "sqlite")]
+    if matches!(db_type, crate::abstract_layer::DbType::Sqlite)
+        && column_schema
+            .iter()
+            .any(|column| column.index_method.is_some_and(|method| method == "fulltext"))
+    {
+        let mut columns = column_schema
+            .iter()
+            .filter(|column| column.is_indexed)
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        if let Some(explicit_columns) = column_schema
+            .iter()
+            .find_map(|column| column.index_columns)
+        {
+            columns = explicit_columns
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .split(',')
+                .map(str::trim)
+                .filter(|column| !column.is_empty())
+                .collect();
+        }
+        return render_sqlite_fulltext(table_name, &columns);
+    }
 
     let mut grouped_indexes: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
         std::collections::BTreeMap::new();
 
-    let column_schema = T::column_schema();
     for column in column_schema.iter() {
         if !column.is_indexed {
             continue;
@@ -3103,7 +3439,24 @@ fn render_index_sql(
     index_name: &str,
     columns: &[&ColumnSchema],
 ) -> crate::Result<String> {
+    #[cfg(feature = "postgresql")]
+    let is_postgresql = matches!(db_type, crate::abstract_layer::DbType::PostgreSQL);
+    #[cfg(not(feature = "postgresql"))]
+    let is_postgresql = false;
+    let method = columns.iter().find_map(|column| column.index_method);
+    let expression = columns.iter().find_map(|column| column.index_expression);
+    let explicit_columns = columns.iter().find_map(|column| column.index_columns);
     let where_clause = columns.iter().find_map(|column| column.index_where);
+    if method.is_some() && expression.is_some() {
+        return Err(crate::ormer_error!(
+            "An index cannot specify both method and expression"
+        ));
+    }
+    if expression.is_some() && columns.len() > 1 {
+        return Err(crate::ormer_error!(
+            "Expression indexes must be declared on only one member of an index group"
+        ));
+    }
     if where_clause.is_some() && is_mysql {
         return Err(crate::ormer_error!(
             "MySQL does not support partial index WHERE clauses"
@@ -3140,19 +3493,51 @@ fn render_index_sql(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    let columns_sql = expression
+        .map(ToString::to_string)
+        .or_else(|| {
+            explicit_columns.map(|columns| {
+                columns
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .to_string()
+            })
+        })
+        .unwrap_or(columns_sql);
+    if let Some(method) = method {
+        if is_mysql {
+            if method != "fulltext" {
+                return Err(crate::ormer_error!(
+                    "MySQL does not support index method {}",
+                    method
+                ));
+            }
+        } else if !is_postgresql {
+            return Err(crate::ormer_error!(
+                "Index method {} is only supported on PostgreSQL",
+                method
+            ));
+        }
+    }
     let sql = if is_mysql {
+        let fulltext = method == Some("fulltext");
         format!(
-            "CREATE INDEX {} ON {} ({})",
+            "CREATE {}INDEX {} ON {} ({})",
+            if fulltext { "FULLTEXT " } else { "" },
             quote_identifier(db_type, index_name),
             quote_qualified_identifier(db_type, table_name),
             columns_sql
         )
     } else {
         format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {} ({})",
+            "CREATE INDEX IF NOT EXISTS {} ON {}{}",
             quote_identifier(db_type, index_name),
             quote_qualified_identifier(db_type, table_name),
-            columns_sql
+            if let Some(method) = method {
+                format!(" USING {method} ({columns_sql})")
+            } else {
+                format!(" ({columns_sql})")
+            }
         )
     };
 
@@ -3161,6 +3546,43 @@ fn render_index_sql(
     } else {
         sql
     })
+}
+
+#[cfg(feature = "sqlite")]
+fn render_sqlite_fulltext(table_name: &str, columns: &[&str]) -> crate::Result<String> {
+    if columns.is_empty() {
+        return Err(crate::ormer_error!(
+            "SQLite full-text indexes require at least one column"
+        ));
+    }
+    let fts_table = quote_identifier(
+        crate::abstract_layer::DbType::Sqlite,
+        &format!("{table_name}_fts"),
+    );
+    let quoted_table = quote_identifier(crate::abstract_layer::DbType::Sqlite, table_name);
+    let quoted_columns = columns
+        .iter()
+        .map(|column| quote_identifier(crate::abstract_layer::DbType::Sqlite, column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let new_values = columns
+        .iter()
+        .map(|column| format!("NEW.{}", quote_identifier(crate::abstract_layer::DbType::Sqlite, column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let old_values = columns
+        .iter()
+        .map(|column| format!("OLD.{}", quote_identifier(crate::abstract_layer::DbType::Sqlite, column)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {fts_table} USING fts5({quoted_columns}, content={table_literal}, content_rowid='rowid');\
+         CREATE TRIGGER IF NOT EXISTS {table_name}_fts_ai AFTER INSERT ON {quoted_table} BEGIN INSERT INTO {fts_table}(rowid, {quoted_columns}) VALUES (NEW.rowid, {new_values}); END;\
+         CREATE TRIGGER IF NOT EXISTS {table_name}_fts_ad AFTER DELETE ON {quoted_table} BEGIN INSERT INTO {fts_table}(fts_table, rowid, {quoted_columns}) VALUES('delete', OLD.rowid, {old_values}); END;\
+         CREATE TRIGGER IF NOT EXISTS {table_name}_fts_au AFTER UPDATE ON {quoted_table} BEGIN INSERT INTO {fts_table}(fts_table, rowid, {quoted_columns}) VALUES('delete', OLD.rowid, {old_values}); INSERT INTO {fts_table}(rowid, {quoted_columns}) VALUES (NEW.rowid, {new_values}); END;",
+        table_literal = quote_sql_literal(table_name),
+        table_name = table_name.replace('"', "_"),
+    ))
 }
 
 /// 生成外键约束 SQL

@@ -1434,11 +1434,10 @@ impl<'a> PooledConnection<'a> {
                 super::unified::SelectExecutor::DuckDB(db.select::<T>())
             }
             #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => super::unified::SelectExecutor::Unsupported {
-                backend: DbType::ClickHouse,
-                feature: "Model select on ClickHouse; use select_sql",
-                _marker: PhantomData,
-            },
+            ConnectionWrapper::ClickHouse(db) => super::unified::SelectExecutor::ClickHouse(
+                db,
+                crate::query::builder::Select::default(),
+            ),
         }
     }
 

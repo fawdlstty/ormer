@@ -2664,7 +2664,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let (sql, params) = self
                 .executor
                 .select
-                .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
+                .try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = self.executor.pool.lock().await;
             let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
@@ -2696,7 +2696,7 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let (sql, params) = self
                 .executor
                 .select
-                .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
+                .try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = self.executor.pool.lock().await;
             let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 

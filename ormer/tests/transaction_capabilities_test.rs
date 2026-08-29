@@ -4,6 +4,33 @@
 use ormer::{DbType, IsolationLevel, OrmerError, TransactionOptions};
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
+async fn sqlite_transaction_options_are_capability_gated() -> Result<(), Box<dyn std::error::Error>>
+{
+    let db = ormer::Database::connect(DbType::Sqlite, ":memory:").await?;
+
+    for options in [
+        TransactionOptions::new().isolation(IsolationLevel::Serializable),
+        TransactionOptions::new().read_only(),
+    ] {
+        let error = db
+            .transaction_opts(options, |_txn| Box::pin(async { Ok(()) }))
+            .await
+            .expect_err("SQLite transaction options must be capability gated");
+        assert!(matches!(
+            error,
+            OrmerError::UnsupportedFeature {
+                backend: DbType::Sqlite,
+                feature: "transaction options on SQLite",
+            }
+        ));
+    }
+
+    db.transaction(|_txn| Box::pin(async { Ok(()) })).await?;
+    Ok(())
+}
+
+#[tokio::test]
 #[cfg(feature = "duckdb")]
 async fn duckdb_transaction_options_are_capability_gated() -> Result<(), Box<dyn std::error::Error>>
 {

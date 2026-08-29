@@ -321,6 +321,36 @@ pub struct MigrationInfo {
     pub checksum: u64,
 }
 
+/// One executable statement in a migration dry-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDryRunStep {
+    pub version: u64,
+    pub migration_name: String,
+    pub migration_index: usize,
+    pub step_index: usize,
+    pub sql: String,
+}
+
+/// An inspectable execution plan for pending versioned migrations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDryRun {
+    pub backend: DbType,
+    pub transactional: bool,
+    pub completed_versions: Vec<u64>,
+    pub steps: Vec<MigrationDryRunStep>,
+    pub warnings: Vec<String>,
+}
+
+/// The precise resume point after a migration was interrupted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationExecutionStatus {
+    pub backend: DbType,
+    pub completed: Vec<MigrationInfo>,
+    pub pending: Vec<MigrationInfo>,
+    pub resume_version: Option<u64>,
+    pub transactional: bool,
+}
+
 impl MigrationInfo {
     pub fn new(version: u64, name: impl Into<String>) -> Self {
         Self {
@@ -356,6 +386,81 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
 
     pub async fn execute(&self) -> crate::Result<usize> {
         self.db.apply_migrations(self.migrations).await
+    }
+
+    /// Render every pending statement without executing it.
+    ///
+    /// For non-transactional backends each item is one statement, so a failed
+    /// statement identifies the exact recovery point.
+    pub async fn dry_run(&self) -> crate::Result<MigrationDryRun> {
+        let backend = self.db.db_type();
+        let transactional = backend.is_transactional();
+        let pending = self.pending().await?;
+        let applied: BTreeSet<u64> = self
+            .db
+            .migration_history()
+            .await?
+            .into_iter()
+            .map(|migration| migration.version)
+            .collect();
+        let mut warnings = Vec::new();
+        if !transactional {
+            warnings.push(
+                "backend migrations are not transactional; resume from the first pending version"
+                    .to_string(),
+            );
+        }
+
+        let mut by_version = self
+            .migrations
+            .iter()
+            .map(|migration| (migration.version(), migration))
+            .collect::<BTreeMap<_, _>>();
+        let mut steps = Vec::new();
+        for (migration_index, info) in pending.iter().enumerate() {
+            let migration = by_version
+                .remove(&info.version)
+                .ok_or_else(|| crate::OrmerError::migration("pending migration disappeared"))?;
+            for (step_index, step) in migration.up().into_iter().enumerate() {
+                let sql = step.sql(backend)?;
+                if !transactional && sql.contains(';') {
+                    return Err(crate::OrmerError::migration(format!(
+                        "non-transactional migration {} step {} must contain one statement",
+                        info.version, step_index
+                    )));
+                }
+                steps.push(MigrationDryRunStep {
+                    version: info.version,
+                    migration_name: info.name.clone(),
+                    migration_index,
+                    step_index,
+                    sql,
+                });
+            }
+        }
+
+        Ok(MigrationDryRun {
+            backend,
+            transactional,
+            completed_versions: applied.into_iter().collect(),
+            steps,
+            warnings,
+        })
+    }
+
+    /// Report completed work and the next safe resume version.
+    pub async fn execution_status(&self) -> crate::Result<MigrationExecutionStatus> {
+        let backend = self.db.db_type();
+        let completed = self.db.migration_history().await?;
+        let pending = self.pending().await?;
+        let resume_version = pending.first().map(|migration| migration.version);
+        Ok(MigrationExecutionStatus {
+            backend,
+            transactional: backend.is_transactional(),
+            completed,
+            pending,
+            resume_version,
+        })
     }
 
     pub async fn rollback_last(&self) -> crate::Result<()> {
@@ -412,6 +517,43 @@ pub struct TableMigration<'a, T: WritableModel> {
 }
 
 impl<'a, T: WritableModel> TableMigration<'a, T> {
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite_rebuild_plan(&self) -> crate::Result<MigrationPlan> {
+        let db_type = self.db.db_type();
+        if !matches!(db_type, DbType::Sqlite) {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "SQLite table rebuild",
+            });
+        }
+
+        let table_name = T::table_name_for_db(db_type);
+        let actual = self.db.schema_columns(table_name).await?.ok_or_else(|| {
+            crate::ormer_error!(
+                "SQLite table {} does not exist; use create_table instead of a rebuild",
+                table_name
+            )
+        })?;
+        let actual_by_name = actual
+            .iter()
+            .map(|column| (column.name.as_str(), column))
+            .collect::<BTreeMap<_, _>>();
+        let mut plan = MigrationPlan::new(table_name, db_type);
+        plan.warnings.push(
+            "SQLite rebuild replaces the table in one transaction; review copy rules before execution"
+                .to_string(),
+        );
+        plan.push(MigrationStep::Sql {
+            sql: sqlite_rebuild_sql::<T>(table_name, &actual_by_name)?,
+        });
+        Ok(plan)
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub async fn sqlite_rebuild_sql(&self) -> crate::Result<String> {
+        self.sqlite_rebuild_plan().await?.to_sql()
+    }
+
     pub async fn plan(&self) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
         let table_name = T::table_name_for_db(db_type);
@@ -1515,6 +1657,10 @@ impl Database {
     }
 
     pub async fn migration_history(&self) -> crate::Result<Vec<MigrationInfo>> {
+        #[cfg(feature = "clickhouse")]
+        if let Database::ClickHouse(db) = self {
+            db.ensure_migration_table().await?;
+        }
         self.ensure_migration_table().await?;
         let rows = self.migration_history_rows().await?;
         Ok(rows
@@ -1556,6 +1702,10 @@ impl Database {
     }
 
     pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> crate::Result<usize> {
+        #[cfg(feature = "clickhouse")]
+        if let Database::ClickHouse(db) = self {
+            return db.apply_migrations(migrations).await;
+        }
         self.ensure_migration_table().await?;
         let applied: BTreeMap<u64, u64> = self
             .migration_history_rows()
@@ -1612,6 +1762,10 @@ impl Database {
     }
 
     async fn ensure_migration_table(&self) -> crate::Result<()> {
+        #[cfg(feature = "clickhouse")]
+        if let Database::ClickHouse(db) = self {
+            return db.ensure_migration_table().await;
+        }
         let sql = match self.db_type() {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => format!(
@@ -1640,11 +1794,7 @@ impl Database {
                  (version BIGINT PRIMARY KEY, name VARCHAR NOT NULL, checksum VARCHAR NOT NULL, applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             ),
             #[cfg(feature = "clickhouse")]
-            DbType::ClickHouse => {
-                return Err(crate::ormer_error!(
-                    "migrations are not implemented for this backend"
-                ));
-            }
+            DbType::ClickHouse => unreachable!("handled by the ClickHouse backend"),
         };
         self.execute_sql(&sql).await?;
         Ok(())

@@ -65,6 +65,78 @@ impl FilterFormatter {
         sql
     }
 
+    pub(crate) fn full_text_search_sql(
+        &self,
+        search: &crate::query::filter::FullTextQuery,
+        param_idx: &mut i32,
+        params: &mut Vec<Value>,
+    ) -> String {
+        let expr_sql = |expr: &SqlExpr, param_idx: &mut i32, params: &mut Vec<Value>| {
+            expr.to_sql(self.db_type, param_idx, params, self.table_prefix.as_deref())
+        };
+        let query_expr = SqlExpr::Value(Value::Text(search.query.clone()));
+        let query_sql = query_expr.to_sql(
+            self.db_type,
+            param_idx,
+            params,
+            self.table_prefix.as_deref(),
+        );
+        if search.exprs.is_empty() {
+            return "1 = 0".to_string();
+        }
+
+        match self.db_type {
+            #[cfg(feature = "postgresql")]
+            DbType::PostgreSQL => {
+                let language = search.language.as_deref().unwrap_or("simple");
+                let language_sql = SqlExpr::Value(Value::Text(language.to_string()))
+                    .to_sql(self.db_type, param_idx, params, None);
+                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                let vector = format!("to_tsvector({}, COALESCE({fields}, ''))", language_sql);
+                let query_fn = match search.mode {
+                    crate::query::filter::FullTextMode::Natural => "plainto_tsquery",
+                    crate::query::filter::FullTextMode::Boolean => "to_tsquery",
+                    crate::query::filter::FullTextMode::WebSearch => "websearch_to_tsquery",
+                };
+                format!("({vector}) @@ {query_fn}({language_sql}, {query_sql})")
+            }
+            #[cfg(feature = "mysql")]
+            DbType::MySQL => {
+                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                let mode = match search.mode {
+                    crate::query::filter::FullTextMode::Natural => " IN NATURAL LANGUAGE MODE",
+                    crate::query::filter::FullTextMode::Boolean => " IN BOOLEAN MODE",
+                    crate::query::filter::FullTextMode::WebSearch => " IN NATURAL LANGUAGE MODE",
+                };
+                format!("MATCH ({fields}) AGAINST ({query_sql}{mode})")
+            }
+            #[cfg(feature = "sqlite")]
+            DbType::Sqlite => {
+                if search.exprs.len() == 1 {
+                    format!("{} MATCH {query_sql}", expr_sql(&search.exprs[0], param_idx, params))
+                } else {
+                    let clauses = search.exprs.iter().map(|expr| format!("{} LIKE {query_sql}", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                    format!("({clauses})")
+                }
+            }
+            #[cfg(feature = "mssql")]
+            DbType::MSSQL => {
+                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                format!("CONTAINS (({fields}), {query_sql})")
+            }
+            #[cfg(feature = "duckdb")]
+            DbType::DuckDB => {
+                let clauses = search.exprs.iter().map(|expr| format!("lower({}) LIKE lower({query_sql})", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                format!("({clauses})")
+            }
+            #[cfg(feature = "clickhouse")]
+            DbType::ClickHouse => {
+                let clauses = search.exprs.iter().map(|expr| format!("multiSearchAnyCaseInsensitive({}, [{query_sql}])", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                format!("({clauses})")
+            }
+        }
+    }
+
     fn format_recursive(
         &self,
         expr: &FilterExpr,
@@ -333,7 +405,23 @@ impl FilterFormatter {
                     params,
                     self.table_prefix.as_deref(),
                 );
-                write!(sql, "{} {} {}", left_sql, operator, right_sql)
+                #[cfg(feature = "sqlite")]
+                let (left_sql, right_sql) =
+                    if matches!(self.db_type, DbType::Sqlite)
+                        && matches!(
+                            right,
+                            SqlExpr::Value(Value::Decimal(_) | Value::BigDecimal(_))
+                        )
+                        && matches!(operator.as_str(), ">" | ">=" | "<" | "<=")
+                    {
+                        (
+                            format!("CAST({left_sql} AS NUMERIC)"),
+                            format!("CAST({right_sql} AS NUMERIC)"),
+                        )
+                    } else {
+                        (left_sql, right_sql)
+                    };
+                write!(sql, "{left_sql} {operator} {right_sql}")
                     .unwrap_or_else(|e| panic!("Failed to write expression comparison: {}", e));
             }
             FilterExpr::ExprIn { expr, values } => {
@@ -428,6 +516,11 @@ impl FilterFormatter {
                 };
                 write!(sql, "{sql_fragment}")
                     .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));
+            }
+            FilterExpr::FullTextSearch(search) => {
+                use std::fmt::Write;
+                write!(sql, "{}", self.full_text_search_sql(search, param_idx, params))
+                    .unwrap_or_else(|e| panic!("Failed to write full-text search clause: {}", e));
             }
             FilterExpr::InvalidDynamicField { .. } => {
                 sql.push_str("1 = 0");
@@ -670,7 +763,7 @@ impl FilterFormatter {
     }
 }
 
-fn rebase_subquery_sql(sql: &str, db_type: DbType, offset: usize) -> String {
+pub(crate) fn rebase_subquery_sql(sql: &str, db_type: DbType, offset: usize) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut chars = sql.char_indices().peekable();
     let mut in_single_quote = false;

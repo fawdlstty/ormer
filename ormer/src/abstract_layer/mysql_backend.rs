@@ -1668,6 +1668,142 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
 }
 
 impl<'a> Transaction<'a> {
+    /// Insert one row and read it back in the same transaction.
+    ///
+    /// This is a two-statement MySQL compatibility helper, not SQL RETURNING.
+    pub async fn insert_returning<I>(&mut self, mut models: I) -> crate::Result<Vec<I::Model>>
+    where
+        I: crate::model::Insertable + Send + Sync,
+        I::Model: crate::model::FromRowValues,
+    {
+        if models.as_refs().len() != 1 {
+            return Err(crate::ormer_error!(
+                "MySQL insert_returning supports exactly one model"
+            ));
+        }
+
+        let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
+        models.run_before_insert(hook_ctx.clone()).await?;
+        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+            DbType::MySQL,
+            &models.as_refs(),
+            None,
+        )?;
+
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| crate::ormer_error!("Transaction connection is unavailable"))?;
+        let mut last_id = 0;
+        for statement in &statements {
+            let params = values_to_params(&statement.params)?;
+            traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
+            last_id = conn.last_insert_id().unwrap_or(last_id);
+        }
+
+        let auto_increment_pk = I::Model::COLUMN_SCHEMA
+            .iter()
+            .find(|column| column.is_primary && column.is_auto_increment)
+            .map(|column| column.name);
+        if let (Some(column), false) = (auto_increment_pk, last_id == 0) {
+            for model in models.as_refs_mut() {
+                model.assign_column_value(column, Value::Integer(last_id as i64))?;
+            }
+        }
+
+        let model_refs = models.as_refs();
+        let model = model_refs
+            .first()
+            .ok_or_else(|| crate::ormer_error!("MySQL insert_returning model is unavailable"))?;
+        let filters = common_helpers::model_primary_key_filters(*model);
+        let Some(filter) = common_helpers::and_filter_exprs(filters) else {
+            return Err(crate::ormer_error!(
+                "MySQL insert_returning requires a primary key"
+            ));
+        };
+
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            common_helpers::quote_column_list(DbType::MySQL, &I::Model::columns()),
+            common_helpers::quote_table_name::<I::Model>(DbType::MySQL)
+        );
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+        common_helpers::format_filter_with_params(
+            &filter,
+            &mut sql,
+            &mut param_idx,
+            &mut params,
+            DbType::MySQL,
+        )?;
+        let result = self
+            .select_raw::<I::Model, Vec<I::Model>>(&sql, params)
+            .await?;
+        models.run_after_insert(hook_ctx).await?;
+        Ok(result)
+    }
+
+    /// Update one model by primary key and read the row back in the transaction.
+    pub async fn update_model_returning<T>(&mut self, model: &T) -> crate::Result<Option<T>>
+    where
+        T: WritableModel + crate::model::FromRowValues + Sync,
+    {
+        let Some(plan) = common_helpers::model_update_plan(model, None) else {
+            return self.select_by_primary_key(model).await;
+        };
+        let statement = common_helpers::build_model_update_sql::<T>(DbType::MySQL, &plan)?;
+        self.exec_raw(&statement.sql, statement.params).await?;
+        self.select_by_primary_key(model).await
+    }
+
+    /// Delete one model by primary key and return the row read before deletion.
+    pub async fn delete_model_returning<T>(&mut self, model: &T) -> crate::Result<Option<T>>
+    where
+        T: WritableModel + crate::model::FromRowValues + Sync,
+    {
+        let existing = self.select_by_primary_key(model).await?;
+        if existing.is_none() {
+            return Ok(None);
+        }
+        let filters = common_helpers::model_delete_filters(model);
+        let (sql, params) = common_helpers::build_delete_sql::<T>(DbType::MySQL, &filters)?;
+        self.exec_raw(&sql, params).await?;
+        Ok(existing)
+    }
+
+    async fn select_by_primary_key<T>(&mut self, model: &T) -> crate::Result<Option<T>>
+    where
+        T: Model + crate::model::FromRowValues + Sync,
+    {
+        let Some(filter) =
+            common_helpers::and_filter_exprs(common_helpers::model_primary_key_filters(model))
+        else {
+            return Err(crate::ormer_error!(
+                "MySQL returning helpers require a primary key"
+            ));
+        };
+
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            common_helpers::quote_column_list(DbType::MySQL, &T::columns()),
+            common_helpers::quote_table_name::<T>(DbType::MySQL)
+        );
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+        common_helpers::format_filter_with_params(
+            &filter,
+            &mut sql,
+            &mut param_idx,
+            &mut params,
+            DbType::MySQL,
+        )?;
+        Ok(self
+            .select_raw::<T, Vec<T>>(&sql, params)
+            .await?
+            .into_iter()
+            .next())
+    }
+
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let conn = self
             .conn
@@ -2012,7 +2148,7 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+            let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
 
             let mut conn = self.pool.get_conn().trace().await?;
 
@@ -2755,7 +2891,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 使用 mysql_async 的 Query::stream() 实现真正的流式查询，
     /// 逐行读取数据而不是一次性加载所有结果到内存中。
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
 
         // 将参数转换为 mysql_async::Value
         let mysql_params = values_to_params(&params)?;

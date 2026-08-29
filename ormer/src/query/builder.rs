@@ -4,7 +4,8 @@ use crate::model::{
     quote_column_reference, quote_qualified_identifier, routed_model_table_name_for_db,
 };
 use crate::query::expr::{
-    AliasedExpr, IntoSqlExpr, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
+    AliasedExpr, IntoSqlExpr, JsonScalarKind, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
+    TimePart, TimeUnit,
 };
 use crate::query::filter::{DynamicSubquery, FilterExpr, OrderBy, OrderDirection};
 #[cfg(feature = "postgresql")]
@@ -13,6 +14,8 @@ use crate::query::filter_formatter::FilterFormatter;
 use std::fmt::Write;
 use std::marker::PhantomData;
 use std::ops::{Add, Div, Mul, Sub};
+#[allow(unused_imports)]
+use std::ops::{Add as StdAdd, Sub as StdSub};
 use std::sync::Arc;
 
 fn table_name_for<T: Model>(db_type: DbType) -> String {
@@ -400,6 +403,40 @@ fn select_expr_for_column<T: Model>(
     }
 }
 
+fn select_expr_value_for_column<T: Model>(
+    column: &'static str,
+    db_type: DbType,
+    ignored_columns: &[String],
+) -> String {
+    if ignored_columns.iter().any(|ignored| ignored == column) {
+        let schema = T::column_schema()
+            .iter()
+            .find(|schema| schema.name == column)
+            .cloned()
+            .unwrap_or_else(|| panic!("Column schema not found: {}", column));
+        ignored_column_default_expr(&schema, db_type)
+    } else {
+        quote_column_reference(db_type, column)
+    }
+}
+
+fn select_exprs_for_model_fallback<T: Model>(
+    db_type: DbType,
+    ignored_columns: &[String],
+) -> Vec<String> {
+    T::columns()
+        .into_iter()
+        .enumerate()
+        .map(|(index, column)| {
+            format!(
+                "{} AS {}",
+                select_expr_value_for_column::<T>(column, db_type, ignored_columns),
+                quote_column_reference(db_type, &format!("__ormer_c{index}"))
+            )
+        })
+        .collect()
+}
+
 fn select_exprs_for_model<T: Model>(
     db_type: DbType,
     ignored_columns: &[String],
@@ -472,6 +509,40 @@ fn is_mssql_db(db_type: DbType) -> bool {
     }
 }
 
+#[cfg(feature = "sqlite")]
+fn sqlite_fulltext_columns<T: Model>() -> Option<Vec<&'static str>> {
+    let schema = T::column_schema();
+    schema
+        .iter()
+        .any(|column| column.index_method == Some("fulltext"))
+        .then(|| {
+            schema
+                .iter()
+                .find_map(|column| column.index_columns)
+                .map(|columns| {
+                    columns
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .split(',')
+                        .filter_map(|column| {
+                            let column = column.trim();
+                            schema
+                                .iter()
+                                .find(|schema_column| schema_column.name == column)
+                                .map(|schema_column| schema_column.name)
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    schema
+                        .iter()
+                        .filter(|column| column.is_indexed)
+                        .map(|column| column.name)
+                        .collect()
+                })
+        })
+}
+
 fn append_filter_clause(
     sql: &mut String,
     keyword: &str,
@@ -510,7 +581,9 @@ fn append_select_tail(
     append_filter_clause(sql, filter_keyword, filters, formatter, param_idx, params);
     append_order_by_clause(sql, order_by, db_type, param_idx, params);
     append_range_clause(sql, range_start, range_end, !order_by.is_empty(), db_type);
-    append_lock_clause(sql, lock);
+    if !is_mssql_db(db_type) {
+        append_lock_clause(sql, lock);
+    }
 }
 
 fn append_order_by_clause(
@@ -592,6 +665,213 @@ fn validate_select_parts(
 ) -> crate::Result<()> {
     validate_filters(filters, db_type)?;
     validate_order_by(order_by)
+}
+
+fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()> {
+    let Some(lock) = lock else {
+        return Ok(());
+    };
+
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => Ok(()),
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => Ok(()),
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL if lock.no_wait => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "NOWAIT row locking",
+        }),
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => Ok(()),
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "duckdb",
+            feature = "clickhouse",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql"
+        ))]
+        _ => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        }),
+    }
+}
+
+fn validate_distinct_on(
+    distinct_on: &[SqlExpr],
+    order_by: &[OrderBy],
+    db_type: DbType,
+) -> crate::Result<()> {
+    if distinct_on.is_empty() {
+        return Ok(());
+    }
+
+    if order_by.len() < distinct_on.len() {
+        return Err(crate::ormer_error!(
+            "distinct_on ORDER BY must start with every partition key"
+        ));
+    }
+    for (key, order) in distinct_on.iter().zip(order_by) {
+        if let Some(error) = order.error() {
+            return Err(crate::ormer_error!("{}", error));
+        }
+        if !expr_equivalent(
+            key,
+            &order
+                .cloned_expr()
+                .unwrap_or(SqlExpr::Column(order.column.clone())),
+        ) {
+            return Err(crate::ormer_error!(
+                "ORDER BY must start with the distinct_on partition keys"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expr_equivalent(left: &SqlExpr, right: &SqlExpr) -> bool {
+    match (left, right) {
+        (SqlExpr::Column(left), SqlExpr::Column(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn distinct_on_rank_sql(
+    distinct_on: &[SqlExpr],
+    order_by: &[OrderBy],
+    db_type: DbType,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) -> String {
+    let partition = format_expr_list(distinct_on, db_type, param_idx, params);
+    let order = order_by
+        .iter()
+        .map(|order| order.to_sql_with_params(db_type, param_idx, params, None))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order})")
+}
+
+fn distinct_on_native(db_type: DbType) -> bool {
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => true,
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => true,
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "clickhouse",
+            feature = "postgresql",
+            feature = "duckdb"
+        ))]
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_distinct_on_fallback(
+    sql: &mut String,
+    table_name: &str,
+    inner_projection: &[String],
+    outer_projection: &str,
+    rank_sql: &str,
+    filters: &[FilterExpr],
+    order_by: &[OrderBy],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    db_type: DbType,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
+    sql.push_str("SELECT ");
+    sql.push_str(&inner_projection.join(", "));
+    sql.push_str(", ");
+    sql.push_str(rank_sql);
+    sql.push_str(" AS \"__ormer_rank\" FROM ");
+    sql.push_str(table_name);
+    append_filter_clause(
+        sql,
+        " WHERE ",
+        filters,
+        FilterFormatter::new(db_type),
+        param_idx,
+        params,
+    );
+    sql.push_str(") \"__ormer_ranked\"");
+    sql.push_str(" WHERE \"__ormer_ranked\".\"__ormer_rank\" = 1");
+    sql.insert_str(0, &format!("SELECT {outer_projection} FROM ("));
+
+    if !order_by.is_empty() {
+        sql.push_str(" ORDER BY ");
+        let orders = order_by
+            .iter()
+            .enumerate()
+            .map(|(index, order)| {
+                let direction = match order.direction {
+                    OrderDirection::Asc => "ASC",
+                    OrderDirection::Desc => "DESC",
+                };
+                format!("\"__ormer_order_{index}\" {direction}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        sql.push_str(&orders);
+    }
+    append_range_clause(sql, range_start, range_end, !order_by.is_empty(), db_type);
+}
+
+fn validate_grouping_clause(
+    grouping_clause: Option<&GroupingClause>,
+    db_type: DbType,
+) -> crate::Result<()> {
+    let Some(clause) = grouping_clause else {
+        return Ok(());
+    };
+
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => Ok(()),
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => Ok(()),
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => Ok(()),
+        #[cfg(feature = "mysql")]
+        DbType::MySQL if matches!(clause, GroupingClause::Rollup(_)) => Ok(()),
+        #[cfg(any(
+            feature = "sqlite",
+            feature = "mysql",
+            feature = "clickhouse",
+            feature = "postgresql",
+            feature = "mssql",
+            feature = "duckdb"
+        ))]
+        _ => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "advanced GROUP BY syntax",
+        }),
+    }
+}
+
+fn validate_projection_exprs(exprs: &[SqlExpr], db_type: DbType) -> crate::Result<()> {
+    for expr in exprs {
+        expr.validate_for_db(db_type)?;
+    }
+    Ok(())
+}
+
+fn validate_join_parts(
+    filters: &[FilterExpr],
+    on_condition: &FilterExpr,
+    join_order_by: &[OrderBy],
+    db_type: DbType,
+) -> crate::Result<()> {
+    validate_filters(filters, db_type)?;
+    validate_filter_expr(on_condition, db_type)?;
+    validate_order_by(join_order_by)
 }
 
 fn filter_has_relation(filter: &FilterExpr) -> bool {
@@ -742,6 +1022,36 @@ struct RecursiveCte {
     direction: RecursiveDirection,
 }
 
+#[derive(Clone)]
+pub(crate) struct CteDefinition {
+    name: String,
+    render: Arc<dyn Fn(DbType) -> CteRenderedSql + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CteRenderedSql {
+    pub sql: String,
+    pub params: Vec<crate::model::Value>,
+    pub columns: Vec<String>,
+    #[cfg(feature = "postgresql")]
+    pub param_rust_types: Vec<&'static str>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CteJoin {
+    name: String,
+    left_column: String,
+    right_column: String,
+}
+
+pub struct CteBuilder;
+
+impl CteBuilder {
+    pub fn select<T: Model>() -> Select<T> {
+        Select::new()
+    }
+}
+
 impl RowLock {
     fn for_update() -> Self {
         Self {
@@ -773,14 +1083,36 @@ fn append_lock_clause(sql: &mut String, lock: Option<RowLock>) {
     }
 }
 
+fn mssql_lock_table_hint(lock: Option<RowLock>) -> &'static str {
+    let Some(lock) = lock else {
+        return "";
+    };
+
+    match (lock.skip_locked, lock.mode) {
+        (true, "FOR UPDATE") => " WITH (UPDLOCK, HOLDLOCK, READPAST)",
+        (_, "FOR UPDATE") => " WITH (UPDLOCK, HOLDLOCK)",
+        (_, "FOR SHARE") => " WITH (HOLDLOCK)",
+        _ => "",
+    }
+}
+
+fn table_name_with_lock_hint(table_name: &str, lock: Option<RowLock>, db_type: DbType) -> String {
+    if is_mssql_db(db_type) {
+        format!("{table_name}{}", mssql_lock_table_hint(lock))
+    } else {
+        table_name.to_string()
+    }
+}
+
 fn select_modifier_sql(
     distinct: bool,
     distinct_on: &[SqlExpr],
     db_type: DbType,
     param_idx: &mut i32,
     params: &mut Vec<crate::model::Value>,
+    ranked: bool,
 ) -> String {
-    if !distinct_on.is_empty() {
+    if !distinct_on.is_empty() && !ranked {
         let exprs = distinct_on
             .iter()
             .map(|expr| expr.to_sql(db_type, param_idx, params, None))
@@ -1306,6 +1638,15 @@ fn collect_filter_param_rust_types<T: Model>(
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             rust_types.push("String");
         }
+        FilterExpr::FullTextSearch(search) => {
+            if cfg!(feature = "postgresql") && search.language.is_some() {
+                rust_types.push("String");
+            }
+            for expr in &search.exprs {
+                collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            }
+            rust_types.push("String");
+        }
     }
 }
 
@@ -1330,10 +1671,35 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
                 collect_sql_expr_param_rust_types::<T>(arg, rust_types);
             }
         }
+        SqlExpr::WindowFunction { args, over, .. } => {
+            for arg in args {
+                collect_sql_expr_param_rust_types::<T>(arg, rust_types);
+            }
+            for expr in &over.partition_by {
+                collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            }
+            collect_order_by_param_rust_types::<T>(&over.order_by, rust_types);
+        }
+        SqlExpr::DateTrunc { expr, .. }
+        | SqlExpr::DatePart { expr, .. }
+        | SqlExpr::AtTimeZone { expr, .. } => {
+            collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        SqlExpr::DateAdd { expr, amount, .. } => {
+            collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            collect_sql_expr_param_rust_types::<T>(amount, rust_types);
+        }
+        SqlExpr::DateDiff { left, right, .. } => {
+            collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        SqlExpr::Now => {}
         SqlExpr::Cast { expr, .. }
         | SqlExpr::Collate { expr, .. }
         | SqlExpr::JsonText { expr, .. }
         | SqlExpr::JsonPathText { expr, .. }
+        | SqlExpr::JsonPathValue { expr, .. }
+        | SqlExpr::JsonPathExists { expr, .. }
         | SqlExpr::ArrayLen { expr } => {
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
@@ -1346,6 +1712,9 @@ fn collect_sql_expr_param_rust_types<T: Model>(expr: &SqlExpr, rust_types: &mut 
         SqlExpr::JsonSet { expr, value, .. } => {
             collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             collect_sql_expr_param_rust_types::<T>(value, rust_types);
+        }
+        SqlExpr::JsonRemove { expr, .. } => {
+            collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
         SqlExpr::Aggregate {
             expr,
@@ -1476,6 +1845,10 @@ pub struct Select<T: Model> {
     ignored_columns: Vec<String>,
     table_route: TableRoute,
     recursive_cte: Option<RecursiveCte>,
+    projection_columns: Vec<SqlExpr>,
+    ctes: Vec<CteDefinition>,
+    cte_joins: Vec<CteJoin>,
+    full_text_search: Option<crate::query::filter::FullTextQuery>,
     _marker: PhantomData<T>,
 }
 
@@ -1528,6 +1901,10 @@ impl_clone_without_bounds!(
             ignored_columns,
             table_route,
             recursive_cte,
+            projection_columns,
+            ctes,
+            cte_joins,
+            full_text_search,
         ],
         marker: PhantomData,
     }
@@ -1951,12 +2328,78 @@ impl<T: Model, V> MappedSelect<T, V> {
         } else {
             self.column_exprs.clone()
         };
+        let table_name = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
+        let outer_projection = column_exprs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let source =
+                    quote_column_reference(db_type, &format!("__ormer_ranked.__ormer_c{index}"));
+                match self.alias_names.get(index).and_then(Option::as_ref) {
+                    Some(alias) => {
+                        format!("{source} AS {}", quote_column_reference(db_type, alias))
+                    }
+                    None => source,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if !self.distinct_on.is_empty() && !distinct_on_native(db_type) {
+            let selected = column_exprs
+                .iter()
+                .map(|expr| expr.to_sql(db_type, &mut param_idx, &mut params, None))
+                .collect::<Vec<_>>();
+            let order_projection_sql = self
+                .order_by
+                .iter()
+                .enumerate()
+                .map(|(index, order)| {
+                    let expr = order
+                        .cloned_expr()
+                        .unwrap_or(SqlExpr::Column(order.column.clone()));
+                    format!(
+                        "{} AS {}",
+                        expr.to_sql(db_type, &mut param_idx, &mut params, None),
+                        quote_column_reference(db_type, &format!("__ormer_order_{index}"))
+                    )
+                })
+                .collect::<Vec<_>>();
+            let rank_sql = distinct_on_rank_sql(
+                &self.distinct_on,
+                &self.order_by,
+                db_type,
+                &mut param_idx,
+                &mut params,
+            );
+            let mut inner = selected;
+            inner.extend(order_projection_sql);
+            let table = table_name_with_lock_hint(&table_name, self.lock, db_type);
+            let filters = self.effective_filters();
+            append_distinct_on_fallback(
+                &mut sql,
+                &table,
+                &inner,
+                &outer_projection,
+                &rank_sql,
+                &filters,
+                &self.order_by,
+                self.range_start,
+                self.range_end,
+                db_type,
+                &mut param_idx,
+                &mut params,
+            );
+            return (sql, params);
+        }
+
         let distinct_str = select_modifier_sql(
             self.distinct,
             &self.distinct_on,
             db_type,
             &mut param_idx,
             &mut params,
+            false,
         );
         let columns = format_projection_list(
             &column_exprs,
@@ -1967,10 +2410,11 @@ impl<T: Model, V> MappedSelect<T, V> {
         );
         write!(
             &mut sql,
-            "SELECT {}{} FROM {}",
+            "SELECT {}{}{} FROM {}",
             distinct_str,
             columns,
-            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
+            "",
+            table_name_with_lock_hint(&table_name, self.lock, db_type)
         )
         .expect("Failed to write SELECT clause");
 
@@ -1995,6 +2439,17 @@ impl<T: Model, V> MappedSelect<T, V> {
     pub fn to_sql(&self) -> String {
         let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
+    }
+
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
+        validate_row_lock(self.lock, db_type)?;
+        validate_distinct_on(&self.distinct_on, &self.order_by, db_type)?;
+        validate_projection_exprs(&self.column_exprs, db_type)?;
+        Ok(self.to_sql_with_params(db_type))
     }
 }
 
@@ -2301,15 +2756,27 @@ impl<T: Model, V> GroupedSelect<T, V> {
                     sql.push_str(&rendered_sets);
                     sql.push(')');
                 }
-                GroupingClause::Rollup(exprs) => {
-                    sql.push_str("ROLLUP (");
-                    sql.push_str(&format_expr_list(
-                        exprs,
-                        db_type,
-                        &mut param_idx,
-                        &mut params,
-                    ));
-                    sql.push(')');
+                GroupingClause::Rollup(exprs) =>
+                {
+                    #[cfg(feature = "mysql")]
+                    if matches!(db_type, DbType::MySQL) {
+                        sql.push_str(&format_expr_list(
+                            exprs,
+                            db_type,
+                            &mut param_idx,
+                            &mut params,
+                        ));
+                        sql.push_str(" WITH ROLLUP");
+                    } else {
+                        sql.push_str("ROLLUP (");
+                        sql.push_str(&format_expr_list(
+                            exprs,
+                            db_type,
+                            &mut param_idx,
+                            &mut params,
+                        ));
+                        sql.push(')');
+                    }
                 }
                 GroupingClause::Cube(exprs) => {
                     sql.push_str("CUBE (");
@@ -2361,6 +2828,19 @@ impl<T: Model, V> GroupedSelect<T, V> {
     pub fn to_sql(&self) -> String {
         let (sql, _) = self.to_sql_with_params(default_db_type());
         sql
+    }
+
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
+        validate_grouping_clause(self.grouping_clause.as_ref(), db_type)?;
+        validate_projection_exprs(&self.column_exprs, db_type)?;
+        for filter in &self.having_filters {
+            validate_filter_expr(filter, db_type)?;
+        }
+        Ok(self.to_sql_with_params(db_type))
     }
 
     /// 生成 SQL（公共方法，供执行器使用）
@@ -2431,6 +2911,10 @@ impl<T: Model> Select<T> {
             ignored_columns: Vec::new(),
             table_route: TableRoute::new(),
             recursive_cte: None,
+            projection_columns: Vec::new(),
+            ctes: Vec::new(),
+            cte_joins: Vec::new(),
+            full_text_search: None,
             _marker: PhantomData,
         }
     }
@@ -2448,7 +2932,129 @@ impl<T: Model> Select<T> {
         let mut filters =
             context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
         filters.extend(self.filters.iter().cloned());
+        if let Some(search) = &self.full_text_search {
+            filters.push(FilterExpr::FullTextSearch(Box::new(search.clone())));
+        }
         filters
+    }
+
+    fn context_and_user_filters(&self) -> Vec<FilterExpr> {
+        let mut filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        filters.extend(self.filters.iter().cloned());
+        filters
+    }
+
+    pub fn fields<F, G>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> G,
+        G: GroupByColumns,
+    {
+        let exprs = f(T::Where::default()).sql_exprs();
+        match &mut self.full_text_search {
+            Some(search) => search.exprs = exprs,
+            None => {
+                let mut search =
+                    crate::query::filter::FullTextQuery::new(SqlExpr::Value(crate::model::Value::Null), "");
+                search.exprs = exprs;
+                self.full_text_search = Some(search);
+            }
+        }
+        self
+    }
+
+    pub fn query(mut self, query: impl Into<String>) -> Self {
+        let query = query.into();
+        match &mut self.full_text_search {
+            Some(search) => search.query = query,
+            None => {
+                self.full_text_search = Some(crate::query::filter::FullTextQuery::new(
+                    SqlExpr::Value(crate::model::Value::Null),
+                    query,
+                ));
+            }
+        }
+        self
+    }
+
+    pub fn search(self, query: impl Into<String>) -> Self {
+        self.query(query)
+    }
+
+    pub fn mode(mut self, mode: crate::query::filter::FullTextMode) -> Self {
+        if let Some(search) = &mut self.full_text_search {
+            search.mode = mode;
+        }
+        self
+    }
+
+    pub fn language(mut self, language: impl Into<String>) -> Self {
+        if let Some(search) = &mut self.full_text_search {
+            search.language = Some(language.into());
+        }
+        self
+    }
+
+    pub fn rank(mut self, rank: crate::query::filter::FullTextRank) -> Self {
+        if let Some(search) = &mut self.full_text_search {
+            search.rank = rank;
+        }
+        self
+    }
+
+    pub fn columns<F, G>(mut self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> G,
+        G: GroupByColumns,
+    {
+        self.projection_columns = f(T::Where::default()).sql_exprs();
+        self
+    }
+
+    pub fn with_cte<F, U>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        F: FnOnce(CteBuilder) -> Select<U>,
+        U: Model + Send + Sync + 'static,
+    {
+        let definition = f(CteBuilder);
+        self.ctes.push(CteDefinition {
+            name: name.into(),
+            render: Arc::new(move |db_type| {
+                let (sql, params) = definition.to_sql_with_params(db_type);
+                CteRenderedSql {
+                    sql,
+                    params,
+                    columns: definition.projection_columns.iter().map(|expr| {
+                        expr.to_sql_no_params(db_type)
+                    }).collect(),
+                    #[cfg(feature = "postgresql")]
+                    param_rust_types: definition.param_rust_types(),
+                }
+            }),
+        });
+        self
+    }
+
+    pub fn inner_join_cte<R, F>(mut self, name: impl Into<String>, f: F) -> Self
+    where
+        R: Model,
+        F: FnOnce(T::Where, R::Where) -> WhereExpr,
+    {
+        let condition = f(T::Where::default(), R::Where::default()).inner;
+        let (left_column, right_column) = match condition {
+            FilterExpr::ColumnComparison {
+                left_column,
+                right_column,
+                ..
+            } => (left_column, right_column),
+            _ => panic!("inner_join_cte currently requires a single column equality condition"),
+        };
+        self.cte_joins.push(CteJoin {
+            name: name.into(),
+            left_column,
+            right_column,
+        });
+        self
     }
 
     /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
@@ -2989,13 +3595,27 @@ impl<T: Model> Select<T> {
         db_type: DbType,
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
         validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
+        validate_row_lock(self.lock, db_type)?;
+        validate_distinct_on(&self.distinct_on, &self.order_by, db_type)?;
         Ok(self.to_sql_with_params(db_type))
     }
 
     /// 生成 SQL 和参数
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        #[cfg(feature = "sqlite")]
+        if matches!(db_type, DbType::Sqlite)
+            && self.recursive_cte.is_none()
+            && self.ctes.is_empty()
+            && self.full_text_search.is_some()
+            && sqlite_fulltext_columns::<T>().is_some()
+        {
+            return self.to_sql_with_sqlite_fulltext();
+        }
         if self.recursive_cte.is_some() {
             return self.to_sql_with_recursive_cte(db_type);
+        }
+        if !self.ctes.is_empty() {
+            return self.to_sql_with_ctes(db_type);
         }
 
         let filters = self.effective_filters();
@@ -3027,19 +3647,90 @@ impl<T: Model> Select<T> {
         let mut param_idx = 1;
         let mut params = Vec::new();
 
+        let table_name = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
+        if !self.distinct_on.is_empty() && !distinct_on_native(db_type) {
+            let selected = select_exprs_for_model_fallback::<T>(db_type, &self.ignored_columns);
+            let outer_projection = T::columns()
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    format!(
+                        "{} AS {}",
+                        quote_column_reference(
+                            db_type,
+                            &format!("__ormer_ranked.__ormer_c{index}")
+                        ),
+                        quote_column_reference(db_type, column)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let order_projection_sql = self
+                .order_by
+                .iter()
+                .enumerate()
+                .map(|(index, order)| {
+                    let expr = order
+                        .cloned_expr()
+                        .unwrap_or(SqlExpr::Column(order.column.clone()));
+                    format!(
+                        "{} AS {}",
+                        expr.to_sql(db_type, &mut param_idx, &mut params, None),
+                        quote_column_reference(db_type, &format!("__ormer_order_{index}"))
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut inner = selected;
+            inner.extend(order_projection_sql);
+            let rank_sql = distinct_on_rank_sql(
+                &self.distinct_on,
+                &self.order_by,
+                db_type,
+                &mut param_idx,
+                &mut params,
+            );
+            let table = table_name_with_lock_hint(&table_name, self.lock, db_type);
+            append_distinct_on_fallback(
+                &mut sql,
+                &table,
+                &inner,
+                &outer_projection,
+                &rank_sql,
+                &filters,
+                &self.order_by,
+                self.range_start,
+                self.range_end,
+                db_type,
+                &mut param_idx,
+                &mut params,
+            );
+            return (sql, params);
+        }
+
         let distinct_str = select_modifier_sql(
             self.distinct,
             &self.distinct_on,
             db_type,
             &mut param_idx,
             &mut params,
+            false,
         );
+        let projection_sql = if self.projection_columns.is_empty() {
+            select_exprs_for_model::<T>(db_type, &self.ignored_columns, None)
+        } else {
+            self.projection_columns
+                .iter()
+                .map(|expr| expr.to_sql(db_type, &mut param_idx, &mut params, None))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         write!(
             &mut sql,
-            "SELECT {}{} FROM {}",
+            "SELECT {}{}{} FROM {}",
             distinct_str,
-            select_exprs_for_model::<T>(db_type, &self.ignored_columns, None),
-            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
+            projection_sql,
+            "",
+            table_name_with_lock_hint(&table_name, self.lock, db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
@@ -3048,7 +3739,7 @@ impl<T: Model> Select<T> {
             &filters,
             " WHERE ",
             FilterFormatter::new(db_type),
-            &self.order_by,
+            &self.search_order_by(db_type, &mut param_idx, &mut params),
             self.range_start,
             self.range_end,
             self.lock,
@@ -3061,13 +3752,210 @@ impl<T: Model> Select<T> {
         (sql, params)
     }
 
+    #[cfg(feature = "sqlite")]
+    fn to_sql_with_sqlite_fulltext(&self) -> (String, Vec<crate::model::Value>) {
+        let search = self
+            .full_text_search
+            .as_ref()
+            .expect("full-text search missing");
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+        let table_name = table_name_for_route_or_panic::<T>(DbType::Sqlite, &self.table_route);
+        let normalized_table = normalize_table_name_for_db(DbType::Sqlite, T::TABLE_NAME);
+        let fts_name =
+            crate::model::quote_identifier(DbType::Sqlite, &format!("{normalized_table}_fts"));
+        let hits_name = quote_column_reference(DbType::Sqlite, "__ormer_fts_hits");
+        let hits_alias = quote_column_reference(DbType::Sqlite, "__ormer_hits");
+        let match_placeholder =
+            crate::abstract_layer::common::common_helpers::placeholder(DbType::Sqlite, param_idx as usize);
+        params.push(crate::model::Value::Text(search.query.clone()));
+        param_idx += 1;
+
+        let rank_projection = if search.rank == crate::query::filter::FullTextRank::Relevance {
+            format!(
+                ", bm25({fts_name}) AS {}",
+                quote_column_reference(DbType::Sqlite, "__ormer_rank")
+            )
+        } else {
+            String::new()
+        };
+        let projection_sql = if !search.exprs.is_empty() {
+            search
+                .exprs
+                .iter()
+                .map(|expr| expr.to_sql(DbType::Sqlite, &mut param_idx, &mut params, Some("t0")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else if self.projection_columns.is_empty() {
+            select_exprs_for_model::<T>(DbType::Sqlite, &self.ignored_columns, Some("t0"))
+        } else {
+            self.projection_columns
+                .iter()
+                .map(|expr| expr.to_sql(DbType::Sqlite, &mut param_idx, &mut params, Some("t0")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        write!(
+            &mut sql,
+            "WITH {hits_name} AS (SELECT {} AS {}{rank_projection} FROM {fts_name} WHERE {fts_name} MATCH {match_placeholder}) \
+             SELECT {} FROM {table_name} AS t0 \
+             JOIN {hits_name} AS {hits_alias} ON {} = {}",
+            quote_column_reference(DbType::Sqlite, "rowid"),
+            quote_column_reference(DbType::Sqlite, "__ormer_rowid"),
+            projection_sql,
+            quote_column_reference(DbType::Sqlite, "t0.rowid"),
+            quote_column_reference(DbType::Sqlite, "__ormer_hits.__ormer_rowid"),
+        )
+        .unwrap_or_else(|e| panic!("Failed to write SQLite full-text SELECT: {e}"));
+
+        append_select_tail(
+            &mut sql,
+            &self.context_and_user_filters(),
+            " WHERE ",
+            FilterFormatter::new(DbType::Sqlite).with_table_prefix("t0"),
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            self.lock,
+            DbType::Sqlite,
+            &mut param_idx,
+            &mut params,
+        );
+        if search.rank == crate::query::filter::FullTextRank::Relevance {
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&quote_column_reference(
+                DbType::Sqlite,
+                "__ormer_hits.__ormer_rank",
+            ));
+            append_range_clause(
+                &mut sql,
+                self.range_start,
+                self.range_end,
+                true,
+                DbType::Sqlite,
+            );
+            if !is_mssql_db(DbType::Sqlite) {
+                append_lock_clause(&mut sql, self.lock);
+            }
+        }
+
+        (sql, params)
+    }
+
+
+    fn search_order_by(
+        &self,
+        db_type: DbType,
+        param_idx: &mut i32,
+        params: &mut Vec<crate::model::Value>,
+    ) -> Vec<OrderBy> {
+        let Some(search) = &self.full_text_search else {
+            return self.order_by.clone();
+        };
+        let mut order_by = self.order_by.clone();
+        if search.rank == crate::query::filter::FullTextRank::Relevance {
+            let formatter = FilterFormatter::new(db_type);
+            let rank_sql = formatter.full_text_search_sql(search, param_idx, params);
+            order_by.push(OrderBy::desc_expr(SqlExpr::Raw(
+                crate::query::expr::RawSqlExpr::plain(rank_sql),
+            )));
+        }
+        order_by
+    }
+
+    fn to_sql_with_ctes(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+        let mut sql = String::new();
+        let mut params = Vec::new();
+        let mut param_idx = 1;
+        let mut definitions = Vec::new();
+
+        for cte in &self.ctes {
+            let rendered = (cte.render)(db_type);
+            let cte_param_count = rendered.params.len();
+            let rebased = crate::abstract_layer::common::common_helpers::rebase_placeholder_sql(
+                &rendered.sql,
+                db_type,
+                param_idx as usize - 1,
+            );
+            definitions.push(format!(
+                "{} AS ({})",
+                crate::model::quote_identifier(db_type, &cte.name),
+                rebased
+            ));
+            params.extend(rendered.params);
+            param_idx += cte_param_count as i32;
+        }
+
+        sql.push_str(if self.recursive_cte.is_some() { "WITH RECURSIVE " } else { "WITH " });
+        sql.push_str(&definitions.join(", "));
+
+        let main_table = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
+        write!(
+            &mut sql,
+            " SELECT {}{} FROM {} AS t0",
+            select_modifier_sql(
+                self.distinct,
+                &self.distinct_on,
+                db_type,
+                &mut param_idx,
+                &mut params,
+                false,
+            ),
+            if self.projection_columns.is_empty() {
+                select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0"))
+            } else {
+                self.projection_columns
+                    .iter()
+                    .map(|expr| expr.to_sql(db_type, &mut param_idx, &mut params, Some("t0")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            main_table
+        )
+        .unwrap_or_else(|e| panic!("Failed to write CTE SELECT: {e}"));
+
+        for join in &self.cte_joins {
+            let join_name = crate::model::quote_identifier(db_type, &join.name);
+            write!(
+                &mut sql,
+                " INNER JOIN {join_name} AS {join_name} ON {}.{} = {join_name}.{}",
+                "t0",
+                crate::model::quote_identifier(db_type, &join.left_column),
+                crate::model::quote_identifier(db_type, &join.right_column),
+            )
+            .unwrap_or_else(|e| panic!("Failed to write CTE join: {e}"));
+        }
+
+        let filters = self.effective_filters();
+        append_select_tail(
+            &mut sql,
+            &filters,
+            " WHERE ",
+            FilterFormatter::new(db_type).with_table_prefix("t0"),
+            &self.search_order_by(db_type, &mut param_idx, &mut params),
+            self.range_start,
+            self.range_end,
+            self.lock,
+            db_type,
+            &mut param_idx,
+            &mut params,
+        );
+
+        (sql, params)
+    }
+
     fn to_sql_with_recursive_cte(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let cte = self.recursive_cte.as_ref().expect("recursive CTE missing");
         let mut sql = String::new();
         let mut params = Vec::new();
         let mut param_idx = 1;
         let cte_name = crate::model::quote_identifier(db_type, cte.name);
-        let table_name = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
+        let table_name = table_name_with_lock_hint(
+            &table_name_for_route_or_panic::<T>(db_type, &self.table_route),
+            self.lock,
+            db_type,
+        );
         let id_column = crate::model::quote_identifier(db_type, cte.id_column);
         let parent_column = crate::model::quote_identifier(db_type, cte.parent_column);
         let id_ref = quote_column_reference(db_type, cte.id_column);
@@ -3081,9 +3969,9 @@ impl<T: Model> Select<T> {
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "WITH",
             #[cfg(feature = "duckdb")]
-            DbType::DuckDB => "WITH",
+            DbType::DuckDB => "WITH RECURSIVE",
             #[cfg(feature = "clickhouse")]
-            DbType::ClickHouse => "WITH",
+            DbType::ClickHouse => "WITH RECURSIVE",
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => "WITH RECURSIVE",
             #[cfg(feature = "postgresql")]
@@ -3123,6 +4011,7 @@ impl<T: Model> Select<T> {
             db_type,
             &mut param_idx,
             &mut params,
+            false,
         );
         write!(
             &mut sql,
@@ -3167,13 +4056,18 @@ impl<T: Model> Select<T> {
             db_type,
             &mut param_idx,
             &mut params,
+            false,
         );
         write!(
             &mut sql,
             "SELECT {}{} FROM {} AS t0",
             distinct_str,
             select_exprs_for_model::<T>(db_type, &self.ignored_columns, Some("t0")),
-            table_name_for_route_or_panic::<T>(db_type, &self.table_route)
+            table_name_with_lock_hint(
+                &table_name_for_route_or_panic::<T>(db_type, &self.table_route),
+                self.lock,
+                db_type,
+            )
         )
         .unwrap_or_else(|e| panic!("Failed to write relation SELECT clause: {}", e));
 
@@ -3223,7 +4117,9 @@ impl<T: Model> Select<T> {
             !self.order_by.is_empty(),
             db_type,
         );
-        append_lock_clause(&mut sql, self.lock);
+        if !is_mssql_db(db_type) {
+            append_lock_clause(&mut sql, self.lock);
+        }
 
         (sql, params)
     }
@@ -3231,6 +4127,13 @@ impl<T: Model> Select<T> {
     #[cfg(feature = "postgresql")]
     pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
         let mut rust_types = Vec::new();
+        for cte in &self.ctes {
+            let rendered = (cte.render)(crate::abstract_layer::DbType::PostgreSQL);
+            rust_types.extend(rendered.param_rust_types);
+        }
+        for expr in &self.projection_columns {
+            collect_sql_expr_param_rust_types::<T>(expr, &mut rust_types);
+        }
         if let Some(cte) = &self.recursive_cte {
             rust_types.push(infer_model_value_rust_type(&cte.start_value));
         }
@@ -4387,6 +5290,62 @@ pub trait ProjectionExpr {
     }
 }
 
+macro_rules! impl_date_expr_api {
+    ($target:ty) => {
+        impl<T, S> $target {
+            pub fn date_trunc(self, unit: TimeUnit) -> TypedExpr<T, S> {
+                TypedExpr::new(SqlExpr::DateTrunc {
+                    expr: Box::new(self.sql_expr()),
+                    unit,
+                })
+            }
+
+            pub fn date_part(self, part: TimePart) -> TypedExpr<i64, S> {
+                TypedExpr::new(SqlExpr::DatePart {
+                    expr: Box::new(self.sql_expr()),
+                    part,
+                })
+            }
+
+            pub fn at_time_zone(self, timezone: impl Into<String>) -> TypedExpr<T, S> {
+                TypedExpr::new(SqlExpr::AtTimeZone {
+                    expr: Box::new(self.sql_expr()),
+                    timezone: timezone.into(),
+                })
+            }
+
+            pub fn until(self, other: impl IntoSqlExpr, part: TimePart) -> TypedExpr<i64, S> {
+                TypedExpr::new(SqlExpr::DateDiff {
+                    left: Box::new(self.sql_expr()),
+                    right: Box::new(other.into_sql_expr()),
+                    part,
+                })
+            }
+
+            pub fn add(self, unit: TimeUnit, amount: impl IntoSqlExpr) -> TypedExpr<T, S> {
+                TypedExpr::new(SqlExpr::DateAdd {
+                    expr: Box::new(self.sql_expr()),
+                    unit,
+                    amount: Box::new(amount.into_sql_expr()),
+                    negative: false,
+                })
+            }
+
+            pub fn sub(self, unit: TimeUnit, amount: impl IntoSqlExpr) -> TypedExpr<T, S> {
+                TypedExpr::new(SqlExpr::DateAdd {
+                    expr: Box::new(self.sql_expr()),
+                    unit,
+                    amount: Box::new(amount.into_sql_expr()),
+                    negative: true,
+                })
+            }
+        }
+    };
+}
+
+impl_date_expr_api!(TypedColumn<T, S>);
+impl_date_expr_api!(TypedExpr<T, S>);
+
 impl<T, S> ProjectionExpr for TypedColumn<T, S> {
     type Output = T;
 
@@ -5301,6 +6260,50 @@ impl<T, S> TypedColumn<T, S> {
     {
         TypedExpr::new(self.sql_expr()).over(f)
     }
+
+    pub fn rank(self) -> TypedExpr<i64, S> {
+        Self::window_function::<i64, S>("RANK", Vec::new())
+    }
+
+    pub fn dense_rank(self) -> TypedExpr<i64, S> {
+        Self::window_function::<i64, S>("DENSE_RANK", Vec::new())
+    }
+
+    pub fn row_number(self) -> TypedExpr<i64, S> {
+        Self::window_function::<i64, S>("ROW_NUMBER", Vec::new())
+    }
+
+    pub fn ntile(self, buckets: i64) -> TypedExpr<i64, S> {
+        Self::window_function::<i64, S>(
+            "NTILE",
+            vec![SqlExpr::Value(crate::model::Value::BigInt(buckets.into()))],
+        )
+    }
+
+    pub fn lag(self, offset: i64) -> TypedExpr<T, S> {
+        Self::window_function::<T, S>(
+            "LAG",
+            vec![self.sql_expr(), SqlExpr::Value(crate::model::Value::BigInt(offset.into()))],
+        )
+    }
+
+    pub fn lead(self, offset: i64) -> TypedExpr<T, S> {
+        Self::window_function::<T, S>(
+            "LEAD",
+            vec![self.sql_expr(), SqlExpr::Value(crate::model::Value::BigInt(offset.into()))],
+        )
+    }
+
+    fn window_function<U, M>(
+        function: &'static str,
+        args: Vec<SqlExpr>,
+    ) -> TypedExpr<U, M> {
+        TypedExpr::new(SqlExpr::WindowFunction {
+            function,
+            args,
+            over: WindowSpecBuilder::default().build(),
+        })
+    }
 }
 
 impl<T, S> TypedColumn<T, S>
@@ -5418,6 +6421,15 @@ impl<T, S> TypedExpr<T, S> {
         F: FnOnce(WindowSpecBuilder) -> WindowSpecBuilder,
     {
         match self.expr {
+            SqlExpr::WindowFunction {
+                function,
+                args,
+                over: _,
+            } => Self::new(SqlExpr::WindowFunction {
+                function,
+                args,
+                over: f(WindowSpecBuilder::default()).build(),
+            }),
             SqlExpr::Aggregate {
                 name,
                 expr,
@@ -5576,88 +6588,68 @@ impl<T: ColumnValueType, S> TypedColumn<T, S> {
 
 // 为支持比较操作的类型（整数和浮点数）实现比较方法
 impl<T: ColumnValueType, S> TypedColumn<T, S> {
-    /// 大于等于
-    pub fn ge(self, value: T) -> WhereExpr {
+    fn compare<V: IntoSqlExpr>(self, operator: &str, value: V) -> WhereExpr {
         debug_assert!(
             T::supports_comparison(),
             "Type does not support comparison operations"
         );
-        let column_name = if let Some(ref func) = self.aggregate_func {
-            format!("{}({})", func, self.column_name)
+        let value = value.into_sql_expr();
+        let inner = if self.aggregate_func.is_some() {
+            let column = format!(
+                "{}({})",
+                self.aggregate_func.as_ref().expect("checked aggregate"),
+                self.column_name
+            );
+            match value {
+                SqlExpr::Value(value) => FilterExpr::Comparison {
+                    column,
+                    operator: operator.to_string(),
+                    value,
+                },
+                value => FilterExpr::ExprComparison {
+                    left: SqlExpr::Column(column),
+                    operator: operator.to_string(),
+                    right: value,
+                },
+            }
         } else {
-            self.column_name.to_string()
+            match value {
+                SqlExpr::Value(value) => FilterExpr::Comparison {
+                    column: self.column_name.to_string(),
+                    operator: operator.to_string(),
+                    value,
+                },
+                value => FilterExpr::ExprComparison {
+                    left: self.sql_expr(),
+                    operator: operator.to_string(),
+                    right: value,
+                },
+            }
         };
         WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: column_name,
-                operator: ">=".to_string(),
-                value: ColumnValueType::to_filter_value(value),
-            },
+            inner,
             ..WhereExpr::defaults()
         }
+    }
+
+    /// 大于等于
+    pub fn ge<V: IntoSqlExpr>(self, value: V) -> WhereExpr {
+        self.compare(">=", value)
     }
 
     /// 大于
-    pub fn gt(self, value: T) -> WhereExpr {
-        debug_assert!(
-            T::supports_comparison(),
-            "Type does not support comparison operations"
-        );
-        let column_name = if let Some(ref func) = self.aggregate_func {
-            format!("{}({})", func, self.column_name)
-        } else {
-            self.column_name.to_string()
-        };
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: column_name,
-                operator: ">".to_string(),
-                value: ColumnValueType::to_filter_value(value),
-            },
-            ..WhereExpr::defaults()
-        }
+    pub fn gt<V: IntoSqlExpr>(self, value: V) -> WhereExpr {
+        self.compare(">", value)
     }
 
     /// 小于等于
-    pub fn le(self, value: T) -> WhereExpr {
-        debug_assert!(
-            T::supports_comparison(),
-            "Type does not support comparison operations"
-        );
-        let column_name = if let Some(ref func) = self.aggregate_func {
-            format!("{}({})", func, self.column_name)
-        } else {
-            self.column_name.to_string()
-        };
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: column_name,
-                operator: "<=".to_string(),
-                value: ColumnValueType::to_filter_value(value),
-            },
-            ..WhereExpr::defaults()
-        }
+    pub fn le<V: IntoSqlExpr>(self, value: V) -> WhereExpr {
+        self.compare("<=", value)
     }
 
     /// 小于
-    pub fn lt(self, value: T) -> WhereExpr {
-        debug_assert!(
-            T::supports_comparison(),
-            "Type does not support comparison operations"
-        );
-        let column_name = if let Some(ref func) = self.aggregate_func {
-            format!("{}({})", func, self.column_name)
-        } else {
-            self.column_name.to_string()
-        };
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: column_name,
-                operator: "<".to_string(),
-                value: ColumnValueType::to_filter_value(value),
-            },
-            ..WhereExpr::defaults()
-        }
+    pub fn lt<V: IntoSqlExpr>(self, value: V) -> WhereExpr {
+        self.compare("<", value)
     }
 
     /// BETWEEN 范围查询
@@ -5876,6 +6868,248 @@ impl<S> TypedColumn<Vec<i64>, S> {
 
 pub trait IntoJsonPath {
     fn into_json_path(self) -> Vec<String>;
+}
+
+pub struct StaticJsonExpr<T, S> {
+    expr: SqlExpr,
+    column: &'static str,
+    path: Vec<String>,
+    _marker: PhantomData<(T, S)>,
+}
+
+impl<T, S> StaticJsonExpr<T, S> {
+    pub fn new(column: &'static str, path: Vec<String>, value_type: JsonScalarKind) -> Self {
+        Self {
+            expr: SqlExpr::JsonPathValue {
+                expr: Box::new(SqlExpr::Column(column.to_string())),
+                path: path.clone(),
+                value_type,
+            },
+            column,
+            path,
+            _marker: PhantomData,
+        }
+    }
+
+    fn path_expr(&self) -> SqlExpr {
+        SqlExpr::JsonPathExists {
+            expr: Box::new(SqlExpr::Column(self.column.to_string())),
+            path: self.path.clone(),
+        }
+    }
+
+    pub fn exists(&self) -> WhereExpr {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: self.path_expr(),
+        })
+    }
+}
+
+impl<T, S> Clone for StaticJsonExpr<T, S> {
+    fn clone(&self) -> Self {
+        Self {
+            expr: self.expr.clone(),
+            column: self.column,
+            path: self.path.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T, S> StaticJsonExpr<T, S> {
+    fn compare<V: IntoSqlExpr>(&self, operator: &str, value: V) -> WhereExpr {
+        WhereExpr {
+            inner: FilterExpr::ExprComparison {
+                left: self.expr.clone(),
+                operator: operator.to_string(),
+                right: value.into_sql_expr(),
+            },
+            ..WhereExpr::defaults()
+        }
+    }
+
+    pub fn eq<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare("=", value)
+    }
+
+    pub fn ne<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare("!=", value)
+    }
+
+    pub fn ge<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare(">=", value)
+    }
+
+    pub fn gt<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare(">", value)
+    }
+
+    pub fn le<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare("<=", value)
+    }
+
+    pub fn lt<V: IntoSqlExpr>(&self, value: V) -> WhereExpr {
+        self.compare("<", value)
+    }
+}
+
+pub struct StaticJsonArrayExpr<S> {
+    column: &'static str,
+    path: Vec<String>,
+    _marker: PhantomData<S>,
+}
+
+impl<S> StaticJsonArrayExpr<S> {
+    pub fn new(column: &'static str, path: Vec<String>) -> Self {
+        Self {
+            column,
+            path,
+            _marker: PhantomData,
+        }
+    }
+
+    fn path_expr(&self) -> SqlExpr {
+        SqlExpr::JsonPathValue {
+            expr: Box::new(SqlExpr::Column(self.column.to_string())),
+            path: self.path.clone(),
+            value_type: JsonScalarKind::Json,
+        }
+    }
+
+    pub fn contains_all<V, I>(&self, values: I) -> WhereExpr
+    where
+        V: IntoJsonScalar,
+        I: IntoIterator<Item = V>,
+    {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayContains {
+                left: Box::new(self.path_expr()),
+                right: Box::new(SqlExpr::Value(crate::model::Value::Json(
+                    json_scalar_array(values),
+                ))),
+            },
+        })
+    }
+
+    pub fn contains_any<V, I>(&self, values: I) -> WhereExpr
+    where
+        V: IntoJsonScalar,
+        I: IntoIterator<Item = V>,
+    {
+        self.overlaps(values)
+    }
+
+    pub fn overlaps<V, I>(&self, values: I) -> WhereExpr
+    where
+        V: IntoJsonScalar,
+        I: IntoIterator<Item = V>,
+    {
+        WhereExpr::from_filter(FilterExpr::ExprPredicate {
+            expr: SqlExpr::ArrayOverlaps {
+                left: Box::new(self.path_expr()),
+                right: Box::new(SqlExpr::Value(crate::model::Value::Json(
+                    json_scalar_array(values),
+                ))),
+            },
+        })
+    }
+}
+
+pub trait IntoJsonScalar {
+    fn into_json_scalar(self) -> serde_json::Value;
+}
+
+macro_rules! impl_into_json_scalar {
+    ($($type:ty),* $(,)?) => {
+        $(
+            impl IntoJsonScalar for $type {
+                fn into_json_scalar(self) -> serde_json::Value {
+                    serde_json::Value::from(self)
+                }
+            }
+        )*
+    };
+}
+
+impl_into_json_scalar!(
+    bool, i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, String, &str
+);
+
+impl IntoJsonScalar for serde_json::Value {
+    fn into_json_scalar(self) -> serde_json::Value {
+        self
+    }
+}
+
+fn json_scalar_array<V, I>(values: I) -> serde_json::Value
+where
+    V: IntoJsonScalar,
+    I: IntoIterator<Item = V>,
+{
+    serde_json::Value::Array(
+        values
+            .into_iter()
+            .map(IntoJsonScalar::into_json_scalar)
+            .collect(),
+    )
+}
+
+#[derive(Default)]
+pub struct StaticJsonUpdate {
+    column: &'static str,
+    path: Vec<String>,
+    assigned: bool,
+    value: Option<crate::query::update::UpdateValue>,
+}
+
+impl StaticJsonUpdate {
+    pub fn new(column: &'static str, path: Vec<String>) -> Self {
+        Self {
+            column,
+            path,
+            assigned: false,
+            value: None,
+        }
+    }
+
+    pub fn set<V>(&mut self, value: V)
+    where
+        V: Into<crate::model::Value>,
+    {
+        self.assigned = true;
+        self.value = Some(crate::query::update::UpdateValue::Expr(
+            crate::query::update::UpdateExpr::Sql(SqlExpr::JsonSet {
+                expr: Box::new(SqlExpr::Column(self.column.to_string())),
+                path: self.path.clone(),
+                value: Box::new(SqlExpr::Value(value.into())),
+            }),
+        ));
+    }
+
+    pub fn set_json(&mut self, value: serde_json::Value) {
+        self.set(value);
+    }
+
+    pub fn remove(&mut self) {
+        self.assigned = true;
+        self.value = Some(crate::query::update::UpdateValue::Expr(
+            crate::query::update::UpdateExpr::Sql(SqlExpr::JsonRemove {
+                expr: Box::new(SqlExpr::Column(self.column.to_string())),
+                path: self.path.clone(),
+            }),
+        ));
+    }
+
+    pub fn assignment(&self) -> Option<crate::query::update::UpdateAssignment> {
+        self.assigned
+            .then(|| crate::query::update::UpdateAssignment {
+                column: self.column.to_string(),
+                value: self
+                    .value
+                    .clone()
+                    .expect("assigned JSON update has a value"),
+            })
+    }
 }
 
 impl IntoJsonPath for &str {
@@ -6584,6 +7818,15 @@ impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
             },
         )
     }
+
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        let filters = self.effective_filters();
+        validate_join_parts(&filters, &self.on_condition, &self.join_order_by, db_type)?;
+        Ok(self.to_sql_with_params(db_type))
+    }
 }
 
 impl<T: Model, J: Model> NamedFilterQuery<T> for LeftJoinedSelect<T, J> {
@@ -6654,6 +7897,15 @@ impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
                 join_range_end: self.join_range_end,
             },
         )
+    }
+
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        let filters = self.effective_filters();
+        validate_join_parts(&filters, &self.on_condition, &self.join_order_by, db_type)?;
+        Ok(self.to_sql_with_params(db_type))
     }
 }
 

@@ -3,13 +3,15 @@
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
-use super::{SqlStatement, common_helpers};
+use super::{SingleSqlStatement, SqlStatement, common_helpers};
 use crate::db_first;
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
     RelationSelection, TableRouteValue, ThroughRelation, Tracked, Value, WritableModel,
     normalize_table_name_for_db, routed_model_table_name_for_db,
 };
+#[cfg(feature = "clickhouse")]
+use crate::query::builder::Select;
 use crate::query::builder::{ContextFilter, DerivedSelect, DerivedTableSelect};
 use crate::query::builder::{FilterQuery, NamedFilterQuery, WhereExpr, WithoutFilterQuery};
 use crate::query::filter::FilterExpr;
@@ -184,6 +186,9 @@ use super::super::mssql_backend;
 
 #[cfg(feature = "duckdb")]
 use super::super::duckdb_backend;
+
+#[cfg(feature = "clickhouse")]
+use super::super::clickhouse_backend;
 
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
@@ -629,6 +634,74 @@ impl<'a> DatabaseScope<'a> {
     }
 }
 
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_select_models_buffered<T>(
+    db: &super::super::clickhouse_backend::Database,
+    select: Select<T>,
+) -> crate::Result<Vec<T>>
+where
+    T: Model,
+{
+    let (sql, params) = select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
+    let columns = T::columns();
+    let rows = db
+        .select_values(RawSql::new(sql).with_params(params), Some(&columns))
+        .await?;
+    rows.iter()
+        .map(|values| T::from_row_values(values))
+        .collect()
+}
+
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_select_models<T, C>(
+    db: &super::super::clickhouse_backend::Database,
+    select: Select<T>,
+) -> crate::Result<C>
+where
+    T: Model + Send + Sync,
+    C: FromIterator<T>,
+{
+    let (sql, params) = select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
+    let columns = T::columns();
+    let rows = db
+        .select_values(RawSql::new(sql).with_params(params), Some(&columns))
+        .await?;
+    rows.iter()
+        .map(|values| T::from_row_values(values))
+        .collect()
+}
+
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_select_first<T>(
+    db: &super::super::clickhouse_backend::Database,
+    select: Select<T>,
+) -> crate::Result<Option<T>>
+where
+    T: Model + Send + Sync,
+{
+    Ok(clickhouse_select_models::<T, Vec<T>>(db, select)
+        .await?
+        .into_iter()
+        .next())
+}
+
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_fetch_page<T>(
+    db: &super::super::clickhouse_backend::Database,
+    select: Select<T>,
+) -> crate::Result<crate::query::builder::CursorPage<T>>
+where
+    T: Model + Send + Sync,
+{
+    let (select, cursor_columns) = select.prepare_cursor_page()?;
+    let items = clickhouse_select_models::<T, Vec<T>>(db, select.clone()).await?;
+    let next_cursor = items
+        .last()
+        .map(|model| select.cursor_values_from_model(model, &cursor_columns))
+        .transpose()?;
+    Ok(crate::query::builder::CursorPage::new(items, next_cursor))
+}
+
 impl<'a, T: Model> NamedFilterQuery<T> for DatabaseScope<'a> {
     fn apply_named_filter(mut self, name: &'static str, expr: WhereExpr) -> Self {
         self.context_filters
@@ -835,12 +908,12 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertExecutor<'a, I>),
     #[cfg(feature = "clickhouse")]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a I>,
-    },
+    ClickHouse(
+        &'a clickhouse_backend::Database,
+        I,
+        Option<crate::query::insert::InsertConflict>,
+        std::marker::PhantomData<I::Model>,
+    ),
 }
 
 pub enum InsertPartialExecutor<'a, T: Model> {
@@ -974,7 +1047,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_conflict(f)),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -996,7 +1069,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_constraint(target)),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1017,7 +1090,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.conflict_where(f)),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1034,7 +1107,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_nothing()),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1051,7 +1124,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update()),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1072,7 +1145,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update_if(f)),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1092,7 +1165,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.set(f)),
             #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
         }
     }
 
@@ -1109,9 +1182,21 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.to_sql(),
             #[cfg(feature = "clickhouse")]
-            InsertExecutor::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            InsertExecutor::ClickHouse(_, models, conflict, _) => {
+                let refs = models.as_refs();
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    super::super::DbType::ClickHouse,
+                    &refs,
+                    conflict.as_ref(),
+                )?;
+                Ok(SqlStatement::batch(
+                    super::super::DbType::ClickHouse,
+                    statements
+                        .into_iter()
+                        .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                        .collect(),
+                ))
+            }
         }
     }
 
@@ -1130,9 +1215,26 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.execute().await,
             #[cfg(feature = "clickhouse")]
-            InsertExecutor::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(backend, feature)),
+            InsertExecutor::ClickHouse(db, mut models, conflict, _) => {
+                let refs = models.as_refs();
+                if refs.is_empty() {
+                    return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+                }
+
+                let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
+                    super::super::DbType::ClickHouse,
+                    &refs,
+                    conflict.as_ref(),
+                )?;
+                let ctx = crate::HookContext::new(crate::HookOperation::Insert);
+                models.run_before_insert(ctx).await?;
+                for statement in statements {
+                    db.execute_sql(RawSql::new(statement.sql).with_params(statement.params))
+                        .await?;
+                }
+                models.run_after_insert(ctx).await?;
+                Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+            }
         }
     }
 
@@ -1153,9 +1255,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.returning().await,
             #[cfg(feature = "clickhouse")]
-            InsertExecutor::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(backend, feature)),
+            InsertExecutor::ClickHouse(..) => Err(unsupported_feature(
+                super::super::DbType::ClickHouse,
+                "DML RETURNING",
+            )),
         }
     }
 }
@@ -1570,11 +1673,9 @@ impl Database {
             #[cfg(feature = "duckdb")]
             Database::DuckDB(db) => InsertExecutor::DuckDB(db.insert::<I>(models)),
             #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(_) => InsertExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
-                feature: "Model insert on ClickHouse",
-                _marker: std::marker::PhantomData,
-            },
+            Database::ClickHouse(db) => {
+                InsertExecutor::ClickHouse(db, models, None, std::marker::PhantomData)
+            }
         }
     }
 
@@ -1799,11 +1900,9 @@ impl Database {
             #[cfg(feature = "duckdb")]
             Database::DuckDB(db) => SelectExecutor::DuckDB(db.select::<T>()),
             #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(_) => SelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
-                feature: "Model select on ClickHouse; use select_sql",
-                _marker: std::marker::PhantomData,
-            },
+            Database::ClickHouse(db) => {
+                SelectExecutor::ClickHouse(db, crate::query::builder::Select::default())
+            }
         }
     }
 
@@ -2388,15 +2487,116 @@ pub enum SelectExecutor<'a, T: Model> {
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectExecutor<'a, T>),
     #[cfg(feature = "clickhouse")]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a T>,
-    },
+    ClickHouse(
+        &'a clickhouse_backend::Database,
+        crate::query::builder::Select<T>,
+    ),
 }
 
 crate::impl_unified_select_executor_methods!(SelectExecutor);
+
+impl<'a, T: Model> SelectExecutor<'a, T> {
+    pub fn fields<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.fields(f)),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.fields(f)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.fields(f)),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.fields(f)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.fields(f)),
+            #[cfg(feature = "clickhouse")]
+            SelectExecutor::ClickHouse(db, select) => {
+                SelectExecutor::ClickHouse(db, select.fields(f))
+            }
+        }
+    }
+
+    pub fn query(self, query: impl Into<String>) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.query(query)),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.query(query)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.query(query)),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.query(query)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.query(query)),
+            #[cfg(feature = "clickhouse")]
+            SelectExecutor::ClickHouse(db, select) => {
+                SelectExecutor::ClickHouse(db, select.query(query))
+            }
+        }
+    }
+
+    pub fn mode(self, mode: crate::query::filter::FullTextMode) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.mode(mode)),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.mode(mode)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.mode(mode)),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.mode(mode)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.mode(mode)),
+            #[cfg(feature = "clickhouse")]
+            SelectExecutor::ClickHouse(db, select) => {
+                SelectExecutor::ClickHouse(db, select.mode(mode))
+            }
+        }
+    }
+
+    pub fn language(self, language: impl Into<String>) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.language(language)),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                SelectExecutor::PostgreSQL(exec.language(language))
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.language(language)),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.language(language)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.language(language)),
+            #[cfg(feature = "clickhouse")]
+            SelectExecutor::ClickHouse(db, select) => {
+                SelectExecutor::ClickHouse(db, select.language(language))
+            }
+        }
+    }
+
+    pub fn rank(self, rank: crate::query::filter::FullTextRank) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.rank(rank)),
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.rank(rank)),
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.rank(rank)),
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.rank(rank)),
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.rank(rank)),
+            #[cfg(feature = "clickhouse")]
+            SelectExecutor::ClickHouse(db, select) => {
+                SelectExecutor::ClickHouse(db, select.rank(rank))
+            }
+        }
+    }
+}
 
 impl<'a, T: Model> FilterQuery<T> for SelectExecutor<'a, T> {
     fn append_filter_expr(self, expr: WhereExpr) -> Self {
@@ -2432,13 +2632,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.select_model::<R>()),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => SelectExecutor::Unsupported {
-                backend: *backend,
-                feature: *feature,
-                _marker: std::marker::PhantomData,
-            },
+            SelectExecutor::ClickHouse(db, select) => SelectExecutor::ClickHouse(
+                db,
+                Select::default().with_context_filters(select.context_filters()),
+            ),
         }
     }
 
@@ -2455,9 +2652,15 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => exec.to_sql(),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            SelectExecutor::ClickHouse(db, select) => {
+                let (sql, params) =
+                    select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
+                Ok(SqlStatement::single(
+                    super::super::DbType::ClickHouse,
+                    sql,
+                    params,
+                ))
+            }
         }
     }
 
@@ -2710,11 +2913,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => RelatedSelectExecutor::DuckDB(exec.from::<T2, R>()),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => RelatedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => RelatedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "related table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2750,11 +2951,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 std::marker::PhantomData,
             ),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => MultiTableSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => MultiTableSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "multi-table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2792,11 +2991,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 std::marker::PhantomData,
             ),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => FourTableSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => FourTableSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "four-table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2825,11 +3022,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 LeftJoinedSelectExecutor::DuckDB(exec.left_join::<J>(f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => LeftJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => LeftJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "left join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2862,11 +3057,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 InnerJoinedSelectExecutor::DuckDB(exec.inner_join::<J>(f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => InnerJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => InnerJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "inner join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2899,11 +3092,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 RightJoinedSelectExecutor::DuckDB(exec.right_join::<J>(f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => RightJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => RightJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "right join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2937,11 +3128,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 LeftJoinedSelectExecutor::DuckDB(exec.left_join_derived::<J>(derived, f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => LeftJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => LeftJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2975,11 +3164,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 InnerJoinedSelectExecutor::DuckDB(exec.inner_join_derived::<J>(derived, f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => InnerJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => InnerJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3013,11 +3200,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 RightJoinedSelectExecutor::DuckDB(exec.right_join_derived::<J>(derived, f))
             }
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => RightJoinedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => RightJoinedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3045,13 +3230,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => CollectFuture::DuckDB(exec.clone().collect::<C>()),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => CollectFuture::Unsupported {
-                backend: *backend,
-                feature: *feature,
-                _marker: std::marker::PhantomData,
-            },
+            SelectExecutor::ClickHouse(db, select) => {
+                CollectFuture::ClickHouse(db, select.clone(), std::marker::PhantomData)
+            }
         }
     }
 
@@ -3072,13 +3253,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => FirstFuture::DuckDB(exec.first()),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => FirstFuture::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
+            SelectExecutor::ClickHouse(db, select) => FirstFuture::ClickHouse(db, select),
         }
     }
 
@@ -3101,11 +3276,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.count(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => AggregateFuture::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3131,11 +3304,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.sum(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => AggregateFuture::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3161,11 +3332,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.avg(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => AggregateFuture::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3191,11 +3360,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.max(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => AggregateFuture::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3221,11 +3388,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.min(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => AggregateFuture::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -3593,6 +3758,12 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::CollectFuture<'a, T, C>),
     #[cfg(feature = "clickhouse")]
+    ClickHouse(
+        &'a clickhouse_backend::Database,
+        crate::query::builder::Select<T>,
+        std::marker::PhantomData<C>,
+    ),
+    #[cfg(feature = "clickhouse")]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3613,6 +3784,11 @@ pub enum FirstFuture<'a, T: Model> {
     MSSQL(mssql_backend::FirstFuture<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::FirstFuture<'a, T>),
+    #[cfg(feature = "clickhouse")]
+    ClickHouse(
+        &'a clickhouse_backend::Database,
+        crate::query::builder::Select<T>,
+    ),
     #[cfg(feature = "clickhouse")]
     #[doc(hidden)]
     Unsupported {
@@ -3891,6 +4067,10 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
             FirstFuture::MSSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "duckdb")]
             FirstFuture::DuckDB(future) => Box::pin(future.into_future()),
+            #[cfg(feature = "clickhouse")]
+            FirstFuture::ClickHouse(db, select) => {
+                Box::pin(async move { clickhouse_select_first(db, select).await })
+            }
             #[cfg(feature = "clickhouse")]
             FirstFuture::Unsupported {
                 backend, feature, ..
@@ -4368,7 +4548,12 @@ pub(crate) async fn apply_transaction_options(
     match txn.db_type() {
         #[cfg(feature = "sqlite")]
         super::super::DbType::Sqlite => {
-            let _ = options;
+            if options.isolation.is_some() || options.read_only {
+                return Err(unsupported_feature(
+                    super::super::DbType::Sqlite,
+                    "transaction options on SQLite",
+                ));
+            }
             Ok(())
         }
         #[cfg(feature = "postgresql")]
@@ -4407,6 +4592,12 @@ pub(crate) async fn apply_transaction_options(
                     isolation_level_sql(isolation)
                 ))
                 .await?;
+            }
+            if options.read_only {
+                return Err(unsupported_feature(
+                    super::super::DbType::MSSQL,
+                    "read-only transactions",
+                ));
             }
             Ok(())
         }
@@ -5250,11 +5441,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.map_to(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => MappedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => MappedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -5280,11 +5469,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.select_column(f)),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => GroupedSelectExecutor::Unsupported {
-                backend,
-                feature,
+            SelectExecutor::ClickHouse(..) => GroupedSelectExecutor::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -5859,12 +6046,10 @@ pub enum SelectStream<'a, T: Model> {
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectStream<'a, T>),
     #[cfg(feature = "clickhouse")]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a T>,
-    },
+    ClickHouse(
+        &'a clickhouse_backend::Database,
+        crate::query::builder::Select<T>,
+    ),
 }
 
 impl<'a, T: Model> SelectExecutor<'a, T> {
@@ -5882,13 +6067,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectStream::DuckDB(exec.stream()),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::Unsupported {
-                backend, feature, ..
-            } => SelectStream::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
+            SelectExecutor::ClickHouse(db, select) => SelectStream::ClickHouse(db, select),
         }
     }
 }
@@ -5906,12 +6085,7 @@ pub enum SelectStreamIterator<'a, T: Model> {
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectStreamIterator<'a, T>),
     #[cfg(feature = "clickhouse")]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a T>,
-    },
+    ClickHouse(std::vec::IntoIter<T>),
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
@@ -5944,9 +6118,10 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 Ok(SelectStreamIterator::DuckDB(iter))
             }
             #[cfg(feature = "clickhouse")]
-            SelectStream::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(backend, feature)),
+            SelectStream::ClickHouse(db, select) => {
+                let rows = clickhouse_select_models_buffered(db, select).await?;
+                Ok(SelectStreamIterator::ClickHouse(rows.into_iter()))
+            }
         }
     }
 }
@@ -5966,9 +6141,7 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectStreamIterator::DuckDB(iter) => iter.next().await,
             #[cfg(feature = "clickhouse")]
-            SelectStreamIterator::Unsupported {
-                backend, feature, ..
-            } => Some(Err(unsupported_feature(*backend, *feature))),
+            SelectStreamIterator::ClickHouse(rows) => rows.next().map(Ok),
         }
     }
 }

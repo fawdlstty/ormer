@@ -114,8 +114,44 @@ pub enum FilterExpr {
     ExprPredicate { expr: SqlExpr },
     /// Full text search
     TextSearch { expr: SqlExpr, query: String },
+    /// Unified full-text search over one or more expressions.
+    FullTextSearch(Box<FullTextQuery>),
     /// Runtime dynamic field that could not be resolved against the model.
     InvalidDynamicField { model: &'static str, field: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTextMode {
+    Natural,
+    Boolean,
+    WebSearch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTextRank {
+    None,
+    Relevance,
+}
+
+#[derive(Debug, Clone)]
+pub struct FullTextQuery {
+    pub exprs: Vec<SqlExpr>,
+    pub query: String,
+    pub mode: FullTextMode,
+    pub language: Option<String>,
+    pub rank: FullTextRank,
+}
+
+impl FullTextQuery {
+    pub fn new(expr: SqlExpr, query: impl Into<String>) -> Self {
+        Self {
+            exprs: vec![expr],
+            query: query.into(),
+            mode: FullTextMode::Natural,
+            language: None,
+            rank: FullTextRank::None,
+        }
+    }
 }
 
 /// 值类型（用于过滤）

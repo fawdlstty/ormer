@@ -1230,6 +1230,15 @@ fn pg_collect_filter_param_rust_types<T: Model>(
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             rust_types.push("String");
         }
+        FilterExpr::FullTextSearch(search) => {
+            for expr in &search.exprs {
+                pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            }
+            rust_types.push("String");
+            if search.language.is_some() {
+                rust_types.push("String");
+            }
+        }
     }
 }
 
@@ -1256,10 +1265,35 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
                 pg_collect_sql_expr_param_rust_types::<T>(arg, rust_types);
             }
         }
+        SqlExpr::WindowFunction { args, over, .. } => {
+            for arg in args {
+                pg_collect_sql_expr_param_rust_types::<T>(arg, rust_types);
+            }
+            for expr in &over.partition_by {
+                pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            }
+            pg_collect_order_by_param_rust_types::<T>(&over.order_by, rust_types);
+        }
+        SqlExpr::DateTrunc { expr, .. }
+        | SqlExpr::DatePart { expr, .. }
+        | SqlExpr::AtTimeZone { expr, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+        }
+        SqlExpr::DateAdd { expr, amount, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(amount, rust_types);
+        }
+        SqlExpr::DateDiff { left, right, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
+            pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
+        }
+        SqlExpr::Now => {}
         SqlExpr::Cast { expr, .. }
         | SqlExpr::Collate { expr, .. }
         | SqlExpr::JsonText { expr, .. }
         | SqlExpr::JsonPathText { expr, .. }
+        | SqlExpr::JsonPathValue { expr, .. }
+        | SqlExpr::JsonPathExists { expr, .. }
         | SqlExpr::ArrayLen { expr } => {
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
@@ -1272,6 +1306,9 @@ fn pg_collect_sql_expr_param_rust_types<T: Model>(
         SqlExpr::JsonSet { expr, value, .. } => {
             pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
             pg_collect_sql_expr_param_rust_types::<T>(value, rust_types);
+        }
+        SqlExpr::JsonRemove { expr, .. } => {
+            pg_collect_sql_expr_param_rust_types::<T>(expr, rust_types);
         }
         SqlExpr::Aggregate {
             expr,
@@ -3527,7 +3564,7 @@ impl<
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let param_rust_types = self.select.param_rust_types();
-            let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+            let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
             let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
             let mut results = Vec::new();
@@ -4546,7 +4583,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器  
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         let param_rust_types = self.select.param_rust_types();
-        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
         let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs = pg_param_refs(&pg_params);
 
@@ -5253,7 +5290,10 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.executor.select.build_sql(DbType::PostgreSQL);
+            let (sql, params) = self
+                .executor
+                .select
+                .try_to_sql_with_params(DbType::PostgreSQL)?;
 
             // 对于PostgreSQL,我们需要智能地转换参数类型
             // 如果SQL中包含::bigint(通常在HAVING子句中),使用i64

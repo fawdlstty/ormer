@@ -84,41 +84,67 @@ fn aggregate_window_and_grouping_sql_are_expression_nodes() {
     let rollup_sql = Select::<ExprUser>::new()
         .select_column(|u| (u.org_id, u.score.sum()))
         .rollup(|u| (u.org_id, u.status))
-        .to_sql();
+        .try_to_sql_with_params(DbType::Sqlite)
+        .expect_err("SQLite cannot provide ROLLUP");
 
-    assert!(rollup_sql.contains("GROUP BY ROLLUP (org_id, status)"));
+    assert!(matches!(
+        rollup_sql,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: DbType::Sqlite,
+            feature: "advanced GROUP BY syntax",
+        }
+    ));
 
     let cube_sql = Select::<ExprUser>::new()
         .select_column(|u| (u.org_id, u.score.sum()))
         .cube(|u| (u.org_id, u.status))
-        .to_sql();
+        .try_to_sql_with_params(DbType::Sqlite)
+        .expect_err("SQLite cannot provide CUBE");
 
-    assert!(cube_sql.contains("GROUP BY CUBE (org_id, status)"));
+    assert!(matches!(
+        cube_sql,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: DbType::Sqlite,
+            feature: "advanced GROUP BY syntax",
+        }
+    ));
 
     let grouping_sets_sql = Select::<ExprUser>::new()
         .select_column(|u| (u.org_id, u.score.sum()))
         .grouping_sets(|u| ((u.org_id,), ()))
-        .to_sql();
+        .try_to_sql_with_params(DbType::Sqlite)
+        .expect_err("SQLite cannot provide GROUPING SETS");
 
-    assert!(grouping_sets_sql.contains("GROUP BY GROUPING SETS ((org_id), ())"));
+    assert!(matches!(
+        grouping_sets_sql,
+        ormer::OrmerError::UnsupportedFeature {
+            backend: DbType::Sqlite,
+            feature: "advanced GROUP BY syntax",
+        }
+    ));
 }
 
 #[test]
 fn row_value_json_text_search_distinct_and_lock_sql() {
     let (sql, params) = Select::<ExprUser>::new()
         .distinct_on(|u| u.org_id)
+        .order_by(|u| u.org_id.asc())
         .filter(|u| (u.org_id, u.email).eq((1, "a@example.com")))
         .filter(|u| u.profile.json_text("role").eq("admin"))
         .filter(|u| u.email.matches_text("rust"))
-        .for_update()
-        .skip_locked()
         .range(..10)
         .to_sql_with_params(DbType::Sqlite);
 
-    assert!(sql.contains("SELECT DISTINCT ON (org_id)"));
+    assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY org_id ASC)"));
+    assert!(
+        sql.contains("__ormer_ranked.__ormer_c0 AS id"),
+        "{sql}"
+    );
+    assert!(sql.contains("__ormer_order_0\" ASC LIMIT 10"), "{sql}");
+    assert!(sql.contains("\"__ormer_ranked\".\"__ormer_rank\" = 1"));
     assert!(sql.contains("(org_id, email) = (?, ?)"));
     assert!(sql.contains("json_extract(profile, '$.role') = ?"));
     assert!(sql.contains("email MATCH ?"));
-    assert!(sql.contains("LIMIT 10 FOR UPDATE SKIP LOCKED"));
+    assert!(sql.contains("LIMIT 10"));
     assert_eq!(params.len(), 4);
 }

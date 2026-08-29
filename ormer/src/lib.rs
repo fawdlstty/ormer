@@ -27,7 +27,8 @@ pub use db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };
 pub use migration::{
-    MIGRATION_TABLE_NAME, Migration, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
+    MIGRATION_TABLE_NAME, Migration, MigrationDryRun, MigrationDryRunStep,
+    MigrationExecutionStatus, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
     TableMigration,
 };
 
@@ -64,7 +65,8 @@ pub use model::{
     ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
     RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
     TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel, Tracked, Value,
-    ViewModel, WritableModel, generate_create_table_sql, generate_create_table_sql_with_name,
+    TableOptions, ViewModel, WritableModel, generate_create_table_sql,
+    generate_create_table_sql_with_name,
 };
 #[cfg(feature = "clickhouse")]
 pub use model::{
@@ -74,16 +76,19 @@ pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum,
 pub use query::builder::{
     AgeColumn, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
     FilterQuery, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoArrayValue,
-    IntoGroupingSets, IntoJsonPath, IsInValue, IsInValues, LeftJoinedSelect, MapToResult,
-    MappedSelect, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor, RecursiveColumns,
-    RelatedSelect, RightJoinedSelect, RowValueCompare, Select, SelectColumnResult, SetOp,
+    IntoGroupingSets, IntoJsonPath, IntoJsonScalar, IsInValue, IsInValues, LeftJoinedSelect,
+    MapToResult, MappedSelect, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor,
+    RecursiveColumns, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
+    SelectColumnResult, SetOp, StaticJsonArrayExpr, StaticJsonExpr, StaticJsonUpdate,
     SubqueryParam, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery, from_derived,
 };
 pub use query::expr::{
     CaseMatchBuilder, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, RawExpr, RawExprSegment, RawSqlExpr,
-    SqlExpr, TypedExpr, WindowSpecBuilder, case_match, raw, row, value,
+    JsonScalarKind, SqlExpr, TypedExpr, WindowSpecBuilder, case_match, raw, row, value,
+    IntervalExpr, NowExpr, TimePart, TimeUnit, days, hours, minutes, now, seconds,
 };
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};
+pub use query::filter::{FullTextMode, FullTextQuery, FullTextRank};
 pub use query::insert::{
     ConflictColumns, InsertAssignment, InsertConflict, InsertConflictAction, InsertConflictTarget,
     InsertValue, IntoInsertAssignment, IntoInsertConflictTarget, IntoInsertDefaultColumn,

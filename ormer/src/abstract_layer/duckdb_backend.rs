@@ -2726,7 +2726,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
     }
 
     async fn collect_inner<C: FromIterator<(T, Option<J>)>>(self) -> crate::Result<C> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::DuckDB)?;
         let turso_params = values_to_params(&params)?;
 
         let mut rows = if turso_params.is_empty() {
@@ -3859,7 +3859,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     where
         V: crate::model::FromRowValues,
     {
-        let (sql, params) = self.select.build_sql(DbType::DuckDB);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::DuckDB)?;
 
         let turso_params = values_to_params(&params)?;
 
@@ -3914,7 +3914,7 @@ pub struct SelectStream<'a, T: Model> {
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
     /// 返回异步迭代器
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::DuckDB);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::DuckDB)?;
 
         // 从 StreamConnection 获取连接
         let conn = self.conn.expect_duckdb().clone();
