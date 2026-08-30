@@ -183,6 +183,7 @@ impl DynamicSubquery {
         (self.render)(db_type)
     }
 
+    #[cfg(feature = "postgresql")]
     pub(crate) fn params(&self, db_type: crate::abstract_layer::DbType) -> Vec<Value> {
         (self.render)(db_type).1
     }

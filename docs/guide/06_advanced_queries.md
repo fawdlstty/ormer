@@ -111,7 +111,7 @@ let rows: Vec<(i32, String, String)> = db
     .await?;
 ```
 
-聚合表达式支持 `FILTER`、内部排序和 `OVER`：
+聚合表达式支持 `FILTER`、内部排序和 `OVER`；不支持的数据库会把 `FILTER` 渲染为 `CASE WHEN`：
 
 ```rust
 let rows: Vec<(i32, i32)> = db
@@ -129,7 +129,7 @@ let rows: Vec<(i32, i32)> = db
     .await?;
 ```
 
-分组支持 `ROLLUP`、`CUBE` 和 `GROUPING SETS`：
+分组支持 `ROLLUP`、`CUBE` 和 `GROUPING SETS`；PostgreSQL / MSSQL / DuckDB 使用原生语法，MySQL 仅支持 `WITH ROLLUP`，SQLite 和 ClickHouse 会拒绝高级分组：
 
 ```rust
 let sql = Select::<Sale>::new()
@@ -155,6 +155,37 @@ let rows: Vec<User> = db
     .for_update()
     .skip_locked()
     .collect()
+    .await?;
+```
+
+`DISTINCT ON` 在 PostgreSQL / DuckDB 使用原生语法，其他数据库改写为窗口函数；`ORDER BY` 必须以分区 key 开头。
+
+`serde_json::Value` 字段可声明静态 JSON path 和数组 path：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i64,
+    #[field(settings.active: bool)]
+    #[field(settings.retry_count: i64)]
+    #[field(tags[]: String)]
+    profile: serde_json::Value,
+}
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.profile.settings.active.eq(true))
+    .filter(|u| u.profile.settings.retry_count.ge(3))
+    .filter(|u| u.profile.tags.contains_all(["admin", "write"]))
+    .collect()
+    .await?;
+
+db.update::<User>()
+    .filter(|u| u.id.eq(1))
+    .set(|u| u.profile.settings.retry_count.set(3))
+    .execute()
     .await?;
 ```
 

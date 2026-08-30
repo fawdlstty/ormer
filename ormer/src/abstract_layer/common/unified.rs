@@ -3,7 +3,9 @@
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
-use super::{SingleSqlStatement, SqlStatement, common_helpers};
+use super::{SqlStatement, common_helpers};
+#[cfg(feature = "clickhouse")]
+use super::SingleSqlStatement;
 use crate::db_first;
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
@@ -200,6 +202,7 @@ fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value
         .collect()
 }
 
+#[allow(dead_code)]
 fn unsupported_feature(backend: super::super::DbType, feature: &'static str) -> crate::OrmerError {
     crate::OrmerError::UnsupportedFeature { backend, feature }
 }
@@ -2652,7 +2655,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => exec.to_sql(),
             #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(db, select) => {
+            SelectExecutor::ClickHouse(_, select) => {
                 let (sql, params) =
                     select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
                 Ok(SqlStatement::single(

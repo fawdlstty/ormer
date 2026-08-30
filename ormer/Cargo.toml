@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -23,7 +23,7 @@ async-trait = "0.1.92"
 byteorder = "1.5"
 bytes = "1.12.1"
 futures = "0.3.34"
-ormer-derive = { version = "0.2.8", path = "../ormer-derive" }
+ormer-derive = { version = "0.2.9", path = "../ormer-derive" }
 paste = "1.0"
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -74,6 +74,7 @@ mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 duckdb = ["sqlite", "dep:duckdb"]
 clickhouse = ["sqlite", "dep:clickhouse", "dep:serde"]
+
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

@@ -1,3 +1,6 @@
+#![cfg(feature = "sqlite")]
+#![allow(deprecated)]
+
 use ormer::{
     DbType, FullTextRank, Select, TimePart, generate_create_table_sql,
 };

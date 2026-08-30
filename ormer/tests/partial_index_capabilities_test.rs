@@ -1,6 +1,8 @@
 #![cfg(any(feature = "sqlite", feature = "duckdb", feature = "postgresql"))]
 
-use ormer::{DbType, OrmerError};
+use ormer::DbType;
+#[cfg(any(feature = "sqlite", feature = "duckdb"))]
+use ormer::OrmerError;
 
 #[derive(Debug, ormer::Model)]
 #[table = "partial_index_capability_users"]
@@ -30,6 +32,7 @@ struct PartialIndexMigrationUserV2 {
     email: Option<String>,
 }
 
+#[cfg(any(feature = "sqlite", feature = "duckdb"))]
 fn assert_partial_index_error(error: OrmerError, db_type: DbType) {
     assert!(matches!(
         error,

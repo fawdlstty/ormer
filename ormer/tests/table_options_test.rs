@@ -1,4 +1,13 @@
-use ormer::{DbType, Model, TableOptions, generate_create_table_sql};
+#![allow(deprecated)]
+
+use ormer::{Model, TableOptions};
+#[cfg(any(
+    feature = "mysql",
+    feature = "postgresql",
+    feature = "mssql",
+    feature = "clickhouse"
+))]
+use ormer::{DbType, generate_create_table_sql};
 
 #[derive(ormer::Model)]
 #[table = "tenant_events"]

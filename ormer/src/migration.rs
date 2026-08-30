@@ -5,7 +5,9 @@
 //! before executing it, while small hand-written migrations remain possible.
 
 use crate::abstract_layer::DbType;
-use crate::abstract_layer::common::{Database, Transaction, common_helpers};
+use crate::abstract_layer::common::{Database, Transaction};
+#[cfg(any(feature = "sqlite", feature = "duckdb"))]
+use crate::abstract_layer::common::common_helpers;
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
 use crate::model::CompressionAlgorithm;
 use crate::model::{ColumnSchema, WritableModel};
@@ -104,6 +106,7 @@ impl MigrationStep {
             } => {
                 let _ = (definition, using);
                 let column = crate::model::quote_identifier(db_type, column);
+                let _ = column;
                 match db_type {
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => Err(crate::ormer_error!(
@@ -964,6 +967,8 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
     let Some(algorithm) = crate::model::column_compression_algorithm(column) else {
         return Ok(());
     };
+    #[cfg(not(any(feature = "postgresql", feature = "mysql")))]
+    let _ = &algorithm;
 
     match db_type {
         #[cfg(feature = "postgresql")]
@@ -992,13 +997,36 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
                 ));
             }
         }
-        _ => {
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "column compression",
+            });
+        }
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "column compression",
+            });
+        }
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "column compression",
+            });
+        }
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => {
             return Err(crate::OrmerError::UnsupportedFeature {
                 backend: db_type,
                 feature: "column compression",
             });
         }
     }
+    #[cfg(any(feature = "postgresql", feature = "mysql"))]
     Ok(())
 }
 

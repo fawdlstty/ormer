@@ -79,7 +79,9 @@ for migration in history {
 }
 ```
 
-SQLite cannot add a foreign key after table creation; `MigrationStep::AddForeignKey` returns an error on SQLite.
+SQLite cannot add a foreign key after table creation. `migrate_table` returns an
+error; call `migrate_table::<T>().sqlite_rebuild_plan().await?` to explicitly
+generate and review the rebuild SQL before executing it.
 
 ClickHouse also uses the unified `Database` migration entry point:
 
@@ -99,6 +101,9 @@ ClickHouse stores migration history in a `MergeTree` table and does not provide
 transactions or automatic rollback. Steps execute one at a time, so completed
 steps remain applied if a later step fails. Use `MigrationStep::Sql` for
 ClickHouse CREATE TABLE DDL that must specify an engine.
+
+On populated DuckDB and ClickHouse tables, inferred column type changes are
+rejected during planning; use an explicit staged migration for those tables.
 
 `migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
 

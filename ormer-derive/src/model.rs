@@ -1,6 +1,6 @@
 use proc_macro2::TokenStream;
-use quote::quote;
-use syn::{DeriveInput, Lit, Meta, spanned::Spanned};
+use quote::{ToTokens, quote};
+use syn::{DeriveInput, Lit, Meta, Token, parse::Parse, spanned::Spanned};
 
 pub fn derive_model(input: DeriveInput) -> TokenStream {
     let name = &input.ident;
@@ -9,6 +9,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
     // 提取表名
     let table_name = extract_table_name(&input);
+    let (table_options, table_options_warning_item) = extract_table_options(&input);
+    let table_options_view = table_options.clone();
+    let table_options_model = table_options.clone();
+    let table_options_method = table_options.clone();
     let filters = extract_model_filters(&input);
     let version = extract_version_attr(&input);
 
@@ -174,6 +178,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 option_string_tokens(index_attr.and_then(|attr| attr.order.as_deref()));
             let index_where =
                 option_string_tokens(index_attr.and_then(|attr| attr.where_clause.as_deref()));
+            let index_method =
+                option_string_tokens(index_attr.and_then(|attr| attr.method.as_deref()));
+            let index_expression =
+                option_string_tokens(index_attr.and_then(|attr| attr.expression.as_deref()));
+            let index_columns =
+                option_string_tokens(index_attr.and_then(|attr| attr.columns.as_deref()));
 
             // 检查 foreign 属性
             let foreign_key = &info.foreign_key;
@@ -228,6 +238,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     index_name: #index_name,
                     index_order: #index_order,
                     index_where: #index_where,
+                    index_method: #index_method,
+                    index_expression: #index_expression,
+                    index_columns: #index_columns,
                     foreign_key: #foreign_key,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
@@ -259,6 +272,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 index_name: None,
                 index_order: None,
                 index_where: None,
+                index_method: None,
+                index_expression: None,
+                index_columns: None,
                 foreign_key: None,
                 enum_variants: None,
                 data_type: None,
@@ -525,6 +541,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             quote! {
                 pub #field_name: <#field_type as ::ormer::model::Embed>::Where
             }
+        } else if !info.json_schema.is_empty() {
+            let root_path = [info.field_name.to_string()];
+            let proxy_type = json_proxy_type_name(name, &root_path, "Where");
+            quote! {
+                pub #field_name: #proxy_type
+            }
         } else {
             let field_type = info
                 .effective_data_type_type
@@ -565,6 +587,12 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             quote! {
                 #field_name: <#field_type as ::ormer::model::Embed>::Where::new_with_prefix(#prefix)
             }
+        } else if !info.json_schema.is_empty() {
+            let root_path = [info.field_name.to_string()];
+            let proxy_type = json_proxy_type_name(name, &root_path, "Where");
+            quote! {
+                #field_name: #proxy_type::default()
+            }
         } else {
             let column_name = &info.column_name;
             quote! {
@@ -590,6 +618,13 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .filter(|info| info.embed.is_none())
         .map(|info| {
             let field_name = info.field_name;
+            if !info.json_schema.is_empty() {
+                let root_path = [info.field_name.to_string()];
+                let proxy_type = json_proxy_type_name(name, &root_path, "Update");
+                return quote! {
+                    pub #field_name: #proxy_type
+                };
+            }
             let field_type = info
                 .effective_data_type_type
                 .as_ref()
@@ -604,6 +639,13 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .filter(|info| info.embed.is_none())
         .map(|info| {
             let field_name = info.field_name;
+            if !info.json_schema.is_empty() {
+                let root_path = [info.field_name.to_string()];
+                let proxy_type = json_proxy_type_name(name, &root_path, "Update");
+                return quote! {
+                    #field_name: #proxy_type::default()
+                };
+            }
             let column_name = &info.column_name;
             quote! {
                 #field_name: ::ormer::query::update::UpdateField::new(#column_name)
@@ -615,6 +657,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .filter(|info| info.embed.is_none())
         .map(|info| {
             let field_name = info.field_name;
+            if !info.json_schema.is_empty() {
+                return quote! {
+                    self.#field_name.collect_assignments(&mut assignments);
+                };
+            }
             quote! {
                 if let Some(assignment) = self.#field_name.assignment() {
                     assignments.push(assignment);
@@ -1401,6 +1448,9 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                             index_name: None,
                             index_order: None,
                             index_where: None,
+                            index_method: None,
+                            index_expression: None,
+                            index_columns: None,
                             foreign_key: None,
                             enum_variants: schema.enum_variants,
                             data_type: schema.data_type,
@@ -1501,8 +1551,89 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         }
     };
 
-    quote! {
+    let json_where_structs = field_infos
+        .iter()
+        .filter(|info| !info.json_schema.is_empty())
+        .flat_map(|info| {
+            let field_path = [info.field_name.to_string()];
+            let wrapper_name = json_proxy_type_name(name, &field_path, "Where");
+            let root_fields = info
+                .json_schema
+                .iter()
+                .map(|root| json_where_child_field(name, root, &field_path));
+            let root_defaults = info
+                .json_schema
+                .iter()
+                .map(|root| json_where_child_default(name, root, &field_path));
+            let wrapper = quote! {
+                pub struct #wrapper_name {
+                    #(#root_fields,)*
+                }
+
+                impl Default for #wrapper_name {
+                    fn default() -> Self {
+                        Self {
+                            #(#root_defaults,)*
+                        }
+                    }
+                }
+            };
+            info.json_schema
+                .iter()
+                .filter(|root| root.leaf.is_none())
+                .map(move |root| json_where_struct(name, root, &field_path))
+                .chain(std::iter::once(wrapper))
+        });
+    let json_update_structs = field_infos
+        .iter()
+        .filter(|info| !info.json_schema.is_empty())
+        .flat_map(|info| {
+            let field_path = [info.field_name.to_string()];
+            let wrapper_name = json_proxy_type_name(name, &field_path, "Update");
+            let root_fields = info
+                .json_schema
+                .iter()
+                .map(|root| json_update_child_field(name, root, &field_path));
+            let root_defaults = info
+                .json_schema
+                .iter()
+                .map(|root| json_update_child_default(root, &field_path));
+            let root_calls = info.json_schema.iter().map(json_update_child_call);
+            let wrapper = quote! {
+                pub struct #wrapper_name {
+                    #(#root_fields,)*
+                }
+
+                impl Default for #wrapper_name {
+                    fn default() -> Self {
+                        Self {
+                            #(#root_defaults,)*
+                        }
+                    }
+                }
+
+                impl #wrapper_name {
+                    pub fn collect_assignments(
+                        &self,
+                        assignments: &mut Vec<::ormer::query::update::UpdateAssignment>,
+                    ) {
+                        #(#root_calls)*
+                    }
+                }
+            };
+            info.json_schema
+                .iter()
+                .filter(|root| root.leaf.is_none())
+                .map(move |root| json_update_struct(name, root, &field_path))
+                .chain(std::iter::once(wrapper))
+        });
+
+    let generated = quote! {
         #filter_trait_tokens
+
+        #(#json_where_structs)*
+
+        #(#json_update_structs)*
 
         // 生成 Where 结构体
         pub struct #where_name {
@@ -1549,6 +1680,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
             const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#all_column_schema_entries),*];
+            const TABLE_OPTIONS: Option<::ormer::model::TableOptions> = #table_options_view;
 
             type QueryBuilder = ::ormer::Select<Self>;
             type Where = #where_name;
@@ -1596,6 +1728,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
             const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#all_column_schema_entries),*];
             const RELATIONS: &'static [::ormer::model::RelationInfo] = &[#(#relation_schema_entries),*];
+            const TABLE_OPTIONS: Option<::ormer::model::TableOptions> = #table_options_model;
 
             type AutoIncrementKeyType = #auto_increment_key_type;
 
@@ -1605,6 +1738,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             #dynamic_columns_method
             #dynamic_column_schema_method
+            fn table_options() -> Option<::ormer::model::TableOptions> {
+                #table_options_method
+            }
+
             #version_info_method
             #hypertable_route_key_method
 
@@ -1782,6 +1919,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             #track_method
         }
+    };
+
+    quote! {
+        #table_options_warning_item
+        #generated
     }
 }
 
@@ -2235,6 +2377,9 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                     index_name: None,
                     index_order: None,
                     index_where: None,
+                    index_method: None,
+                    index_expression: None,
+                    index_columns: None,
                     foreign_key: None,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
@@ -2626,8 +2771,24 @@ struct FieldInfo<'a> {
     hypertable_route: bool,
     compress: bool,
     compression: proc_macro2::TokenStream,
+    json_paths: Vec<JsonPathSchema>,
+    json_schema: Vec<JsonSchemaNode>,
     is_ignored: bool,
     normal_index: Option<usize>,
+}
+
+#[derive(Clone)]
+struct JsonPathSchema {
+    path: Vec<String>,
+    value_type: Option<syn::Type>,
+    is_array: bool,
+}
+
+#[derive(Default)]
+struct JsonSchemaNode {
+    name: Option<syn::Ident>,
+    children: Vec<JsonSchemaNode>,
+    leaf: Option<JsonPathSchema>,
 }
 
 impl<'a> FieldInfo<'a> {
@@ -2728,12 +2889,24 @@ impl<'a> FieldInfo<'a> {
                     }
                 })
                 .unwrap_or_else(|| quote! { None }),
+            json_paths: extract_json_paths(field),
+            json_schema: Vec::new(),
             is_ignored: field
                 .attrs
                 .iter()
                 .any(|attr| attr.path().is_ident("ormer_ignore")),
             normal_index: None,
         }
+        .with_json_schema()
+    }
+
+    fn with_json_schema(mut self) -> Self {
+        let mut roots = Vec::new();
+        for schema in self.json_paths.clone() {
+            insert_json_schema(&mut roots, schema);
+        }
+        self.json_schema = roots;
+        self
     }
 
     fn is_relation(&self) -> bool {
@@ -2759,6 +2932,392 @@ fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
         }
     }
     (false, false)
+}
+
+fn extract_json_paths(field: &syn::Field) -> Vec<JsonPathSchema> {
+    let schema_attrs: Vec<_> = field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("field"))
+        .collect();
+    if schema_attrs.is_empty() {
+        return Vec::new();
+    }
+
+    let field_type = &field.ty;
+    let type_str = normalize_type_string(quote! { #field_type }.to_string());
+    if !type_str.contains("serde_json") || !type_str.contains("Value") {
+        panic!("#[field(path)] is only supported on serde_json::Value columns");
+    }
+
+    schema_attrs
+        .into_iter()
+        .map(|attr| match &attr.meta {
+            Meta::List(list) => {
+                let parsed: JsonPathAttrParser =
+                    syn::parse2(list.tokens.clone()).expect("invalid #[field(path)] schema");
+                let mut schema = JsonPathSchema::from(parsed);
+                if !schema.is_array
+                    && schema
+                        .value_type
+                        .as_ref()
+                        .map(|value_type| {
+                            normalize_type_string(quote! { #value_type }.to_string())
+                                .starts_with("Vec<")
+                        })
+                        .unwrap_or(false)
+                {
+                    schema.is_array = true;
+                    let value_type = schema.value_type.take().expect("array type");
+                    schema.value_type = vec_inner_type(&value_type).cloned();
+                }
+                schema
+            }
+            _ => panic!("#[field] JSON schema must use #[field(path: Type)]"),
+        })
+        .collect()
+}
+
+struct JsonPathAttrParser {
+    path: Vec<String>,
+    value_type: Option<syn::Type>,
+    is_array: bool,
+}
+
+impl Parse for JsonPathAttrParser {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut path = Vec::new();
+        loop {
+            let ident: syn::Ident = input.parse()?;
+            path.push(ident.to_string());
+            if input.peek(Token![.]) {
+                input.parse::<Token![.]>()?;
+            } else {
+                break;
+            }
+        }
+
+        let mut is_array = false;
+        if input.peek(syn::token::Bracket) {
+            let content;
+            syn::bracketed!(content in input);
+            if !content.is_empty() {
+                return Err(content.error("JSON array marker must be empty"));
+            }
+            is_array = true;
+        }
+
+        let mut value_type = None;
+        if input.peek(Token![:]) {
+            input.parse::<Token![:]>()?;
+            value_type = Some(input.parse()?);
+        }
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens in #[field(path)]"));
+        }
+
+        Ok(Self {
+            path,
+            value_type,
+            is_array,
+        })
+    }
+}
+
+impl From<JsonPathAttrParser> for JsonPathSchema {
+    fn from(parser: JsonPathAttrParser) -> Self {
+        Self {
+            path: parser.path,
+            value_type: parser.value_type,
+            is_array: parser.is_array,
+        }
+    }
+}
+
+fn insert_json_schema(roots: &mut Vec<JsonSchemaNode>, schema: JsonPathSchema) {
+    if schema.path.is_empty() {
+        panic!("JSON path schema cannot be empty");
+    }
+    let first = syn::Ident::new(&schema.path[0], proc_macro2::Span::call_site());
+    let root_index = roots
+        .iter()
+        .position(|root| root.name.as_ref() == Some(&first))
+        .unwrap_or_else(|| {
+            roots.push(JsonSchemaNode {
+                name: Some(first),
+                children: Vec::new(),
+                leaf: None,
+            });
+            roots.len() - 1
+        });
+    let mut node = &mut roots[root_index];
+    if node.leaf.is_some() {
+        panic!("JSON path schema overlaps an existing parent path");
+    }
+    let names: Vec<String> = schema.path.iter().skip(1).cloned().collect();
+    let total_parts = names.len();
+    for (index, name) in names.into_iter().enumerate() {
+        let ident = syn::Ident::new(&name, proc_macro2::Span::call_site());
+        let existing = node
+            .children
+            .iter()
+            .position(|child| child.name.as_ref() == Some(&ident));
+        node = match existing {
+            Some(index) => &mut node.children[index],
+            None => {
+                node.children.push(JsonSchemaNode {
+                    name: Some(ident),
+                    children: Vec::new(),
+                    leaf: None,
+                });
+                node.children
+                    .last_mut()
+                    .expect("just pushed JSON schema node")
+            }
+        };
+        if node.leaf.is_some() {
+            panic!("JSON path schema overlaps an existing parent path");
+        }
+        if index + 1 == total_parts {
+            node.leaf = Some(schema.clone());
+            if !node.children.is_empty() {
+                panic!("JSON path schema overlaps existing child paths");
+            }
+        }
+    }
+    if total_parts == 0 {
+        node.leaf = Some(schema);
+    }
+}
+fn json_schema_type_name(parts: &[String], suffix: &str) -> syn::Ident {
+    let mut name = parts.join("_");
+    name.push('_');
+    name.push_str(suffix);
+    syn::Ident::new(&name, proc_macro2::Span::call_site())
+}
+
+fn json_proxy_type_name(model: &syn::Ident, path: &[String], suffix: &str) -> syn::Ident {
+    let mut parts = Vec::with_capacity(path.len() + 1);
+    parts.push(model.to_string());
+    parts.extend(path.iter().cloned());
+    json_schema_type_name(&parts, suffix)
+}
+
+fn json_path_lits(path: &[String]) -> TokenStream {
+    let parts = path.iter().map(|part| quote! { #part.to_string() });
+    quote! { vec![#(#parts),*] }
+}
+
+fn json_scalar_kind(value_type: Option<&syn::Type>) -> TokenStream {
+    let Some(value_type) = value_type else {
+        return quote! { ::ormer::query::expr::JsonScalarKind::Json };
+    };
+    let type_str = normalize_type_string(quote! { #value_type }.to_string());
+    let kind = if type_str == "bool" {
+        "Boolean"
+    } else if matches!(
+        type_str.as_str(),
+        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+    ) {
+        "Integer"
+    } else if type_str == "f32" || type_str == "f64" {
+        "Real"
+    } else if type_str == "String" {
+        "String"
+    } else {
+        "Integer"
+    };
+    let kind = syn::Ident::new(kind, proc_macro2::Span::call_site());
+    quote! { ::ormer::query::expr::JsonScalarKind::#kind }
+}
+
+fn json_where_leaf_field(
+    model: &syn::Ident,
+    leaf: &JsonPathSchema,
+    name: &syn::Ident,
+    parent_path: &[String],
+) -> TokenStream {
+    let mut path = parent_path.to_vec();
+    path.push(name.to_string());
+    let value_type = leaf
+        .value_type
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(serde_json::Value));
+    let leaf_type = if leaf.is_array {
+        quote! { ::ormer::query::builder::StaticJsonArrayExpr<#model> }
+    } else {
+        quote! { ::ormer::query::builder::StaticJsonExpr<#value_type, #model> }
+    };
+    quote! { pub #name: #leaf_type }
+}
+
+fn json_where_leaf_default(
+    leaf: &JsonPathSchema,
+    name: &syn::Ident,
+    parent_path: &[String],
+) -> TokenStream {
+    let mut path = parent_path.to_vec();
+    path.push(name.to_string());
+    let column = parent_path.first().expect("JSON path starts with a column");
+    let path = json_path_lits(&path[1..]);
+    if leaf.is_array {
+        quote! { #name: ::ormer::query::builder::StaticJsonArrayExpr::new(#column, #path) }
+    } else {
+        let kind = json_scalar_kind(leaf.value_type.as_ref());
+        quote! {
+            #name: ::ormer::query::builder::StaticJsonExpr::new(#column, #path, #kind)
+        }
+    }
+}
+
+fn json_where_child_field(
+    model: &syn::Ident,
+    child: &JsonSchemaNode,
+    parent_path: &[String],
+) -> TokenStream {
+    let name = child.name.as_ref().expect("JSON schema child has a name");
+    if let Some(leaf) = child.leaf.as_ref() {
+        return json_where_leaf_field(model, leaf, name, parent_path);
+    }
+    let mut path = parent_path.to_vec();
+    path.push(name.to_string());
+    let child_type = json_proxy_type_name(model, &path, "Where");
+    quote! { pub #name: #child_type }
+}
+
+fn json_where_child_default(
+    _model: &syn::Ident,
+    child: &JsonSchemaNode,
+    parent_path: &[String],
+) -> TokenStream {
+    let name = child.name.as_ref().expect("JSON schema child has a name");
+    if let Some(leaf) = child.leaf.as_ref() {
+        return json_where_leaf_default(leaf, name, parent_path);
+    }
+    quote! { #name: Default::default() }
+}
+
+fn json_where_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]) -> TokenStream {
+    let node_name = node.name.as_ref().expect("JSON schema node has a name");
+    let mut full_path = path.to_vec();
+    full_path.push(node_name.to_string());
+    let struct_name = json_proxy_type_name(model, &full_path, "Where");
+
+    let child_structs = node
+        .children
+        .iter()
+        .filter(|child| child.leaf.is_none())
+        .map(|child| json_where_struct(model, child, &full_path));
+    let child_fields = node
+        .children
+        .iter()
+        .map(|child| json_where_child_field(model, child, &full_path));
+    let child_defaults = node
+        .children
+        .iter()
+        .map(|child| json_where_child_default(model, child, &full_path));
+
+    quote! {
+        #(#child_structs)*
+
+        pub struct #struct_name {
+            #(#child_fields,)*
+        }
+
+        impl Default for #struct_name {
+            fn default() -> Self {
+                Self {
+                    #(#child_defaults,)*
+                }
+            }
+        }
+    }
+}
+
+fn json_update_child_field(
+    model: &syn::Ident,
+    child: &JsonSchemaNode,
+    parent_path: &[String],
+) -> TokenStream {
+    let name = child.name.as_ref().expect("JSON schema child has a name");
+    if child.leaf.is_some() {
+        return quote! { pub #name: ::ormer::query::builder::StaticJsonUpdate };
+    }
+    let mut path = parent_path.to_vec();
+    path.push(name.to_string());
+    let child_type = json_proxy_type_name(model, &path, "Update");
+    quote! { pub #name: #child_type }
+}
+
+fn json_update_child_default(child: &JsonSchemaNode, parent_path: &[String]) -> TokenStream {
+    let name = child.name.as_ref().expect("JSON schema child has a name");
+    if child.leaf.is_some() {
+        let mut path = parent_path.to_vec();
+        path.push(name.to_string());
+        let column = parent_path.first().expect("JSON path starts with a column");
+        let path = json_path_lits(&path[1..]);
+        return quote! { #name: ::ormer::query::builder::StaticJsonUpdate::new(#column, #path) };
+    }
+    quote! { #name: Default::default() }
+}
+
+fn json_update_child_call(child: &JsonSchemaNode) -> TokenStream {
+    let name = child.name.as_ref().expect("JSON schema child has a name");
+    if child.leaf.is_some() {
+        return quote! {
+            if let Some(assignment) = self.#name.assignment() {
+                assignments.push(assignment);
+            }
+        };
+    }
+    quote! { self.#name.collect_assignments(assignments); }
+}
+
+fn json_update_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]) -> TokenStream {
+    let node_name = node.name.as_ref().expect("JSON schema node has a name");
+    let mut full_path = path.to_vec();
+    full_path.push(node_name.to_string());
+    let struct_name = json_proxy_type_name(model, &full_path, "Update");
+
+    let child_structs = node
+        .children
+        .iter()
+        .filter(|child| child.leaf.is_none())
+        .map(|child| json_update_struct(model, child, &full_path));
+    let child_fields = node
+        .children
+        .iter()
+        .map(|child| json_update_child_field(model, child, &full_path));
+    let child_defaults = node
+        .children
+        .iter()
+        .map(|child| json_update_child_default(child, &full_path));
+    let collect_calls = node.children.iter().map(json_update_child_call);
+
+    quote! {
+        #(#child_structs)*
+
+        pub struct #struct_name {
+            #(#child_fields,)*
+        }
+
+        impl Default for #struct_name {
+            fn default() -> Self {
+                Self {
+                    #(#child_defaults,)*
+                }
+            }
+        }
+
+        impl #struct_name {
+            pub fn collect_assignments(
+                &self,
+                assignments: &mut Vec<::ormer::query::update::UpdateAssignment>,
+            ) {
+                #(#collect_calls)*
+            }
+        }
+    }
 }
 
 fn extract_compress_attr(field: &syn::Field) -> Option<syn::Ident> {
@@ -3211,6 +3770,202 @@ fn derive_model_tuple_wrapper(
     }
 }
 
+#[derive(Default)]
+struct DialectTableOptions {
+    first: Option<String>,
+    second: Option<String>,
+    third: Option<String>,
+    fourth: Option<String>,
+    fifth: Option<String>,
+    sixth: Option<String>,
+    number: Option<u8>,
+}
+
+impl DialectTableOptions {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+            && self.second.is_none()
+            && self.third.is_none()
+            && self.fourth.is_none()
+            && self.fifth.is_none()
+            && self.sixth.is_none()
+            && self.number.is_none()
+    }
+
+    fn set_string(field: &mut Option<String>, name: &str, value: String) {
+        if value.trim().is_empty() {
+            panic!("#{name} table option must not be empty");
+        }
+        if field.is_some() {
+            panic!("duplicate {name} table option");
+        }
+        *field = Some(value);
+    }
+
+    fn set_fillfactor(&mut self, value: u8) {
+        if !(10..=100).contains(&value) {
+            panic!("PostgreSQL fillfactor must be between 10 and 100");
+        }
+        if self.number.is_some() {
+            panic!("duplicate fillfactor table option");
+        }
+        self.number = Some(value);
+    }
+}
+
+#[derive(Default)]
+struct ModelTableOptions {
+    mysql: DialectTableOptions,
+    postgresql: DialectTableOptions,
+    mssql: DialectTableOptions,
+    clickhouse: DialectTableOptions,
+}
+
+impl ModelTableOptions {
+    fn is_empty(&self) -> bool {
+        self.mysql.is_empty()
+            && self.postgresql.is_empty()
+            && self.mssql.is_empty()
+            && self.clickhouse.is_empty()
+    }
+}
+
+fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+    let mut options = ModelTableOptions::default();
+    for attr in &input.attrs {
+        let dialect = if attr.path().is_ident("mysql") {
+            &mut options.mysql
+        } else if attr.path().is_ident("postgresql") {
+            &mut options.postgresql
+        } else if attr.path().is_ident("mssql") {
+            &mut options.mssql
+        } else if attr.path().is_ident("clickhouse") {
+            &mut options.clickhouse
+        } else {
+            continue;
+        };
+
+        let Meta::List(_) = &attr.meta else {
+            panic!("dialect table options must use #[dialect(...)]");
+        };
+        attr.parse_nested_meta(|meta| {
+            let name = meta
+                .path
+                .get_ident()
+                .map(|ident| ident.to_string())
+                .unwrap_or_else(|| meta.path.to_token_stream().to_string());
+            let value = meta.value()?;
+            let expr: syn::Expr = value.parse()?;
+            let syn::Expr::Lit(expr) = expr else {
+                return Err(syn::Error::new(expr.span(), "table option must be a literal"));
+            };
+            match (name.as_str(), &expr.lit) {
+                ("fillfactor", Lit::Int(lit)) => {
+                    let value = lit.base10_parse::<u8>()?;
+                    dialect.set_fillfactor(value);
+                }
+                ("fillfactor", Lit::Str(lit)) => {
+                    let value = lit
+                        .value()
+                        .parse::<u8>()
+                        .map_err(|error| syn::Error::new(lit.span(), error.to_string()))?;
+                    dialect.set_fillfactor(value);
+                }
+                (_, Lit::Str(lit)) => {
+                    let value = lit.value();
+                    if name == "engine" {
+                        DialectTableOptions::set_string(&mut dialect.first, &name, value);
+                    } else if name == "charset" || name == "storage" || name == "filegroup" {
+                        DialectTableOptions::set_string(&mut dialect.second, &name, value);
+                    } else if name == "collation" || name == "order_by" {
+                        DialectTableOptions::set_string(&mut dialect.third, &name, value);
+                    } else if name == "partition_by" {
+                        DialectTableOptions::set_string(&mut dialect.fourth, &name, value);
+                    } else if name == "ttl" {
+                        DialectTableOptions::set_string(&mut dialect.fifth, &name, value);
+                    } else if name == "settings" {
+                        DialectTableOptions::set_string(&mut dialect.sixth, &name, value);
+                    } else {
+                        return Err(syn::Error::new(meta.path.span(), "unsupported table option"));
+                    }
+                }
+                _ => {
+                    return Err(syn::Error::new(expr.span(), "unsupported table option value"));
+                }
+            }
+            Ok(())
+        })
+        .expect("Failed to parse dialect table options");
+    }
+
+    if options.is_empty() {
+        return (quote! { None }, quote! {});
+    }
+
+    let mysql = if options.mysql.is_empty() {
+        quote! { None }
+    } else {
+        let engine = options.mysql.first.as_deref().map(|value| quote!(Some(#value)));
+        let charset = options.mysql.second.as_deref().map(|value| quote!(Some(#value)));
+        let collation = options.mysql.third.as_deref().map(|value| quote!(Some(#value)));
+        quote! {
+            ::ormer::model::mysql_table_options(
+                #engine, #charset, #collation,
+            )
+        }
+    };
+    let postgresql = if options.postgresql.is_empty() {
+        quote! { None }
+    } else {
+        let storage = options.postgresql.second.as_deref().map(|value| quote!(Some(#value)));
+        let fillfactor = options.postgresql.number.map(|value| quote!(Some(#value)));
+        quote! {
+            ::ormer::model::postgresql_table_options(#storage, #fillfactor)
+        }
+    };
+    let mssql = if options.mssql.is_empty() {
+        quote! { None }
+    } else {
+        let filegroup = options.mssql.second.as_deref().map(|value| quote!(Some(#value)));
+        quote! {
+            ::ormer::model::mssql_table_options(#filegroup)
+        }
+    };
+    let clickhouse = if options.clickhouse.is_empty() {
+        quote! { None }
+    } else {
+        let optional = |value: Option<&String>| match value {
+            Some(value) => quote!(Some(#value)),
+            None => quote!(None),
+        };
+        let engine = optional(options.clickhouse.first.as_ref());
+        let order_by = optional(options.clickhouse.third.as_ref());
+        let partition_by = optional(options.clickhouse.fourth.as_ref());
+        let ttl = optional(options.clickhouse.fifth.as_ref());
+        let settings = optional(options.clickhouse.sixth.as_ref());
+        quote! {
+            ::ormer::model::clickhouse_table_options(#engine, #order_by, #partition_by, #ttl, #settings)
+        }
+    };
+
+    let table_options = quote! {
+        ::ormer::model::merge_table_options(#mysql, #postgresql, #mssql, #clickhouse)
+    };
+    let warning_ident = syn::Ident::new(
+        &format!("__ORMER_TABLE_OPTIONS_{}", input.ident.to_string().to_uppercase()),
+        input.ident.span(),
+    );
+    let warning_item = quote! {
+        macro_rules! #warning_ident {
+            () => {
+                const _: Option<::ormer::model::TableOptions> = #table_options;
+            };
+        }
+        #warning_ident!();
+    };
+    (table_options.clone(), warning_item)
+}
+
 fn extract_table_name(input: &DeriveInput) -> String {
     // 查找 #[table = "name"] 或 #[table(schema = "...", name = "...")] 属性
     for attr in &input.attrs {
@@ -3358,6 +4113,9 @@ struct IndexAttr {
     name: Option<String>,
     order: Option<String>,
     where_clause: Option<String>,
+    method: Option<String>,
+    expression: Option<String>,
+    columns: Option<String>,
 }
 
 fn extract_index_attr(field: &syn::Field) -> Option<IndexAttr> {
@@ -3385,6 +4143,21 @@ fn extract_index_attr(field: &syn::Field) -> Option<IndexAttr> {
                         let value = meta.value()?;
                         let lit: syn::LitStr = value.parse()?;
                         index.where_clause = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("method") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.method = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("expression") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.expression = Some(lit.value());
+                        Ok(())
+                    } else if meta.path.is_ident("columns") {
+                        let value = meta.value()?;
+                        let lit: syn::LitStr = value.parse()?;
+                        index.columns = Some(lit.value());
                         Ok(())
                     } else {
                         Err(meta.error("unsupported #[index] argument"))

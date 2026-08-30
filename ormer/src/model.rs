@@ -410,6 +410,7 @@ pub const fn merge_table_options(
 }
 
 impl TableOptions {
+    #[cfg(feature = "mysql")]
     fn append_mysql_options(&self, sql: &mut String) {
         let mut parts = Vec::new();
         if let Some(engine) = self.mysql_engine {
@@ -427,6 +428,7 @@ impl TableOptions {
         }
     }
 
+    #[cfg(feature = "postgresql")]
     fn append_postgresql_options(&self, sql: &mut String) -> crate::Result<()> {
         let mut parts = Vec::new();
         if let Some(storage) = self.postgresql_storage {
@@ -444,6 +446,7 @@ impl TableOptions {
         Ok(())
     }
 
+    #[cfg(feature = "mssql")]
     fn append_mssql_options(&self, sql: &mut String) -> crate::Result<()> {
         if let Some(filegroup) = self.mssql_filegroup {
             if filegroup.contains('\'') {

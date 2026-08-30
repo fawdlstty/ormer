@@ -79,7 +79,8 @@ for migration in history {
 }
 ```
 
-SQLite 不支持在建表后追加外键；`MigrationStep::AddForeignKey` 在 SQLite 上会返回错误。
+SQLite 不支持在建表后追加外键。`migrate_table` 会返回错误；需要时先调用
+`migrate_table::<T>().sqlite_rebuild_plan().await?` 显式生成并审查重建 SQL，再执行。
 
 ClickHouse 也使用统一的 `Database` 迁移入口：
 
@@ -97,6 +98,9 @@ let applied = runner.execute().await?;
 
 ClickHouse 使用 `MergeTree` 保存迁移历史，不提供事务或自动回滚；迁移步骤逐条执行，
 失败时已经执行的步骤会保留。需要 ClickHouse engine 的建表 DDL 时，使用 `MigrationStep::Sql` 写明完整 SQL。
+
+DuckDB 和 ClickHouse 的已有数据表在迁移计划阶段会拒绝自动推断的列类型转换；
+这类表需要显式的分阶段迁移。
 
 `migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
 

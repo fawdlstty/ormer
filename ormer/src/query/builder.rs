@@ -671,12 +671,20 @@ fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()
     let Some(lock) = lock else {
         return Ok(());
     };
+    #[cfg(not(any(feature = "postgresql", feature = "mysql", feature = "mssql")))]
+    let _ = &lock;
 
     match db_type {
         #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => Ok(()),
+        DbType::PostgreSQL => {
+            let _ = &lock;
+            Ok(())
+        }
         #[cfg(feature = "mysql")]
-        DbType::MySQL => Ok(()),
+        DbType::MySQL => {
+            let _ = &lock;
+            Ok(())
+        }
         #[cfg(feature = "mssql")]
         DbType::MSSQL if lock.no_wait => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
@@ -684,15 +692,18 @@ fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()
         }),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => Ok(()),
-        #[cfg(any(
-            feature = "sqlite",
-            feature = "duckdb",
-            feature = "clickhouse",
-            feature = "postgresql",
-            feature = "mysql",
-            feature = "mssql"
-        ))]
-        _ => Err(crate::OrmerError::UnsupportedFeature {
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        }),
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        }),
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "row locking",
         }),
@@ -702,7 +713,6 @@ fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()
 fn validate_distinct_on(
     distinct_on: &[SqlExpr],
     order_by: &[OrderBy],
-    db_type: DbType,
 ) -> crate::Result<()> {
     if distinct_on.is_empty() {
         return Ok(());
@@ -760,15 +770,14 @@ fn distinct_on_native(db_type: DbType) -> bool {
         DbType::PostgreSQL => true,
         #[cfg(feature = "duckdb")]
         DbType::DuckDB => true,
-        #[cfg(any(
-            feature = "sqlite",
-            feature = "mysql",
-            feature = "mssql",
-            feature = "clickhouse",
-            feature = "postgresql",
-            feature = "duckdb"
-        ))]
-        _ => false,
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => false,
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => false,
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => false,
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => false,
     }
 }
 
@@ -831,25 +840,47 @@ fn validate_grouping_clause(
     let Some(clause) = grouping_clause else {
         return Ok(());
     };
+    #[cfg(not(any(
+        feature = "postgresql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "mysql"
+    )))]
+    let _ = &clause;
 
     match db_type {
         #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => Ok(()),
+        DbType::PostgreSQL => {
+            let _ = &clause;
+            Ok(())
+        }
         #[cfg(feature = "mssql")]
-        DbType::MSSQL => Ok(()),
+        DbType::MSSQL => {
+            let _ = &clause;
+            Ok(())
+        }
         #[cfg(feature = "duckdb")]
-        DbType::DuckDB => Ok(()),
+        DbType::DuckDB => {
+            let _ = &clause;
+            Ok(())
+        }
         #[cfg(feature = "mysql")]
         DbType::MySQL if matches!(clause, GroupingClause::Rollup(_)) => Ok(()),
-        #[cfg(any(
-            feature = "sqlite",
-            feature = "mysql",
-            feature = "clickhouse",
-            feature = "postgresql",
-            feature = "mssql",
-            feature = "duckdb"
-        ))]
-        _ => Err(crate::OrmerError::UnsupportedFeature {
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => {
+            let _ = &clause;
+            Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "advanced GROUP BY syntax",
+            })
+        }
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "advanced GROUP BY syntax",
+        }),
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "advanced GROUP BY syntax",
         }),
@@ -1032,6 +1063,7 @@ pub(crate) struct CteDefinition {
 pub(crate) struct CteRenderedSql {
     pub sql: String,
     pub params: Vec<crate::model::Value>,
+    #[allow(dead_code)]
     pub columns: Vec<String>,
     #[cfg(feature = "postgresql")]
     pub param_rust_types: Vec<&'static str>,
@@ -2447,7 +2479,7 @@ impl<T: Model, V> MappedSelect<T, V> {
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
         validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
         validate_row_lock(self.lock, db_type)?;
-        validate_distinct_on(&self.distinct_on, &self.order_by, db_type)?;
+        validate_distinct_on(&self.distinct_on, &self.order_by)?;
         validate_projection_exprs(&self.column_exprs, db_type)?;
         Ok(self.to_sql_with_params(db_type))
     }
@@ -2758,6 +2790,8 @@ impl<T: Model, V> GroupedSelect<T, V> {
                 }
                 GroupingClause::Rollup(exprs) =>
                 {
+                    #[cfg(not(feature = "mysql"))]
+                    let _ = &exprs;
                     #[cfg(feature = "mysql")]
                     if matches!(db_type, DbType::MySQL) {
                         sql.push_str(&format_expr_list(
@@ -2938,6 +2972,7 @@ impl<T: Model> Select<T> {
         filters
     }
 
+    #[cfg(feature = "sqlite")]
     fn context_and_user_filters(&self) -> Vec<FilterExpr> {
         let mut filters =
             context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
@@ -3596,7 +3631,7 @@ impl<T: Model> Select<T> {
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
         validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
         validate_row_lock(self.lock, db_type)?;
-        validate_distinct_on(&self.distinct_on, &self.order_by, db_type)?;
+        validate_distinct_on(&self.distinct_on, &self.order_by)?;
         Ok(self.to_sql_with_params(db_type))
     }
 

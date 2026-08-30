@@ -40,7 +40,8 @@ db.transaction_opts(
 ).await?;
 ```
 
-SQLite treats transaction options as compatible no-ops.
+SQLite does not support transaction options. MSSQL applies isolation levels but
+rejects `read_only()`. PostgreSQL and MySQL apply both options.
 
 ## Savepoints
 
@@ -140,6 +141,25 @@ txn.insert_or_update(&user).execute().await?;
 txn.insert_or_ignore(&user).execute().await?;
 txn.commit().await?;
 ```
+
+On SQLite these are simulated. `insert_or_update` is `DELETE` + `INSERT`, while
+`insert_or_ignore` captures only unique-constraint errors; both emit a warning
+and mark generated SQL. SQLite auto-increment keys and insert hooks may therefore
+behave differently from a native atomic upsert.
+
+### MySQL Two-Step Returning
+
+MySQL has no DML `RETURNING`. The transaction helpers write, then read the row
+on the same transaction and connection:
+
+```rust
+let inserted: Vec<User> = txn.insert_returning(&user).await?;
+let updated: Option<User> = txn.update_model_returning(&user).await?;
+let deleted: Option<User> = txn.delete_model_returning(&user).await?;
+```
+
+This is not single-statement atomic `RETURNING`. Use the surrounding transaction
+to keep the write and primary-key lookup consistent.
 
 ## Error Handling
 

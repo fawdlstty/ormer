@@ -18,6 +18,7 @@ pub struct Database {
     client: clickhouse::Client,
 }
 
+#[allow(dead_code)]
 impl Database {
     /// Connect to a ClickHouse HTTP endpoint.
     ///

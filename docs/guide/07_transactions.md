@@ -39,7 +39,8 @@ db.transaction_opts(
 ).await?;
 ```
 
-SQLite 对事务选项保持兼容性 no-op。
+SQLite 不支持事务选项。MSSQL 会应用隔离级别，但显式拒绝 `read_only()`。
+PostgreSQL 和 MySQL 会应用这两类选项。
 
 ## Savepoint
 
@@ -139,6 +140,22 @@ txn.insert_or_update(&user).execute().await?;
 txn.insert_or_ignore(&user).execute().await?;
 txn.commit().await?;
 ```
+
+SQLite 上这些操作是模拟语义：`insert_or_update` 使用 `DELETE` + `INSERT`，
+`insert_or_ignore` 只捕获唯一约束错误；生成 SQL 会带有模拟语义标记。
+自增主键和插入 hook 的行为可能与原生原子 upsert 不同。
+
+### MySQL 两步回查
+
+MySQL 没有 DML `RETURNING`。以下事务 helper 会先写入，再在同一事务连接上按主键回查：
+
+```rust
+let inserted: Vec<User> = txn.insert_returning(&user).await?;
+let updated: Option<User> = txn.update_model_returning(&user).await?;
+let deleted: Option<User> = txn.delete_model_returning(&user).await?;
+```
+
+这不是单条 SQL 的原子 `RETURNING`；写入和回查的一致性依赖外层事务。
 
 ## 错误处理
 

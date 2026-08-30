@@ -25,7 +25,11 @@ Insert and return all inserted rows (PostgreSQL, SQLite, MSSQL):
 let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
 ```
 
-`update().returning()` and `delete().returning()` support the same backends. MySQL does not support DML returning and returns `UnsupportedFeature`; use `execute()` first, then `find_by_id` or `select` when returned rows are needed.
+`update().returning()` and `delete().returning()` support the same backends. MySQL
+does not support DML returning and returns `UnsupportedFeature`; inside a MySQL
+transaction, `insert_returning`, `update_model_returning`, and
+`delete_model_returning` write first and read back by primary key. They are
+two-step helpers, not SQL `RETURNING`.
 
 ### Batch Insert
 
@@ -92,6 +96,10 @@ db.insert_or_update(&vec![user1, user2])
 ```rust
 db.upsert(&user).execute().await?;
 ```
+
+SQLite does not have a native backend path for these helpers: upsert is simulated
+with `DELETE` + `INSERT`, and ignore is simulated by capturing unique-constraint
+errors. Generated SQL is marked with the simulated semantics.
 
 ### Object Graph Insert and Update
 

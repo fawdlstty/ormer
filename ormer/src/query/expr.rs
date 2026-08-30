@@ -1,7 +1,9 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers::placeholder;
-use crate::model::{Value, quote_column_reference, quote_identifier, quote_sql_literal};
 use std::marker::PhantomData;
+use crate::model::{Value, quote_column_reference, quote_identifier};
+#[cfg(feature = "sqlite")]
+use crate::model::quote_sql_literal;
 
 #[derive(Debug, Clone)]
 pub enum SqlExpr {
@@ -133,6 +135,7 @@ pub enum TimePart {
 }
 
 impl TimeUnit {
+    #[cfg_attr(feature = "sqlite", allow(dead_code))]
     fn pg_name(self) -> &'static str {
         match self {
             Self::Second => "second",
@@ -145,6 +148,7 @@ impl TimeUnit {
         }
     }
 
+    #[cfg_attr(not(feature = "clickhouse"), allow(dead_code))]
     fn clickhouse_interval(self) -> &'static str {
         match self {
             Self::Second => "toIntervalSecond",
@@ -157,6 +161,7 @@ impl TimeUnit {
         }
     }
 
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     fn sqlite_format(self) -> &'static str {
         match self {
             Self::Second => "%Y-%m-%d %H:%M:%S",
@@ -171,6 +176,10 @@ impl TimeUnit {
 }
 
 impl TimePart {
+    #[cfg_attr(
+        not(any(feature = "postgresql", feature = "duckdb", feature = "clickhouse")),
+        allow(dead_code)
+    )]
     fn name(self) -> &'static str {
         match self {
             Self::Second => "second",
@@ -183,6 +192,10 @@ impl TimePart {
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "mysql", feature = "mssql", feature = "clickhouse")),
+        allow(dead_code)
+    )]
     fn name_upper(self) -> &'static str {
         match self {
             Self::Second => "SECOND",
@@ -195,6 +208,7 @@ impl TimePart {
         }
     }
 
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     fn sqlite_format(self) -> &'static str {
         match self {
             Self::Second => "%S",
@@ -207,6 +221,7 @@ impl TimePart {
         }
     }
 
+    #[cfg_attr(not(any(feature = "postgresql", feature = "sqlite")), allow(dead_code))]
     fn epoch_divisor(self) -> f64 {
         match self {
             Self::Second => 1.0,
@@ -235,6 +250,10 @@ pub enum JsonScalarKind {
 }
 
 impl JsonScalarKind {
+    #[cfg_attr(
+        not(any(feature = "postgresql", feature = "mssql", feature = "duckdb")),
+        allow(dead_code)
+    )]
     fn sql_type(self) -> &'static str {
         match self {
             Self::Boolean => "BOOLEAN",
@@ -990,6 +1009,7 @@ impl SqlExpr {
                 path,
                 value_type,
             } => {
+                let _ = value_type;
                 let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
                 match db_type {
                     #[cfg(feature = "postgresql")]
@@ -1128,25 +1148,38 @@ impl SqlExpr {
                     ),
                 }
             }
-            SqlExpr::JsonContains { left, right } => match db_type {
-                #[cfg(feature = "postgresql")]
-                DbType::PostgreSQL => {
-                    let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
-                    let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
-                    format!("{}::jsonb @> {}::jsonb", left_sql, right_sql)
+            SqlExpr::JsonContains { left, right } => {
+                let _ = (left, right);
+                #[cfg(any(
+                    feature = "sqlite",
+                    feature = "mssql",
+                    feature = "clickhouse",
+                    feature = "duckdb"
+                ))]
+                let unsupported = "0 = 1 /* OrmerError::UnsupportedFeature: JSON containment predicates */";
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => {
+                        let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                        let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                        format!("{}::jsonb @> {}::jsonb", left_sql, right_sql)
+                    }
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => {
+                        let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
+                        let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
+                        format!("JSON_CONTAINS({}, {})", left_sql, right_sql)
+                    }
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => unsupported.to_string(),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => unsupported.to_string(),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => unsupported.to_string(),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => unsupported.to_string(),
                 }
-                #[cfg(feature = "mysql")]
-                DbType::MySQL => {
-                    let left_sql = left.to_sql(db_type, param_idx, params, table_prefix);
-                    let right_sql = right.to_sql(db_type, param_idx, params, table_prefix);
-                    format!("JSON_CONTAINS({}, {})", left_sql, right_sql)
-                }
-                _ => {
-                    let _ = (left, right);
-                    "0 = 1 /* OrmerError::UnsupportedFeature: JSON containment predicates */"
-                        .to_string()
-                }
-            },
+            }
             SqlExpr::JsonSet { expr, path, value } => {
                 let expr_sql = expr.to_sql(db_type, param_idx, params, table_prefix);
                 let value_sql = value.to_sql(db_type, param_idx, params, table_prefix);
@@ -1394,6 +1427,7 @@ impl SqlExpr {
             SqlExpr::AtTimeZone { expr, timezone } => {
                 let value = expr.to_sql(db_type, param_idx, params, table_prefix);
                 let zone = timezone.replace('\'', "''");
+                let _ = (&value, &zone);
                 match db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => format!("{value} AT TIME ZONE '{zone}'"),
@@ -1413,6 +1447,7 @@ impl SqlExpr {
             } => {
                 let value = expr.to_sql(db_type, param_idx, params, table_prefix);
                 let mut delta = amount.to_sql(db_type, param_idx, params, table_prefix);
+                let _ = &unit;
                 if *negative {
                     delta = format!("-({delta})");
                 }
@@ -1506,15 +1541,31 @@ impl SqlExpr {
             SqlExpr::JsonContains { left, right } => {
                 left.validate_for_db(db_type)?;
                 right.validate_for_db(db_type)?;
+                #[cfg(any(
+                    feature = "sqlite",
+                    feature = "mssql",
+                    feature = "clickhouse",
+                    feature = "duckdb"
+                ))]
+                let unsupported = || -> crate::Result<()> {
+                    Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "JSON containment predicates",
+                    })
+                };
                 match db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => Ok(()),
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => Ok(()),
-                    _ => Err(crate::OrmerError::UnsupportedFeature {
-                        backend: db_type,
-                        feature: "JSON containment predicates",
-                    }),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => unsupported(),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => unsupported(),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => unsupported(),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => unsupported(),
                 }
             }
             SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
@@ -1680,15 +1731,12 @@ pub(crate) fn aggregate_filter_native(db_type: DbType) -> bool {
         DbType::Sqlite => true,
         #[cfg(feature = "duckdb")]
         DbType::DuckDB => true,
-        #[cfg(any(
-            feature = "mysql",
-            feature = "mssql",
-            feature = "clickhouse",
-            feature = "postgresql",
-            feature = "sqlite",
-            feature = "duckdb"
-        ))]
-        _ => false,
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => false,
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => false,
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => false,
     }
 }
 

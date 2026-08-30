@@ -25,7 +25,10 @@ db.insert(&User {
 let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
 ```
 
-`update().returning()` 和 `delete().returning()` 支持同样的后端；MySQL 不支持 DML returning，会返回 `UnsupportedFeature`。需要 MySQL 返回数据时，先用 `execute()` 写入，再用 `find_by_id` 或 `select` 查询。
+`update().returning()` 和 `delete().returning()` 支持同样的后端；MySQL 不支持 DML
+returning，会返回 `UnsupportedFeature`。在 MySQL 事务中，`insert_returning`、
+`update_model_returning` 和 `delete_model_returning` 会先写入再按主键回查；
+它们是两步 helper，不是 SQL `RETURNING`。
 
 ### 批量插入
 
@@ -93,6 +96,9 @@ db.insert_or_update(&vec![user1, user2])
 ```rust
 db.upsert(&user).execute().await?;
 ```
+
+SQLite 后端没有这些 helper 的原生路径：upsert 使用 `DELETE` + `INSERT` 模拟，
+ignore 通过捕获唯一约束错误模拟。生成 SQL 会带有模拟语义标记。
 
 ### 对象图插入与更新
 

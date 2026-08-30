@@ -111,7 +111,7 @@ let rows: Vec<(i32, String, String)> = db
     .await?;
 ```
 
-Aggregate expressions support `FILTER`, inner ordering, and `OVER`:
+Aggregate expressions support `FILTER`, inner ordering, and `OVER`; backends without `FILTER` render it as `CASE WHEN`:
 
 ```rust
 let rows: Vec<(i32, i32)> = db
@@ -129,7 +129,7 @@ let rows: Vec<(i32, i32)> = db
     .await?;
 ```
 
-Grouping supports `ROLLUP`, `CUBE`, and `GROUPING SETS`:
+Grouping supports `ROLLUP`, `CUBE`, and `GROUPING SETS`; PostgreSQL / MSSQL / DuckDB use native syntax, MySQL supports only `WITH ROLLUP`, and SQLite and ClickHouse reject advanced grouping:
 
 ```rust
 let sql = Select::<Sale>::new()
@@ -155,6 +155,37 @@ let rows: Vec<User> = db
     .for_update()
     .skip_locked()
     .collect()
+    .await?;
+```
+
+`DISTINCT ON` uses native syntax on PostgreSQL / DuckDB and a window-function rewrite elsewhere; `ORDER BY` must start with the partition keys.
+
+A `serde_json::Value` field can declare static JSON paths and array paths:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "users"]
+struct User {
+    #[primary]
+    id: i64,
+    #[field(settings.active: bool)]
+    #[field(settings.retry_count: i64)]
+    #[field(tags[]: String)]
+    profile: serde_json::Value,
+}
+
+let users: Vec<User> = db
+    .select::<User>()
+    .filter(|u| u.profile.settings.active.eq(true))
+    .filter(|u| u.profile.settings.retry_count.ge(3))
+    .filter(|u| u.profile.tags.contains_all(["admin", "write"]))
+    .collect()
+    .await?;
+
+db.update::<User>()
+    .filter(|u| u.id.eq(1))
+    .set(|u| u.profile.settings.retry_count.set(3))
+    .execute()
     .await?;
 ```
 
