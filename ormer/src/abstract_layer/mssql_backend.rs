@@ -164,6 +164,7 @@ pub type Pool = Arc<Mutex<Client<tokio_util::compat::Compat<TcpStream>>>>;
 /// MSSQL 数据库连接封装
 pub struct Database {
     pool: Pool,
+    connection_string: String,
 }
 
 fn mssql_escape_literal(value: &str) -> String {
@@ -183,15 +184,22 @@ fn mssql_fk_action(action: &str) -> Option<&'static str> {
 
 impl Database {
     pub async fn connect(_db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
+        let client = Self::connect_client(connection_string).await?;
+        Ok(Self {
+            pool: Arc::new(Mutex::new(client)),
+            connection_string: connection_string.to_string(),
+        })
+    }
+
+    async fn connect_client(connection_string: &str) -> crate::Result<MssqlClient> {
         let config = Config::from_ado_string(connection_string)
             .trace_for("tiberius::Config::from_ado_string")?;
         let tcp = TcpStream::connect(config.get_addr()).trace().await?;
         tcp.set_nodelay(true)
             .trace_for("tokio::net::TcpStream::set_nodelay")?;
-        let client = Client::connect(config, tcp.compat_write()).trace().await?;
-        Ok(Self {
-            pool: Arc::new(Mutex::new(client)),
-        })
+        Client::connect(config, tcp.compat_write())
+            .trace_for("tiberius::Client::connect")
+            .await
     }
 
     pub(crate) async fn db_first_tables(
@@ -655,13 +663,7 @@ impl Database {
     }
 
     pub async fn transaction(&self) -> crate::Result<Transaction<'_>> {
-        let _client = self.pool.lock().await;
-        Ok(Transaction {
-            pool: self.pool.clone(),
-            committed: false,
-            rolled_back: false,
-            _marker: PhantomData,
-        })
+        self.begin().await
     }
 
     /// 验证表结构是否与模型定义匹配
@@ -865,12 +867,15 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
-        let mut client = self.pool.lock().await;
-        traced_mssql_execute(&mut client, "BEGIN TRANSACTION", &[]).await?;
+        let client = Self::connect_client(&self.connection_string).await?;
+        let pool = Arc::new(Mutex::new(client));
+        {
+            let mut client = pool.lock().await;
+            traced_mssql_execute(&mut client, "BEGIN TRANSACTION", &[]).await?;
+        }
         Ok(Transaction {
-            pool: self.pool.clone(),
-            committed: false,
-            rolled_back: false,
+            pool,
+            state: common_helpers::TransactionState::Active,
             _marker: PhantomData,
         })
     }
@@ -1500,17 +1505,17 @@ pub struct UpdateExecutor<'a, T: Model> {
 /// 事务
 pub struct Transaction<'a> {
     pool: Pool,
-    committed: bool,
-    rolled_back: bool,
+    state: common_helpers::TransactionState,
     _marker: PhantomData<&'a ()>,
 }
 
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
-        if self.committed || self.rolled_back {
+        if !self.state.is_active() {
             return;
         }
 
+        self.state = common_helpers::TransactionState::RolledBack;
         let pool = self.pool.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -1519,6 +1524,8 @@ impl<'a> Drop for Transaction<'a> {
                 let _ = query.execute(&mut *client).trace().await;
             });
         }
+        // Outside a runtime the private connection is dropped here; closing the
+        // connection makes SQL Server roll back its active transaction.
     }
 }
 
@@ -1546,19 +1553,35 @@ impl<'a> Transaction<'a> {
     }
 
     pub async fn commit(mut self) -> crate::Result<()> {
+        if self.state.is_closed() {
+            return Err(crate::ormer_error!(
+                "Transaction already committed or rolled back".to_string(),
+            ));
+        }
         let mut client = self.pool.lock().await;
         let query = Query::new("COMMIT");
         query.execute(&mut *client).trace().await?;
-        self.committed = true;
+        self.state = common_helpers::TransactionState::Committed;
         Ok(())
     }
 
     pub async fn rollback(mut self) -> crate::Result<()> {
-        let mut client = self.pool.lock().await;
-        let query = Query::new("ROLLBACK");
-        query.execute(&mut *client).trace().await?;
-        self.rolled_back = true;
+        if self.state.is_closed() {
+            return Err(crate::ormer_error!(
+                "Transaction already committed or rolled back".to_string(),
+            ));
+        }
+        {
+            let mut client = self.pool.lock().await;
+            let query = Query::new("ROLLBACK");
+            query.execute(&mut *client).trace().await?;
+        }
+        self.state = common_helpers::TransactionState::RolledBack;
         Ok(())
+    }
+
+    pub async fn close(self) -> crate::Result<()> {
+        self.rollback().await
     }
 
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
@@ -2513,8 +2536,8 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
-    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::MSSQL)
+    pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        self.select.try_to_sql_with_params(DbType::MSSQL)
     }
 
     /// 执行查询并收集结果

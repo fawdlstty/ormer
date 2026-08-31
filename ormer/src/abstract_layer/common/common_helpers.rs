@@ -28,6 +28,8 @@ pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
     match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => format!("${_param_idx}"),
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => format!("${_param_idx}"),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => format!("@P{_param_idx}"),
         #[cfg(feature = "sqlite")]
@@ -36,6 +38,23 @@ pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
         DbType::MySQL => "?".to_string(),
         #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
         _ => "?".to_string(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionState {
+    Active,
+    Committed,
+    RolledBack,
+}
+
+impl TransactionState {
+    pub fn is_active(self) -> bool {
+        self == Self::Active
+    }
+
+    pub fn is_closed(self) -> bool {
+        !self.is_active()
     }
 }
 
@@ -227,6 +246,7 @@ pub fn build_update_sql<T: Model>(
     let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
     let mut params = Vec::new();
     for (index, assignment) in sets.iter().enumerate() {
+        validate_update_assignment(db_type, assignment)?;
         if index > 0 {
             sql.push_str(", ");
         }
@@ -234,6 +254,28 @@ pub fn build_update_sql<T: Model>(
     }
     push_filters_sql(db_type, &mut sql, &mut params, filters)?;
     Ok((sql, params))
+}
+
+fn validate_update_assignment(db_type: DbType, assignment: &UpdateAssignment) -> crate::Result<()> {
+    validate_update_value(db_type, &assignment.value)
+}
+
+fn validate_update_value(db_type: DbType, value: &UpdateValue) -> crate::Result<()> {
+    match value {
+        UpdateValue::Literal(_) => Ok(()),
+        UpdateValue::Expr(expr) => validate_update_expr(db_type, expr),
+    }
+}
+
+fn validate_update_expr(db_type: DbType, expr: &UpdateExpr) -> crate::Result<()> {
+    match expr {
+        UpdateExpr::Sql(expr) => expr.validate_for_db(db_type),
+        UpdateExpr::Binary { left, right, .. } => {
+            validate_update_expr(db_type, left)?;
+            validate_update_expr(db_type, right)
+        }
+        _ => Ok(()),
+    }
 }
 
 pub fn build_model_update_sql<T: Model>(
@@ -269,6 +311,8 @@ pub fn bind_param_limit(db_type: DbType) -> usize {
         DbType::Sqlite => 999,
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => 65_535,
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => 65_535,
         #[cfg(feature = "mysql")]
         DbType::MySQL => 65_535,
         #[cfg(feature = "mssql")]
@@ -605,6 +649,8 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
                 "UPDATE {table} AS target SET {assignments} FROM (VALUES {values_sql}) AS source ({source_column_list}) WHERE {predicates}"
             )
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => String::new(),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => {
             let assignments = source_assignments_sql(db_type, set_columns, Some("target"));
@@ -752,6 +798,11 @@ fn build_bulk_model_update_sql<T: Model>(
         DbType::PostgreSQL => {
             build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "bulk model updates",
+        }),
         #[cfg(feature = "mysql")]
         DbType::MySQL => build_mysql_bulk_model_update_sql::<T>(plans, pk_values, set_columns),
         #[cfg(feature = "mssql")]
@@ -881,6 +932,8 @@ fn incoming_column_sql(db_type: DbType, column: &str) -> String {
     match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => quote_column_with_prefix(db_type, "EXCLUDED", column),
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => quote_column_with_prefix(db_type, "excluded", column),
         #[cfg(feature = "sqlite")]
         DbType::Sqlite => quote_column_with_prefix(db_type, "excluded", column),
         #[cfg(feature = "mysql")]
@@ -1484,6 +1537,8 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
             let pk_col = quote_column_list(DbType::PostgreSQL, &[_pk_col]);
             format!("{sql} RETURNING {pk_col}")
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => sql,
         #[cfg(feature = "mysql")]
         DbType::MySQL => sql,
         #[cfg(feature = "duckdb")]
@@ -1907,6 +1962,11 @@ fn append_insert_conflict_clause<T: Model>(
         DbType::PostgreSQL => {
             append_standard_insert_conflict_clause::<T>(DbType::PostgreSQL, sql, params, conflict)
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "insert conflict handling",
+        }),
         #[cfg(feature = "sqlite")]
         DbType::Sqlite => {
             append_standard_insert_conflict_clause::<T>(DbType::Sqlite, sql, params, conflict)
@@ -2016,6 +2076,13 @@ fn append_standard_conflict_target(
                 }
                 sql.push_str(" ON CONSTRAINT ");
                 sql.push_str(&quote_identifier(db_type, _name));
+            }
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "insert conflict constraint targets",
+                });
             }
             #[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql"))]
             _ => {

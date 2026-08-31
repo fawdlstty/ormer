@@ -118,6 +118,11 @@ pub enum FilterExpr {
     FullTextSearch(Box<FullTextQuery>),
     /// Runtime dynamic field that could not be resolved against the model.
     InvalidDynamicField { model: &'static str, field: String },
+    /// A query part that is known not to be supported by the target backend.
+    Unsupported {
+        backend: crate::abstract_layer::DbType,
+        feature: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +166,9 @@ pub type Value = crate::model::Value;
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct DynamicSubquery {
-    render: Arc<dyn Fn(crate::abstract_layer::DbType) -> (String, Vec<Value>) + Send + Sync>,
+    render: Arc<
+        dyn Fn(crate::abstract_layer::DbType) -> crate::Result<(String, Vec<Value>)> + Send + Sync,
+    >,
 }
 
 impl fmt::Debug for DynamicSubquery {
@@ -172,20 +179,28 @@ impl fmt::Debug for DynamicSubquery {
 
 impl DynamicSubquery {
     pub(crate) fn new(
-        render: impl Fn(crate::abstract_layer::DbType) -> (String, Vec<Value>) + Send + Sync + 'static,
+        render: impl Fn(crate::abstract_layer::DbType) -> crate::Result<(String, Vec<Value>)>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         Self {
             render: Arc::new(render),
         }
     }
 
-    pub(crate) fn render(&self, db_type: crate::abstract_layer::DbType) -> (String, Vec<Value>) {
+    pub(crate) fn render(
+        &self,
+        db_type: crate::abstract_layer::DbType,
+    ) -> crate::Result<(String, Vec<Value>)> {
         (self.render)(db_type)
     }
 
     #[cfg(feature = "postgresql")]
     pub(crate) fn params(&self, db_type: crate::abstract_layer::DbType) -> Vec<Value> {
-        (self.render)(db_type).1
+        (self.render)(db_type)
+            .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"))
+            .1
     }
 }
 
@@ -297,7 +312,7 @@ impl crate::query::builder::IsInValue<uuid::Uuid> for &&uuid::Uuid {
 /// 子查询 trait - 用于 is_in 方法
 pub trait Subquery {
     /// 获取子查询的 SQL 和参数
-    fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>);
+    fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)>;
 }
 
 impl FilterExpr {

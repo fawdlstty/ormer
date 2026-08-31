@@ -4,6 +4,7 @@
 
 - Sqlite
 - PostgreSQL
+- QuestDB (PostgreSQL wire protocol)
 - MySQL
 - MSSQL
 - DuckDB (local connections, CRUD, transactions, raw SQL, streams, schema introspection, and connection pools)
@@ -25,6 +26,13 @@ ormer = { version = "0.2", features = ["sqlite"] }
 
 **PostgreSQL:**
 - `postgresql://user:password@localhost/dbname`
+
+**QuestDB:**
+- `postgresql://admin:quest@localhost:8812/qdb`
+- Use `Database::connect(DbType::QuestDB, "...")` through the PostgreSQL wire protocol.
+- Supports insert/select/update, create/drop table, raw SQL, streams, connection pools, and step-by-step migrations.
+- A `#[hypertable(...)]` time field produces a QuestDB designated timestamp in `create_table`.
+- Row-level deletes, transactions, constraints, auto-increment/`RETURNING`, upserts, COPY, row locks, schema introspection, and advanced grouping are unsupported.
 
 **MySQL:**
 - `mysql://user:password@localhost/dbname`

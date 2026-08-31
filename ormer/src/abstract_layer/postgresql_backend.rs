@@ -1204,7 +1204,8 @@ fn pg_collect_filter_param_rust_types<T: Model>(
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
         | FilterExpr::IsNotNull { .. }
-        | FilterExpr::InvalidDynamicField { .. } => {}
+        | FilterExpr::InvalidDynamicField { .. }
+        | FilterExpr::Unsupported { .. } => {}
         FilterExpr::ExprComparison { left, right, .. } => {
             pg_collect_sql_expr_param_rust_types::<T>(left, rust_types);
             pg_collect_sql_expr_param_rust_types::<T>(right, rust_types);
@@ -1467,14 +1468,64 @@ fn postgres_fk_action(action: &str) -> Option<&'static str> {
     }
 }
 
+/// QuestDB 类型映射器
+///
+/// QuestDB uses the PostgreSQL wire protocol, but its storage dialect has no
+/// constraints, sequences, or nullable column types.
+pub struct QuestDBTypeMapper;
+
+impl DbBackendTypeMapper for QuestDBTypeMapper {
+    fn sql_type(
+        rust_type: &str,
+        _is_primary: bool,
+        is_auto_increment: bool,
+        _is_nullable: bool,
+        enum_variants: Option<&[&str]>,
+    ) -> String {
+        if is_auto_increment {
+            return "LONG".to_string();
+        }
+        if enum_variants.is_some() {
+            return "SYMBOL".to_string();
+        }
+        let base_type = match rust_type {
+            "i8" | "i16" => "SHORT",
+            "i32" | "u8" | "u16" => "INT",
+            "i64" | "u32" | "u64" | "usize" | "isize" => "LONG",
+            "f32" => "FLOAT",
+            "f64" => "DOUBLE",
+            "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
+                "DOUBLE"
+            }
+            "String" => "STRING",
+            "bool" => "BOOLEAN",
+            "Duration" | "std::time::Duration" => "LONG",
+            "Vec<u8>" | "&[u8]" => "BINARY",
+            "Uuid" | "uuid::Uuid" => "UUID",
+            "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>"
+            | "NaiveDateTime"
+            | "chrono::NaiveDateTime" => "TIMESTAMP",
+            "NaiveDate" | "chrono::NaiveDate" => "DATE",
+            "NaiveTime" | "chrono::NaiveTime" => "STRING",
+            "JsonValue" | "serde_json::Value" => "STRING",
+            _ => "STRING",
+        };
+        base_type.to_string()
+    }
+}
+
 /// PostgreSQL 数据库连接封装
 pub struct Database {
-    client: tokio_postgres::Client,
+    client: std::sync::Arc<tokio_postgres::Client>,
+    db_type: DbType,
 }
 
 /// 创建表执行器
 pub struct CreateTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
+    db_type: DbType,
     table_name: Option<String>,
     _marker: std::marker::PhantomData<T>,
 }
@@ -1489,24 +1540,26 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
         let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
         let mut statements = Vec::new();
 
-        for column in T::COLUMN_SCHEMA.iter() {
-            if let Some(variants) = column.enum_variants {
-                let enum_name = to_snake_case(column.rust_type);
-                let variants_str = variants
-                    .iter()
-                    .map(|v| format!("'{}'", v))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let create_enum_sql = format!(
-                    "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN CREATE TYPE {} AS ENUM ({}); END IF; END $$",
-                    enum_name, enum_name, variants_str
-                );
-                statements.push(SingleSqlStatement::new(create_enum_sql, Vec::new()));
+        if !self.db_type.is_questdb() {
+            for column in T::COLUMN_SCHEMA.iter() {
+                if let Some(variants) = column.enum_variants {
+                    let enum_name = to_snake_case(column.rust_type);
+                    let variants_str = variants
+                        .iter()
+                        .map(|v| format!("'{}'", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let create_enum_sql = format!(
+                        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{}') THEN CREATE TYPE {} AS ENUM ({}); END IF; END $$",
+                        enum_name, enum_name, variants_str
+                    );
+                    statements.push(SingleSqlStatement::new(create_enum_sql, Vec::new()));
+                }
             }
         }
 
         let create_sql = crate::generate_create_table_sql_with_name::<T>(
-            crate::abstract_layer::DbType::PostgreSQL,
+            self.db_type,
             self.table_name.as_deref(),
         )?;
 
@@ -1524,7 +1577,9 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             statements.push(SingleSqlStatement::new(sql_part, Vec::new()));
         }
 
-        if let Some((time_column, chunk_interval)) = T::hypertable_info() {
+        if !self.db_type.is_questdb()
+            && let Some((time_column, chunk_interval)) = T::hypertable_info()
+        {
             let interval_str = chunk_interval.to_interval_string();
             let hypertable_sql = format!(
                 "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE)",
@@ -1533,7 +1588,7 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             statements.push(SingleSqlStatement::new(hypertable_sql, Vec::new()));
         }
 
-        Ok(SqlStatement::batch(DbType::PostgreSQL, statements))
+        Ok(SqlStatement::batch(self.db_type, statements))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -1559,16 +1614,22 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
 /// 删除表执行器
 pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
+    db_type: DbType,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
-            DbType::PostgreSQL,
+            self.db_type,
             format!(
-                "DROP TABLE IF EXISTS {} CASCADE",
-                common_helpers::quote_table_name::<T>(DbType::PostgreSQL)
+                "DROP TABLE IF EXISTS {}{}",
+                common_helpers::quote_table_name::<T>(self.db_type),
+                if self.db_type.is_questdb() {
+                    ""
+                } else {
+                    " CASCADE"
+                }
             ),
             Vec::new(),
         ))
@@ -1607,6 +1668,19 @@ impl_insert_conflict_methods!(InsertExecutor, with_conflict);
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
+        let db_type = self.db.db_type();
+        if db_type.is_questdb() && self.conflict.is_some() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "insert conflict handling",
+            });
+        }
+        if db_type.is_questdb() && common_helpers::auto_increment_column::<I::Model>().is_some() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "auto-increment insert returning",
+            });
+        }
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
@@ -1657,6 +1731,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
 
     /// 执行插入并返回插入的行数据（PostgreSQL RETURNING 支持）
     pub async fn returning(mut self) -> crate::Result<Vec<I::Model>> {
+        if self.db.db_type().is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "INSERT RETURNING",
+            });
+        }
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
         let mut sql = self.to_sql()?;
@@ -1688,7 +1768,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     }
 
     pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        let use_copy = {
+        let use_copy = !self.db.db_type().is_questdb() && {
             let refs = self.models.as_refs();
             pg_should_use_copy_insert::<I::Model>(&refs, self.conflict.as_ref())
         };
@@ -1729,6 +1809,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
     }
 
     async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if self.db.db_type().is_questdb()
+            && I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment)
+        {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "auto-increment insert returning",
+            });
+        }
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
@@ -1822,6 +1910,16 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        if self.db.db_type().is_questdb()
+            && T::COLUMN_SCHEMA
+                .iter()
+                .any(|column| column.is_auto_increment)
+        {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "auto-increment insert returning",
+            });
+        }
         common_helpers::validate_insert_model_table::<T>(DbType::PostgreSQL, self.source_table)?;
         let statement =
             common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
@@ -1853,6 +1951,16 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
     }
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        if self.db.db_type().is_questdb()
+            && T::COLUMN_SCHEMA
+                .iter()
+                .any(|column| column.is_auto_increment)
+        {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "auto-increment insert returning",
+            });
+        }
         if sql.statements.is_empty() {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
         }
@@ -1907,6 +2015,12 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        if self.db.db_type().is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "INSERT ON CONFLICT DO UPDATE",
+            });
+        }
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -1972,6 +2086,12 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        if self.db.db_type().is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db.db_type(),
+                feature: "INSERT ON CONFLICT DO NOTHING",
+            });
+        }
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -2035,8 +2155,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
 }
 
 impl Database {
-    /// 连接到 PostgreSQL 数据库
-    pub async fn connect(_db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
+    /// Connect through the PostgreSQL wire protocol.
+    pub(crate) fn db_type(&self) -> DbType {
+        self.db_type
+    }
+
+    pub async fn connect(db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
         let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
             .trace()
             .await?;
@@ -2051,16 +2175,27 @@ impl Database {
             }
         });
 
-        // 将服务端消息级别设为 WARNING，过滤掉 NOTICE/INFO/LOG/DEBUG（如 "关系已存在, 跳过"）
-        traced_pg_execute_empty(&client, "SET client_min_messages TO WARNING;").await?;
+        if !db_type.is_questdb() {
+            // 将服务端消息级别设为 WARNING，过滤掉 NOTICE/INFO/LOG/DEBUG（如 "关系已存在, 跳过"）
+            traced_pg_execute_empty(&client, "SET client_min_messages TO WARNING;").await?;
+        }
 
-        Ok(Self { client })
+        Ok(Self {
+            client: std::sync::Arc::new(client),
+            db_type,
+        })
     }
 
     pub(crate) async fn db_first_tables(
         &self,
         schema: Option<&str>,
     ) -> crate::Result<Vec<DbFirstTable>> {
+        if self.db_type.is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db_type,
+                feature: "db-first entity generation",
+            });
+        }
         let schema_name = schema.filter(|value| !value.is_empty()).unwrap_or("public");
         let rows = self
             .client
@@ -2284,19 +2419,24 @@ impl Database {
     /// 复制是安全的，只是增加 Arc 引用计数），然后 forget PooledConnection
     /// 防止其 drop 时关闭连接。
     pub fn from_pooled_connection(
+        db_type: DbType,
         pooled: bb8::PooledConnection<'_, bb8_postgres::PostgresConnectionManager<NoTls>>,
     ) -> Self {
         use std::ops::Deref;
         let client_ref: &tokio_postgres::Client = pooled.deref();
         let client = unsafe { std::ptr::read(client_ref as *const _) };
         std::mem::forget(pooled);
-        Self { client }
+        Self {
+            client: std::sync::Arc::new(client),
+            db_type,
+        }
     }
 
     /// 创建表 - 返回执行器
     pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         CreateTableExecutor {
             client: &self.client,
+            db_type: self.db_type,
             table_name: None,
             _marker: std::marker::PhantomData,
         }
@@ -2359,6 +2499,12 @@ impl Database {
 
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
+        if self.db_type.is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db_type,
+                feature: "schema introspection",
+            });
+        }
         // 检查表是否存在
         let table_exists = self.check_table_exists::<T>().trace().await?;
 
@@ -2879,6 +3025,7 @@ impl Database {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            questdb: self.db_type.is_questdb().then_some(self.db_type),
             client: &self.client,
             _marker: PhantomData,
         }
@@ -2906,11 +3053,17 @@ impl Database {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
+        if self.db_type.is_questdb() {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db_type,
+                feature: "transactions",
+            });
+        }
         traced_pg_execute_empty(&self.client, "BEGIN").await?;
         Ok(Transaction {
-            client: &self.client,
-            committed: false,
-            rolled_back: false,
+            client: std::sync::Arc::clone(&self.client),
+            state: common_helpers::TransactionState::Active,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -2918,6 +3071,7 @@ impl Database {
     pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
             client: &self.client,
+            db_type: self.db_type,
             _marker: std::marker::PhantomData,
         }
     }
@@ -2965,26 +3119,37 @@ impl Database {
     }
 
     pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
-        let rows = self
-            .client
-            .query(
-                "SELECT version, name, checksum FROM __ormer_migrations ORDER BY version",
-                &[],
+        let sql = if self.db_type.is_questdb() {
+            // QuestDB's PG-wire query cache does not invalidate after DDL in the
+            // same session, so each history read needs a distinct statement key.
+            let cache_key = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            format!(
+                "SELECT version, name, checksum FROM __ormer_migrations \
+                 WHERE rolled_back = FALSE ORDER BY version /* {cache_key} */"
             )
-            .trace()
-            .await?;
+        } else {
+            "SELECT version, name, checksum FROM __ormer_migrations ORDER BY version".to_string()
+        };
+        let rows = self.client.query(&sql, &[]).trace().await?;
         rows.into_iter()
             .map(|row| {
                 let version: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
                 let name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
-                let checksum: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+                let checksum = row
+                    .try_get::<_, String>(2)
+                    .trace_for("tokio_postgres::Row::try_get")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        crate::ormer_error!("Migration checksum is not a valid unsigned integer")
+                    })?;
                 Ok((
                     u64::try_from(version)
                         .map_err(|_| crate::ormer_error!("Migration version cannot be negative"))?,
                     name,
-                    checksum.parse::<u64>().map_err(|_| {
-                        crate::ormer_error!("Migration checksum is not a valid unsigned integer")
-                    })?,
+                    checksum,
                 ))
             })
             .collect()
@@ -3077,9 +3242,25 @@ impl Database {
 
 /// PostgreSQL 事务对象
 pub struct Transaction<'a> {
-    client: &'a tokio_postgres::Client,
-    committed: bool,
-    rolled_back: bool,
+    client: std::sync::Arc<tokio_postgres::Client>,
+    state: common_helpers::TransactionState,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Drop for Transaction<'a> {
+    fn drop(&mut self) {
+        if !self.state.is_active() {
+            return;
+        }
+
+        self.state = common_helpers::TransactionState::RolledBack;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = std::sync::Arc::clone(&self.client);
+            handle.spawn(async move {
+                let _ = traced_pg_execute_empty(&client, "ROLLBACK").await;
+            });
+        }
+    }
 }
 
 /// 事务中的插入执行器
@@ -3318,7 +3499,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 
 impl<'a> Transaction<'a> {
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
-        pg_execute_untyped(self.client, sql, &params).await
+        pg_execute_untyped(&self.client, sql, &params).await
     }
 
     pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
@@ -3326,7 +3507,7 @@ impl<'a> Transaction<'a> {
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let rows = pg_query_untyped(self.client, sql, &params).await?;
+        let rows = pg_query_untyped(&self.client, sql, &params).await?;
         let mut results = Vec::new();
         for row in rows {
             results.push(pg_decode_row_values_from_row(&row, row.columns().len())?);
@@ -3336,33 +3517,38 @@ impl<'a> Transaction<'a> {
 
     /// 提交事务
     pub async fn commit(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        traced_pg_execute_empty(self.client, "COMMIT").await?;
-        self.committed = true;
+        traced_pg_execute_empty(&self.client, "COMMIT").await?;
+        self.state = common_helpers::TransactionState::Committed;
         Ok(())
     }
 
     /// 回滚事务
     pub async fn rollback(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
         }
-        traced_pg_execute_empty(self.client, "ROLLBACK").await?;
-        self.rolled_back = true;
+        traced_pg_execute_empty(&self.client, "ROLLBACK").await?;
+        self.state = common_helpers::TransactionState::RolledBack;
         Ok(())
+    }
+
+    /// 关闭并回滚事务
+    pub async fn close(self) -> crate::Result<()> {
+        self.rollback().await
     }
 
     /// 创建 Select 查询执行器
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
-            client: self.client,
+            client: &self.client,
             _marker: PhantomData,
         }
     }
@@ -3371,7 +3557,7 @@ impl<'a> Transaction<'a> {
     pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
         GroupedSelectExecutor {
             select: GroupedSelect::<T, V>::new(),
-            client: self.client,
+            client: &self.client,
             _marker: PhantomData,
         }
     }
@@ -3381,7 +3567,8 @@ impl<'a> Transaction<'a> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
-            client: self.client,
+            questdb: None,
+            client: &self.client,
             _marker: PhantomData,
         }
     }
@@ -3392,7 +3579,7 @@ impl<'a> Transaction<'a> {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
-            client: self.client,
+            client: &self.client,
             _marker: PhantomData,
         }
     }
@@ -3403,7 +3590,7 @@ impl<'a> Transaction<'a> {
         models: I,
     ) -> TransactionInsertExecutor<'_, I> {
         TransactionInsertExecutor {
-            client: self.client,
+            client: &self.client,
             models,
             conflict: None,
             _marker: std::marker::PhantomData,
@@ -3416,7 +3603,7 @@ impl<'a> Transaction<'a> {
         models: I,
     ) -> TransactionInsertOrUpdateExecutor<'_, I> {
         TransactionInsertOrUpdateExecutor {
-            client: self.client,
+            client: &self.client,
             models,
             _marker: std::marker::PhantomData,
         }
@@ -3428,7 +3615,7 @@ impl<'a> Transaction<'a> {
         models: I,
     ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
         TransactionInsertOrIgnoreExecutor {
-            client: self.client,
+            client: &self.client,
             models,
             _marker: std::marker::PhantomData,
         }
@@ -3458,7 +3645,7 @@ impl<'a> Transaction<'a> {
             .iter()
             .map(|col| col.data_type.unwrap_or(col.rust_type))
             .collect();
-        pg_execute_with_types(self.client, &sql, &all_values, &rust_types).await?;
+        pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
 
         Ok(())
     }
@@ -3508,8 +3695,8 @@ pub struct GroupedSelectExecutor<'a, T: Model, V> {
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
-    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::PostgreSQL)
+    pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        self.select.try_to_sql_with_params(DbType::PostgreSQL)
     }
 
     /// 执行查询并收集结果
@@ -4108,6 +4295,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
     versioned: bool,
+    questdb: Option<DbType>,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<T>,
 }
@@ -4126,6 +4314,12 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        if let Some(backend) = self.questdb {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend,
+                feature: "row delete",
+            });
+        }
         let (sql, params) = self.build_sql_with_params();
         let rust_types = self.filter_param_rust_types();
         Ok(SqlStatement::batch(

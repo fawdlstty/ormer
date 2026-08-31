@@ -13,13 +13,14 @@ pub mod utils;
 #[cfg(not(any(
     feature = "sqlite",
     feature = "postgresql",
+    feature = "questdb",
     feature = "mysql",
     feature = "mssql",
     feature = "duckdb",
     feature = "clickhouse"
 )))]
 compile_error!(
-    "At least one database feature must be enabled: sqlite, postgresql, mysql, mssql, duckdb, or clickhouse"
+    "At least one database feature must be enabled: sqlite, postgresql, questdb, mysql, mssql, duckdb, or clickhouse"
 );
 
 pub use abstract_layer::DbType;
@@ -36,6 +37,7 @@ pub use migration::{
 #[cfg(any(
     feature = "sqlite",
     feature = "postgresql",
+    feature = "questdb",
     feature = "mysql",
     feature = "mssql",
     feature = "duckdb",
@@ -64,8 +66,8 @@ pub use model::{
     FromSingleValue, FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum,
     ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
     RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
-    TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel, Tracked, Value,
-    TableOptions, ViewModel, WritableModel, generate_create_table_sql,
+    TableOptions, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel,
+    Tracked, Value, ViewModel, WritableModel, generate_create_table_sql,
     generate_create_table_sql_with_name,
 };
 #[cfg(feature = "clickhouse")]
@@ -83,9 +85,9 @@ pub use query::builder::{
     SubqueryParam, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery, from_derived,
 };
 pub use query::expr::{
-    CaseMatchBuilder, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, RawExpr, RawExprSegment, RawSqlExpr,
-    JsonScalarKind, SqlExpr, TypedExpr, WindowSpecBuilder, case_match, raw, row, value,
-    IntervalExpr, NowExpr, TimePart, TimeUnit, days, hours, minutes, now, seconds,
+    CaseMatchBuilder, IntervalExpr, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, JsonScalarKind,
+    NowExpr, RawExpr, RawExprSegment, RawSqlExpr, SqlExpr, TimePart, TimeUnit, TypedExpr,
+    WindowSpecBuilder, case_match, days, hours, minutes, now, raw, row, seconds, value,
 };
 pub use query::filter::{FilterExpr, OrderBy, OrderDirection};
 pub use query::filter::{FullTextMode, FullTextQuery, FullTextRank};

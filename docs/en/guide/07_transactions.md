@@ -10,6 +10,18 @@ txn.commit().await?;
 txn.rollback().await?;
 ```
 
+`commit` and `rollback` consume the transaction. To cancel a transaction in a
+business path, prefer `close()`; it is an explicit rollback:
+
+```rust
+txn.close().await?;
+```
+
+When an active transaction is dropped, SQLite and DuckDB roll back synchronously;
+other backends make a best-effort rollback on their dedicated transaction
+connection. Do not rely on Drop for error reporting; normal paths should still
+call `commit`, `rollback`, or `close`.
+
 ## Closure Transactions
 
 Stable Rust uses a boxed future:

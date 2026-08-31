@@ -587,7 +587,7 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
         #[cfg(feature = "sqlite")]
         ConnectionWrapper::Sqlite(_) => DbType::Sqlite,
         #[cfg(feature = "postgresql")]
-        ConnectionWrapper::PostgreSQL(_) => DbType::PostgreSQL,
+        ConnectionWrapper::PostgreSQL(db) => db.db_type(),
         #[cfg(feature = "mysql")]
         ConnectionWrapper::MySQL(_) => DbType::MySQL,
         #[cfg(feature = "mssql")]
@@ -756,6 +756,10 @@ impl ManualPool {
             DbType::PostgreSQL => Err(crate::ormer_error!(
                 "Build the pool through PoolBuilder/ConnectionPool"
             )),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => Err(crate::ormer_error!(
+                "Build the pool through PoolBuilder/ConnectionPool"
+            )),
             #[cfg(feature = "mysql")]
             DbType::MySQL => Err(crate::ormer_error!(
                 "Build the pool through PoolBuilder/ConnectionPool"
@@ -837,6 +841,11 @@ impl ManualPool {
             self.total_connections.fetch_sub(1, Ordering::SeqCst);
             // 连接失效时不放入空闲队列，会自动被丢弃
         }
+    }
+
+    /// 将租约对应连接退役，释放池容量但不进入空闲队列。
+    async fn retire_connection(&self) {
+        self.total_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// 维护最小连接数
@@ -929,19 +938,9 @@ impl PoolBuilder {
                 Ok(ConnectionPool::Sqlite(pool))
             }
             #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => {
-                let manager = crate::utils::ResultTraceExt::trace_for(
-                    PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls),
-                    "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
-                )?;
-                let mut builder = bb8::Pool::builder();
-                builder = builder.max_size(self.config.max_size);
-                if self.config.min_size > 0 {
-                    builder = builder.min_idle(Some(self.config.min_size));
-                }
-                let pool = crate::utils::FutureTraceExt::trace(builder.build(manager)).await?;
-                Ok(ConnectionPool::PostgreSQL(pool))
-            }
+            DbType::PostgreSQL => self.build_postgres_like_pool().await,
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => self.build_postgres_like_pool().await,
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
                 let opts = crate::utils::ResultTraceExt::trace_for(
@@ -979,6 +978,21 @@ impl PoolBuilder {
                 Ok(ConnectionPool::ClickHouse(pool))
             }
         }
+    }
+
+    #[cfg(feature = "postgresql")]
+    async fn build_postgres_like_pool(self) -> crate::Result<ConnectionPool> {
+        let manager = crate::utils::ResultTraceExt::trace_for(
+            PostgresConnectionManager::new_from_stringlike(&self.connection_string, NoTls),
+            "bb8_postgres::PostgresConnectionManager::new_from_stringlike",
+        )?;
+        let mut builder = bb8::Pool::builder();
+        builder = builder.max_size(self.config.max_size);
+        if self.config.min_size > 0 {
+            builder = builder.min_idle(Some(self.config.min_size));
+        }
+        let pool = crate::utils::FutureTraceExt::trace(builder.build(manager)).await?;
+        Ok(ConnectionPool::PostgreSQL(pool, self.db_type))
     }
 }
 
@@ -1089,7 +1103,7 @@ pub enum ConnectionPool {
     #[cfg(feature = "sqlite")]
     Sqlite(Arc<ManualPool>),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(bb8::Pool<PostgresConnectionManager<NoTls>>),
+    PostgreSQL(bb8::Pool<PostgresConnectionManager<NoTls>>, DbType),
     #[cfg(feature = "mysql")]
     MySQL(mysql_async::Pool),
     #[cfg(feature = "mssql")]
@@ -1110,7 +1124,7 @@ impl ConnectionPool {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(_) => DbType::Sqlite,
             #[cfg(feature = "postgresql")]
-            ConnectionPool::PostgreSQL(_) => DbType::PostgreSQL,
+            ConnectionPool::PostgreSQL(_, db_type) => *db_type,
             #[cfg(feature = "mysql")]
             ConnectionPool::MySQL(_) => DbType::MySQL,
             #[cfg(feature = "mssql")]
@@ -1138,9 +1152,9 @@ impl ConnectionPool {
                 })
             }
             #[cfg(feature = "postgresql")]
-            ConnectionPool::PostgreSQL(pool) => {
+            ConnectionPool::PostgreSQL(pool, db_type) => {
                 let pooled = crate::utils::FutureTraceExt::trace(pool.get()).await?;
-                let db = postgresql_backend::Database::from_pooled_connection(pooled);
+                let db = postgresql_backend::Database::from_pooled_connection(*db_type, pooled);
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::PostgreSQL,
                     connection: Some(ConnectionWrapper::PostgreSQL(db)),
@@ -1228,6 +1242,23 @@ impl PooledConnectionInner {
             PooledConnectionInner::ClickHouse(pool) => pool.return_connection(conn).await,
         }
     }
+
+    async fn close_connection(&self) {
+        match self {
+            #[cfg(feature = "sqlite")]
+            PooledConnectionInner::Sqlite(pool) => pool.retire_connection().await,
+            #[cfg(feature = "postgresql")]
+            PooledConnectionInner::PostgreSQL => {}
+            #[cfg(feature = "mysql")]
+            PooledConnectionInner::MySQL => {}
+            #[cfg(feature = "mssql")]
+            PooledConnectionInner::MSSQL(pool) => pool.retire_connection().await,
+            #[cfg(feature = "duckdb")]
+            PooledConnectionInner::DuckDB(pool) => pool.retire_connection().await,
+            #[cfg(feature = "clickhouse")]
+            PooledConnectionInner::ClickHouse(pool) => pool.retire_connection().await,
+        }
+    }
 }
 
 pub struct PooledRawSelectExecutor<'conn, 'pool, T> {
@@ -1310,19 +1341,32 @@ impl<'a> Drop for PooledConnection<'a> {
                         inner.return_connection(conn).await;
                     });
                 }
-                Err(_) => {
-                    // 不在 tokio 运行时中，这种情况不应该在正常使用中出现
-                    // 记录警告信息，连接可能会被泄露
-                    eprintln!(
-                        "Warning: PooledConnection dropped outside tokio runtime, connection may be leaked"
-                    );
-                }
+                Err(_) => futures::executor::block_on(inner.return_connection(conn)),
             }
         }
     }
 }
 
 impl<'a> PooledConnection<'a> {
+    /// 显式归还健康连接；重复归还返回错误。
+    pub async fn return_(mut self) -> crate::Result<()> {
+        let Some(conn) = self.connection.take() else {
+            return Err(crate::ormer_error!("connection already returned"));
+        };
+        self.inner.return_connection(conn).await;
+        Ok(())
+    }
+
+    /// 关闭底层连接，不归还连接池。
+    pub async fn close(mut self) -> crate::Result<()> {
+        let Some(conn) = self.connection.take() else {
+            return Err(crate::ormer_error!("connection already returned"));
+        };
+        drop(conn);
+        self.inner.close_connection().await;
+        Ok(())
+    }
+
     /// 获取底层连接的引用(内部使用)
     fn get_connection(&self) -> &ConnectionWrapper {
         self.connection.as_ref().expect("Connection already taken")

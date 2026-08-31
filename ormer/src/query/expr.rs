@@ -1,9 +1,9 @@
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::common_helpers::placeholder;
-use std::marker::PhantomData;
-use crate::model::{Value, quote_column_reference, quote_identifier};
 #[cfg(feature = "sqlite")]
 use crate::model::quote_sql_literal;
+use crate::model::{Value, quote_column_reference, quote_identifier};
+use std::marker::PhantomData;
 
 #[derive(Debug, Clone)]
 pub enum SqlExpr {
@@ -263,7 +263,6 @@ impl JsonScalarKind {
             Self::Json => "JSONB",
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -361,19 +360,31 @@ pub fn now() -> NowExpr {
 }
 
 pub fn days(amount: i64) -> IntervalExpr {
-    IntervalExpr { amount, unit: TimeUnit::Day }
+    IntervalExpr {
+        amount,
+        unit: TimeUnit::Day,
+    }
 }
 
 pub fn hours(amount: i64) -> IntervalExpr {
-    IntervalExpr { amount, unit: TimeUnit::Hour }
+    IntervalExpr {
+        amount,
+        unit: TimeUnit::Hour,
+    }
 }
 
 pub fn minutes(amount: i64) -> IntervalExpr {
-    IntervalExpr { amount, unit: TimeUnit::Minute }
+    IntervalExpr {
+        amount,
+        unit: TimeUnit::Minute,
+    }
 }
 
 pub fn seconds(amount: i64) -> IntervalExpr {
-    IntervalExpr { amount, unit: TimeUnit::Second }
+    IntervalExpr {
+        amount,
+        unit: TimeUnit::Second,
+    }
 }
 
 impl<T, S> Clone for TypedExpr<T, S> {
@@ -960,6 +971,10 @@ impl SqlExpr {
                         expr_sql,
                         quote_json_path(key)
                     ),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB JSON text extraction is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::JsonPathText { expr, path } => {
@@ -1002,6 +1017,10 @@ impl SqlExpr {
                         expr_sql,
                         quote_json_path_parts(path)
                     ),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => unreachable!(
+                        "QuestDB JSON path text extraction is gated by validate_for_db"
+                    ),
                 }
             }
             SqlExpr::JsonPathValue {
@@ -1043,7 +1062,11 @@ impl SqlExpr {
                             quote_json_path_parts(path)
                         ),
                         JsonScalarKind::Boolean | JsonScalarKind::Json => {
-                            format!("JSON_EXTRACT({}, {})", expr_sql, quote_json_path_parts(path))
+                            format!(
+                                "JSON_EXTRACT({}, {})",
+                                expr_sql,
+                                quote_json_path_parts(path)
+                            )
                         }
                     },
                     #[cfg(feature = "sqlite")]
@@ -1056,7 +1079,9 @@ impl SqlExpr {
                     }
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => match value_type {
-                        JsonScalarKind::Boolean => format!("JSON_QUERY({}, {})", expr_sql, quote_json_path_parts(path)),
+                        JsonScalarKind::Boolean => {
+                            format!("JSON_QUERY({}, {})", expr_sql, quote_json_path_parts(path))
+                        }
                         JsonScalarKind::String => {
                             format!("JSON_VALUE({}, {})", expr_sql, quote_json_path_parts(path))
                         }
@@ -1102,6 +1127,10 @@ impl SqlExpr {
                             value_type.sql_type()
                         ),
                     },
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => unreachable!(
+                        "QuestDB JSON path value extraction is gated by validate_for_db"
+                    ),
                 }
             }
             SqlExpr::JsonPathExists { expr, path } => {
@@ -1141,11 +1170,13 @@ impl SqlExpr {
                         })
                     ),
                     #[cfg(feature = "duckdb")]
-                    DbType::DuckDB => format!(
-                        "json_exists({}, {})",
-                        expr_sql,
-                        quote_json_path_parts(path)
-                    ),
+                    DbType::DuckDB => {
+                        format!("json_exists({}, {})", expr_sql, quote_json_path_parts(path))
+                    }
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB JSON path existence is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::JsonContains { left, right } => {
@@ -1154,9 +1185,10 @@ impl SqlExpr {
                     feature = "sqlite",
                     feature = "mssql",
                     feature = "clickhouse",
-                    feature = "duckdb"
+                    feature = "duckdb",
+                    feature = "questdb"
                 ))]
-                let unsupported = "0 = 1 /* OrmerError::UnsupportedFeature: JSON containment predicates */";
+                let unsupported = "JSON containment predicates are gated by validate_for_db";
                 match db_type {
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => {
@@ -1171,13 +1203,15 @@ impl SqlExpr {
                         format!("JSON_CONTAINS({}, {})", left_sql, right_sql)
                     }
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => unsupported.to_string(),
+                    DbType::Sqlite => unreachable!("{unsupported}"),
                     #[cfg(feature = "mssql")]
-                    DbType::MSSQL => unsupported.to_string(),
+                    DbType::MSSQL => unreachable!("{unsupported}"),
                     #[cfg(feature = "clickhouse")]
-                    DbType::ClickHouse => unsupported.to_string(),
+                    DbType::ClickHouse => unreachable!("{unsupported}"),
                     #[cfg(feature = "duckdb")]
-                    DbType::DuckDB => unsupported.to_string(),
+                    DbType::DuckDB => unreachable!("{unsupported}"),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => unreachable!("{unsupported}"),
                 }
             }
             SqlExpr::JsonSet { expr, path, value } => {
@@ -1226,7 +1260,7 @@ impl SqlExpr {
                     }
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => {
-                        "0 = 1 /* OrmerError::UnsupportedFeature: JSON updates */".to_string()
+                        unreachable!("ClickHouse JSON updates are gated by validate_for_db")
                     }
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!(
@@ -1235,6 +1269,10 @@ impl SqlExpr {
                         quote_json_path_parts(path),
                         value_sql
                     ),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB JSON updates are gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::ArrayContains { left, right } => {
@@ -1259,6 +1297,10 @@ impl SqlExpr {
                     DbType::ClickHouse => format!("hasAll({}, {})", left_sql, right_sql),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!("list_has_all({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB array containment is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::JsonRemove { expr, path } => {
@@ -1269,17 +1311,13 @@ impl SqlExpr {
                         format!("{} #- {}", expr_sql, quote_pg_text_path(path))
                     }
                     #[cfg(feature = "mysql")]
-                    DbType::MySQL => format!(
-                        "JSON_REMOVE({}, {})",
-                        expr_sql,
-                        quote_json_path_parts(path)
-                    ),
+                    DbType::MySQL => {
+                        format!("JSON_REMOVE({}, {})", expr_sql, quote_json_path_parts(path))
+                    }
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => format!(
-                        "json_remove({}, {})",
-                        expr_sql,
-                        quote_json_path_parts(path)
-                    ),
+                    DbType::Sqlite => {
+                        format!("json_remove({}, {})", expr_sql, quote_json_path_parts(path))
+                    }
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!(
                         "JSON_MODIFY({}, {}, NULL)",
@@ -1288,14 +1326,16 @@ impl SqlExpr {
                     ),
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => {
-                        "0 = 1 /* OrmerError::UnsupportedFeature: JSON updates */".to_string()
+                        unreachable!("ClickHouse JSON updates are gated by validate_for_db")
                     }
                     #[cfg(feature = "duckdb")]
-                    DbType::DuckDB => format!(
-                        "json_remove({}, {})",
-                        expr_sql,
-                        quote_json_path_parts(path)
-                    ),
+                    DbType::DuckDB => {
+                        format!("json_remove({}, {})", expr_sql, quote_json_path_parts(path))
+                    }
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB JSON updates are gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::ArrayOverlaps { left, right } => {
@@ -1320,6 +1360,10 @@ impl SqlExpr {
                     DbType::ClickHouse => format!("hasAny({}, {})", left_sql, right_sql),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!("list_has_any({}, {})", left_sql, right_sql),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB array overlap is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::ArrayLen { expr } => {
@@ -1337,6 +1381,10 @@ impl SqlExpr {
                     DbType::ClickHouse => format!("length({})", expr_sql),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!("length({})", expr_sql),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB array length is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::WindowFunction {
@@ -1367,12 +1415,7 @@ impl SqlExpr {
                         over.order_by
                             .iter()
                             .map(|order| {
-                                order.to_sql_with_params(
-                                    db_type,
-                                    param_idx,
-                                    params,
-                                    table_prefix,
-                                )
+                                order.to_sql_with_params(db_type, param_idx, params, table_prefix)
                             })
                             .collect::<Vec<_>>()
                             .join(", ")
@@ -1393,18 +1436,26 @@ impl SqlExpr {
                         TimeUnit::Minute => format!("DATE_FORMAT({value}, '%Y-%m-%d %H:%i:00')"),
                         TimeUnit::Hour => format!("DATE_FORMAT({value}, '%Y-%m-%d %H:00:00')"),
                         TimeUnit::Day => format!("DATE({value})"),
-                        TimeUnit::Week => format!("DATE_SUB(DATE({value}), INTERVAL WEEKDAY({value}) DAY)"),
+                        TimeUnit::Week => {
+                            format!("DATE_SUB(DATE({value}), INTERVAL WEEKDAY({value}) DAY)")
+                        }
                         TimeUnit::Month => format!("DATE_FORMAT({value}, '%Y-%m-01')"),
                         TimeUnit::Year => format!("DATE_FORMAT({value}, '%Y-01-01')"),
                     },
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => format!("strftime({}, {})", quote_sql_literal(unit.sqlite_format()), value),
+                    DbType::Sqlite => format!(
+                        "strftime({}, {})",
+                        quote_sql_literal(unit.sqlite_format()),
+                        value
+                    ),
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!("DATETRUNC({}, {})", unit.pg_name(), value),
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => format!("dateTrunc('{}', {})", unit.pg_name(), value),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!("date_trunc('{}', {})", unit.pg_name(), value),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => format!("date_trunc('{}', {})", unit.pg_name(), value),
                 }
             }
             SqlExpr::DatePart { expr, part } => {
@@ -1415,13 +1466,19 @@ impl SqlExpr {
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => format!("EXTRACT({} FROM {})", part.name_upper(), value),
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => format!("CAST(strftime({}, {}) AS INTEGER)", quote_sql_literal(part.sqlite_format()), value),
+                    DbType::Sqlite => format!(
+                        "CAST(strftime({}, {}) AS INTEGER)",
+                        quote_sql_literal(part.sqlite_format()),
+                        value
+                    ),
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!("DATEPART({}, {})", part.name_upper(), value),
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => format!("to{}({})", part.name_upper(), value),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => format!("date_part('{}', {})", part.name(), value),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => format!("EXTRACT({} FROM {})", part.name_upper(), value),
                 }
             }
             SqlExpr::AtTimeZone { expr, timezone } => {
@@ -1436,7 +1493,11 @@ impl SqlExpr {
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => format!("CONVERT_TZ({value}, 'UTC', '{zone}')"),
                     #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "clickhouse"))]
-                    _ => "CAST(NULL AS TEXT) /* OrmerError::UnsupportedFeature: timezone conversion */".to_string(),
+                    _ => unreachable!("timezone conversion is gated by validate_for_db"),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        unreachable!("QuestDB timezone conversion is gated by validate_for_db")
+                    }
                 }
             }
             SqlExpr::DateAdd {
@@ -1453,11 +1514,17 @@ impl SqlExpr {
                 }
                 match db_type {
                     #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name()),
+                    DbType::PostgreSQL => {
+                        format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name())
+                    }
                     #[cfg(feature = "mysql")]
-                    DbType::MySQL => format!("DATE_ADD({}, INTERVAL {} {})", value, delta, unit.pg_name()),
+                    DbType::MySQL => {
+                        format!("DATE_ADD({}, INTERVAL {} {})", value, delta, unit.pg_name())
+                    }
                     #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => format!("datetime({}, printf('%+d seconds', {}))", value, delta),
+                    DbType::Sqlite => {
+                        format!("datetime({}, printf('%+d seconds', {}))", value, delta)
+                    }
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!("DATEADD({}, {}, {})", unit.pg_name(), delta, value),
                     #[cfg(feature = "clickhouse")]
@@ -1469,7 +1536,13 @@ impl SqlExpr {
                         value
                     ),
                     #[cfg(feature = "duckdb")]
-                    DbType::DuckDB => format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name()),
+                    DbType::DuckDB => {
+                        format!("{} + ({}) * INTERVAL '1 {}'", value, delta, unit.pg_name())
+                    }
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        format!("dateadd('{}', {}, {})", unit.pg_name(), delta, value)
+                    }
                 }
             }
             SqlExpr::DateDiff { left, right, part } => {
@@ -1482,18 +1555,38 @@ impl SqlExpr {
                         format!("date_part('epoch', {left_sql} - {right_sql}) / {divisor}")
                     }
                     #[cfg(feature = "mysql")]
-                    DbType::MySQL => format!("TIMESTAMPDIFF({}, {}, {})", part.name_upper(), left_sql, right_sql),
+                    DbType::MySQL => format!(
+                        "TIMESTAMPDIFF({}, {}, {})",
+                        part.name_upper(),
+                        left_sql,
+                        right_sql
+                    ),
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => {
                         let divisor = part.epoch_divisor() * 86400.0;
-                        format!("CAST((julianday({left_sql}) - julianday({right_sql})) * {divisor} AS INTEGER)")
+                        format!(
+                            "CAST((julianday({left_sql}) - julianday({right_sql})) * {divisor} AS INTEGER)"
+                        )
                     }
                     #[cfg(feature = "mssql")]
-                    DbType::MSSQL => format!("DATEDIFF({}, {}, {})", part.name_upper(), left_sql, right_sql),
+                    DbType::MSSQL => format!(
+                        "DATEDIFF({}, {}, {})",
+                        part.name_upper(),
+                        left_sql,
+                        right_sql
+                    ),
                     #[cfg(feature = "clickhouse")]
-                    DbType::ClickHouse => format!("dateDiff('{}', {}, {})", part.name(), left_sql, right_sql),
+                    DbType::ClickHouse => {
+                        format!("dateDiff('{}', {}, {})", part.name(), left_sql, right_sql)
+                    }
                     #[cfg(feature = "duckdb")]
-                    DbType::DuckDB => format!("date_diff('{}', {}, {})", part.name(), left_sql, right_sql),
+                    DbType::DuckDB => {
+                        format!("date_diff('{}', {}, {})", part.name(), left_sql, right_sql)
+                    }
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => {
+                        format!("datediff('{}', {}, {})", part.name(), left_sql, right_sql)
+                    }
                 }
             }
             SqlExpr::Now => match db_type {
@@ -1509,6 +1602,8 @@ impl SqlExpr {
                 DbType::ClickHouse => "now()".to_string(),
                 #[cfg(feature = "duckdb")]
                 DbType::DuckDB => "now()".to_string(),
+                #[cfg(feature = "questdb")]
+                DbType::QuestDB => "NOW()".to_string(),
             },
             SqlExpr::Row(exprs) => {
                 let values = exprs
@@ -1530,6 +1625,58 @@ impl SqlExpr {
 
     pub(crate) fn validate_for_db(&self, db_type: DbType) -> crate::Result<()> {
         match self {
+            #[cfg(feature = "questdb")]
+            SqlExpr::JsonText { expr, .. } | SqlExpr::JsonPathText { expr, .. }
+                if matches!(db_type, DbType::QuestDB) =>
+            {
+                expr.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "JSON text extraction",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::JsonPathValue { expr, .. } if matches!(db_type, DbType::QuestDB) => {
+                expr.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "JSON path value extraction",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::JsonPathExists { expr, .. } if matches!(db_type, DbType::QuestDB) => {
+                expr.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "JSON path existence",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::ArrayContains { left, right } if matches!(db_type, DbType::QuestDB) => {
+                left.validate_for_db(db_type)?;
+                right.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "array containment predicates",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::ArrayOverlaps { left, right } if matches!(db_type, DbType::QuestDB) => {
+                left.validate_for_db(db_type)?;
+                right.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "array overlap predicates",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::ArrayLen { expr } if matches!(db_type, DbType::QuestDB) => {
+                expr.validate_for_db(db_type)?;
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "array length",
+                })
+            }
             SqlExpr::Column(_) | SqlExpr::Value(_) => Ok(()),
             SqlExpr::Binary { left, right, .. }
             | SqlExpr::ArrayContains { left, right }
@@ -1545,7 +1692,8 @@ impl SqlExpr {
                     feature = "sqlite",
                     feature = "mssql",
                     feature = "clickhouse",
-                    feature = "duckdb"
+                    feature = "duckdb",
+                    feature = "questdb"
                 ))]
                 let unsupported = || -> crate::Result<()> {
                     Err(crate::OrmerError::UnsupportedFeature {
@@ -1566,6 +1714,8 @@ impl SqlExpr {
                     DbType::ClickHouse => unsupported(),
                     #[cfg(feature = "duckdb")]
                     DbType::DuckDB => unsupported(),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => unsupported(),
                 }
             }
             SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
@@ -1588,9 +1738,40 @@ impl SqlExpr {
                 }
                 Ok(())
             }
-            SqlExpr::DateTrunc { expr, .. }
-            | SqlExpr::DatePart { expr, .. }
-            | SqlExpr::AtTimeZone { expr, .. } => expr.validate_for_db(db_type),
+            SqlExpr::DateTrunc { expr, .. } | SqlExpr::DatePart { expr, .. } => {
+                expr.validate_for_db(db_type)
+            }
+            SqlExpr::AtTimeZone { expr, .. } => {
+                expr.validate_for_db(db_type)?;
+                #[cfg(any(
+                    feature = "sqlite",
+                    feature = "duckdb",
+                    feature = "clickhouse",
+                    feature = "questdb"
+                ))]
+                let unsupported = || -> crate::Result<()> {
+                    Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "timezone conversion",
+                    })
+                };
+                match db_type {
+                    #[cfg(feature = "postgresql")]
+                    DbType::PostgreSQL => Ok(()),
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => Ok(()),
+                    #[cfg(feature = "mysql")]
+                    DbType::MySQL => Ok(()),
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => unsupported(),
+                    #[cfg(feature = "duckdb")]
+                    DbType::DuckDB => unsupported(),
+                    #[cfg(feature = "clickhouse")]
+                    DbType::ClickHouse => unsupported(),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => unsupported(),
+                }
+            }
             SqlExpr::DateAdd { amount, .. } => amount.validate_for_db(db_type),
             SqlExpr::DateDiff { left, right, .. } => {
                 left.validate_for_db(db_type)?;
@@ -1600,6 +1781,15 @@ impl SqlExpr {
             #[cfg(feature = "clickhouse")]
             SqlExpr::JsonSet { .. } | SqlExpr::JsonRemove { .. }
                 if matches!(db_type, DbType::ClickHouse) =>
+            {
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "JSON updates",
+                })
+            }
+            #[cfg(feature = "questdb")]
+            SqlExpr::JsonSet { .. } | SqlExpr::JsonRemove { .. }
+                if matches!(db_type, DbType::QuestDB) =>
             {
                 Err(crate::OrmerError::UnsupportedFeature {
                     backend: db_type,
@@ -1682,6 +1872,12 @@ pub(crate) fn validate_filter_for_db(
             field,
             model
         )),
+        FilterExpr::Unsupported { backend, feature } => {
+            Err(crate::OrmerError::UnsupportedFeature {
+                backend: *backend,
+                feature: *feature,
+            })
+        }
         FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
             validate_filter_for_db(left, db_type)?;
             validate_filter_for_db(right, db_type)
@@ -1712,10 +1908,36 @@ pub(crate) fn validate_filter_for_db(
         FilterExpr::ExprIsNull { expr }
         | FilterExpr::ExprIsNotNull { expr }
         | FilterExpr::ExprPredicate { expr } => expr.validate_for_db(db_type),
-        FilterExpr::TextSearch { expr, .. } => expr.validate_for_db(db_type),
+        FilterExpr::InSubqueryDynamic { subquery, .. }
+        | FilterExpr::NotInSubqueryDynamic { subquery, .. }
+        | FilterExpr::ExistsDynamic { subquery }
+        | FilterExpr::NotExistsDynamic { subquery } => subquery.render(db_type).map(|_| ()),
+        FilterExpr::TextSearch { expr, .. } => {
+            expr.validate_for_db(db_type)?;
+            #[cfg(feature = "questdb")]
+            if matches!(db_type, DbType::QuestDB) {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "text search",
+                });
+            }
+            Ok(())
+        }
         FilterExpr::FullTextSearch(search) => {
+            if search.exprs.is_empty() {
+                return Err(crate::ormer_error!(
+                    "Full-text search requires at least one field"
+                ));
+            }
             for expr in &search.exprs {
                 expr.validate_for_db(db_type)?;
+            }
+            #[cfg(feature = "questdb")]
+            if matches!(db_type, DbType::QuestDB) {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "full-text search",
+                });
             }
             Ok(())
         }
@@ -1737,6 +1959,8 @@ pub(crate) fn aggregate_filter_native(db_type: DbType) -> bool {
         DbType::MSSQL => false,
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => false,
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => true,
     }
 }
 

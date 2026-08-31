@@ -26,6 +26,14 @@ struct CapabilityRow {
     active: bool,
 }
 
+#[derive(Debug, ormer::Model)]
+#[table = "query_dialect_timezone_users"]
+struct TimezoneUser {
+    #[primary]
+    id: i32,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[test]
 fn distinct_on_supports_composite_keys_and_rejects_bad_order() {
     let select = ormer::Select::<CapabilityRow>::new()
@@ -189,4 +197,82 @@ fn sqlite_rejects_advanced_grouping_but_allows_filtered_aggregates() {
         .select_column(|u| u.amount.sum().filter(|u| u.active.eq(true)))
         .try_to_sql_with_params(DbType::Sqlite)
         .expect("SQLite supports aggregate FILTER");
+}
+
+#[test]
+fn at_time_zone_is_gated_by_backend_capability() {
+    let select =
+        ormer::Select::<TimezoneUser>::new().map_to(|u| u.created_at.at_time_zone("Asia/Shanghai"));
+
+    #[cfg(feature = "postgresql")]
+    {
+        let (sql, _) = select
+            .clone()
+            .try_to_sql_with_params(DbType::PostgreSQL)
+            .expect("backend supports AT TIME ZONE");
+        assert!(sql.contains("AT TIME ZONE 'Asia/Shanghai'"), "SQL: {sql}");
+    }
+
+    #[cfg(feature = "mysql")]
+    {
+        let (sql, _) = select
+            .clone()
+            .try_to_sql_with_params(DbType::MySQL)
+            .expect("MySQL supports timezone conversion");
+        assert!(sql.contains("CONVERT_TZ("), "SQL: {sql}");
+        assert!(sql.contains("'UTC', 'Asia/Shanghai')"), "SQL: {sql}");
+    }
+
+    #[cfg(feature = "mssql")]
+    {
+        let (sql, _) = select
+            .clone()
+            .try_to_sql_with_params(DbType::MSSQL)
+            .expect("MSSQL supports AT TIME ZONE");
+        assert!(sql.contains("AT TIME ZONE 'Asia/Shanghai'"), "SQL: {sql}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        let error = select
+            .clone()
+            .try_to_sql_with_params(DbType::Sqlite)
+            .expect_err("backend must reject timezone conversion");
+        assert!(matches!(
+            error,
+            ormer::OrmerError::UnsupportedFeature {
+                feature: "timezone conversion",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "duckdb")]
+    {
+        let error = select
+            .clone()
+            .try_to_sql_with_params(DbType::DuckDB)
+            .expect_err("DuckDB must reject timezone conversion");
+        assert!(matches!(
+            error,
+            ormer::OrmerError::UnsupportedFeature {
+                feature: "timezone conversion",
+                ..
+            }
+        ));
+    }
+
+    #[cfg(feature = "clickhouse")]
+    {
+        let error = select
+            .try_to_sql_with_params(DbType::ClickHouse)
+            .expect_err("ClickHouse must reject timezone conversion");
+        assert!(matches!(
+            error,
+            ormer::OrmerError::UnsupportedFeature {
+                feature: "timezone conversion",
+                ..
+            }
+        ));
+    }
 }

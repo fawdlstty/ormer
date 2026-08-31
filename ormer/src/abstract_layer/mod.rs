@@ -8,6 +8,9 @@ pub mod sqlite_backend;
 #[cfg(feature = "postgresql")]
 pub mod postgresql_backend;
 
+#[cfg(feature = "questdb")]
+pub mod questdb_backend;
+
 #[cfg(feature = "mysql")]
 pub mod mysql_backend;
 
@@ -32,6 +35,9 @@ pub enum DbType {
     /// PostgreSQL 数据库
     #[cfg(feature = "postgresql")]
     PostgreSQL,
+    /// QuestDB database
+    #[cfg(feature = "questdb")]
+    QuestDB,
     /// MySQL 数据库
     #[cfg(feature = "mysql")]
     MySQL,
@@ -47,10 +53,23 @@ pub enum DbType {
 }
 
 impl DbType {
+    pub(crate) fn is_questdb(&self) -> bool {
+        match self {
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     /// Whether the backend provides transactional migration execution.
     pub fn is_transactional(&self) -> bool {
         #[cfg(feature = "clickhouse")]
         if matches!(self, DbType::ClickHouse) {
+            return false;
+        }
+        #[cfg(feature = "questdb")]
+        if matches!(self, DbType::QuestDB) {
             return false;
         }
         true
@@ -84,6 +103,14 @@ impl DbType {
                     _enum_variants,
                 )
             }
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => crate::abstract_layer::questdb_backend::QuestDBTypeMapper::sql_type(
+                _rust_type,
+                _is_primary,
+                _is_auto_increment,
+                _is_nullable,
+                _enum_variants,
+            ),
             #[cfg(feature = "mysql")]
             DbType::MySQL => crate::abstract_layer::mysql_backend::MySQLTypeMapper::sql_type(
                 _rust_type,

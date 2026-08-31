@@ -144,6 +144,8 @@ macro_rules! test_on_all_dbs {
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
+                        #[cfg(feature = "questdb")]
+                        ormer::DbType::QuestDB => "QuestDB",
                         #[cfg(feature = "mysql")]
                         ormer::DbType::MySQL => "MySQL",
                         #[cfg(feature = "mssql")]
@@ -178,6 +180,8 @@ macro_rules! test_on_all_dbs_result {
                         ormer::DbType::Sqlite => "Sqlite",
                         #[cfg(feature = "postgresql")]
                         ormer::DbType::PostgreSQL => "PostgreSQL",
+                        #[cfg(feature = "questdb")]
+                        ormer::DbType::QuestDB => "QuestDB",
                         #[cfg(feature = "mysql")]
                         ormer::DbType::MySQL => "MySQL",
                         #[cfg(feature = "mssql")]

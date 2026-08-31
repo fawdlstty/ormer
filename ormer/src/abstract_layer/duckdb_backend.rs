@@ -145,6 +145,14 @@ pub(crate) mod duckcompat {
             .map_err(|e| Error(e.to_string()))?
         }
 
+        pub fn rollback_sync(&self) -> Result<(), Error> {
+            let guard = self.conn.lock().map_err(|e| Error(e.to_string()))?;
+            guard
+                .execute("ROLLBACK", duckdb::params![])
+                .map(|_| ())
+                .map_err(|e| Error(e.to_string()))
+        }
+
         pub async fn query<P: IntoParams>(&self, sql: &str, params: P) -> Result<Rows, Error> {
             let sql = sql.to_string();
             let values = params.into_values();
@@ -1807,8 +1815,7 @@ impl Database {
         traced_duckdb_execute(&self.conn, "BEGIN", (), &[]).await?;
         Ok(Transaction {
             conn: self.conn.clone(),
-            committed: false,
-            rolled_back: false,
+            state: common_helpers::TransactionState::Active,
         })
     }
 
@@ -1956,22 +1963,17 @@ impl Database {
 /// DuckDB 事务对象
 pub struct Transaction {
     conn: Arc<duckcompat::Connection>,
-    committed: bool,
-    rolled_back: bool,
+    state: common_helpers::TransactionState,
 }
 
 impl Drop for Transaction {
     fn drop(&mut self) {
-        if self.committed || self.rolled_back {
+        if !self.state.is_active() {
             return;
         }
 
-        let conn = Arc::clone(&self.conn);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = traced_duckdb_execute(&conn, "ROLLBACK", (), &[]).await;
-            });
-        }
+        self.state = common_helpers::TransactionState::RolledBack;
+        let _ = self.conn.rollback_sync();
     }
 }
 
@@ -2218,26 +2220,31 @@ impl Transaction {
 
     /// 提交事务
     pub async fn commit(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back"
             ));
         }
         traced_duckdb_execute(&self.conn, "COMMIT", (), &[]).await?;
-        self.committed = true;
+        self.state = common_helpers::TransactionState::Committed;
         Ok(())
     }
 
     /// 回滚事务
     pub async fn rollback(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back"
             ));
         }
         traced_duckdb_execute(&self.conn, "ROLLBACK", (), &[]).await?;
-        self.rolled_back = true;
+        self.state = common_helpers::TransactionState::RolledBack;
         Ok(())
+    }
+
+    /// 关闭并回滚事务
+    pub async fn close(self) -> crate::Result<()> {
+        self.rollback().await
     }
 
     /// 创建 Select 查询执行器
@@ -3707,8 +3714,8 @@ where
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 获取子查询的 SQL 和参数
-    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::DuckDB)
+    pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        self.select.try_to_sql_with_params(DbType::DuckDB)
     }
 
     /// 执行查询并收集结果

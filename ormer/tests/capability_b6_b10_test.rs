@@ -1,10 +1,8 @@
 #![cfg(feature = "sqlite")]
 #![allow(deprecated)]
 
-use ormer::{
-    DbType, FullTextRank, Select, TimePart, generate_create_table_sql,
-};
 use ormer::query::CteBuilder;
+use ormer::{DbType, FullTextRank, Select, TimePart, generate_create_table_sql};
 
 #[derive(ormer::Model)]
 #[table = "b6_articles"]
@@ -76,30 +74,49 @@ fn sqlite_fulltext_uses_shadow_table_and_bm25() {
 #[test]
 fn sqlite_date_window_and_cte_sql_is_parameterized() {
     let (date_sql, date_params) = Select::<Event>::new()
-        .filter(|e| e.occurred_at.ge(chrono::Utc::now().naive_utc() - chrono::Duration::days(7)))
-        .map_to(|e| (e.occurred_at.date_trunc(ormer::TimeUnit::Day).alias("day"), e.points.sum()))
+        .filter(|e| {
+            e.occurred_at
+                .ge(chrono::Utc::now().naive_utc() - chrono::Duration::days(7))
+        })
+        .map_to(|e| {
+            (
+                e.occurred_at.date_trunc(ormer::TimeUnit::Day).alias("day"),
+                e.points.sum(),
+            )
+        })
         .to_sql_with_params(DbType::Sqlite);
     assert!(date_sql.contains("strftime("), "{date_sql}");
     assert_eq!(date_params.len(), 1);
 
     let (interval_sql, interval_params) = Select::<Event>::new()
         .filter(|e| e.occurred_at.le(ormer::now() + ormer::days(7)))
-        .map_to(|e| (
-            e.occurred_at.until(ormer::now(), TimePart::Hour).alias("age"),
-            e.points.sum(),
-        ))
+        .map_to(|e| {
+            (
+                e.occurred_at
+                    .until(ormer::now(), TimePart::Hour)
+                    .alias("age"),
+                e.points.sum(),
+            )
+        })
         .to_sql_with_params(DbType::Sqlite);
     assert!(interval_sql.contains("datetime('now')"), "{interval_sql}");
-    assert!(interval_sql.contains("printf('%+d seconds'"), "{interval_sql}");
+    assert!(
+        interval_sql.contains("printf('%+d seconds'"),
+        "{interval_sql}"
+    );
     assert!(interval_sql.contains("julianday("), "{interval_sql}");
     assert_eq!(interval_params.len(), 1);
 
     let (window_sql, _) = Select::<Event>::new()
-        .map_to(|e| (
-            e.game_id,
-            e.points,
-            e.points.rank().over(|w| w.partition_by(e.game_id).order_by(e.points.desc())),
-        ))
+        .map_to(|e| {
+            (
+                e.game_id,
+                e.points,
+                e.points
+                    .rank()
+                    .over(|w| w.partition_by(e.game_id).order_by(e.points.desc())),
+            )
+        })
         .to_sql_with_params(DbType::Sqlite);
     assert!(window_sql.contains("RANK() OVER (PARTITION BY game_id ORDER BY points DESC)"));
 
@@ -120,7 +137,10 @@ fn sqlite_date_window_and_cte_sql_is_parameterized() {
         .filter(|c| c.region.eq("eu"))
         .to_sql_with_params(DbType::Sqlite);
     assert!(cte_sql.starts_with("WITH "), "{cte_sql}");
-    assert!(cte_sql.contains("recent_orders AS (SELECT id, customer_id FROM "), "{cte_sql}");
+    assert!(
+        cte_sql.contains("recent_orders AS (SELECT id, customer_id FROM "),
+        "{cte_sql}"
+    );
     assert!(cte_sql.contains("t0.region = ?"), "{cte_sql}");
     assert_eq!(cte_params.len(), 2);
 
@@ -130,17 +150,21 @@ fn sqlite_date_window_and_cte_sql_is_parameterized() {
     assert!(recursive_sql.contains("WITH RECURSIVE"));
 
     #[cfg(feature = "duckdb")]
-    assert!(Select::<Order>::new()
-        .descendants(|o| (o.id, o.customer_id), 1)
-        .to_sql_with_params(DbType::DuckDB)
-        .0
-        .contains("WITH RECURSIVE"));
+    assert!(
+        Select::<Order>::new()
+            .descendants(|o| (o.id, o.customer_id), 1)
+            .to_sql_with_params(DbType::DuckDB)
+            .0
+            .contains("WITH RECURSIVE")
+    );
     #[cfg(feature = "clickhouse")]
-    assert!(Select::<Order>::new()
-        .descendants(|o| (o.id, o.customer_id), 1)
-        .to_sql_with_params(DbType::ClickHouse)
-        .0
-        .contains("WITH RECURSIVE"));
+    assert!(
+        Select::<Order>::new()
+            .descendants(|o| (o.id, o.customer_id), 1)
+            .to_sql_with_params(DbType::ClickHouse)
+            .0
+            .contains("WITH RECURSIVE")
+    );
 }
 
 #[test]
@@ -157,7 +181,10 @@ fn table_options_generate_dialect_ddl() {
     #[cfg(feature = "postgresql")]
     {
         let sql = generate_create_table_sql::<B10TenantEvent>(DbType::PostgreSQL).unwrap();
-        assert!(sql.contains("WITH (storage = 'main', fillfactor = 80)"), "{sql}");
+        assert!(
+            sql.contains("WITH (storage = 'main', fillfactor = 80)"),
+            "{sql}"
+        );
     }
     #[cfg(feature = "mssql")]
     {
@@ -177,7 +204,11 @@ fn table_options_generate_dialect_ddl() {
 #[postgresql(storage = "main", fillfactor = 80)]
 #[mssql(filegroup = "PRIMARY")]
 #[clickhouse(engine = "MergeTree", order_by = "(tenant_id, occurred_at)")]
-#[mysql(engine = "InnoDB", charset = "utf8mb4", collation = "utf8mb4_unicode_ci")]
+#[mysql(
+    engine = "InnoDB",
+    charset = "utf8mb4",
+    collation = "utf8mb4_unicode_ci"
+)]
 struct B10TenantEvent {
     #[primary]
     id: i64,

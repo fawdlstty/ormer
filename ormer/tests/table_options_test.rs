@@ -1,6 +1,5 @@
 #![allow(deprecated)]
 
-use ormer::{Model, TableOptions};
 #[cfg(any(
     feature = "mysql",
     feature = "postgresql",
@@ -8,10 +7,15 @@ use ormer::{Model, TableOptions};
     feature = "clickhouse"
 ))]
 use ormer::{DbType, generate_create_table_sql};
+use ormer::{Model, TableOptions};
 
 #[derive(ormer::Model)]
 #[table = "tenant_events"]
-#[mysql(engine = "InnoDB", charset = "utf8mb4", collation = "utf8mb4_0900_ai_ci")]
+#[mysql(
+    engine = "InnoDB",
+    charset = "utf8mb4",
+    collation = "utf8mb4_0900_ai_ci"
+)]
 #[postgresql(storage = "main", fillfactor = 80)]
 #[mssql(filegroup = "PRIMARY")]
 #[clickhouse(engine = "MergeTree", order_by = "(tenant_id, occurred_at)")]
@@ -36,7 +40,12 @@ fn dialect_attributes_are_gated_by_backend_features() {
 
     #[cfg(feature = "mysql")]
     assert_eq!(options.unwrap().mysql_engine, Some("InnoDB"));
-    #[cfg(not(feature = "mysql"))]
+    #[cfg(all(
+        not(feature = "mysql"),
+        not(feature = "postgresql"),
+        not(feature = "mssql"),
+        not(feature = "clickhouse")
+    ))]
     assert!(options.is_none());
 }
 
@@ -44,7 +53,10 @@ fn dialect_attributes_are_gated_by_backend_features() {
 #[test]
 fn postgresql_table_options_render_as_storage_parameters() {
     let sql = generate_create_table_sql::<TenantEvent>(DbType::PostgreSQL).unwrap();
-    assert!(sql.contains(" WITH (storage = 'main', fillfactor = 80)"), "{sql}");
+    assert!(
+        sql.contains(" WITH (storage = 'main', fillfactor = 80)"),
+        "{sql}"
+    );
 }
 
 #[cfg(feature = "mysql")]

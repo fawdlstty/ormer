@@ -57,6 +57,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
 
         let db_type_name = match config.0 {
@@ -72,6 +74,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => "DuckDB",
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => "ClickHouse",
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => "QuestDB",
         };
         println!("{} SQL: {}", db_type_name, sql);
         Ok(())
@@ -122,6 +126,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
         Ok(())
     }
@@ -171,6 +177,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
         Ok(())
     }
@@ -277,6 +285,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
         Ok(())
     }
@@ -330,6 +340,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
         Ok(())
     }
@@ -376,6 +388,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => {}
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => {}
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => {}
         }
 
         let db_type_name = match config.0 {
@@ -391,6 +405,8 @@ mod create_table_tests {
             ormer::DbType::DuckDB => "DuckDB",
             #[cfg(feature = "clickhouse")]
             ormer::DbType::ClickHouse => "ClickHouse",
+            #[cfg(feature = "questdb")]
+            ormer::DbType::QuestDB => "QuestDB",
         };
         println!("{} Complete Types SQL: {}", db_type_name, sql);
         Ok(())

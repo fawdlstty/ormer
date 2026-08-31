@@ -10,6 +10,16 @@ txn.commit().await?;
 txn.rollback().await?;
 ```
 
+`commit` 和 `rollback` 会消费事务所有权。若要在业务路径中取消事务，
+优先使用 `close()`；它等价于显式回滚：
+
+```rust
+txn.close().await?;
+```
+
+已激活的事务被 Drop 时，SQLite 和 DuckDB 会同步回滚；其他后端会尽力回滚
+其专属事务连接。Drop 兜底不适合依赖错误传播，正常流程仍应显式关闭。
+
 ## 闭包式事务
 
 稳定 Rust 使用 boxed future：

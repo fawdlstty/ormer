@@ -30,6 +30,13 @@ async fn test_pool_basic_impl(
                 .build()
                 .await?
         }
+        #[cfg(feature = "questdb")]
+        ormer::DbType::QuestDB => {
+            Database::create_pool(config.0, config.1)
+                .range(0..3) // 其他数据库: max=3
+                .build()
+                .await?
+        }
         #[cfg(feature = "mysql")]
         ormer::DbType::MySQL => {
             Database::create_pool(config.0, config.1)

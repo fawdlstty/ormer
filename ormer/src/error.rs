@@ -334,6 +334,8 @@ fn backend_name(backend: DbType) -> &'static str {
         DbType::Sqlite => "SQLite",
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => "PostgreSQL",
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => "QuestDB",
         #[cfg(feature = "mysql")]
         DbType::MySQL => "MySQL",
         #[cfg(feature = "mssql")]

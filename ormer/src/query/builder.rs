@@ -4,8 +4,8 @@ use crate::model::{
     quote_column_reference, quote_qualified_identifier, routed_model_table_name_for_db,
 };
 use crate::query::expr::{
-    AliasedExpr, IntoSqlExpr, JsonScalarKind, RawExpr, SqlExpr, TypedExpr, WindowSpecBuilder,
-    TimePart, TimeUnit,
+    AliasedExpr, IntoSqlExpr, JsonScalarKind, RawExpr, SqlExpr, TimePart, TimeUnit, TypedExpr,
+    WindowSpecBuilder,
 };
 use crate::query::filter::{DynamicSubquery, FilterExpr, OrderBy, OrderDirection};
 #[cfg(feature = "postgresql")]
@@ -183,6 +183,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "NULL".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "NULL".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "NULL".to_string(),
         };
     }
 
@@ -204,6 +206,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST(0 AS INT)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "0".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "0".to_string(),
         },
         "i64" | "u64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -216,6 +220,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "0".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "0".to_string(),
         },
         "f32" | "f64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -228,6 +234,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST(0 AS FLOAT)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "0.0".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "0.0".to_string(),
         },
         "bool" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -240,6 +248,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST(0 AS BIT)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "FALSE".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "FALSE".to_string(),
         },
         "Duration" | "std::time::Duration" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -252,6 +262,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "0".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "0".to_string(),
         },
         "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
             quote_sql_string("")
@@ -267,6 +279,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST('' AS VARBINARY(MAX))".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "NULL".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "X''".to_string(),
         },
         "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -279,6 +293,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "NULL".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "NULL".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "NULL".to_string(),
         },
         "Vec<i64>"
         | "std::vec::Vec<i64>"
@@ -296,6 +312,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "NULL".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => "NULL".to_string(),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "NULL".to_string(),
         },
         "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -308,6 +326,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("1970-01-01T00:00:00"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDateTime" | "chrono::NaiveDateTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -320,6 +340,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("1970-01-01T00:00:00"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDate" | "chrono::NaiveDate" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -332,6 +354,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST('1970-01-01' AS DATE)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("1970-01-01"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("1970-01-01"),
         },
         "NaiveTime" | "chrono::NaiveTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -344,6 +368,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => "CAST('00:00:00' AS TIME)".to_string(),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("00:00:00"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("00:00:00"),
         },
         "JsonValue" | "serde_json::Value" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -356,6 +382,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => quote_sql_string("null"),
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("null"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("null"),
         },
         "Uuid" | "uuid::Uuid" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -372,6 +400,8 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             }
             #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             _ => quote_sql_string("00000000-0000-0000-0000-000000000000"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => quote_sql_string("00000000-0000-0000-0000-000000000000"),
         },
         _ => quote_sql_string(""),
     }
@@ -707,13 +737,15 @@ fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()
             backend: db_type,
             feature: "row locking",
         }),
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        }),
     }
 }
 
-fn validate_distinct_on(
-    distinct_on: &[SqlExpr],
-    order_by: &[OrderBy],
-) -> crate::Result<()> {
+fn validate_distinct_on(distinct_on: &[SqlExpr], order_by: &[OrderBy]) -> crate::Result<()> {
     if distinct_on.is_empty() {
         return Ok(());
     }
@@ -778,6 +810,8 @@ fn distinct_on_native(db_type: DbType) -> bool {
         DbType::MSSQL => false,
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => false,
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => false,
     }
 }
 
@@ -881,6 +915,11 @@ fn validate_grouping_clause(
         }),
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "advanced GROUP BY syntax",
+        }),
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "advanced GROUP BY syntax",
         }),
@@ -1636,7 +1675,8 @@ fn collect_filter_param_rust_types<T: Model>(
         FilterExpr::ColumnComparison { .. }
         | FilterExpr::IsNull { .. }
         | FilterExpr::IsNotNull { .. }
-        | FilterExpr::InvalidDynamicField { .. } => {}
+        | FilterExpr::InvalidDynamicField { .. }
+        | FilterExpr::Unsupported { .. } => {}
         FilterExpr::Exists {
             subquery_params, ..
         }
@@ -2788,8 +2828,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
                     sql.push_str(&rendered_sets);
                     sql.push(')');
                 }
-                GroupingClause::Rollup(exprs) =>
-                {
+                GroupingClause::Rollup(exprs) => {
                     #[cfg(not(feature = "mysql"))]
                     let _ = &exprs;
                     #[cfg(feature = "mysql")]
@@ -2989,8 +3028,10 @@ impl<T: Model> Select<T> {
         match &mut self.full_text_search {
             Some(search) => search.exprs = exprs,
             None => {
-                let mut search =
-                    crate::query::filter::FullTextQuery::new(SqlExpr::Value(crate::model::Value::Null), "");
+                let mut search = crate::query::filter::FullTextQuery::new(
+                    SqlExpr::Value(crate::model::Value::Null),
+                    "",
+                );
                 search.exprs = exprs;
                 self.full_text_search = Some(search);
             }
@@ -3059,9 +3100,11 @@ impl<T: Model> Select<T> {
                 CteRenderedSql {
                     sql,
                     params,
-                    columns: definition.projection_columns.iter().map(|expr| {
-                        expr.to_sql_no_params(db_type)
-                    }).collect(),
+                    columns: definition
+                        .projection_columns
+                        .iter()
+                        .map(|expr| expr.to_sql_no_params(db_type))
+                        .collect(),
                     #[cfg(feature = "postgresql")]
                     param_rust_types: definition.param_rust_types(),
                 }
@@ -3595,7 +3638,11 @@ impl<T: Model> Select<T> {
     }
 
     /// 生成 EXISTS 子查询专用 SQL（SELECT 1 FROM ...）
-    fn to_exists_sql_with_params_for(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+    fn to_exists_sql_with_params_for(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        validate_filters(&self.filters, db_type)?;
         let mut sql = String::new();
         let mut params = Vec::new();
 
@@ -3616,7 +3663,7 @@ impl<T: Model> Select<T> {
             &mut params,
         );
 
-        (sql, params)
+        Ok((sql, params))
     }
 
     /// 生成 SQL
@@ -3802,8 +3849,10 @@ impl<T: Model> Select<T> {
             crate::model::quote_identifier(DbType::Sqlite, &format!("{normalized_table}_fts"));
         let hits_name = quote_column_reference(DbType::Sqlite, "__ormer_fts_hits");
         let hits_alias = quote_column_reference(DbType::Sqlite, "__ormer_hits");
-        let match_placeholder =
-            crate::abstract_layer::common::common_helpers::placeholder(DbType::Sqlite, param_idx as usize);
+        let match_placeholder = crate::abstract_layer::common::common_helpers::placeholder(
+            DbType::Sqlite,
+            param_idx as usize,
+        );
         params.push(crate::model::Value::Text(search.query.clone()));
         param_idx += 1;
 
@@ -3878,7 +3927,6 @@ impl<T: Model> Select<T> {
         (sql, params)
     }
 
-
     fn search_order_by(
         &self,
         db_type: DbType,
@@ -3922,7 +3970,11 @@ impl<T: Model> Select<T> {
             param_idx += cte_param_count as i32;
         }
 
-        sql.push_str(if self.recursive_cte.is_some() { "WITH RECURSIVE " } else { "WITH " });
+        sql.push_str(if self.recursive_cte.is_some() {
+            "WITH RECURSIVE "
+        } else {
+            "WITH "
+        });
         sql.push_str(&definitions.join(", "));
 
         let main_table = table_name_for_route_or_panic::<T>(db_type, &self.table_route);
@@ -4013,6 +4065,8 @@ impl<T: Model> Select<T> {
             DbType::PostgreSQL => "WITH RECURSIVE",
             #[cfg(feature = "mysql")]
             DbType::MySQL => "WITH RECURSIVE",
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => "WITH RECURSIVE",
         };
 
         write!(
@@ -5397,7 +5451,10 @@ impl<T, S> ProjectionExpr for TypedExpr<T, S> {
     type Output = T;
 
     fn column_name(&self) -> String {
-        self.sql_expr().to_sql_no_params(default_db_type())
+        match self.sql_expr() {
+            SqlExpr::Column(column) => column,
+            _ => "__ormer_expr".to_string(),
+        }
     }
 
     fn sql_expr(&self) -> SqlExpr {
@@ -5409,7 +5466,10 @@ impl<T> ProjectionExpr for RawExpr<T> {
     type Output = T;
 
     fn column_name(&self) -> String {
-        self.sql_expr().to_sql_no_params(default_db_type())
+        match self.sql_expr() {
+            SqlExpr::Column(column) => column,
+            _ => "__ormer_raw".to_string(),
+        }
     }
 
     fn sql_expr(&self) -> SqlExpr {
@@ -5990,7 +6050,7 @@ impl<T: Model + Send + Sync + 'static, V: ColumnValueType + Send + Sync + 'stati
         WhereExpr {
             inner: FilterExpr::InSubqueryDynamic {
                 column,
-                subquery: DynamicSubquery::new(move |db_type| self.to_sql_with_params(db_type)),
+                subquery: DynamicSubquery::new(move |db_type| self.try_to_sql_with_params(db_type)),
             },
             ..WhereExpr::defaults()
         }
@@ -6005,7 +6065,7 @@ impl<T: Model + Send + Sync + 'static, V: ColumnValueType + Send + Sync + 'stati
         WhereExpr {
             inner: FilterExpr::NotInSubqueryDynamic {
                 column,
-                subquery: DynamicSubquery::new(move |db_type| self.to_sql_with_params(db_type)),
+                subquery: DynamicSubquery::new(move |db_type| self.try_to_sql_with_params(db_type)),
             },
             ..WhereExpr::defaults()
         }
@@ -6318,21 +6378,24 @@ impl<T, S> TypedColumn<T, S> {
     pub fn lag(self, offset: i64) -> TypedExpr<T, S> {
         Self::window_function::<T, S>(
             "LAG",
-            vec![self.sql_expr(), SqlExpr::Value(crate::model::Value::BigInt(offset.into()))],
+            vec![
+                self.sql_expr(),
+                SqlExpr::Value(crate::model::Value::BigInt(offset.into())),
+            ],
         )
     }
 
     pub fn lead(self, offset: i64) -> TypedExpr<T, S> {
         Self::window_function::<T, S>(
             "LEAD",
-            vec![self.sql_expr(), SqlExpr::Value(crate::model::Value::BigInt(offset.into()))],
+            vec![
+                self.sql_expr(),
+                SqlExpr::Value(crate::model::Value::BigInt(offset.into())),
+            ],
         )
     }
 
-    fn window_function<U, M>(
-        function: &'static str,
-        args: Vec<SqlExpr>,
-    ) -> TypedExpr<U, M> {
+    fn window_function<U, M>(function: &'static str, args: Vec<SqlExpr>) -> TypedExpr<U, M> {
         TypedExpr::new(SqlExpr::WindowFunction {
             function,
             args,

@@ -28,6 +28,10 @@ async fn test_data_type_override_impl(
         ormer::DbType::PostgreSQL => {
             assert!(sql.contains("big_count BIGINT NOT NULL"));
         }
+        #[cfg(feature = "questdb")]
+        ormer::DbType::QuestDB => {
+            assert!(sql.contains("big_count LONG NOT NULL"));
+        }
         #[cfg(feature = "mysql")]
         ormer::DbType::MySQL => {
             assert!(sql.contains("big_count BIGINT NOT NULL"));

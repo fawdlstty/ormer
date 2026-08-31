@@ -136,10 +136,7 @@ fn row_value_json_text_search_distinct_and_lock_sql() {
         .to_sql_with_params(DbType::Sqlite);
 
     assert!(sql.contains("ROW_NUMBER() OVER (PARTITION BY org_id ORDER BY org_id ASC)"));
-    assert!(
-        sql.contains("__ormer_ranked.__ormer_c0 AS id"),
-        "{sql}"
-    );
+    assert!(sql.contains("__ormer_ranked.__ormer_c0 AS id"), "{sql}");
     assert!(sql.contains("__ormer_order_0\" ASC LIMIT 10"), "{sql}");
     assert!(sql.contains("\"__ormer_ranked\".\"__ormer_rank\" = 1"));
     assert!(sql.contains("(org_id, email) = (?, ?)"));

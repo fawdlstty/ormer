@@ -5,9 +5,9 @@
 //! before executing it, while small hand-written migrations remain possible.
 
 use crate::abstract_layer::DbType;
-use crate::abstract_layer::common::{Database, Transaction};
 #[cfg(any(feature = "sqlite", feature = "duckdb"))]
 use crate::abstract_layer::common::common_helpers;
+use crate::abstract_layer::common::{Database, Transaction};
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
 use crate::model::CompressionAlgorithm;
 use crate::model::{ColumnSchema, WritableModel};
@@ -152,6 +152,11 @@ impl MigrationStep {
                             "ALTER TABLE {table} MODIFY COLUMN {column} {definition}"
                         ))
                     }
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "ALTER COLUMN migrations",
+                    }),
                 }
             }
             Self::AddConstraint { definition, .. } => {
@@ -175,6 +180,8 @@ impl MigrationStep {
                     DbType::PostgreSQL => " IF NOT EXISTS",
                     #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
                     _ => " IF NOT EXISTS",
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => " IF NOT EXISTS",
                 };
                 Ok(format!(
                     "CREATE{unique} INDEX{if_not_exists} {} ON {table} ({})",
@@ -491,6 +498,23 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
             });
         }
 
+        if !self.db.db_type().is_transactional() {
+            execute_steps_nontransactional(self.db, self.db.db_type(), &steps).await?;
+            let sql = if self.db.db_type().is_questdb() {
+                format!(
+                    "UPDATE {MIGRATION_TABLE_NAME} SET rolled_back = TRUE WHERE version = {}",
+                    last.version
+                )
+            } else {
+                format!(
+                    "DELETE FROM {MIGRATION_TABLE_NAME} WHERE version = {}",
+                    last.version
+                )
+            };
+            self.db.execute_sql(sql).await?;
+            return Ok(());
+        }
+
         let mut transaction = self.db.begin().await?;
         let result = async {
             execute_steps(&mut transaction, self.db.db_type(), &steps).await?;
@@ -781,6 +805,13 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                 sqlite_rebuild_required = true;
                 continue;
             }
+            #[cfg(feature = "questdb")]
+            if matches!(db_type, DbType::QuestDB) {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "column metadata migrations",
+                });
+            }
 
             #[cfg(any(
                 feature = "postgresql",
@@ -806,6 +837,8 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         DbType::Sqlite => unreachable!("SQLite uses table rebuilds"),
                         #[cfg(feature = "clickhouse")]
                         DbType::ClickHouse => (column_definition(db_type, expected)?, None),
+                        #[cfg(feature = "questdb")]
+                        DbType::QuestDB => (String::new(), None),
                     };
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
@@ -841,6 +874,8 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         }
                         #[cfg(feature = "clickhouse")]
                         DbType::ClickHouse => column_definition(db_type, expected)?,
+                        #[cfg(feature = "questdb")]
+                        DbType::QuestDB => String::new(),
                     };
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
@@ -899,6 +934,10 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         let plan = self.plan().await?;
         if plan.is_empty() {
             return Ok(());
+        }
+
+        if !plan.db_type().is_transactional() {
+            return execute_steps_nontransactional(self.db, plan.db_type(), &plan.steps).await;
         }
 
         let mut transaction = self.db.begin().await?;
@@ -1025,6 +1064,13 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
                 feature: "column compression",
             });
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "column compression",
+            });
+        }
     }
     #[cfg(any(feature = "postgresql", feature = "mysql"))]
     Ok(())
@@ -1124,6 +1170,8 @@ fn index_migration_step(
         DbType::Sqlite => " IF NOT EXISTS",
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => " IF NOT EXISTS",
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => " IF NOT EXISTS",
         #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
         _ => " IF NOT EXISTS",
     };
@@ -1214,6 +1262,8 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 _ => upper,
             }
         }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => upper,
         #[cfg(feature = "mysql")]
         DbType::MySQL => {
             let base = upper.split('(').next().unwrap_or(&upper);
@@ -1456,6 +1506,20 @@ async fn execute_steps(
     Ok(())
 }
 
+async fn execute_steps_nontransactional(
+    db: &Database,
+    db_type: DbType,
+    steps: &[MigrationStep],
+) -> crate::Result<()> {
+    for step in steps {
+        let sql = step.sql(db_type)?;
+        for statement in split_sql_statements(&sql) {
+            db.execute_sql(statement).await?;
+        }
+    }
+    Ok(())
+}
+
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -1661,7 +1725,7 @@ impl Database {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(_) => DbType::Sqlite,
             #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(_) => DbType::PostgreSQL,
+            Database::PostgreSQL(db) => db.db_type(),
             #[cfg(feature = "mysql")]
             Database::MySQL(_) => DbType::MySQL,
             #[cfg(feature = "mssql")]
@@ -1760,6 +1824,21 @@ impl Database {
         }
 
         let db_type = self.db_type();
+        if !db_type.is_transactional() {
+            for migration in &pending {
+                execute_steps_nontransactional(self, db_type, &migration.up()).await?;
+                let name = migration.name().replace('\'', "''");
+                let sql = format!(
+                    "INSERT INTO {MIGRATION_TABLE_NAME} (version, name, checksum, rolled_back) VALUES ({}, '{}', '{}', FALSE)",
+                    migration.version(),
+                    name,
+                    migration.checksum()
+                );
+                self.execute_sql(sql).await?;
+            }
+            return Ok(pending.len());
+        }
+
         let mut transaction = self.begin().await?;
         let result = async {
             for migration in &pending {
@@ -1823,6 +1902,11 @@ impl Database {
             ),
             #[cfg(feature = "clickhouse")]
             DbType::ClickHouse => unreachable!("handled by the ClickHouse backend"),
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => format!(
+                "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE_NAME} \
+                 (version LONG, name STRING, checksum STRING, rolled_back BOOLEAN)"
+            ),
         };
         self.execute_sql(&sql).await?;
         Ok(())
@@ -1855,6 +1939,13 @@ impl Database {
         table_name: &str,
     ) -> crate::Result<Option<Vec<crate::migration::SchemaColumn>>> {
         match self {
+            #[cfg(feature = "questdb")]
+            Database::PostgreSQL(db) if db.db_type().is_questdb() => {
+                Err(crate::OrmerError::UnsupportedFeature {
+                    backend: DbType::QuestDB,
+                    feature: "migrate_table schema introspection",
+                })
+            }
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.schema_columns(table_name).await,
             #[cfg(feature = "postgresql")]

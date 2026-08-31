@@ -25,6 +25,10 @@ async fn test_duration_sql_type_impl(
         ormer::DbType::PostgreSQL => {
             assert!(sql.contains("duration INTERVAL NOT NULL"));
         }
+        #[cfg(feature = "questdb")]
+        ormer::DbType::QuestDB => {
+            assert!(sql.contains("duration LONG NOT NULL"));
+        }
         #[cfg(feature = "mysql")]
         ormer::DbType::MySQL => {
             assert!(sql.contains("duration BIGINT NOT NULL"));

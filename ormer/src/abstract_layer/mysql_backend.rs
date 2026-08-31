@@ -1356,8 +1356,7 @@ impl Database {
         Ok(Transaction {
             conn: Some(conn),
             pool: &self.pool,
-            committed: false,
-            rolled_back: false,
+            state: common_helpers::TransactionState::Active,
         })
     }
 
@@ -1502,16 +1501,16 @@ impl Database {
 pub struct Transaction<'a> {
     conn: Option<mysql_async::Conn>,
     pool: &'a Pool,
-    committed: bool,
-    rolled_back: bool,
+    state: common_helpers::TransactionState,
 }
 
 impl<'a> Drop for Transaction<'a> {
     fn drop(&mut self) {
-        if self.committed || self.rolled_back {
+        if !self.state.is_active() {
             return;
         }
 
+        self.state = common_helpers::TransactionState::RolledBack;
         if let Some(mut conn) = self.conn.take() {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -1850,7 +1849,7 @@ impl<'a> Transaction<'a> {
 
     /// 提交事务
     pub async fn commit(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
@@ -1858,13 +1857,13 @@ impl<'a> Transaction<'a> {
         if let Some(mut conn) = self.conn.take() {
             traced_mysql_query_drop(&mut conn, "COMMIT").await?;
         }
-        self.committed = true;
+        self.state = common_helpers::TransactionState::Committed;
         Ok(())
     }
 
     /// 回滚事务
     pub async fn rollback(mut self) -> crate::Result<()> {
-        if self.committed || self.rolled_back {
+        if self.state.is_closed() {
             return Err(crate::ormer_error!(
                 "Transaction already committed or rolled back".to_string(),
             ));
@@ -1872,8 +1871,13 @@ impl<'a> Transaction<'a> {
         if let Some(mut conn) = self.conn.take() {
             traced_mysql_query_drop(&mut conn, "ROLLBACK").await?;
         }
-        self.rolled_back = true;
+        self.state = common_helpers::TransactionState::RolledBack;
         Ok(())
+    }
+
+    /// 关闭并回滚事务
+    pub async fn close(self) -> crate::Result<()> {
+        self.rollback().await
     }
 
     /// 创建 Select 查询执行器
@@ -2093,8 +2097,8 @@ pub struct GroupedSelectExecutor<'a, T: Model, V> {
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
-    pub fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
-        self.select.to_sql_with_params(DbType::MySQL)
+    pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        self.select.try_to_sql_with_params(DbType::MySQL)
     }
 
     /// 执行查询并收集结果

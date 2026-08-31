@@ -3830,7 +3830,9 @@ impl ModelTableOptions {
     }
 }
 
-fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+fn extract_table_options(
+    input: &DeriveInput,
+) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     let mut options = ModelTableOptions::default();
     for attr in &input.attrs {
         let dialect = if attr.path().is_ident("mysql") {
@@ -3857,7 +3859,10 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
             let value = meta.value()?;
             let expr: syn::Expr = value.parse()?;
             let syn::Expr::Lit(expr) = expr else {
-                return Err(syn::Error::new(expr.span(), "table option must be a literal"));
+                return Err(syn::Error::new(
+                    expr.span(),
+                    "table option must be a literal",
+                ));
             };
             match (name.as_str(), &expr.lit) {
                 ("fillfactor", Lit::Int(lit)) => {
@@ -3886,11 +3891,17 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
                     } else if name == "settings" {
                         DialectTableOptions::set_string(&mut dialect.sixth, &name, value);
                     } else {
-                        return Err(syn::Error::new(meta.path.span(), "unsupported table option"));
+                        return Err(syn::Error::new(
+                            meta.path.span(),
+                            "unsupported table option",
+                        ));
                     }
                 }
                 _ => {
-                    return Err(syn::Error::new(expr.span(), "unsupported table option value"));
+                    return Err(syn::Error::new(
+                        expr.span(),
+                        "unsupported table option value",
+                    ));
                 }
             }
             Ok(())
@@ -3905,9 +3916,21 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
     let mysql = if options.mysql.is_empty() {
         quote! { None }
     } else {
-        let engine = options.mysql.first.as_deref().map(|value| quote!(Some(#value)));
-        let charset = options.mysql.second.as_deref().map(|value| quote!(Some(#value)));
-        let collation = options.mysql.third.as_deref().map(|value| quote!(Some(#value)));
+        let engine = options
+            .mysql
+            .first
+            .as_deref()
+            .map(|value| quote!(Some(#value)));
+        let charset = options
+            .mysql
+            .second
+            .as_deref()
+            .map(|value| quote!(Some(#value)));
+        let collation = options
+            .mysql
+            .third
+            .as_deref()
+            .map(|value| quote!(Some(#value)));
         quote! {
             ::ormer::model::mysql_table_options(
                 #engine, #charset, #collation,
@@ -3917,7 +3940,11 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
     let postgresql = if options.postgresql.is_empty() {
         quote! { None }
     } else {
-        let storage = options.postgresql.second.as_deref().map(|value| quote!(Some(#value)));
+        let storage = options
+            .postgresql
+            .second
+            .as_deref()
+            .map(|value| quote!(Some(#value)));
         let fillfactor = options.postgresql.number.map(|value| quote!(Some(#value)));
         quote! {
             ::ormer::model::postgresql_table_options(#storage, #fillfactor)
@@ -3926,7 +3953,11 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
     let mssql = if options.mssql.is_empty() {
         quote! { None }
     } else {
-        let filegroup = options.mssql.second.as_deref().map(|value| quote!(Some(#value)));
+        let filegroup = options
+            .mssql
+            .second
+            .as_deref()
+            .map(|value| quote!(Some(#value)));
         quote! {
             ::ormer::model::mssql_table_options(#filegroup)
         }
@@ -3952,7 +3983,10 @@ fn extract_table_options(input: &DeriveInput) -> (proc_macro2::TokenStream, proc
         ::ormer::model::merge_table_options(#mysql, #postgresql, #mssql, #clickhouse)
     };
     let warning_ident = syn::Ident::new(
-        &format!("__ORMER_TABLE_OPTIONS_{}", input.ident.to_string().to_uppercase()),
+        &format!(
+            "__ORMER_TABLE_OPTIONS_{}",
+            input.ident.to_string().to_uppercase()
+        ),
         input.ident.span(),
     );
     let warning_item = quote! {

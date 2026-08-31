@@ -72,7 +72,12 @@ impl FilterFormatter {
         params: &mut Vec<Value>,
     ) -> String {
         let expr_sql = |expr: &SqlExpr, param_idx: &mut i32, params: &mut Vec<Value>| {
-            expr.to_sql(self.db_type, param_idx, params, self.table_prefix.as_deref())
+            expr.to_sql(
+                self.db_type,
+                param_idx,
+                params,
+                self.table_prefix.as_deref(),
+            )
         };
         let query_expr = SqlExpr::Value(Value::Text(search.query.clone()));
         let query_sql = query_expr.to_sql(
@@ -82,16 +87,25 @@ impl FilterFormatter {
             self.table_prefix.as_deref(),
         );
         if search.exprs.is_empty() {
-            return "1 = 0".to_string();
+            unreachable!("empty full-text search is gated by validate_filter_for_db");
         }
 
         match self.db_type {
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
                 let language = search.language.as_deref().unwrap_or("simple");
-                let language_sql = SqlExpr::Value(Value::Text(language.to_string()))
-                    .to_sql(self.db_type, param_idx, params, None);
-                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                let language_sql = SqlExpr::Value(Value::Text(language.to_string())).to_sql(
+                    self.db_type,
+                    param_idx,
+                    params,
+                    None,
+                );
+                let fields = search
+                    .exprs
+                    .iter()
+                    .map(|expr| expr_sql(expr, param_idx, params))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let vector = format!("to_tsvector({}, COALESCE({fields}, ''))", language_sql);
                 let query_fn = match search.mode {
                     crate::query::filter::FullTextMode::Natural => "plainto_tsquery",
@@ -102,7 +116,12 @@ impl FilterFormatter {
             }
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
-                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                let fields = search
+                    .exprs
+                    .iter()
+                    .map(|expr| expr_sql(expr, param_idx, params))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 let mode = match search.mode {
                     crate::query::filter::FullTextMode::Natural => " IN NATURAL LANGUAGE MODE",
                     crate::query::filter::FullTextMode::Boolean => " IN BOOLEAN MODE",
@@ -113,26 +132,65 @@ impl FilterFormatter {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => {
                 if search.exprs.len() == 1 {
-                    format!("{} MATCH {query_sql}", expr_sql(&search.exprs[0], param_idx, params))
+                    format!(
+                        "{} MATCH {query_sql}",
+                        expr_sql(&search.exprs[0], param_idx, params)
+                    )
                 } else {
-                    let clauses = search.exprs.iter().map(|expr| format!("{} LIKE {query_sql}", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                    let clauses = search
+                        .exprs
+                        .iter()
+                        .map(|expr| {
+                            format!("{} LIKE {query_sql}", expr_sql(expr, param_idx, params))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
                     format!("({clauses})")
                 }
             }
             #[cfg(feature = "mssql")]
             DbType::MSSQL => {
-                let fields = search.exprs.iter().map(|expr| expr_sql(expr, param_idx, params)).collect::<Vec<_>>().join(", ");
+                let fields = search
+                    .exprs
+                    .iter()
+                    .map(|expr| expr_sql(expr, param_idx, params))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("CONTAINS (({fields}), {query_sql})")
             }
             #[cfg(feature = "duckdb")]
             DbType::DuckDB => {
-                let clauses = search.exprs.iter().map(|expr| format!("lower({}) LIKE lower({query_sql})", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                let clauses = search
+                    .exprs
+                    .iter()
+                    .map(|expr| {
+                        format!(
+                            "lower({}) LIKE lower({query_sql})",
+                            expr_sql(expr, param_idx, params)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
                 format!("({clauses})")
             }
             #[cfg(feature = "clickhouse")]
             DbType::ClickHouse => {
-                let clauses = search.exprs.iter().map(|expr| format!("multiSearchAnyCaseInsensitive({}, [{query_sql}])", expr_sql(expr, param_idx, params))).collect::<Vec<_>>().join(" OR ");
+                let clauses = search
+                    .exprs
+                    .iter()
+                    .map(|expr| {
+                        format!(
+                            "multiSearchAnyCaseInsensitive({}, [{query_sql}])",
+                            expr_sql(expr, param_idx, params)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
                 format!("({clauses})")
+            }
+            #[cfg(feature = "questdb")]
+            DbType::QuestDB => {
+                unreachable!("QuestDB full-text search is gated by validate_filter_for_db")
             }
         }
     }
@@ -218,7 +276,9 @@ impl FilterFormatter {
             }
             FilterExpr::InSubqueryDynamic { column, subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let (subquery_sql, subquery_params) = subquery
+                    .render(self.db_type)
+                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql).unwrap_or_else(
@@ -245,7 +305,9 @@ impl FilterFormatter {
             }
             FilterExpr::NotInSubqueryDynamic { column, subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let (subquery_sql, subquery_params) = subquery
+                    .render(self.db_type)
+                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(
@@ -318,7 +380,9 @@ impl FilterFormatter {
             }
             FilterExpr::ExistsDynamic { subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let (subquery_sql, subquery_params) = subquery
+                    .render(self.db_type)
+                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "EXISTS ({})", subquery_sql)
@@ -338,7 +402,9 @@ impl FilterFormatter {
             }
             FilterExpr::NotExistsDynamic { subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery.render(self.db_type);
+                let (subquery_sql, subquery_params) = subquery
+                    .render(self.db_type)
+                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "NOT EXISTS ({})", subquery_sql)
@@ -406,21 +472,20 @@ impl FilterFormatter {
                     self.table_prefix.as_deref(),
                 );
                 #[cfg(feature = "sqlite")]
-                let (left_sql, right_sql) =
-                    if matches!(self.db_type, DbType::Sqlite)
-                        && matches!(
-                            right,
-                            SqlExpr::Value(Value::Decimal(_) | Value::BigDecimal(_))
-                        )
-                        && matches!(operator.as_str(), ">" | ">=" | "<" | "<=")
-                    {
-                        (
-                            format!("CAST({left_sql} AS NUMERIC)"),
-                            format!("CAST({right_sql} AS NUMERIC)"),
-                        )
-                    } else {
-                        (left_sql, right_sql)
-                    };
+                let (left_sql, right_sql) = if matches!(self.db_type, DbType::Sqlite)
+                    && matches!(
+                        right,
+                        SqlExpr::Value(Value::Decimal(_) | Value::BigDecimal(_))
+                    )
+                    && matches!(operator.as_str(), ">" | ">=" | "<" | "<=")
+                {
+                    (
+                        format!("CAST({left_sql} AS NUMERIC)"),
+                        format!("CAST({right_sql} AS NUMERIC)"),
+                    )
+                } else {
+                    (left_sql, right_sql)
+                };
                 write!(sql, "{left_sql} {operator} {right_sql}")
                     .unwrap_or_else(|e| panic!("Failed to write expression comparison: {}", e));
             }
@@ -513,18 +578,30 @@ impl FilterFormatter {
                     crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
                     #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
                     _ => format!("{} LIKE {}", expr_sql, query_sql),
+                    #[cfg(feature = "questdb")]
+                    crate::DbType::QuestDB => {
+                        unreachable!("QuestDB text search is gated by validate_filter_for_db")
+                    }
                 };
                 write!(sql, "{sql_fragment}")
                     .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));
             }
             FilterExpr::FullTextSearch(search) => {
                 use std::fmt::Write;
-                write!(sql, "{}", self.full_text_search_sql(search, param_idx, params))
-                    .unwrap_or_else(|e| panic!("Failed to write full-text search clause: {}", e));
+                write!(
+                    sql,
+                    "{}",
+                    self.full_text_search_sql(search, param_idx, params)
+                )
+                .unwrap_or_else(|e| panic!("Failed to write full-text search clause: {}", e));
             }
             FilterExpr::InvalidDynamicField { .. } => {
-                sql.push_str("1 = 0");
+                unreachable!("invalid dynamic field is gated by validate_filter_for_db")
             }
+            FilterExpr::Unsupported { backend, feature } => panic!(
+                "{} cannot be rendered for {backend:?}; validate the filter before formatting",
+                feature
+            ),
         }
     }
 

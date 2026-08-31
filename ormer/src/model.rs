@@ -298,7 +298,9 @@ pub const fn postgresql_table_options(
 /// A configured `#[postgresql(...)]` attribute warns without compiling out
 /// the model when the PostgreSQL backend feature is disabled.
 #[cfg(not(feature = "postgresql"))]
-#[deprecated(note = "#[postgresql(...)] is ignored because the ormer `postgresql` feature is disabled")]
+#[deprecated(
+    note = "#[postgresql(...)] is ignored because the ormer `postgresql` feature is disabled"
+)]
 pub const fn postgresql_table_options(
     storage: Option<&'static str>,
     fillfactor: Option<u8>,
@@ -351,7 +353,9 @@ pub const fn clickhouse_table_options(
 /// A configured `#[clickhouse(...)]` attribute warns without compiling out
 /// the model when the ClickHouse backend feature is disabled.
 #[cfg(not(feature = "clickhouse"))]
-#[deprecated(note = "#[clickhouse(...)] is ignored because the ormer `clickhouse` feature is disabled")]
+#[deprecated(
+    note = "#[clickhouse(...)] is ignored because the ormer `clickhouse` feature is disabled"
+)]
 pub const fn clickhouse_table_options(
     engine: Option<&'static str>,
     order_by: Option<&'static str>,
@@ -543,6 +547,10 @@ impl ColumnDefault {
                 crate::abstract_layer::DbType::Sqlite => if value { "1" } else { "0" }.to_string(),
                 #[cfg(feature = "postgresql")]
                 crate::abstract_layer::DbType::PostgreSQL => {
+                    if value { "TRUE" } else { "FALSE" }.to_string()
+                }
+                #[cfg(feature = "questdb")]
+                crate::abstract_layer::DbType::QuestDB => {
                     if value { "TRUE" } else { "FALSE" }.to_string()
                 }
                 #[cfg(feature = "mysql")]
@@ -2091,6 +2099,10 @@ where
         crate::abstract_layer::DbType::MySQL => {
             format!("INSERT IGNORE INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
         }
+        #[cfg(feature = "questdb")]
+        crate::abstract_layer::DbType::QuestDB => {
+            format!("INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})")
+        }
         #[cfg(feature = "mssql")]
         crate::abstract_layer::DbType::MSSQL => format!(
             "IF NOT EXISTS (SELECT 1 FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}) \
@@ -2287,6 +2299,8 @@ pub fn normalize_table_name_for_db(
         crate::abstract_layer::DbType::MySQL => table_name_without_schema(table_name),
         #[cfg(feature = "postgresql")]
         crate::abstract_layer::DbType::PostgreSQL => table_name,
+        #[cfg(feature = "questdb")]
+        crate::abstract_layer::DbType::QuestDB => table_name_without_schema(table_name),
         #[cfg(feature = "mssql")]
         crate::abstract_layer::DbType::MSSQL => table_name,
         #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
@@ -2952,6 +2966,10 @@ pub fn quote_identifier(db_type: crate::abstract_layer::DbType, identifier: &str
         crate::abstract_layer::DbType::PostgreSQL => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
+        #[cfg(feature = "questdb")]
+        crate::abstract_layer::DbType::QuestDB => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
         #[cfg(feature = "duckdb")]
         crate::abstract_layer::DbType::DuckDB => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -3015,7 +3033,69 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
+    #[cfg(feature = "questdb")]
+    if matches!(db_type, crate::abstract_layer::DbType::QuestDB) {
+        return generate_questdb_create_table_sql_with_name::<T>(table_name);
+    }
     generate_create_table_sql_with_engine::<T>(db_type, table_name, None)
+}
+
+#[cfg(feature = "questdb")]
+fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
+    table_name: Option<&str>,
+) -> crate::Result<String> {
+    let db_type = crate::abstract_layer::DbType::QuestDB;
+    let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
+    let quoted_table_name = quote_qualified_identifier(db_type, &table_name);
+    let mut sql = format!("CREATE TABLE IF NOT EXISTS {quoted_table_name} (");
+
+    for (index, column) in T::column_schema().iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        if column.is_auto_increment {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "auto-increment columns",
+            });
+        }
+        if column.rust_type.starts_with("Vec<")
+            || column.rust_type.starts_with("std::vec::Vec<")
+            || column.rust_type.starts_with("alloc::vec::Vec<")
+        {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "array columns",
+            });
+        }
+        let sql_type = if let Some(db_value_type) = column.db_value_type {
+            db_value_type(db_type).to_string()
+        } else {
+            let sql_type = db_type.sql_type(
+                column.data_type.unwrap_or(column.rust_type),
+                false,
+                false,
+                column.is_nullable,
+                column.enum_variants,
+            );
+            sql_type.trim_end_matches(" NOT NULL").to_string()
+        };
+        sql.push_str(&quote_identifier(db_type, column.name));
+        sql.push(' ');
+        sql.push_str(&sql_type);
+        if let Some(default) = column.default {
+            sql.push_str(" DEFAULT ");
+            sql.push_str(&default.to_sql(db_type));
+        }
+    }
+
+    sql.push(')');
+    if let Some((time_column, _)) = T::hypertable_info() {
+        sql.push_str(" timestamp(");
+        sql.push_str(&quote_identifier(db_type, time_column));
+        sql.push(')');
+    }
+    Ok(sql)
 }
 
 fn generate_create_table_sql_with_engine<T: WritableModel>(
@@ -3363,18 +3443,18 @@ fn generate_indexes_with_name<T: WritableModel>(
     let column_schema = T::column_schema();
     #[cfg(feature = "sqlite")]
     if matches!(db_type, crate::abstract_layer::DbType::Sqlite)
-        && column_schema
-            .iter()
-            .any(|column| column.index_method.is_some_and(|method| method == "fulltext"))
+        && column_schema.iter().any(|column| {
+            column
+                .index_method
+                .is_some_and(|method| method == "fulltext")
+        })
     {
         let mut columns = column_schema
             .iter()
             .filter(|column| column.is_indexed)
             .map(|column| column.name)
             .collect::<Vec<_>>();
-        if let Some(explicit_columns) = column_schema
-            .iter()
-            .find_map(|column| column.index_columns)
+        if let Some(explicit_columns) = column_schema.iter().find_map(|column| column.index_columns)
         {
             columns = explicit_columns
                 .trim_start_matches('(')
@@ -3570,12 +3650,22 @@ fn render_sqlite_fulltext(table_name: &str, columns: &[&str]) -> crate::Result<S
         .join(", ");
     let new_values = columns
         .iter()
-        .map(|column| format!("NEW.{}", quote_identifier(crate::abstract_layer::DbType::Sqlite, column)))
+        .map(|column| {
+            format!(
+                "NEW.{}",
+                quote_identifier(crate::abstract_layer::DbType::Sqlite, column)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let old_values = columns
         .iter()
-        .map(|column| format!("OLD.{}", quote_identifier(crate::abstract_layer::DbType::Sqlite, column)))
+        .map(|column| {
+            format!(
+                "OLD.{}",
+                quote_identifier(crate::abstract_layer::DbType::Sqlite, column)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     Ok(format!(

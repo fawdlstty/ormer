@@ -4,6 +4,7 @@
 
 - Sqlite
 - PostgreSQL
+- QuestDB（PostgreSQL wire 协议）
 - MySQL
 - MSSQL
 - DuckDB（支持本地连接、建表、CRUD、事务、原生 SQL、流式查询、schema introspection 和连接池）
@@ -25,6 +26,13 @@ ormer = { version = "0.2", features = ["sqlite"] }
 
 **PostgreSQL:**
 - `postgresql://user:password@localhost/dbname`
+
+**QuestDB:**
+- `postgresql://admin:quest@localhost:8812/qdb`
+- 通过 `Database::connect(DbType::QuestDB, "...")` 使用 PostgreSQL wire 协议。
+- 支持 insert/select/update、建表/删表、原生 SQL、流式查询、连接池和逐条迁移。
+- 模型时间字段标注 `#[hypertable(...)]` 时，QuestDB 建表会生成 designated timestamp。
+- 不支持行级删除、事务、约束、自增/`RETURNING`、upsert、COPY、行锁、schema introspection 和高级分组。
 
 **MySQL:**
 - `mysql://user:password@localhost/dbname`

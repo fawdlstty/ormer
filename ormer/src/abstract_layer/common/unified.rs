@@ -1,11 +1,11 @@
 #![allow(clippy::upper_case_acronyms)]
 
+#[cfg(feature = "clickhouse")]
+use super::SingleSqlStatement;
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
 use super::{SqlStatement, common_helpers};
-#[cfg(feature = "clickhouse")]
-use super::SingleSqlStatement;
 use crate::db_first;
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
@@ -432,6 +432,11 @@ fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
                     crate::model::quote_identifier(db_type, table)
                 )
             }
+        }
+        #[cfg(feature = "questdb")]
+        super::super::DbType::QuestDB => {
+            let (_, table) = crate::model::split_schema_table_name(normalized, "public");
+            crate::model::quote_identifier(db_type, table)
         }
         #[cfg(feature = "sqlite")]
         super::super::DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
@@ -1577,6 +1582,11 @@ impl Database {
                 let db = postgresql_backend::Database::connect(db_type, connection_string).await?;
                 Ok(Database::PostgreSQL(db))
             }
+            #[cfg(feature = "questdb")]
+            super::super::DbType::QuestDB => {
+                let db = postgresql_backend::Database::connect(db_type, connection_string).await?;
+                Ok(Database::PostgreSQL(db))
+            }
             #[cfg(feature = "mysql")]
             super::super::DbType::MySQL => {
                 let db = mysql_backend::Database::connect(db_type, connection_string).await?;
@@ -2565,9 +2575,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(feature = "sqlite")]
             SelectExecutor::Sqlite(exec) => SelectExecutor::Sqlite(exec.language(language)),
             #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => {
-                SelectExecutor::PostgreSQL(exec.language(language))
-            }
+            SelectExecutor::PostgreSQL(exec) => SelectExecutor::PostgreSQL(exec.language(language)),
             #[cfg(feature = "mysql")]
             SelectExecutor::MySQL(exec) => SelectExecutor::MySQL(exec.language(language)),
             #[cfg(feature = "mssql")]
@@ -4573,6 +4581,11 @@ pub(crate) async fn apply_transaction_options(
             }
             Ok(())
         }
+        #[cfg(feature = "questdb")]
+        super::super::DbType::QuestDB => Err(unsupported_feature(
+            super::super::DbType::QuestDB,
+            "transaction options",
+        )),
         #[cfg(feature = "mysql")]
         super::super::DbType::MySQL => {
             if let Some(isolation) = options.isolation {
@@ -4755,6 +4768,23 @@ impl<'a> Transaction<'a> {
             Transaction::MSSQL(txn) => txn.rollback().await,
             #[cfg(feature = "duckdb")]
             Transaction::DuckDB(txn) => txn.rollback().await,
+            Transaction::_Phantom(_) => unreachable!(),
+        }
+    }
+
+    /// 关闭并回滚事务
+    pub async fn close(self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Transaction::Sqlite(txn) => txn.close().await,
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => txn.close().await,
+            #[cfg(feature = "mysql")]
+            Transaction::MySQL(txn) => txn.close().await,
+            #[cfg(feature = "mssql")]
+            Transaction::MSSQL(txn) => txn.close().await,
+            #[cfg(feature = "duckdb")]
+            Transaction::DuckDB(txn) => txn.close().await,
             Transaction::_Phantom(_) => unreachable!(),
         }
     }
@@ -5259,28 +5289,26 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
         }
     }
 
-    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    pub fn as_model<R: Model>(self) -> crate::Result<DerivedSelect<R>>
     where
         T: Send + Sync + 'static,
         V: Send + Sync + 'static,
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => exec.as_model::<R>(),
+            GroupedSelectExecutor::Sqlite(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => exec.as_model::<R>(),
+            GroupedSelectExecutor::PostgreSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
+            GroupedSelectExecutor::MySQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+            GroupedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => exec.as_model::<R>(),
+            GroupedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "clickhouse")]
             GroupedSelectExecutor::Unsupported {
                 backend, feature, ..
-            } => {
-                panic!("{}", unsupported_feature(backend, feature))
-            }
+            } => Err(unsupported_feature(backend, feature)),
         }
     }
 }
@@ -5628,28 +5656,26 @@ where
 }
 
 impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
-    pub fn as_model<R: Model>(self) -> DerivedSelect<R>
+    pub fn as_model<R: Model>(self) -> crate::Result<DerivedSelect<R>>
     where
         T: Send + Sync + 'static,
         V: Send + Sync + 'static,
     {
         match self {
             #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => exec.as_model::<R>(),
+            MappedSelectExecutor::Sqlite(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => exec.as_model::<R>(),
+            MappedSelectExecutor::PostgreSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => exec.as_model::<R>(),
+            MappedSelectExecutor::MySQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => exec.as_model::<R>(),
+            MappedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => exec.as_model::<R>(),
+            MappedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "clickhouse")]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
-            } => {
-                panic!("{}", unsupported_feature(backend, feature))
-            }
+            } => Err(unsupported_feature(backend, feature)),
         }
     }
 
@@ -5740,27 +5766,33 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
-// 为 MappedSelectExecutor 实现 Subquery trait
-impl<'a, T: Model, V> crate::query::filter::Subquery for MappedSelectExecutor<'a, T, V> {
-    fn to_subquery_sql(&self) -> (String, Vec<crate::model::Value>) {
+impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+    fn into_in_filter(self, column: String) -> crate::query::filter::FilterExpr {
+        let in_subquery = |subquery: crate::Result<(String, Vec<crate::model::Value>)>| {
+            crate::query::filter::FilterExpr::InSubqueryDynamic {
+                column,
+                subquery: crate::query::filter::DynamicSubquery::new(move |_| subquery.clone()),
+            }
+        };
+
         match self {
             #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => exec.to_subquery_sql(),
+            MappedSelectExecutor::Sqlite(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => exec.to_subquery_sql(),
+            MappedSelectExecutor::PostgreSQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => exec.to_subquery_sql(),
+            MappedSelectExecutor::MySQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => exec.to_subquery_sql(),
+            MappedSelectExecutor::MSSQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => exec.to_subquery_sql(),
+            MappedSelectExecutor::DuckDB(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "clickhouse")]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
-            } => {
-                let message = unsupported_feature(*backend, *feature).to_string();
-                (format!("SELECT 1 WHERE 0 = 1 /* {message} */"), Vec::new())
-            }
+            } => in_subquery(Err(crate::OrmerError::UnsupportedFeature {
+                backend,
+                feature,
+            })),
         }
     }
 }
@@ -5770,18 +5802,7 @@ impl<'a, T: Model, V: crate::query::builder::ColumnValueType> crate::query::buil
     for MappedSelectExecutor<'a, T, V>
 {
     fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
-        use crate::query::filter::Subquery;
-
-        let (sql, params) = self.to_subquery_sql();
-
-        // 构造 FilterExpr::InSubquery
-        let filter_expr = crate::query::filter::FilterExpr::InSubquery {
-            column,
-            subquery_sql: sql,
-            subquery_params: params,
-        };
-
-        crate::query::builder::WhereExpr::from_filter(filter_expr)
+        crate::query::builder::WhereExpr::from_filter(self.into_in_filter(column))
     }
 }
 
@@ -5790,18 +5811,7 @@ impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
     crate::query::builder::IsInValues<V> for &'b MappedSelectExecutor<'a, T, V>
 {
     fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
-        use crate::query::filter::Subquery;
-
-        let (sql, params) = self.to_subquery_sql();
-
-        // 构造 FilterExpr::InSubquery
-        let filter_expr = crate::query::filter::FilterExpr::InSubquery {
-            column,
-            subquery_sql: sql,
-            subquery_params: params,
-        };
-
-        crate::query::builder::WhereExpr::from_filter(filter_expr)
+        crate::query::builder::WhereExpr::from_filter(self.clone().into_in_filter(column))
     }
 }
 

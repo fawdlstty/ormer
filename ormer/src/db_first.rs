@@ -612,6 +612,8 @@ fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> String {
         DbType::Sqlite => sqlite_rust_type(&lower),
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => postgresql_rust_type(&lower),
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => postgresql_rust_type(&lower),
         #[cfg(feature = "mysql")]
         DbType::MySQL => mysql_rust_type(&lower),
         #[cfg(feature = "mssql")]

@@ -169,6 +169,76 @@ async fn clickhouse_unified_database_accepts_http_connection_string_and_raw_sql(
     drop(optimize);
 }
 
+#[tokio::test]
+#[cfg(feature = "clickhouse")]
+async fn clickhouse_grouped_and_mapped_as_model_return_errors_without_panicking() {
+    let db = ormer::Database::connect(DbType::ClickHouse, "http://localhost:8123")
+        .await
+        .expect("ClickHouse client construction should not require a live server");
+
+    let grouped_error = db
+        .select_column::<ClickHouseCapabilityUser, i64>()
+        .as_model::<ClickHouseCapabilityUser>()
+        .err()
+        .expect("grouped model conversion must be capability gated");
+    assert!(matches!(
+        grouped_error,
+        OrmerError::UnsupportedFeature {
+            backend: DbType::ClickHouse,
+            feature: "Model select_column on ClickHouse; use select_sql",
+        }
+    ));
+
+    let mapped_error = db
+        .select::<ClickHouseCapabilityUser>()
+        .map_to(|user| user.id)
+        .as_model::<ClickHouseCapabilityUser>()
+        .err()
+        .expect("mapped model conversion must be capability gated");
+    assert!(matches!(
+        mapped_error,
+        OrmerError::UnsupportedFeature {
+            backend: DbType::ClickHouse,
+            feature: "select capability on ClickHouse",
+        }
+    ));
+
+    let mapped_subquery = db
+        .select::<ClickHouseCapabilityUser>()
+        .map_to(|user| user.id);
+    let subquery_error = db
+        .select::<ClickHouseCapabilityUser>()
+        .filter(|user| user.id.is_in(mapped_subquery))
+        .to_sql()
+        .err()
+        .expect("mapped is_in subqueries must be capability gated");
+    assert!(matches!(
+        subquery_error,
+        OrmerError::UnsupportedFeature {
+            backend: DbType::ClickHouse,
+            feature: "select capability on ClickHouse",
+        }
+    ));
+
+    let mapped_subquery = db
+        .select::<ClickHouseCapabilityUser>()
+        .map_to(|user| user.id);
+    let execution_error = db
+        .select::<ClickHouseCapabilityUser>()
+        .filter(|user| user.id.is_in(mapped_subquery))
+        .collect::<Vec<ClickHouseCapabilityUser>>()
+        .await
+        .err()
+        .expect("mapped is_in execution must be capability gated");
+    assert!(matches!(
+        execution_error,
+        OrmerError::UnsupportedFeature {
+            backend: DbType::ClickHouse,
+            feature: "select capability on ClickHouse",
+        }
+    ));
+}
+
 #[cfg(feature = "duckdb")]
 #[derive(Debug, ormer::Model)]
 #[table = "duckdb_pool_users"]

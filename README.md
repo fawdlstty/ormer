@@ -5,7 +5,7 @@
 
 English | [简体中文](README.zh.md)
 
-A minimalist ORM framework that supports SQLite, PostgreSQL, MySQL, and SqlServer.
+A minimalist ORM framework that supports SQLite, PostgreSQL, QuestDB, MySQL, and SqlServer.
 
 It also includes raw SQL and typed raw expression parameter binding, relation loading, object graph writes, tracked dirty-field saves, optimized batch insert/update paths, embedded value objects, decimal types, typed derived tables, model filters, dynamic table routing, hooks, global SQL trace callbacks, and versioned migration support.
 

@@ -5,7 +5,7 @@
 
 [English](README.md) | 简体中文
 
-一款极简语法的ORM框架，支持Sqlite、PostgreSQL、MySQL、SqlServer。
+一款极简语法的ORM框架，支持Sqlite、PostgreSQL、QuestDB、MySQL、SqlServer。
 
 同时提供原生 SQL 与类型化 raw 表达式参数绑定、关系加载、对象图写入、实体快照变更保存、批量插入/更新优化路径、嵌入值对象、精确小数、类型化派生表、模型级过滤器、动态表路由、Hooks、全局 SQL trace 回调和版本化迁移支持。
 

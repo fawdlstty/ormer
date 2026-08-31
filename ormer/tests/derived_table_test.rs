@@ -82,7 +82,7 @@ async fn test_derived_table_from_and_join_impl(
         .as_model::<UserTotal>();
 
     let hot_users: Vec<UserTotal> = db
-        .from_derived(totals.clone())
+        .from_derived(totals.clone()?)
         .filter(|t| t.total.gt(50_i64))
         .order_by_desc(|t| t.total)
         .collect()
@@ -94,7 +94,7 @@ async fn test_derived_table_from_and_join_impl(
 
     let rows: Vec<(DerivedUser, Option<UserTotal>)> = db
         .select::<DerivedUser>()
-        .left_join_derived(totals, |u, t| u.id.eq(t.user_id))
+        .left_join_derived(totals?, |u, t| u.id.eq(t.user_id))
         .collect::<Vec<_>>()
         .await?;
 
@@ -119,7 +119,7 @@ async fn test_derived_table_from_and_join_impl(
         .as_model::<UserTotal>();
 
     let filtered_only: Vec<UserTotal> = db
-        .from_derived(filtered_totals.clone())
+        .from_derived(filtered_totals.clone()?)
         .collect::<Vec<_>>()
         .await?;
     assert_eq!(filtered_only.len(), 1);
