@@ -48,6 +48,14 @@ struct PgStringArrayModel {
     tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, ormer::Model)]
+#[table = "test_postgresql_text_to_array"]
+struct PgTextToArrayMigrationModel {
+    #[primary]
+    id: i32,
+    tags: Vec<String>,
+}
+
 #[tokio::test]
 async fn test_postgresql_array_sql_and_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let config = _test_common::postgresql_config();
@@ -141,5 +149,70 @@ async fn test_postgresql_string_array_uses_text_array_value()
     assert_eq!(items, vec![model]);
 
     db.drop_table::<PgStringArrayModel>().execute().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_postgresql_text_to_string_array_migration() -> Result<(), Box<dyn std::error::Error>>
+{
+    let config = _test_common::postgresql_config();
+    let db = _test_common::create_db_connection(&config).await?;
+
+    let _ = db
+        .drop_table::<PgTextToArrayMigrationModel>()
+        .execute()
+        .await;
+    db.execute_sql(
+        "CREATE TABLE test_postgresql_text_to_array (
+            id INTEGER PRIMARY KEY,
+            tags TEXT NOT NULL
+        )",
+    )
+    .await?;
+    db.execute_sql(
+        "INSERT INTO test_postgresql_text_to_array (id, tags) VALUES
+         (1, '[\"alpha,beta\",\"gamma\"]'),
+         (2, 'legacy,value')",
+    )
+    .await?;
+
+    let plan = db
+        .migrate_table::<PgTextToArrayMigrationModel>()
+        .plan()
+        .await?;
+    assert!(!plan.steps().is_empty());
+    db.migrate_table::<PgTextToArrayMigrationModel>()
+        .execute()
+        .await?;
+    assert!(
+        db.migrate_table::<PgTextToArrayMigrationModel>()
+            .plan()
+            .await?
+            .steps()
+            .is_empty()
+    );
+
+    let items = db
+        .select::<PgTextToArrayMigrationModel>()
+        .order_by(|item| item.id.asc())
+        .collect::<Vec<_>>()
+        .await?;
+    assert_eq!(
+        items,
+        vec![
+            PgTextToArrayMigrationModel {
+                id: 1,
+                tags: vec!["alpha,beta".to_string(), "gamma".to_string()],
+            },
+            PgTextToArrayMigrationModel {
+                id: 2,
+                tags: vec!["legacy,value".to_string()],
+            },
+        ]
+    );
+
+    db.drop_table::<PgTextToArrayMigrationModel>()
+        .execute()
+        .await?;
     Ok(())
 }

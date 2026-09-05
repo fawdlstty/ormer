@@ -6,6 +6,7 @@ use syn::{Data, DeriveInput, Fields, LitStr};
 struct DbTypeAttrs {
     sqlite: Option<String>,
     postgresql: Option<String>,
+    questdb: Option<String>,
     mysql: Option<String>,
     mssql: Option<String>,
     duckdb: Option<String>,
@@ -33,6 +34,12 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
         quote! {
             #[cfg(feature = "postgresql")]
             ::ormer::DbType::PostgreSQL => #ty,
+        }
+    });
+    let questdb_arm = db_types.questdb.map(|ty| {
+        quote! {
+            #[cfg(feature = "questdb")]
+            ::ormer::DbType::QuestDB => #ty,
         }
     });
     let mysql_arm = db_types.mysql.map(|ty| {
@@ -74,6 +81,7 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
                 match db_type {
                     #sqlite_arm
                     #postgresql_arm
+                    #questdb_arm
                     #mysql_arm
                     #mssql_arm
                     #duckdb_arm
@@ -170,6 +178,8 @@ fn extract_db_types(input: &DeriveInput) -> DbTypeAttrs {
                 db_types.sqlite = Some(lit.value());
             } else if meta.path.is_ident("postgresql") {
                 db_types.postgresql = Some(lit.value());
+            } else if meta.path.is_ident("questdb") {
+                db_types.questdb = Some(lit.value());
             } else if meta.path.is_ident("mysql") {
                 db_types.mysql = Some(lit.value());
             } else if meta.path.is_ident("mssql") {

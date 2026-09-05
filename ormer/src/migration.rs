@@ -1338,7 +1338,9 @@ fn postgresql_using_expression(
             return Some(format!(
                 "CASE WHEN {column} IS NULL THEN {null_value} \
                  WHEN jsonb_typeof({column}::jsonb) = 'array' \
-                 THEN ARRAY(SELECT jsonb_array_elements_text({column}::jsonb)) \
+                 THEN CONCAT( \
+                     '{{', btrim({column}::text, '[]'), '}}' \
+                 )::TEXT[] \
                  WHEN jsonb_typeof({column}::jsonb) = 'string' \
                  THEN ARRAY[({column}::jsonb #>> '{{}}')]::TEXT[] \
                  ELSE ARRAY[{column}::text]::TEXT[] END"
@@ -1348,7 +1350,9 @@ fn postgresql_using_expression(
             "CASE WHEN {column} IS NULL THEN {null_value} \
              WHEN btrim({column}::text) = '' THEN ARRAY[]::TEXT[] \
                  WHEN left(btrim({column}::text), 1) = '[' \
-             THEN ARRAY(SELECT jsonb_array_elements_text({column}::jsonb)) \
+             THEN CONCAT( \
+                 '{{', btrim({column}::text, '[]'), '}}' \
+             )::TEXT[] \
              ELSE ARRAY[{column}::text]::TEXT[] END"
         ));
     }

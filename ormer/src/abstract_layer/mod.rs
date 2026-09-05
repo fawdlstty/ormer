@@ -23,6 +23,8 @@ pub mod duckdb_backend;
 #[cfg(feature = "clickhouse")]
 pub(crate) mod clickhouse_backend;
 
+pub mod capabilities;
+
 /// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
 pub mod common;
 

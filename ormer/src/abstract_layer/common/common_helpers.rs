@@ -305,6 +305,94 @@ pub fn build_model_update_sql<T: Model>(
     })
 }
 
+#[cfg(feature = "duckdb")]
+pub fn build_duckdb_graph_update_sql<T: Model>(
+    model: &T,
+    plan: &ModelUpdatePlan,
+) -> crate::Result<ModelSqlStatement> {
+    const TARGET: &str = "__ormer_update_target";
+    const SOURCE: &str = "__ormer_update_source";
+    let db_type = DbType::DuckDB;
+    let mut source_columns = Vec::new();
+    let mut join_conditions = Vec::new();
+    let mut params = Vec::new();
+
+    for (index, column) in T::primary_key_columns().iter().enumerate() {
+        let value = model.column_value(column).ok_or_else(|| {
+            crate::ormer_error!("Missing graph update primary key value for column {column}")
+        })?;
+        let alias = format!("__ormer_key_{index}");
+        source_columns.push(format!(
+            "{} AS {}",
+            placeholder(db_type, params.len() + 1),
+            quote_identifier(db_type, &alias)
+        ));
+        params.push(value);
+        join_conditions.push(format!(
+            "{}.{} = {}.{}",
+            TARGET,
+            quote_identifier(db_type, column),
+            SOURCE,
+            quote_identifier(db_type, &alias)
+        ));
+    }
+
+    if let Some(info) = T::version_info() {
+        let old_version = crate::model::model_version(model);
+        let alias = "__ormer_old_version";
+        source_columns.push(format!(
+            "{} AS {}",
+            placeholder(db_type, params.len() + 1),
+            quote_identifier(db_type, alias)
+        ));
+        params.push(Value::from(old_version));
+        join_conditions.push(format!(
+            "{}.{} = {}.{}",
+            TARGET,
+            quote_identifier(db_type, info.column),
+            SOURCE,
+            quote_identifier(db_type, alias)
+        ));
+    }
+
+    let set_assignments = plan
+        .sets
+        .iter()
+        .enumerate()
+        .map(|(index, (column, value))| {
+            let alias = format!("__ormer_value_{index}");
+            source_columns.push(format!(
+                "{} AS {}",
+                placeholder(db_type, params.len() + 1),
+                quote_identifier(db_type, &alias)
+            ));
+            params.push(value.clone());
+            Ok(format!(
+                "{} = {}.{}",
+                quote_identifier(db_type, column),
+                SOURCE,
+                quote_identifier(db_type, &alias)
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    let sql = format!(
+        "MERGE INTO {} AS {TARGET} USING (SELECT {}) AS {SOURCE} \
+         ON {} WHEN MATCHED THEN UPDATE SET {}",
+        quote_table_name::<T>(db_type),
+        source_columns.join(", "),
+        join_conditions.join(" AND "),
+        set_assignments.join(", ")
+    );
+    Ok(ModelSqlStatement {
+        sql,
+        params,
+        versioned: plan.version_update.is_some(),
+        version_update: plan.version_update.clone(),
+        param_columns: None,
+    })
+}
+
 pub fn bind_param_limit(db_type: DbType) -> usize {
     match db_type {
         #[cfg(feature = "sqlite")]
@@ -814,9 +902,10 @@ fn build_bulk_model_update_sql<T: Model>(
             build_values_source_bulk_model_update_sql::<T>(db_type, plans, pk_values, set_columns)
         }
         #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => Err(crate::ormer_error!(
-            "bulk model update is not implemented for this backend"
-        )),
+        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "bulk model updates",
+        }),
     }
 }
 
@@ -1982,9 +2071,10 @@ fn append_insert_conflict_clause<T: Model>(
             "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
         )),
         #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => Err(crate::ormer_error!(
-            "insert conflict handling is not implemented for this backend"
-        )),
+        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "insert conflict handling",
+        }),
     }
 }
 

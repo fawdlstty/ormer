@@ -3179,7 +3179,7 @@ impl Database {
         let rows = self
             .client
             .query(
-                "SELECT c.column_name, c.data_type, c.is_nullable, \
+                "SELECT c.column_name, c.data_type, c.udt_name, c.is_nullable, \
                         EXISTS (
                             SELECT 1
                             FROM information_schema.table_constraints tc
@@ -3217,10 +3217,16 @@ impl Database {
         for row in rows {
             let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
             let type_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
-            let nullable: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
-            let primary_key: bool = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let primary_key: bool = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
             let compression: Option<String> =
-                row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+                row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
+            let type_name = if type_name == "USER-DEFINED" || type_name == "ARRAY" {
+                udt_name
+            } else {
+                type_name
+            };
             columns.push(schema_column_with_compression(
                 name,
                 type_name,

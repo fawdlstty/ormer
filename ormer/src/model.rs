@@ -2051,6 +2051,18 @@ where
     .await
 }
 
+#[cfg(any(feature = "sqlite", feature = "questdb"))]
+fn through_link_needs_existence_probe(db_type: crate::abstract_layer::DbType) -> bool {
+    #[allow(unreachable_patterns)]
+    match db_type {
+        #[cfg(feature = "sqlite")]
+        crate::abstract_layer::DbType::Sqlite => true,
+        #[cfg(feature = "questdb")]
+        crate::abstract_layer::DbType::QuestDB => true,
+        _ => false,
+    }
+}
+
 pub async fn graph_insert_through_link_values<'tx, Via>(
     tx: &mut crate::abstract_layer::Transaction<'tx>,
     owner_column: &'static str,
@@ -2066,8 +2078,8 @@ where
     let owner_col = quote_identifier(db_type, owner_column);
     let target_col = quote_identifier(db_type, target_column);
 
-    #[cfg(feature = "sqlite")]
-    if matches!(db_type, crate::abstract_layer::DbType::Sqlite) {
+    #[cfg(any(feature = "sqlite", feature = "questdb"))]
+    if through_link_needs_existence_probe(db_type) {
         let exists_sql = format!(
             "SELECT COUNT(*) FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}"
         );
@@ -2108,11 +2120,18 @@ where
             "IF NOT EXISTS (SELECT 1 FROM {table} WHERE {owner_col} = {{}} AND {target_col} = {{}}) \
              INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}})"
         ),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
-        _ => {
-            return Err(crate::ormer_error!(
-                "through-link insertion is not implemented for this backend"
-            ));
+        #[cfg(feature = "duckdb")]
+        crate::abstract_layer::DbType::DuckDB => {
+            format!(
+                "INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}}) ON CONFLICT DO NOTHING"
+            )
+        }
+        #[cfg(feature = "clickhouse")]
+        crate::abstract_layer::DbType::ClickHouse => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "through-link insertion",
+            });
         }
     };
     let raw = crate::RawSql::new(sql)

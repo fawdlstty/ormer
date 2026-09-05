@@ -24,6 +24,7 @@ compile_error!(
 );
 
 pub use abstract_layer::DbType;
+pub use abstract_layer::capabilities::Capabilities;
 pub use db_first::{
     DbFirstColumn, DbFirstForeignKey, DbFirstIndex, DbFirstIndexColumn, DbFirstTable,
 };

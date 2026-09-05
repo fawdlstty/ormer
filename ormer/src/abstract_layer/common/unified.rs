@@ -1378,6 +1378,34 @@ where
     pub async fn execute(self) -> crate::Result<u64> {
         let mut tx = self.db.begin().await?;
         let affected = match async {
+            #[cfg(feature = "duckdb")]
+            let affected = if tx.db_type() == super::super::DbType::DuckDB {
+                match common_helpers::model_update_plan(&*self.model, None) {
+                    Some(plan) => {
+                        let statement =
+                            common_helpers::build_duckdb_graph_update_sql::<T>(&*self.model, &plan)?;
+                        match &mut tx {
+                            Transaction::DuckDB(txn) => {
+                                let executor = txn.update::<T>();
+                                <duckdb_backend::UpdateExecutor<T> as super::SqlExecutor>::execute_with_sql(
+                                    executor,
+                                    SqlStatement::single(
+                                        super::super::DbType::DuckDB,
+                                        statement.sql,
+                                        statement.params,
+                                    ),
+                                )
+                                .await?
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    None => 0,
+                }
+            } else {
+                tx.update::<T>().set_model(&*self.model).execute().await?
+            };
+            #[cfg(not(feature = "duckdb"))]
             let affected = tx.update::<T>().set_model(&*self.model).execute().await?;
             <T as crate::model::GraphWritable>::update_graph_relations(&mut tx, self.model).await?;
             Ok::<u64, crate::OrmerError>(affected)
