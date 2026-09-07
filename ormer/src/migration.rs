@@ -36,6 +36,10 @@ pub enum MigrationStep {
         column: String,
         definition: String,
     },
+    DropColumn {
+        table: String,
+        column: String,
+    },
     BackfillColumn {
         table: String,
         column: String,
@@ -91,6 +95,21 @@ impl MigrationStep {
                 Ok(format!(
                     "ALTER TABLE {table} ADD COLUMN {column} {definition}"
                 ))
+            }
+            Self::DropColumn { column, .. } => {
+                let column = crate::model::quote_identifier(db_type, column);
+                match db_type {
+                    #[cfg(feature = "sqlite")]
+                    DbType::Sqlite => Err(crate::ormer_error!(
+                        "SQLite does not support DROP COLUMN; use a hand-written table rebuild"
+                    )),
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "DROP COLUMN migrations",
+                    }),
+                    _ => Ok(format!("ALTER TABLE {table} DROP COLUMN {column}")),
+                }
             }
             Self::BackfillColumn {
                 column, expression, ..
@@ -216,6 +235,7 @@ impl MigrationStep {
 fn table_name(step: &MigrationStep) -> &str {
     match step {
         MigrationStep::AddColumn { table, .. }
+        | MigrationStep::DropColumn { table, .. }
         | MigrationStep::BackfillColumn { table, .. }
         | MigrationStep::AlterColumn { table, .. }
         | MigrationStep::AddConstraint { table, .. }
@@ -606,14 +626,26 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             .map(|column| (column.name.as_str(), column))
             .collect();
 
+        #[cfg(feature = "sqlite")]
+        let mut sqlite_rebuild_required = false;
+
         for column in &actual {
-            if !expected_names.contains(column.name.as_str()) {
-                return Err(crate::ormer_error!(
-                    "Cannot migrate table {} because existing column {} is not present in the model",
-                    table_name,
-                    column.name
-                ));
+            if expected_names.contains(column.name.as_str()) {
+                continue;
             }
+            #[cfg(feature = "sqlite")]
+            if matches!(db_type, DbType::Sqlite) {
+                sqlite_rebuild_required = true;
+                continue;
+            }
+            plan.warnings.push(format!(
+                "dropping column {} because it is not present in the model",
+                column.name
+            ));
+            plan.push(MigrationStep::DropColumn {
+                table: table_name.to_string(),
+                column: column.name.clone(),
+            });
         }
 
         // Additive changes are safe to infer when a non-null column can be
@@ -751,8 +783,6 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
         }
 
-        #[cfg(feature = "sqlite")]
-        let mut sqlite_rebuild_required = false;
         for expected in T::COLUMN_SCHEMA {
             let Some(actual) = actual_by_name.get(expected.name) else {
                 continue;
