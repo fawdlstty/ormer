@@ -203,6 +203,7 @@ pub struct ColumnSchema {
     pub default: Option<ColumnDefault>,                                           // 数据库端默认值
     pub check: Option<CheckConstraint>,                                           // CHECK 约束
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
+    pub hypertable_space: Option<u16>,           // TimescaleDB hypertable 空间分区数量
     pub compress: bool,                          // 是否启用数据库级压缩
     pub compression: Option<CompressionAlgorithm>, // 压缩算法
     pub index_method: Option<&'static str>,      // fulltext、gin 等索引方法
@@ -224,6 +225,7 @@ pub struct TableOptions {
     pub clickhouse_partition_by: Option<&'static str>,
     pub clickhouse_ttl: Option<&'static str>,
     pub clickhouse_settings: Option<&'static str>,
+    pub influxdb_retention: Option<std::time::Duration>,
 }
 
 impl Default for TableOptions {
@@ -246,6 +248,7 @@ impl TableOptions {
             clickhouse_partition_by: None,
             clickhouse_ttl: None,
             clickhouse_settings: None,
+            influxdb_retention: None,
         }
     }
 }
@@ -367,12 +370,39 @@ pub const fn clickhouse_table_options(
     None
 }
 
+/// Build model-declared InfluxDB table options.
+#[cfg(feature = "influxdb")]
+pub const fn influxdb_table_options(
+    retention: Option<std::time::Duration>,
+) -> Option<TableOptions> {
+    Some(TableOptions {
+        influxdb_retention: retention,
+        ..TableOptions::empty()
+    })
+}
+
+/// Build model-declared InfluxDB table options.
+///
+/// A configured `#[influxdb(...)]` attribute warns without compiling out
+/// the model when the InfluxDB backend feature is disabled.
+#[cfg(not(feature = "influxdb"))]
+#[deprecated(
+    note = "#[influxdb(...)] is ignored because the ormer `influxdb` feature is disabled"
+)]
+pub const fn influxdb_table_options(
+    retention: Option<std::time::Duration>,
+) -> Option<TableOptions> {
+    let _ = retention;
+    None
+}
+
 /// Merge dialect-specific model table options into one DDL metadata value.
 pub const fn merge_table_options(
     mysql: Option<TableOptions>,
     postgresql: Option<TableOptions>,
     mssql: Option<TableOptions>,
     clickhouse: Option<TableOptions>,
+    influxdb: Option<TableOptions>,
 ) -> Option<TableOptions> {
     let mut options = TableOptions::empty();
     if let Some(value) = mysql {
@@ -394,6 +424,9 @@ pub const fn merge_table_options(
         options.clickhouse_ttl = value.clickhouse_ttl;
         options.clickhouse_settings = value.clickhouse_settings;
     }
+    if let Some(value) = influxdb {
+        options.influxdb_retention = value.influxdb_retention;
+    }
 
     if options.mysql_engine.is_some()
         || options.mysql_charset.is_some()
@@ -406,6 +439,7 @@ pub const fn merge_table_options(
         || options.clickhouse_partition_by.is_some()
         || options.clickhouse_ttl.is_some()
         || options.clickhouse_settings.is_some()
+        || options.influxdb_retention.is_some()
     {
         Some(options)
     } else {
@@ -470,10 +504,14 @@ impl TableOptions {
             .filter(|engine| !engine.is_empty())
     }
 
-    fn append_clickhouse_options(&self, sql: &mut String) -> crate::Result<()> {
+    fn append_clickhouse_options(
+        &self,
+        sql: &mut String,
+        partition_by: Option<&str>,
+    ) -> crate::Result<()> {
         for (label, clause) in [
             ("ORDER BY", self.clickhouse_order_by),
-            ("PARTITION BY", self.clickhouse_partition_by),
+            ("PARTITION BY", partition_by),
             ("TTL", self.clickhouse_ttl),
             ("SETTINGS", self.clickhouse_settings),
         ] {
@@ -567,6 +605,10 @@ impl ColumnDefault {
                 crate::abstract_layer::DbType::ClickHouse => {
                     if value { "TRUE" } else { "FALSE" }.to_string()
                 }
+                #[cfg(feature = "influxdb")]
+                crate::abstract_layer::DbType::InfluxDB => unreachable!(
+                    "InfluxDB does not support SQL column defaults"
+                ),
             },
             Self::Expression(expr) => expr.to_string(),
         }
@@ -1348,6 +1390,25 @@ pub trait ViewModel: Sized {
         None
     }
 
+    /// 时序时间列。时序库分块/分区能力（按块删除、未来 InfluxDB 后端）的统一声明入口，
+    /// 默认取 `#[hypertable]` 声明，不直接依赖 `hypertable_info()`。
+    fn ts_time_key() -> Option<&'static str> {
+        Self::hypertable_info().map(|(column, _)| column)
+    }
+
+    /// 时序分块时长。默认取 `#[hypertable]` 声明。
+    fn ts_block_interval() -> Option<std::time::Duration> {
+        Self::hypertable_info().map(|(_, duration)| duration)
+    }
+
+    /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
+    fn hypertable_space_info() -> Option<(&'static str, u16)> {
+        Self::column_schema().into_iter().find_map(|col| {
+            col.hypertable_space
+                .map(|partitions| (col.name, partitions))
+        })
+    }
+
     type QueryBuilder;
     type Where: Default;
 
@@ -1420,6 +1481,25 @@ pub trait Model: Sized {
             }
         }
         None
+    }
+
+    /// 时序时间列。时序库分块/分区能力（按块删除、未来 InfluxDB 后端）的统一声明入口，
+    /// 默认取 `#[hypertable]` 声明，不直接依赖 `hypertable_info()`。
+    fn ts_time_key() -> Option<&'static str> {
+        Self::hypertable_info().map(|(column, _)| column)
+    }
+
+    /// 时序分块时长。默认取 `#[hypertable]` 声明。
+    fn ts_block_interval() -> Option<std::time::Duration> {
+        Self::hypertable_info().map(|(_, duration)| duration)
+    }
+
+    /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
+    fn hypertable_space_info() -> Option<(&'static str, u16)> {
+        Self::column_schema().into_iter().find_map(|col| {
+            col.hypertable_space
+                .map(|partitions| (col.name, partitions))
+        })
     }
 
     /// 获取 TimescaleDB 字符串拆表路由键（如果有）。
@@ -2063,6 +2143,18 @@ fn through_link_needs_existence_probe(db_type: crate::abstract_layer::DbType) ->
     }
 }
 
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+fn through_link_is_column_store(db_type: crate::abstract_layer::DbType) -> bool {
+    #[allow(unreachable_patterns)]
+    match db_type {
+        #[cfg(feature = "clickhouse")]
+        crate::abstract_layer::DbType::ClickHouse => true,
+        #[cfg(feature = "influxdb")]
+        crate::abstract_layer::DbType::InfluxDB => true,
+        _ => false,
+    }
+}
+
 pub async fn graph_insert_through_link_values<'tx, Via>(
     tx: &mut crate::abstract_layer::Transaction<'tx>,
     owner_column: &'static str,
@@ -2096,6 +2188,13 @@ where
         }
     }
 
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+    if through_link_is_column_store(db_type) {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "through-link insertion",
+        });
+    }
     let sql = match db_type {
         #[cfg(feature = "sqlite")]
         crate::abstract_layer::DbType::Sqlite => {
@@ -2126,13 +2225,11 @@ where
                 "INSERT INTO {table} ({owner_col}, {target_col}) VALUES ({{}}, {{}}) ON CONFLICT DO NOTHING"
             )
         }
+        // 不可达：ClickHouse/InfluxDB 已在函数开头提前报错，仅为 match 穷尽性保留
         #[cfg(feature = "clickhouse")]
-        crate::abstract_layer::DbType::ClickHouse => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "through-link insertion",
-            });
-        }
+        crate::abstract_layer::DbType::ClickHouse => String::new(),
+        #[cfg(feature = "influxdb")]
+        crate::abstract_layer::DbType::InfluxDB => String::new(),
     };
     let raw = crate::RawSql::new(sql)
         .bind(owner_value.clone())
@@ -2322,7 +2419,7 @@ pub fn normalize_table_name_for_db(
         crate::abstract_layer::DbType::QuestDB => table_name_without_schema(table_name),
         #[cfg(feature = "mssql")]
         crate::abstract_layer::DbType::MSSQL => table_name,
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
         _ => table_name,
     }
 }
@@ -2997,6 +3094,8 @@ pub fn quote_identifier(db_type: crate::abstract_layer::DbType, identifier: &str
         crate::abstract_layer::DbType::ClickHouse => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
+        #[cfg(feature = "influxdb")]
+        crate::abstract_layer::DbType::InfluxDB => identifier.to_string(),
     }
 }
 
@@ -3109,12 +3208,52 @@ fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
     }
 
     sql.push(')');
-    if let Some((time_column, _)) = T::hypertable_info() {
+    if let Some((time_column, chunk_interval)) = T::hypertable_info() {
         sql.push_str(" timestamp(");
         sql.push_str(&quote_identifier(db_type, time_column));
-        sql.push(')');
+        sql.push_str(") PARTITION BY ");
+        sql.push_str(
+            crate::abstract_layer::common::common_helpers::PartitionUnit::from_duration(
+                chunk_interval,
+            )
+            .questdb_unit(),
+        );
     }
     Ok(sql)
+}
+
+/// ClickHouse 建表 `PARTITION BY` 子句的生效值：优先 `#[clickhouse(partition_by = ...)]`
+/// 声明；未声明时由 `#[hypertable]` 时长按公共映射推导（补写分区子句）；
+/// 两处都声明且粒度不一致时报错。
+fn derive_clickhouse_partition_by<T: WritableModel>(
+    table_options: Option<TableOptions>,
+) -> crate::Result<Option<String>> {
+    use crate::abstract_layer::common::common_helpers::PartitionUnit;
+
+    let declared = table_options.and_then(|options| options.clickhouse_partition_by);
+    let derived = T::hypertable_info()
+        .map(|(column, duration)| (PartitionUnit::from_duration(duration), column));
+    match (declared, derived) {
+        (Some(declared), Some((derived_unit, _))) => {
+            match PartitionUnit::parse_clickhouse_partition_by(declared) {
+                Some((declared_unit, _)) => {
+                    if declared_unit != derived_unit {
+                        return Err(crate::OrmerError::invalid_operation(format!(
+                            "ClickHouse partition_by {declared:?} granularity does not match the #[hypertable] duration granularity"
+                        )));
+                    }
+                    Ok(Some(declared.to_string()))
+                }
+                // 自定义分区表达式保持原样；按块删除会在解析失败时报错
+                None => Ok(Some(declared.to_string())),
+            }
+        }
+        (Some(declared), None) => Ok(Some(declared.to_string())),
+        (None, Some((unit, column))) => {
+            Ok(Some(format!("{}({})", unit.clickhouse_function(), column)))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 fn generate_create_table_sql_with_engine<T: WritableModel>(
@@ -3188,14 +3327,14 @@ fn generate_create_table_sql_with_engine<T: WritableModel>(
         "CREATE TABLE IF NOT EXISTS {} (",
         quoted_table_name
     ));
+    // 有效主键列：TimescaleDB 空间分区超表要求主键包含分区列，
+    // 此时主键一律作为表级复合约束输出，不使用列级 PRIMARY KEY。
+    let effective_primary_keys = effective_primary_key_columns::<T>(db_type);
+    let is_composite_primary = effective_primary_keys.len() > 1;
     for (i, column) in column_schema.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
         }
-
-        // 检查是否有复合主键（多个主键字段）
-        let primary_key_count = column_schema.iter().filter(|c| c.is_primary).count();
-        let is_composite_primary = primary_key_count > 1;
 
         // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
         let sql_type = if let Some(db_value_type) = column.db_value_type {
@@ -3337,8 +3476,13 @@ fn generate_create_table_sql_with_engine<T: WritableModel>(
     if is_clickhouse {
         sql.push_str(" ENGINE = ");
         sql.push_str(clickhouse_engine.expect("validated ClickHouse engine"));
+        let derived_partition_by = derive_clickhouse_partition_by::<T>(table_options)?;
+        let manual_partition_clause = table_options.is_none() && derived_partition_by.is_some();
         if let Some(options) = &table_options {
-            options.append_clickhouse_options(&mut sql)?;
+            options.append_clickhouse_options(&mut sql, derived_partition_by.as_deref())?;
+        } else if manual_partition_clause {
+            sql.push_str(" PARTITION BY ");
+            sql.push_str(derived_partition_by.as_deref().unwrap_or_default());
         }
         return Ok(sql);
     }
@@ -3730,22 +3874,51 @@ fn generate_foreign_key_constraints<T: WritableModel>(
     constraints
 }
 
+/// 计算表的有效主键列。
+///
+/// TimescaleDB 要求超表上的所有唯一索引（含主键）必须包含空间分区列，
+/// 因此对 PostgreSQL 上同时声明了时间分片与空间分区的模型，若声明的主键
+/// 未包含空间分区列，则将其追加到有效主键列中，保证建表、校验与迁移
+/// 使用一致的主键定义。其余后端与普通模型返回声明的主键列。
+pub fn effective_primary_key_columns<T: Model>(
+    #[cfg_attr(not(feature = "postgresql"), allow(unused_variables))]
+    db_type: crate::abstract_layer::DbType,
+) -> Vec<&'static str> {
+    #[cfg(feature = "postgresql")]
+    let mut columns: Vec<&'static str> = T::column_schema()
+        .iter()
+        .filter(|column| column.is_primary)
+        .map(|column| column.name)
+        .collect();
+    #[cfg(not(feature = "postgresql"))]
+    let columns: Vec<&'static str> = T::column_schema()
+        .iter()
+        .filter(|column| column.is_primary)
+        .map(|column| column.name)
+        .collect();
+    #[cfg(feature = "postgresql")]
+    if matches!(db_type, crate::abstract_layer::DbType::PostgreSQL)
+        && T::hypertable_info().is_some()
+        && let Some((space_column, _)) = T::hypertable_space_info()
+        && !columns.contains(&space_column)
+    {
+        columns.push(space_column);
+    }
+    columns
+}
+
 /// 生成复合主键约束 SQL
 fn generate_composite_primary_key_constraint<T: WritableModel>(
     db_type: crate::abstract_layer::DbType,
 ) -> String {
-    let primary_keys: Vec<&str> = T::column_schema()
-        .iter()
-        .filter(|c| c.is_primary)
-        .map(|c| c.name)
-        .collect();
+    let primary_keys = effective_primary_key_columns::<T>(db_type);
 
     if primary_keys.len() > 1 {
         // 复合主键：PRIMARY KEY (col1, col2, ...)
         format!(
             "PRIMARY KEY ({})",
             primary_keys
-                .into_iter()
+                .iter()
                 .map(|column| quote_identifier(db_type, column))
                 .collect::<Vec<_>>()
                 .join(", ")

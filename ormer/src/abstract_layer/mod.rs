@@ -23,6 +23,9 @@ pub mod duckdb_backend;
 #[cfg(feature = "clickhouse")]
 pub(crate) mod clickhouse_backend;
 
+#[cfg(feature = "influxdb")]
+pub(crate) mod influxdb_backend;
+
 pub mod capabilities;
 
 /// 公共模块 - 包含共享辅助函数、宏定义、连接池和统一接口
@@ -52,6 +55,9 @@ pub enum DbType {
     /// ClickHouse 数据库
     #[cfg(feature = "clickhouse")]
     ClickHouse,
+    /// InfluxDB 2.x database
+    #[cfg(feature = "influxdb")]
+    InfluxDB,
 }
 
 impl DbType {
@@ -72,6 +78,10 @@ impl DbType {
         }
         #[cfg(feature = "questdb")]
         if matches!(self, DbType::QuestDB) {
+            return false;
+        }
+        #[cfg(feature = "influxdb")]
+        if matches!(self, DbType::InfluxDB) {
             return false;
         }
         true
@@ -137,36 +147,40 @@ impl DbType {
                 _is_nullable,
                 _enum_variants,
             ),
-            #[cfg(feature = "clickhouse")]
-            DbType::ClickHouse => {
+        #[cfg(feature = "clickhouse")]
+        DbType::ClickHouse => {
                 crate::abstract_layer::clickhouse_backend::ClickHouseTypeMapper::sql_type(
                     _rust_type,
                     _is_primary,
                     _is_auto_increment,
                     _is_nullable,
                     _enum_variants,
-                )
-            }
+            )
+        }
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => String::new(),
         }
     }
 }
 
 pub use common::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
-    CollectFuture, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
-    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
-    DoubleIncludedSelectExecutor, DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor,
-    IncludedCollectFuture, IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor,
-    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel,
-    LeftJoinCollectFuture, LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
-    ModelCollectWithFuture, NestedInclude, PooledRawSelectExecutor, RawCollectFuture,
-    RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader,
-    ReplicatedDatabase, ReplicatedDatabaseBuilder, SaveExecutor, ScopedDeleteExecutor,
-    ScopedUpdateExecutor, SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement,
-    SqlExecutor, SqlStatement, Transaction, TransactionFuture, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
-    UpdateExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
+    BlockDeleteExecutor, BlockDeleteResult, CollectFuture, CreateTableExecutor, Database,
+    DbExecutor, DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
+    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
+    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
+    InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
+    InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
+    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder,
+    SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
+    SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
+    TransactionFuture, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
+    TransactionRawSelectExecutor, TransactionSaveExecutor, TruncateTableExecutor, UpdateExecutor,
+    UpdateGraphExecutor,
+    WithoutHooksExecutor,
 };
 
 pub use common::{

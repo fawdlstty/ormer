@@ -6,15 +6,39 @@ use crate::model::{FromRowValues, Model, RelationSelection, WritableModel};
 use crate::query::builder::{ContextFilter, NamedFilterQuery, WhereExpr};
 use crate::query::insert::InsertConflict;
 use crate::raw_sql::{IntoRawSql, RawSql};
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
 use std::sync::Arc;
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-#[cfg(any(feature = "sqlite", feature = "mssql", feature = "duckdb"))]
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
 use tokio::sync::Mutex;
 
 #[cfg(feature = "postgresql")]
@@ -29,7 +53,8 @@ use tokio_postgres::NoTls;
     feature = "mysql",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 ))]
 use super::unified::{
     CreateTableExecutor, DropTableExecutor, RelationNestedLoader, ScopedDeleteExecutor,
@@ -208,6 +233,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertExecutor<'a, I> {
                 backend: DbType::ClickHouse,
                 feature: "Model insert on ClickHouse",
             }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "insert to_sql (InfluxDB writes use Line Protocol over HTTP)",
+            }),
         }
     }
 
@@ -274,6 +304,25 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsert
                 backend: DbType::ClickHouse,
                 feature: "Model insert on ClickHouse",
             }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => {
+                let mut models = self.models;
+                let refs = models.as_refs();
+                if refs.is_empty() {
+                    return Ok(<I::Model as crate::model::Model>::AutoIncrementKeyType::default());
+                }
+                super::super::influxdb_backend::validate_influx_model::<I::Model>(
+                    DbType::InfluxDB,
+                )?;
+                let lines = super::super::influxdb_backend::render_line_protocol::<I::Model>(
+                    &refs,
+                )?;
+                let ctx = crate::HookContext::new(crate::HookOperation::Insert);
+                models.run_before_insert(ctx).await?;
+                db.write_lines(&lines).await?;
+                models.run_after_insert(ctx).await?;
+                Ok(<I::Model as crate::model::Model>::AutoIncrementKeyType::default())
+            }
         }
     }
 }
@@ -426,6 +475,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 backend: DbType::ClickHouse,
                 feature: "conflict writes on ClickHouse",
             }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "conflict writes",
+            }),
         }
     }
 
@@ -462,6 +516,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
             ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
                 backend: DbType::ClickHouse,
                 feature: "conflict writes on ClickHouse",
+            }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "conflict writes",
             }),
         }
     }
@@ -570,6 +629,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 backend: DbType::ClickHouse,
                 feature: "conflict writes on ClickHouse",
             }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "conflict writes",
+            }),
         }
     }
 
@@ -596,6 +660,8 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
         ConnectionWrapper::DuckDB(_) => DbType::DuckDB,
         #[cfg(feature = "clickhouse")]
         ConnectionWrapper::ClickHouse(_) => DbType::ClickHouse,
+        #[cfg(feature = "influxdb")]
+        ConnectionWrapper::InfluxDB(_) => DbType::InfluxDB,
     }
 }
 
@@ -627,6 +693,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
                 backend: DbType::ClickHouse,
                 feature: "conflict writes on ClickHouse",
             }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "conflict writes",
+            }),
         }
     }
 }
@@ -650,6 +721,9 @@ use super::super::duckdb_backend;
 #[cfg(feature = "clickhouse")]
 use super::super::clickhouse_backend;
 
+#[cfg(feature = "influxdb")]
+use super::super::influxdb_backend;
+
 /// 连接包装器 - 包装各后端的 Database 实例
 #[allow(clippy::upper_case_acronyms)]
 enum ConnectionWrapper {
@@ -665,13 +739,16 @@ enum ConnectionWrapper {
     DuckDB(duckdb_backend::Database),
     #[cfg(feature = "clickhouse")]
     ClickHouse(clickhouse_backend::Database),
+    #[cfg(feature = "influxdb")]
+    InfluxDB(influxdb_backend::Database),
 }
 
 #[cfg(any(
     feature = "sqlite",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 ))]
 impl ConnectionWrapper {
     /// 检查连接是否有效
@@ -679,7 +756,8 @@ impl ConnectionWrapper {
         feature = "sqlite",
         feature = "mssql",
         feature = "duckdb",
-        feature = "clickhouse"
+        feature = "clickhouse",
+        feature = "influxdb"
     ))]
     async fn is_valid(&self) -> bool {
         match self {
@@ -695,6 +773,8 @@ impl ConnectionWrapper {
             ConnectionWrapper::DuckDB(db) => db.is_valid().await,
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(db) => db.is_valid().await,
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => db.is_valid().await,
         }
     }
 }
@@ -707,7 +787,8 @@ impl ConnectionWrapper {
     feature = "sqlite",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 ))]
 pub struct ManualPool {
     /// 空闲连接队列
@@ -726,7 +807,8 @@ pub struct ManualPool {
     feature = "sqlite",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 ))]
 impl ManualPool {
     /// 创建新的连接池
@@ -773,7 +855,6 @@ impl ManualPool {
                 .await?;
                 Ok(ConnectionWrapper::MSSQL(db))
             }
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
             #[cfg(feature = "duckdb")]
             DbType::DuckDB => {
                 let db = crate::utils::FutureTraceExt::trace(duckdb_backend::Database::connect(
@@ -787,6 +868,11 @@ impl ManualPool {
             DbType::ClickHouse => {
                 let db = clickhouse_backend::Database::connect(&self.connection_string)?;
                 Ok(ConnectionWrapper::ClickHouse(db))
+            }
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => {
+                let db = influxdb_backend::Database::connect(&self.connection_string)?;
+                Ok(ConnectionWrapper::InfluxDB(db))
             }
         }
     }
@@ -977,6 +1063,15 @@ impl PoolBuilder {
                 }
                 Ok(ConnectionPool::ClickHouse(pool))
             }
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => {
+                let pool =
+                    ManualPool::new(self.db_type, self.connection_string, self.config.clone());
+                if self.config.min_size > 0 {
+                    pool.maintain_min_connections().await;
+                }
+                Ok(ConnectionPool::InfluxDB(pool))
+            }
         }
     }
 
@@ -1112,6 +1207,8 @@ pub enum ConnectionPool {
     DuckDB(Arc<ManualPool>),
     #[cfg(feature = "clickhouse")]
     ClickHouse(Arc<ManualPool>),
+    #[cfg(feature = "influxdb")]
+    InfluxDB(Arc<ManualPool>),
 }
 
 impl ConnectionPool {
@@ -1133,6 +1230,8 @@ impl ConnectionPool {
             ConnectionPool::DuckDB(_) => DbType::DuckDB,
             #[cfg(feature = "clickhouse")]
             ConnectionPool::ClickHouse(_) => DbType::ClickHouse,
+            #[cfg(feature = "influxdb")]
+            ConnectionPool::InfluxDB(_) => DbType::InfluxDB,
         }
     }
 
@@ -1197,6 +1296,15 @@ impl ConnectionPool {
                     _marker: PhantomData,
                 })
             }
+            #[cfg(feature = "influxdb")]
+            ConnectionPool::InfluxDB(pool) => {
+                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                Ok(PooledConnection {
+                    inner: PooledConnectionInner::InfluxDB(pool.clone()),
+                    connection: Some(conn),
+                    _marker: PhantomData,
+                })
+            }
         }
     }
 }
@@ -1217,6 +1325,8 @@ enum PooledConnectionInner {
     DuckDB(Arc<ManualPool>),
     #[cfg(feature = "clickhouse")]
     ClickHouse(Arc<ManualPool>),
+    #[cfg(feature = "influxdb")]
+    InfluxDB(Arc<ManualPool>),
 }
 
 impl PooledConnectionInner {
@@ -1240,6 +1350,8 @@ impl PooledConnectionInner {
             PooledConnectionInner::DuckDB(pool) => pool.return_connection(conn).await,
             #[cfg(feature = "clickhouse")]
             PooledConnectionInner::ClickHouse(pool) => pool.return_connection(conn).await,
+            #[cfg(feature = "influxdb")]
+            PooledConnectionInner::InfluxDB(pool) => pool.return_connection(conn).await,
         }
     }
 
@@ -1257,6 +1369,8 @@ impl PooledConnectionInner {
             PooledConnectionInner::DuckDB(pool) => pool.retire_connection().await,
             #[cfg(feature = "clickhouse")]
             PooledConnectionInner::ClickHouse(pool) => pool.retire_connection().await,
+            #[cfg(feature = "influxdb")]
+            PooledConnectionInner::InfluxDB(pool) => pool.retire_connection().await,
         }
     }
 }
@@ -1302,6 +1416,15 @@ impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
             }
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(db) => {
+                let rows = db
+                    .select_values(raw_sql, <T as FromRowValues>::row_columns())
+                    .await?;
+                rows.into_iter()
+                    .map(|values| <T as FromRowValues>::from_row_values(&values))
+                    .collect()
+            }
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => {
                 let rows = db
                     .select_values(raw_sql, <T as FromRowValues>::row_columns())
                     .await?;
@@ -1393,6 +1516,10 @@ impl<'a> PooledConnection<'a> {
                 feature: "CREATE TABLE without explicit ClickHouse engine settings",
                 _marker: PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => {
+                CreateTableExecutor::InfluxDB(db, PhantomData)
+            }
         }
     }
 
@@ -1412,6 +1539,11 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
                 backend: DbType::ClickHouse,
+                feature: "validate_table",
+            }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
                 feature: "validate_table",
             }),
         }
@@ -1479,7 +1611,12 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(db) => super::unified::SelectExecutor::ClickHouse(
-                db,
+                super::unified::ClickHouseSelectBackend::ClickHouse(db),
+                crate::query::builder::Select::default(),
+            ),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => super::unified::SelectExecutor::ClickHouse(
+                super::unified::ClickHouseSelectBackend::Influx(db),
                 crate::query::builder::Select::default(),
             ),
         }
@@ -1522,6 +1659,50 @@ impl<'a> PooledConnection<'a> {
                 feature: "row delete on ClickHouse",
                 _marker: PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => super::unified::DeleteExecutor::Unsupported {
+                backend: DbType::InfluxDB,
+                feature: "row delete",
+                _marker: PhantomData,
+            },
+        }
+    }
+
+    /// 创建按块删除执行器（时序数据整块清理）
+    pub fn delete_blocks<T: WritableModel>(&self) -> super::unified::BlockDeleteExecutor<'_, T> {
+        match self.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => super::unified::BlockDeleteExecutor::fallback(
+                DbType::Sqlite,
+                super::unified::DeleteExecutor::Sqlite(db.delete::<T>(), std::marker::PhantomData),
+            ),
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => {
+                super::unified::BlockDeleteExecutor::PostgreSQL(db.delete_blocks::<T>())
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => super::unified::BlockDeleteExecutor::fallback(
+                DbType::MySQL,
+                super::unified::DeleteExecutor::MySQL(db.delete::<T>()),
+            ),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => super::unified::BlockDeleteExecutor::fallback(
+                DbType::MSSQL,
+                super::unified::DeleteExecutor::MSSQL(db.delete::<T>()),
+            ),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => super::unified::BlockDeleteExecutor::fallback(
+                DbType::DuckDB,
+                super::unified::DeleteExecutor::DuckDB(db.delete::<T>()),
+            ),
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(db) => super::unified::BlockDeleteExecutor::ClickHouse(
+                crate::abstract_layer::clickhouse_backend::BlockDeleteExecutor::new(db),
+            ),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => super::unified::BlockDeleteExecutor::InfluxDB(
+                influxdb_backend::BlockDeleteExecutor::new(db),
+            ),
         }
     }
 
@@ -1548,6 +1729,12 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::ClickHouse(_) => super::unified::UpdateExecutor::Unsupported {
                 backend: DbType::ClickHouse,
                 feature: "row update on ClickHouse; use execute_sql",
+                _marker: PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => super::unified::UpdateExecutor::Unsupported {
+                backend: DbType::InfluxDB,
+                feature: "row update",
                 _marker: PhantomData,
             },
         }
@@ -1587,6 +1774,14 @@ impl<'a> PooledConnection<'a> {
                     _marker: PhantomData,
                 }
             }
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => {
+                super::unified::RelatedSelectExecutor::Unsupported {
+                    backend: DbType::InfluxDB,
+                    feature: "relation select",
+                    _marker: PhantomData,
+                }
+            }
         }
     }
 
@@ -1622,6 +1817,11 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
                 backend: DbType::ClickHouse,
                 feature: "transactions on ClickHouse",
+            }),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "transactions",
             }),
         }
     }
@@ -1681,6 +1881,8 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => DropTableExecutor::DuckDB(db.drop_table::<T>()),
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(db) => DropTableExecutor::ClickHouse(db, PhantomData),
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => DropTableExecutor::InfluxDB(db, PhantomData),
         }
     }
 
@@ -1723,6 +1925,11 @@ impl<'a> PooledConnection<'a> {
             }
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(db) => {
+                db.execute_sql(raw_sql).await?;
+                Ok(0)
+            }
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(db) => {
                 db.execute_sql(raw_sql).await?;
                 Ok(0)
             }
@@ -1842,6 +2049,14 @@ impl<'a> DbExecutor for PooledConnection<'a> {
                 super::unified::GroupedSelectExecutor::Unsupported {
                     backend: DbType::ClickHouse,
                     feature: "Model select_column on ClickHouse; use select_sql",
+                    _marker: PhantomData,
+                }
+            }
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => {
+                super::unified::GroupedSelectExecutor::Unsupported {
+                    backend: DbType::InfluxDB,
+                    feature: "select_column",
                     _marker: PhantomData,
                 }
             }

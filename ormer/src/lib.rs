@@ -1,3 +1,7 @@
+// 让 crate 内部（含单元测试）也能使用 `::ormer::` 绝对路径，
+// 与派生宏（ormer-derive）生成的代码路径保持一致。
+extern crate self as ormer;
+
 pub mod abstract_layer;
 pub mod db_first;
 pub mod error;
@@ -17,10 +21,11 @@ pub mod utils;
     feature = "mysql",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 )))]
 compile_error!(
-    "At least one database feature must be enabled: sqlite, postgresql, questdb, mysql, mssql, duckdb, or clickhouse"
+    "At least one database feature must be enabled: sqlite, postgresql, questdb, mysql, mssql, duckdb, clickhouse, or influxdb"
 );
 
 pub use abstract_layer::DbType;
@@ -31,7 +36,7 @@ pub use db_first::{
 pub use migration::{
     MIGRATION_TABLE_NAME, Migration, MigrationDryRun, MigrationDryRunStep,
     MigrationExecutionStatus, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
-    TableMigration,
+    TableEnsureOutcome, TableMigration,
 };
 
 // 数据库相关类型 - 当启用任一数据库 feature 时可用
@@ -42,22 +47,23 @@ pub use migration::{
     feature = "mysql",
     feature = "mssql",
     feature = "duckdb",
-    feature = "clickhouse"
+    feature = "clickhouse",
+    feature = "influxdb"
 ))]
 pub use abstract_layer::{
-    BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, ConnectionPool,
-    CreateTableExecutor, Database, DbExecutor, DeleteExecutor, DerivedTableCollectFuture,
-    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
-    DropTableExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertPartialExecutor,
-    IsolationLevel, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    NestedInclude, PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor,
-    RawCollectFuture, RawSelectExecutor, RelationNestedLoader, ReplicatedConnectionPool,
-    ReplicatedDatabase, ReplicatedDatabaseBuilder, ReplicatedPoolBuilder, SaveExecutor,
-    ScopedDeleteExecutor, ScopedUpdateExecutor, SelectStream, SelectStreamIterator,
-    SingleSqlStatement, SqlExecutor, SqlStatement, Transaction, TransactionFuture,
-    TransactionInsertOrIgnoreExecutor, TransactionOptions, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor, TransactionSaveExecutor, UpdateGraphExecutor,
-    WithoutHooksExecutor,
+    BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, BlockDeleteExecutor,
+    BlockDeleteResult, ConnectionPool, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
+    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
+    DoubleIncludedSelectExecutor, DropTableExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor,
+    InsertPartialExecutor, IsolationLevel, MappedCollectFuture, MappedSelectExecutor,
+    ModelCollectWithFuture, NestedInclude, PooledConnection, PooledDatabaseScope,
+    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelationNestedLoader,
+    ReplicatedConnectionPool, ReplicatedDatabase, ReplicatedDatabaseBuilder,
+    ReplicatedPoolBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement,
+    Transaction, TransactionFuture, TransactionInsertOrIgnoreExecutor, TransactionOptions,
+    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
+    TruncateTableExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
@@ -68,8 +74,8 @@ pub use model::{
     ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
     RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
     TableOptions, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel,
-    Tracked, Value, ViewModel, WritableModel, generate_create_table_sql,
-    generate_create_table_sql_with_name,
+    Tracked, Value, ViewModel, WritableModel, effective_primary_key_columns,
+    generate_create_table_sql, generate_create_table_sql_with_name,
 };
 #[cfg(feature = "clickhouse")]
 pub use model::{

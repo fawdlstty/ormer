@@ -1520,6 +1520,8 @@ impl DbBackendTypeMapper for QuestDBTypeMapper {
 pub struct Database {
     client: std::sync::Arc<tokio_postgres::Client>,
     db_type: DbType,
+    /// timescaledb 扩展是否可用（首次按块删除时探测，随连接缓存）。
+    timescaledb: std::sync::OnceLock<bool>,
 }
 
 /// 创建表执行器
@@ -1581,10 +1583,22 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             && let Some((time_column, chunk_interval)) = T::hypertable_info()
         {
             let interval_str = chunk_interval.to_interval_string();
-            let hypertable_sql = format!(
-                "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE)",
-                table_name, time_column, interval_str
-            );
+            // create_default_indexes => FALSE：TimescaleDB 默认会额外创建
+            // 时间列/分区列组合的默认索引，导致实际索引集合与模型声明不一致；
+            // 关闭后表结构完全由模型声明决定（主键 + #[index]）。
+            let hypertable_sql = if let Some((space_column, partitions)) =
+                T::hypertable_space_info()
+            {
+                format!(
+                    "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', partitioning_column => '{}', number_partitions => {}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
+                    table_name, time_column, interval_str, space_column, partitions
+                )
+            } else {
+                format!(
+                    "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
+                    table_name, time_column, interval_str
+                )
+            };
             statements.push(SingleSqlStatement::new(hypertable_sql, Vec::new()));
         }
 
@@ -1645,6 +1659,47 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
         DropTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        for statement in sql.statements {
+            traced_pg_execute_empty(self.client, &statement.sql).await?;
+        }
+        Ok(())
+    }
+}
+
+/// 清空表执行器：生成 `TRUNCATE TABLE t`，PostgreSQL 与 QuestDB 通用。
+///
+/// QuestDB 原生支持 `TRUNCATE TABLE`，是不支持行级 DELETE 的替代清空手段。
+pub struct TruncateTableExecutor<'a, T: crate::model::WritableModel> {
+    client: &'a tokio_postgres::Client,
+    db_type: DbType,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            self.db_type,
+            format!(
+                "TRUNCATE TABLE {}",
+                common_helpers::quote_table_name::<T>(self.db_type)
+            ),
+            Vec::new(),
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: crate::model::WritableModel> SqlExecutor for TruncateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        TruncateTableExecutor::to_sql(self)
     }
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
@@ -2183,6 +2238,7 @@ impl Database {
         Ok(Self {
             client: std::sync::Arc::new(client),
             db_type,
+            timescaledb: std::sync::OnceLock::new(),
         })
     }
 
@@ -2429,6 +2485,7 @@ impl Database {
         Self {
             client: std::sync::Arc::new(client),
             db_type,
+            timescaledb: std::sync::OnceLock::new(),
         }
     }
 
@@ -2566,7 +2623,7 @@ impl Database {
         &self,
         time_column: &str,
         chunk_interval: std::time::Duration,
-    ) -> crate::Result<(i64, i64)> {
+    ) -> crate::Result<(i64, i64, i64)> {
         let sql = "SELECT to_regclass('timescaledb_information.dimensions') IS NOT NULL";
         let row = self.client.query_one(sql, &[]).trace().await?;
         let has_dimensions_view: bool = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
@@ -2580,29 +2637,69 @@ impl Database {
 
         let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let expected_interval = to_postgres_interval(chunk_interval);
-        let sql = r#"
-            SELECT
-                COUNT(*)::BIGINT,
-                COUNT(*) FILTER (
-                    WHERE column_name = $3
-                      AND time_interval = $4::interval
-                )::BIGINT
-            FROM timescaledb_information.dimensions
-            WHERE hypertable_schema = $1 AND hypertable_name = $2
-        "#;
-        let row = self
-            .client
-            .query_one(
-                sql,
-                &[&schema_name, &table_name, &time_column, &expected_interval],
-            )
-            .trace()
-            .await?;
-        let dimension_count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
-        let matching_dimension_count: i64 =
-            row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
-
-        Ok((dimension_count, matching_dimension_count))
+        let expected_space = T::hypertable_space_info();
+        if let Some((space_column, partitions)) = expected_space {
+            let expected_partitions = partitions as i16;
+            let sql = r#"
+                SELECT
+                    COUNT(*)::BIGINT,
+                    COUNT(*) FILTER (
+                        WHERE column_name = $3
+                          AND time_interval = $4::interval
+                    )::BIGINT,
+                    COUNT(*) FILTER (
+                        WHERE column_name = $5
+                          AND dimension_type = 'Space'
+                          AND num_partitions = $6
+                    )::BIGINT
+                FROM timescaledb_information.dimensions
+                WHERE hypertable_schema = $1 AND hypertable_name = $2
+            "#;
+            let row = self
+                .client
+                .query_one(
+                    sql,
+                    &[
+                        &schema_name,
+                        &table_name,
+                        &time_column,
+                        &expected_interval,
+                        &space_column,
+                        &expected_partitions,
+                    ],
+                )
+                .trace()
+                .await?;
+            Ok((
+                row.try_get(0).trace_for("tokio_postgres::Row::try_get")?,
+                row.try_get(1).trace_for("tokio_postgres::Row::try_get")?,
+                row.try_get(2).trace_for("tokio_postgres::Row::try_get")?,
+            ))
+        } else {
+            let sql = r#"
+                SELECT
+                    COUNT(*)::BIGINT,
+                    COUNT(*) FILTER (
+                        WHERE column_name = $3
+                          AND time_interval = $4::interval
+                    )::BIGINT
+                FROM timescaledb_information.dimensions
+                WHERE hypertable_schema = $1 AND hypertable_name = $2
+            "#;
+            let row = self
+                .client
+                .query_one(
+                    sql,
+                    &[&schema_name, &table_name, &time_column, &expected_interval],
+                )
+                .trace()
+                .await?;
+            Ok((
+                row.try_get(0).trace_for("tokio_postgres::Row::try_get")?,
+                row.try_get(1).trace_for("tokio_postgres::Row::try_get")?,
+                0,
+            ))
+        }
     }
 
     async fn validate_table_hypertable<T: Model>(&self) -> crate::Result<()> {
@@ -2627,18 +2724,29 @@ impl Database {
         }
 
         if let Some((time_column, chunk_interval)) = expected_hypertable {
-            let (dimension_count, matching_dimension_count) = self
+            let (dimension_count, time_dimension_count, space_dimension_count) = self
                 .check_hypertable_dimensions::<T>(time_column, chunk_interval)
                 .await?;
+            let expected_space = T::hypertable_space_info();
+            let expected_dimension_count = if expected_space.is_some() { 2 } else { 1 };
 
-            if dimension_count != 1 || matching_dimension_count != 1 {
+            if dimension_count != expected_dimension_count
+                || time_dimension_count != 1
+                || space_dimension_count != if expected_space.is_some() { 1 } else { 0 }
+            {
                 return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Hypertable dimension mismatch: expected one time dimension on column '{}' with chunk interval '{}', but actual dimensions={} matching_dimensions={}",
+                    "Schema mismatch: table {}, reason: Hypertable dimension mismatch: expected {} dimensions (one time dimension on column '{}' with chunk interval '{}'{}), but actual dimensions={} matching_time_dimensions={} matching_space_dimensions={}",
                     T::TABLE_NAME,
+                    expected_dimension_count,
                     time_column,
                     chunk_interval.to_interval_string(),
+                    expected_space.map_or_else(String::new, |(column, partitions)| format!(
+                        ", one space dimension on column '{}' with {} partitions",
+                        column, partitions
+                    )),
                     dimension_count,
-                    matching_dimension_count
+                    time_dimension_count,
+                    space_dimension_count
                 ));
             }
         }
@@ -2734,6 +2842,9 @@ impl Database {
         }
 
         // 比较每一列的定义
+        // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
+        let effective_primary_keys =
+            crate::model::effective_primary_key_columns::<T>(crate::abstract_layer::DbType::PostgreSQL);
         for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
             if i >= actual_columns.len() {
                 return Err(crate::ormer_error!(
@@ -2763,12 +2874,13 @@ impl Database {
                 ));
             }
 
-            if expected_col.is_primary != *actual_primary {
+            let expected_primary = effective_primary_keys.contains(&expected_col.name);
+            if expected_primary != *actual_primary {
                 return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
                     T::TABLE_NAME,
                     expected_col.name,
-                    if expected_col.is_primary { "" } else { "not " },
+                    if expected_primary { "" } else { "not " },
                     if *actual_primary { "" } else { "not " }
                 ));
             }
@@ -2843,7 +2955,7 @@ impl Database {
             }
 
             // 检查 NOT NULL 约束（主键列除外，因为主键自动 NOT NULL）
-            if !expected_col.is_primary {
+            if !expected_primary {
                 let expected_nullable = expected_col.is_nullable;
                 if *actual_nullable != expected_nullable {
                     return Err(crate::ormer_error!(
@@ -3031,6 +3143,22 @@ impl Database {
         }
     }
 
+    /// 创建按块删除执行器。
+    ///
+    /// QuestDB 生成 `ALTER TABLE ... DROP PARTITION`；PostgreSQL 优先
+    /// TimescaleDB `drop_chunks`（首次执行时探测扩展并随连接缓存，未安装时
+    /// 回退为对齐边界的行删除，SQL trace 中带 `block_delete_fallback` 标注）。
+    pub fn delete_blocks<T: Model>(&self) -> BlockDeleteExecutor<'_, T> {
+        BlockDeleteExecutor {
+            db_type: self.db_type,
+            key: common_helpers::resolve_block_key::<T>(self.db_type).ok(),
+            range: None,
+            client: &self.client,
+            timescaledb: &self.timescaledb,
+            _marker: PhantomData,
+        }
+    }
+
     /// 创建 Update 执行器
     pub fn update<T: WritableModel>(&self) -> UpdateExecutor<'_, T> {
         UpdateExecutor {
@@ -3038,6 +3166,7 @@ impl Database {
             filters: Vec::new(),
             model_updates: Vec::new(),
             client: &self.client,
+            db_type: self.db_type,
             _marker: PhantomData,
         }
     }
@@ -3070,6 +3199,15 @@ impl Database {
     /// 删除表 - 返回执行器
     pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
+            client: &self.client,
+            db_type: self.db_type,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 清空表数据 - 返回执行器（`TRUNCATE TABLE`，QuestDB 唯一的清空手段）
+    pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
+        TruncateTableExecutor {
             client: &self.client,
             db_type: self.db_type,
             _marker: std::marker::PhantomData,
@@ -3153,6 +3291,36 @@ impl Database {
                 ))
             })
             .collect()
+    }
+
+    /// QuestDB 表结构自省：查询元函数 `table_columns('表名')`。
+    ///
+    /// QuestDB 不支持 information_schema，改用原生元函数；列全部可空，
+    /// designated timestamp 列映射为 primary_key 标记供迁移逻辑参考。
+    /// 返回 `None` 表示表不存在。
+    #[cfg(feature = "questdb")]
+    pub(crate) async fn questdb_schema_columns(
+        &self,
+        table_name: &str,
+    ) -> crate::Result<Option<Vec<SchemaColumn>>> {
+        let table = crate::model::table_name_without_schema(table_name);
+        let sql = format!(
+            "SELECT column, type, designated, indexed FROM table_columns('{}')",
+            table.replace('\'', "''")
+        );
+        let rows = self.client.query(&sql, &[]).trace().await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut columns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let type_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let designated: bool = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let _indexed: bool = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            columns.push(crate::migration::schema_column(name, type_name, true, designated));
+        }
+        Ok(Some(columns))
     }
 
     pub(crate) async fn schema_columns(
@@ -3586,6 +3754,8 @@ impl<'a> Transaction<'a> {
             filters: Vec::new(),
             model_updates: Vec::new(),
             client: &self.client,
+            // 事务不可能建立在 QuestDB 连接上（begin 已拒绝），仅为类型完备
+            db_type: DbType::PostgreSQL,
             _marker: PhantomData,
         }
     }
@@ -4421,12 +4591,316 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for DeleteExecutor<'
     }
 }
 
+/// 生成 QuestDB 分区删除 SQL。`cutoff` 已由公共层对齐到建表分区单位边界，
+/// 分区谓词只命中完整落在区间内的分区。
+#[cfg(feature = "questdb")]
+pub(crate) fn block_delete_questdb_sql<T: Model>(
+    key: &common_helpers::BlockKey,
+    range: &common_helpers::AlignedBlockRange,
+) -> crate::Result<SqlStatement> {
+    let db_type = DbType::QuestDB;
+    let table = common_helpers::quote_table_name::<T>(db_type);
+    let column = crate::model::quote_identifier(db_type, &key.time_column);
+    let mut predicate = format!(
+        "{} < '{}'",
+        column,
+        format_questdb_timestamp(range.end)
+    );
+    if let Some(start) = range.start {
+        predicate = format!(
+            "{} >= '{}' AND {}",
+            column,
+            format_questdb_timestamp(start),
+            predicate
+        );
+    }
+    Ok(SqlStatement::single(
+        db_type,
+        format!("ALTER TABLE {table} DROP PARTITION WHERE {predicate}"),
+        Vec::new(),
+    ))
+}
+
+/// 生成 TimescaleDB `drop_chunks` SQL（服务端整块语义，边界不做客户端对齐）。
+pub(crate) fn block_delete_drop_chunks_sql<T: Model>(
+    range: &common_helpers::AlignedBlockRange,
+) -> crate::Result<SqlStatement> {
+    let db_type = DbType::PostgreSQL;
+    let table_name = T::table_name_for_db(db_type).replace('\'', "''");
+    let mut sql = format!(
+        "SELECT drop_chunks(relation => '{table_name}'::regclass, older_than => $1::timestamptz"
+    );
+    let mut params = vec![Value::DateTime(range.end)];
+    if let Some(start) = range.start {
+        sql.push_str(", newer_than => $2::timestamptz");
+        params.push(Value::DateTime(start));
+    }
+    sql.push(')');
+    let rust_types = vec!["DateTime<Utc>"; params.len()];
+    Ok(SqlStatement::batch(
+        db_type,
+        vec![SingleSqlStatement::new(sql, params)
+            .with_param_rust_types(rust_types)],
+    ))
+}
+
+/// 生成块删除回退（行删除）SQL：对齐边界上的 `DELETE ... WHERE`。
+pub(crate) fn block_delete_fallback_sql<T: Model>(
+    db_type: DbType,
+    key: &common_helpers::BlockKey,
+    range: &common_helpers::AlignedBlockRange,
+) -> crate::Result<SqlStatement> {
+    let filters = common_helpers::block_delete_fallback_filters(range, &key.time_column);
+    let (sql, params) = common_helpers::build_delete_sql::<T>(db_type, &filters)?;
+    let mut rust_types = Vec::new();
+    for filter in &filters {
+        pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
+    }
+    Ok(SqlStatement::batch(
+        db_type,
+        vec![SingleSqlStatement::new(
+            format!("/* block_delete_fallback */ {sql}"),
+            params,
+        )
+        .with_param_rust_types(rust_types)],
+    ))
+}
+
+#[cfg(feature = "questdb")]
+fn format_questdb_timestamp(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// 按块删除执行器（PostgreSQL/TimescaleDB 与 QuestDB 共用）。
+///
+/// QuestDB 生成 `ALTER TABLE ... DROP PARTITION`；PostgreSQL 首次执行时探测
+/// `timescaledb` 扩展（结果随连接缓存），已安装走 `drop_chunks` 并统计块数，
+/// 未安装回退为对齐边界的行删除（SQL trace 带 `block_delete_fallback` 标注，
+/// 不静默失败）。
+pub struct BlockDeleteExecutor<'a, T: Model> {
+    db_type: DbType,
+    key: Option<common_helpers::BlockKey>,
+    range: Option<common_helpers::BlockRange>,
+    client: &'a tokio_postgres::Client,
+    timescaledb: &'a std::sync::OnceLock<bool>,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
+    pub fn with_range(mut self, range: common_helpers::BlockRange) -> Self {
+        self.range = Some(range);
+        self
+    }
+
+    /// 输出规范 SQL 形态：QuestDB 为 `DROP PARTITION`，PostgreSQL 为
+    /// `drop_chunks`（运行时无 timescaledb 扩展时 `execute` 会改走回退路径）。
+    /// 对齐后为空区间时返回空语句（安全 no-op）。
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        let Some((key, range)) = self.resolve_range()? else {
+            return Ok(SqlStatement::batch(self.db_type, Vec::new()));
+        };
+        if self.db_type.is_questdb() {
+            self.questdb_sql(&key, &range)
+        } else {
+            block_delete_drop_chunks_sql::<T>(&range)
+        }
+    }
+
+    /// 执行按块删除并返回结果。
+    pub async fn execute(self) -> crate::Result<super::common::BlockDeleteResult> {
+        let Some((key, range)) = self.resolve_range()? else {
+            return Ok(super::common::BlockDeleteResult::default());
+        };
+        if self.db_type.is_questdb() {
+            return self.execute_questdb(&key, &range).await;
+        }
+
+        if !self.detect_timescaledb().await? {
+            // 未安装 timescaledb：对齐边界行删除回退，SQL 注释中标注回退路径
+            let sql = block_delete_fallback_sql::<T>(self.db_type, &key, &range)?;
+            let rows = self.execute_statement(&sql).await?;
+            return Ok(super::common::BlockDeleteResult {
+                blocks_dropped: 0,
+                rows_deleted: Some(rows),
+            });
+        }
+
+        let sql = block_delete_drop_chunks_sql::<T>(&range)?;
+        // 先取删除前的块数，再执行 drop_chunks，最后取删除后的块数，
+        // 两者之差才是本次删除掉的块数。
+        let before = self.count_chunks().await;
+        self.execute_statement(&sql).await?;
+        let after = self.count_chunks().await;
+        Ok(super::common::BlockDeleteResult {
+            blocks_dropped: before.saturating_sub(after),
+            rows_deleted: None,
+        })
+    }
+
+    /// 执行预构建 SQL 并返回影响行数（DDL 语句返回 0）。
+    pub(crate) async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<u64> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        self.execute_statement(&sql).await
+    }
+
+    #[cfg(feature = "questdb")]
+    fn questdb_sql(
+        &self,
+        key: &common_helpers::BlockKey,
+        range: &common_helpers::AlignedBlockRange,
+    ) -> crate::Result<SqlStatement> {
+        block_delete_questdb_sql::<T>(key, range)
+    }
+
+    #[cfg(feature = "questdb")]
+    async fn execute_questdb(
+        &self,
+        key: &common_helpers::BlockKey,
+        range: &common_helpers::AlignedBlockRange,
+    ) -> crate::Result<super::common::BlockDeleteResult> {
+        self.validate_questdb_designated_timestamp(&key.time_column).await?;
+        let sql = self.questdb_sql(key, range)?;
+        traced_pg_execute_empty(self.client, &sql.statements[0].sql).await?;
+        Ok(super::common::BlockDeleteResult::default())
+    }
+
+    // 未启用 questdb feature 时连接不可能是 QuestDB，仅为类型完备保留
+    #[cfg(not(feature = "questdb"))]
+    fn questdb_sql(
+        &self,
+        _key: &common_helpers::BlockKey,
+        _range: &common_helpers::AlignedBlockRange,
+    ) -> crate::Result<SqlStatement> {
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type,
+            feature: "questdb block delete",
+        })
+    }
+
+    #[cfg(not(feature = "questdb"))]
+    async fn execute_questdb(
+        &self,
+        _key: &common_helpers::BlockKey,
+        _range: &common_helpers::AlignedBlockRange,
+    ) -> crate::Result<super::common::BlockDeleteResult> {
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type,
+            feature: "questdb block delete",
+        })
+    }
+
+    fn missing_key_error(&self) -> crate::OrmerError {
+        crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type,
+            feature: "block delete (declare #[hypertable(Duration)] on the model's time column)",
+        }
+    }
+
+    /// 解析分块声明与对齐后的区间；`None` 表示空区间（安全 no-op）。
+    fn resolve_range(
+        &self,
+    ) -> crate::Result<Option<(common_helpers::BlockKey, common_helpers::AlignedBlockRange)>> {
+        let key = self.key.clone().ok_or_else(|| self.missing_key_error())?;
+        let range = self.range.ok_or_else(|| {
+            crate::OrmerError::invalid_operation(
+                "block delete requires before(), between() or retain()",
+            )
+        })?;
+        Ok(common_helpers::AlignedBlockRange::align(
+            range,
+            key.unit,
+            chrono::Utc::now(),
+        )?
+        .map(|range| (key, range)))
+    }
+
+    /// 探测 timescaledb 扩展（首次探测后随连接缓存）。
+    async fn detect_timescaledb(&self) -> crate::Result<bool> {
+        if let Some(&installed) = self.timescaledb.get() {
+            return Ok(installed);
+        }
+        let installed: bool = self
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+                &[],
+            )
+            .trace()
+            .await?
+            .try_get(0)
+            .trace_for("tokio_postgres::Row::try_get")?;
+        let _ = self.timescaledb.set(installed);
+        Ok(installed)
+    }
+
+    /// QuestDB 只有 designated timestamp 表才有分区；删除前显式确认，
+    /// 避免把普通表误当作分区表处理。
+    #[cfg(feature = "questdb")]
+    async fn validate_questdb_designated_timestamp(
+        &self,
+        _time_column: &str,
+    ) -> crate::Result<()> {
+        let table_name = T::table_name_for_db(self.db_type);
+        let row = self
+            .client
+            .query_opt(
+                "SELECT designatedTimestamp FROM tables() WHERE table_name = $1",
+                &[&table_name],
+            )
+            .trace()
+            .await?;
+        let has_designated_timestamp = row
+            .map(|row| row.try_get::<_, Option<String>>(0))
+            .transpose()
+            .trace_for("tokio_postgres::Row::try_get")?
+            .flatten()
+            .is_some_and(|column| !column.trim().is_empty());
+        if !has_designated_timestamp {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: self.db_type,
+                feature: "block delete (the QuestDB table has no designated timestamp; recreate it with #[hypertable(Duration)])",
+            });
+        }
+        Ok(())
+    }
+
+    /// 统计目标超表当前块数（尽力而为，失败按 0 处理）。
+    async fn count_chunks(&self) -> u64 {
+        let table_name = T::table_name_for_db(self.db_type);
+        let count: Option<i64> = self
+            .client
+            .query_opt(
+                "SELECT count(*) FROM _timescaledb_catalog.chunk c \
+                 JOIN _timescaledb_catalog.hypertable h ON h.id = c.hypertable_id \
+                 WHERE h.table_name = $1",
+                &[&table_name],
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.try_get::<_, i64>(0).ok());
+        count.map(|value| value.max(0) as u64).unwrap_or(0)
+    }
+
+    async fn execute_statement(&self, sql: &SqlStatement) -> crate::Result<u64> {
+        if sql.statements.is_empty() {
+            return Ok(0);
+        }
+        let statement = &sql.statements[0];
+        let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+        pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types).await
+    }
+}
+
 /// Update 执行器
 pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
     client: &'a tokio_postgres::Client,
+    db_type: DbType,
     _marker: PhantomData<T>,
 }
 
@@ -4512,6 +4986,22 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
     }
 
     fn build_all_sql(&self) -> crate::Result<UpdateSqlBatch> {
+        // QuestDB 明确禁止更新 designated timestamp 列，统一走公共校验
+        #[cfg(feature = "questdb")]
+        if self.db_type.is_questdb() {
+            common_helpers::validate_questdb_update_columns::<T>(
+                self.db_type,
+                self.sets
+                    .iter()
+                    .map(|assignment| assignment.column.as_str())
+                    .chain(
+                        self.model_updates
+                            .iter()
+                            .flat_map(|plan| plan.sets.iter().map(|(column, _)| column.as_str())),
+                    ),
+            )?;
+        }
+
         let mut statements = Vec::new();
 
         // Base UPDATE from sets/filters
@@ -5521,5 +6011,211 @@ impl<
 
             Ok(results.into_iter().collect())
         })
+    }
+}
+
+#[cfg(test)]
+mod block_delete_tests {
+    use super::*;
+    use crate::abstract_layer::common::common_helpers::AlignedBlockRange;
+    use crate::model::ColumnSchema;
+
+    struct TsEvent;
+
+    fn ts_column(name: &'static str, hypertable: Option<std::time::Duration>) -> ColumnSchema {
+        ColumnSchema {
+            rust_name: name,
+            name,
+            rust_type: "DateTime<Utc>",
+            hypertable,
+            ..unused_fields(name)
+        }
+    }
+
+    // ColumnSchema 无 Default；测试只需 name/rust_type/hypertable 三个字段
+    fn unused_fields(name: &'static str) -> ColumnSchema {
+        ColumnSchema {
+            rust_name: name,
+            name,
+            rust_type: "",
+            is_primary: false,
+            is_auto_increment: false,
+            is_nullable: false,
+            unique_group: None,
+            unique_name: None,
+            is_indexed: false,
+            index_group: None,
+            index_name: None,
+            index_order: None,
+            index_where: None,
+            foreign_key: None,
+            enum_variants: None,
+            data_type: None,
+            db_value_type: None,
+            default: None,
+            check: None,
+            hypertable: None,
+            hypertable_space: None,
+            compress: false,
+            compression: None,
+            index_method: None,
+            index_expression: None,
+            index_columns: None,
+        }
+    }
+
+    impl Model for TsEvent {
+        const TABLE_NAME: &'static str = "block_delete_events";
+        const COLUMNS: &'static [&'static str] = &["id", "time"];
+        const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn column_schema() -> Vec<ColumnSchema> {
+            let mut id = unused_fields("id");
+            id.rust_type = "i64";
+            id.is_primary = true;
+            vec![
+                id,
+                ts_column("time", Some(std::time::Duration::from_secs(86_400))),
+            ]
+        }
+
+        fn query() -> Self::QueryBuilder {}
+        fn select() -> Self::QueryBuilder {}
+        fn from_row(_row: &Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn field_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn primary_key_columns() -> &'static [&'static str] {
+            &["id"]
+        }
+        fn primary_key_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    fn day(text: &str) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap();
+        chrono::Utc.from_utc_datetime(&naive)
+    }
+
+    #[cfg(feature = "questdb")]
+    #[test]
+    fn questdb_update_rejects_designated_timestamp_column() {
+        // designated timestamp 列（此处为 "time"）禁止 UPDATE
+        let error = common_helpers::validate_questdb_update_columns::<TsEvent>(
+            DbType::QuestDB,
+            ["time"],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::OrmerError::UnsupportedFeature { .. }
+        ));
+
+        // 普通列更新不受影响；非 QuestDB 后端直接放行
+        common_helpers::validate_questdb_update_columns::<TsEvent>(DbType::QuestDB, ["id"])
+            .unwrap();
+        common_helpers::validate_questdb_update_columns::<TsEvent>(
+            DbType::PostgreSQL,
+            ["time"],
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "questdb")]
+    #[test]
+    fn questdb_block_delete_generates_partition_predicate() {
+        let key = common_helpers::resolve_block_key::<TsEvent>(DbType::QuestDB).unwrap();
+        let range = AlignedBlockRange {
+            start: None,
+            end: day("2024-01-17 00:00:00"),
+        };
+        let sql = block_delete_questdb_sql::<TsEvent>(&key, &range)
+            .unwrap()
+            .statements
+            .remove(0);
+        assert_eq!(
+            sql.sql,
+            "ALTER TABLE block_delete_events DROP PARTITION WHERE time < '2024-01-17T00:00:00.000000Z'"
+        );
+        assert!(sql.params.is_empty());
+
+        let range = AlignedBlockRange {
+            start: Some(day("2024-01-15 00:00:00")),
+            end: day("2024-01-17 00:00:00"),
+        };
+        let sql = block_delete_questdb_sql::<TsEvent>(&key, &range)
+            .unwrap()
+            .statements
+            .remove(0);
+        assert_eq!(
+            sql.sql,
+            "ALTER TABLE block_delete_events DROP PARTITION WHERE time >= '2024-01-15T00:00:00.000000Z' AND time < '2024-01-17T00:00:00.000000Z'"
+        );
+    }
+
+    #[test]
+    fn drop_chunks_statement_uses_named_arguments() {
+        let range = AlignedBlockRange {
+            start: None,
+            end: day("2024-01-17 00:00:00"),
+        };
+        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range)
+            .unwrap()
+            .statements
+            .remove(0);
+        assert_eq!(
+            sql.sql,
+            "SELECT drop_chunks(relation => 'block_delete_events'::regclass, older_than => $1::timestamptz)"
+        );
+        assert_eq!(sql.params.len(), 1);
+
+        let range = AlignedBlockRange {
+            start: Some(day("2024-01-15 00:00:00")),
+            end: day("2024-01-17 00:00:00"),
+        };
+        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range)
+            .unwrap()
+            .statements
+            .remove(0);
+        assert_eq!(
+            sql.sql,
+            "SELECT drop_chunks(relation => 'block_delete_events'::regclass, older_than => $1::timestamptz, newer_than => $2::timestamptz)"
+        );
+        // older_than 是 $1，newer_than 是 $2
+        assert_eq!(sql.params.len(), 2);
+    }
+
+    #[test]
+    fn fallback_statement_carries_aligned_bounds_and_annotation() {
+        let key = common_helpers::resolve_block_key::<TsEvent>(DbType::PostgreSQL).unwrap();
+        let range = AlignedBlockRange {
+            start: None,
+            end: day("2024-01-17 00:00:00"),
+        };
+        let sql = block_delete_fallback_sql::<TsEvent>(DbType::PostgreSQL, &key, &range)
+            .unwrap()
+            .statements
+            .remove(0);
+        assert_eq!(
+            sql.sql,
+            "/* block_delete_fallback */ DELETE FROM block_delete_events WHERE time < $1"
+        );
+        assert_eq!(sql.params.len(), 1);
+        assert!(matches!(
+            sql.params[0],
+            Value::DateTime(t) if t == day("2024-01-17 00:00:00")
+        ));
     }
 }

@@ -36,7 +36,7 @@ pub fn placeholder(db_type: DbType, _param_idx: usize) -> String {
         DbType::Sqlite => "?".to_string(),
         #[cfg(feature = "mysql")]
         DbType::MySQL => "?".to_string(),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
         _ => "?".to_string(),
     }
 }
@@ -238,6 +238,371 @@ pub fn build_delete_sql<T: Model>(
     Ok((sql, params))
 }
 
+// ===== 时序数据按块删除（Block Delete）公共层 =====
+
+/// 时序数据分块粒度。
+///
+/// 由 `#[hypertable(Duration)]` 时长按唯一映射推导（QuestDB 分区、ClickHouse
+/// 默认 `PARTITION BY` 与按块删除对齐共用同一份映射）：
+/// `< 1h` → 小时，`1h ≤ d < 7d` → 天，`7d ≤ d < 30d` → 周，
+/// `30d ≤ d < 365d` → 月，`≥ 365d` → 年。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionUnit {
+    Hour,
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl PartitionUnit {
+    /// 「时长 → 分块粒度」的唯一映射实现。
+    pub fn from_duration(duration: std::time::Duration) -> Self {
+        const HOUR_SECS: f64 = 3600.0;
+        const DAY_SECS: f64 = 86_400.0;
+        let secs = duration.as_secs_f64();
+        if secs < HOUR_SECS {
+            Self::Hour
+        } else if secs < 7.0 * DAY_SECS {
+            Self::Day
+        } else if secs < 30.0 * DAY_SECS {
+            Self::Week
+        } else if secs < 365.0 * DAY_SECS {
+            Self::Month
+        } else {
+            Self::Year
+        }
+    }
+
+    /// QuestDB `PARTITION BY` 单位名。
+    pub fn questdb_unit(self) -> &'static str {
+        match self {
+            Self::Hour => "HOUR",
+            Self::Day => "DAY",
+            Self::Week => "WEEK",
+            Self::Month => "MONTH",
+            Self::Year => "YEAR",
+        }
+    }
+
+    /// ClickHouse 默认 `PARTITION BY` 时间函数名。
+    pub fn clickhouse_function(self) -> &'static str {
+        match self {
+            Self::Hour => "toStartOfHour",
+            Self::Day => "toYYYYMMDD",
+            Self::Week => "toMonday",
+            Self::Month => "toYYYYMM",
+            Self::Year => "toYYYY",
+        }
+    }
+
+    /// 识别 ClickHouse `partition_by` 表达式（仅支持映射表列出的时间函数形式），
+    /// 返回 `(粒度, 列名)`。
+    pub fn parse_clickhouse_partition_by(expr: &str) -> Option<(Self, String)> {
+        let expr = expr.trim();
+        let open = expr.find('(')?;
+        let close = expr.rfind(')')?;
+        if close != expr.len() - 1 {
+            return None;
+        }
+        let name = expr[..open].trim();
+        let column = expr[open + 1..close]
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '`' || c == '"')
+            .trim();
+        let unit = match name {
+            "toStartOfHour" => Self::Hour,
+            "toYYYYMMDD" => Self::Day,
+            "toMonday" => Self::Week,
+            "toYYYYMM" => Self::Month,
+            "toYYYY" => Self::Year,
+            _ => return None,
+        };
+        if column.is_empty() {
+            return None;
+        }
+        Some((unit, column.to_string()))
+    }
+
+    /// ClickHouse `system.parts.partition` 的 key 文本解析为分区起始时间（UTC）。
+    pub fn parse_clickhouse_partition_key(
+        self,
+        key: &str,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::TimeZone;
+
+        let naive = match self {
+            Self::Hour => chrono::NaiveDateTime::parse_from_str(key.trim(), "%Y-%m-%d %H:%M:%S").ok()?,
+            Self::Day => {
+                let n: u32 = key.trim().parse().ok()?;
+                chrono::NaiveDate::from_ymd_opt((n / 10_000) as i32, n / 100 % 100, n % 100)?
+                    .and_hms_opt(0, 0, 0)?
+            }
+            Self::Week => chrono::NaiveDate::parse_from_str(key.trim(), "%Y-%m-%d")
+                .ok()?
+                .and_hms_opt(0, 0, 0)?,
+            Self::Month => {
+                let n: u32 = key.trim().parse().ok()?;
+                chrono::NaiveDate::from_ymd_opt((n / 100) as i32, n % 100, 1)?.and_hms_opt(0, 0, 0)?
+            }
+            Self::Year => {
+                let n: u32 = key.trim().parse().ok()?;
+                chrono::NaiveDate::from_ymd_opt(n as i32, 1, 1)?.and_hms_opt(0, 0, 0)?
+            }
+        };
+        Some(chrono::Utc.from_utc_datetime(&naive))
+    }
+
+    /// 把时间向下对齐（floor）到所在块边界（UTC 日历对齐）。
+    pub fn align_to_block(self, t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{Datelike, TimeZone, Timelike};
+        let naive = t.naive_utc();
+        let date = naive.date();
+        let aligned = match self {
+            Self::Hour => date.and_hms_opt(naive.hour(), 0, 0),
+            Self::Day => date.and_hms_opt(0, 0, 0),
+            Self::Week => {
+                let monday =
+                    date - chrono::Duration::days(date.weekday().num_days_from_monday() as i64);
+                monday.and_hms_opt(0, 0, 0)
+            }
+            Self::Month => date.with_day(1).and_then(|d| d.and_hms_opt(0, 0, 0)),
+            Self::Year => date
+                .with_month(1)
+                .and_then(|d| d.with_day(1))
+                .and_then(|d| d.and_hms_opt(0, 0, 0)),
+        };
+        chrono::Utc
+            .from_utc_datetime(&aligned.expect("block boundary is always a valid datetime"))
+    }
+
+    /// 当前块边界的下一个边界（用于 `between` 起点的向上对齐）。
+    fn next_block_boundary(self, t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        use chrono::{Months, TimeZone};
+        let naive = t.naive_utc();
+        let naive = match self {
+            Self::Hour => naive + chrono::Duration::hours(1),
+            Self::Day => naive + chrono::Duration::days(1),
+            Self::Week => naive + chrono::Duration::weeks(1),
+            Self::Month => naive
+                .checked_add_months(Months::new(1))
+                .expect("next block boundary out of range"),
+            Self::Year => naive
+                .checked_add_months(Months::new(12))
+                .expect("next block boundary out of range"),
+        };
+        chrono::Utc.from_utc_datetime(&naive)
+    }
+
+    /// 向上对齐（ceil）：不在块边界上时进到下一个边界。
+    fn align_to_block_ceil(
+        self,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        let floor = self.align_to_block(t);
+        if floor == t {
+            floor
+        } else {
+            self.next_block_boundary(floor)
+        }
+    }
+}
+
+/// 模型时序分块声明的解析结果：时间列 + 分块粒度。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockKey {
+    pub time_column: String,
+    pub unit: PartitionUnit,
+}
+
+/// 块删除范围选择：`before` / `between` / `retain` 三选一。
+#[derive(Debug, Clone, Copy)]
+pub enum BlockRange {
+    /// 删除所有「块结束时间 ≤ cutoff」的块（cutoff 向下对齐到块边界）。
+    Before {
+        cutoff: chrono::DateTime<chrono::Utc>,
+    },
+    /// 删除完整落在 `[start, end)` 内的块（两端对齐到块边界）。
+    Between {
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    },
+    /// 保留最近 `duration` 的数据；`now` 由调用方在执行期提供（客户端时钟）。
+    Retain { duration: std::time::Duration },
+}
+
+/// 对齐后的半开块区间 `[start, end)`；`start` 为 `None` 表示无下界（`before`/`retain`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlignedBlockRange {
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    pub end: chrono::DateTime<chrono::Utc>,
+}
+
+impl AlignedBlockRange {
+    /// 按统一语义对齐 `BlockRange`。返回 `None` 表示对齐后为空区间（安全 no-op）；
+    /// `between` 的 `start >= end` 报参数错误。
+    pub fn align(
+        range: BlockRange,
+        unit: PartitionUnit,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::Result<Option<Self>> {
+        match range {
+            BlockRange::Before { cutoff } => Ok(Some(Self {
+                start: None,
+                end: unit.align_to_block(cutoff),
+            })),
+            BlockRange::Between { start, end } => {
+                if start >= end {
+                    return Err(crate::OrmerError::invalid_operation(
+                        "block delete between requires start < end",
+                    ));
+                }
+                let start = unit.align_to_block_ceil(start);
+                let end = unit.align_to_block(end);
+                if start >= end {
+                    return Ok(None);
+                }
+                Ok(Some(Self {
+                    start: Some(start),
+                    end,
+                }))
+            }
+            BlockRange::Retain { duration } => {
+                let step = chrono::Duration::from_std(duration).map_err(|_| {
+                    crate::OrmerError::invalid_operation(
+                        "block delete retain duration is out of range",
+                    )
+                })?;
+                Ok(Some(Self {
+                    start: None,
+                    end: unit.align_to_block(now - step),
+                }))
+            }
+        }
+    }
+
+    /// 判断以 `block_start` 起始的块是否完整落在区间内。
+    pub fn contains_block(&self, block_start: chrono::DateTime<chrono::Utc>) -> bool {
+        if let Some(start) = self.start {
+            if block_start < start {
+                return false;
+            }
+        }
+        block_start < self.end
+    }
+}
+
+/// 解析模型的时序分块声明；无 `#[hypertable]` 时间列声明时报 `UnsupportedFeature`。
+pub fn resolve_block_key<T: Model>(db_type: DbType) -> crate::Result<BlockKey> {
+    let missing = || crate::OrmerError::UnsupportedFeature {
+        backend: db_type,
+        feature: "block delete (declare #[hypertable(Duration)] on the model's time column)",
+    };
+    let time_column = T::ts_time_key().ok_or_else(missing)?;
+    let duration = T::ts_block_interval().ok_or_else(missing)?;
+    Ok(BlockKey {
+        time_column: time_column.to_string(),
+        unit: PartitionUnit::from_duration(duration),
+    })
+}
+
+/// Resolve the timestamp column for an HTTP time-series backend.
+///
+/// InfluxDB models use the timestamp declared by `#[hypertable]`, or a single
+/// `DateTime` primary key when no chunk interval is needed.
+pub fn resolve_influx_time_key<T: Model>(db_type: DbType) -> crate::Result<String> {
+    if let Some(column) = T::ts_time_key() {
+        return Ok(column.to_string());
+    }
+
+    let mut timestamp_columns = T::column_schema()
+        .into_iter()
+        .filter(|column| {
+            column.is_primary
+                && (column.rust_type.starts_with("DateTime<")
+                    || column.rust_type.starts_with("chrono::DateTime<")
+                    || column.rust_type.starts_with("Option<DateTime<")
+                    || column.rust_type.starts_with("Option<chrono::DateTime<"))
+        })
+        .map(|column| column.name.to_string())
+        .collect::<Vec<_>>();
+    if timestamp_columns.len() == 1 {
+        return Ok(timestamp_columns.remove(0));
+    }
+
+    Err(crate::OrmerError::UnsupportedFeature {
+        backend: db_type,
+        feature: "block delete (declare #[hypertable(Duration)] or mark one DateTime field #[primary])",
+    })
+}
+
+/// Raw time-range bounds for backends whose server owns shard boundaries.
+/// Returns `None` for a safe no-op; reversed `between` remains an error.
+pub fn time_delete_bounds(
+    range: BlockRange,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::Result<
+    Option<(
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+    )>,
+> {
+    match range {
+        BlockRange::Before { cutoff } => Ok(Some((None, cutoff))),
+        BlockRange::Between { start, end } => {
+            if start >= end {
+                return Err(crate::OrmerError::invalid_operation(
+                    "block delete between requires start < end",
+                ));
+            }
+            Ok(Some((Some(start), end)))
+        }
+        BlockRange::Retain { duration } => {
+            let step = chrono::Duration::from_std(duration).map_err(|_| {
+                crate::OrmerError::invalid_operation(
+                    "block delete retain duration is out of range",
+                )
+            })?;
+            Ok(Some((None, now - step)))
+        }
+    }
+}
+
+/// 回退路径（行删除）的过滤条件：对齐后的块区间 → 时间列边界。
+pub fn block_delete_fallback_filters(
+    range: &AlignedBlockRange,
+    time_column: &str,
+) -> Vec<FilterExpr> {
+    let mut filters = Vec::with_capacity(2);
+    if let Some(start) = range.start {
+        filters.push(FilterExpr::Comparison {
+            column: time_column.to_string(),
+            operator: ">=".to_string(),
+            value: value_to_filter_value(&Value::DateTime(start)),
+        });
+    }
+    filters.push(FilterExpr::Comparison {
+        column: time_column.to_string(),
+        operator: "<".to_string(),
+        value: value_to_filter_value(&Value::DateTime(range.end)),
+    });
+    filters
+}
+
+/// OLTP 后端的块删除回退 SQL：`DELETE FROM t WHERE <对齐边界>`。
+///
+/// 返回 `None` 表示空区间（安全 no-op）；SQL 带 `block_delete_fallback` 注释，
+/// 供 sql_trace 识别回退路径。
+pub fn build_block_delete_fallback_sql<T: Model>(
+    db_type: DbType,
+    key: &BlockKey,
+    range: &AlignedBlockRange,
+) -> crate::Result<Option<(String, Vec<Value>)>> {
+    let filters = block_delete_fallback_filters(range, &key.time_column);
+    let (sql, params) = build_delete_sql::<T>(db_type, &filters)?;
+    Ok(Some((format!("/* block_delete_fallback */ {sql}"), params)))
+}
+
 pub fn build_update_sql<T: Model>(
     db_type: DbType,
     sets: &[UpdateAssignment],
@@ -276,6 +641,31 @@ fn validate_update_expr(db_type: DbType, expr: &UpdateExpr) -> crate::Result<()>
         }
         _ => Ok(()),
     }
+}
+
+/// QuestDB 语义约束：designated timestamp 列不可被 UPDATE。
+///
+/// QuestDB 的 UPDATE 为 copy-on-write 实现，服务端明确禁止更新
+/// `timestamp(col)` 声明的 designated timestamp 列。这里按模型声明
+/// （`#[hypertable]` 时间列）统一校验，供各执行路径复用。
+#[cfg(feature = "questdb")]
+pub fn validate_questdb_update_columns<'a, T: Model>(
+    db_type: DbType,
+    columns: impl IntoIterator<Item = &'a str>,
+) -> crate::Result<()> {
+    if !db_type.is_questdb() {
+        return Ok(());
+    }
+    let Some((time_column, _)) = T::hypertable_info() else {
+        return Ok(());
+    };
+    if columns.into_iter().any(|column| column == time_column) {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "update on the designated timestamp column (QuestDB forbids updating timestamp(...) columns; rewrite history via block delete and re-insert)",
+        });
+    }
+    Ok(())
 }
 
 pub fn build_model_update_sql<T: Model>(
@@ -409,6 +799,8 @@ pub fn bind_param_limit(db_type: DbType) -> usize {
         DbType::DuckDB => 65_535,
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => 65_535,
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => 65_535,
     }
 }
 
@@ -891,6 +1283,11 @@ fn build_bulk_model_update_sql<T: Model>(
             backend: db_type,
             feature: "bulk model updates",
         }),
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "bulk model updates",
+        }),
         #[cfg(feature = "mysql")]
         DbType::MySQL => build_mysql_bulk_model_update_sql::<T>(plans, pk_values, set_columns),
         #[cfg(feature = "mssql")]
@@ -1029,7 +1426,7 @@ fn incoming_column_sql(db_type: DbType, column: &str) -> String {
         DbType::MySQL => format!("VALUES({})", quote_identifier(db_type, column)),
         #[cfg(feature = "mssql")]
         DbType::MSSQL => quote_column_with_prefix(db_type, "source", column),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
         _ => quote_column_with_prefix(db_type, "excluded", column),
     }
 }
@@ -1628,6 +2025,8 @@ pub fn append_auto_increment_returning<T: Model>(db_type: DbType, sql: String) -
         }
         #[cfg(feature = "questdb")]
         DbType::QuestDB => sql,
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => sql,
         #[cfg(feature = "mysql")]
         DbType::MySQL => sql,
         #[cfg(feature = "duckdb")]
@@ -1874,6 +2273,13 @@ pub fn build_partial_insert_statement_for_table<T: Model>(
             DbType::MySQL => format!("INSERT INTO {table_name} () VALUES ()"),
             #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mssql"))]
             _ => format!("INSERT INTO {table_name} DEFAULT VALUES"),
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "partial insert without columns",
+                });
+            }
         }
     } else {
         let columns_str = quote_column_list(db_type, &columns);
@@ -2053,6 +2459,11 @@ fn append_insert_conflict_clause<T: Model>(
         }
         #[cfg(feature = "questdb")]
         DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "insert conflict handling",
+        }),
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "insert conflict handling",
         }),
@@ -2614,4 +3025,210 @@ mod tests {
             );
         }
     }
+}
+
+
+#[cfg(test)]
+mod block_delete_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn dt(text: &str) -> chrono::DateTime<chrono::Utc> {
+        let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap();
+        chrono::Utc.from_utc_datetime(&naive)
+    }
+
+    #[test]
+    fn partition_unit_maps_duration_to_granularity() {
+        // < 1h → 小时
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(1800)),
+            PartitionUnit::Hour
+        );
+        // 1h ≤ d < 7d → 天
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(3600)),
+            PartitionUnit::Day
+        );
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(6 * 86_400)),
+            PartitionUnit::Day
+        );
+        // 7d ≤ d < 30d → 周
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(7 * 86_400)),
+            PartitionUnit::Week
+        );
+        // 30d ≤ d < 365d → 月
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(30 * 86_400)),
+            PartitionUnit::Month
+        );
+        // ≥ 365d → 年
+        assert_eq!(
+            PartitionUnit::from_duration(std::time::Duration::from_secs(365 * 86_400)),
+            PartitionUnit::Year
+        );
+    }
+
+    #[test]
+    fn questdb_units_and_clickhouse_functions_match_mapping() {
+        assert_eq!(PartitionUnit::Hour.questdb_unit(), "HOUR");
+        assert_eq!(PartitionUnit::Day.questdb_unit(), "DAY");
+        assert_eq!(PartitionUnit::Week.questdb_unit(), "WEEK");
+        assert_eq!(PartitionUnit::Month.questdb_unit(), "MONTH");
+        assert_eq!(PartitionUnit::Year.questdb_unit(), "YEAR");
+        assert_eq!(PartitionUnit::Hour.clickhouse_function(), "toStartOfHour");
+        assert_eq!(PartitionUnit::Day.clickhouse_function(), "toYYYYMMDD");
+        assert_eq!(PartitionUnit::Week.clickhouse_function(), "toMonday");
+        assert_eq!(PartitionUnit::Month.clickhouse_function(), "toYYYYMM");
+        assert_eq!(PartitionUnit::Year.clickhouse_function(), "toYYYY");
+    }
+
+    #[test]
+    fn align_to_block_floor_supports_calendar_boundaries() {
+        // 2024-01-17 是周三
+        let wednesday = dt("2024-01-17 12:34:56");
+        assert_eq!(
+            PartitionUnit::Hour.align_to_block(wednesday),
+            dt("2024-01-17 12:00:00")
+        );
+        assert_eq!(PartitionUnit::Day.align_to_block(wednesday), dt("2024-01-17 00:00:00"));
+        // 周界：向下对齐到 UTC 周一
+        assert_eq!(PartitionUnit::Week.align_to_block(wednesday), dt("2024-01-15 00:00:00"));
+        // 月界与年界
+        assert_eq!(PartitionUnit::Month.align_to_block(wednesday), dt("2024-01-01 00:00:00"));
+        assert_eq!(PartitionUnit::Year.align_to_block(wednesday), dt("2024-01-01 00:00:00"));
+        // 恰在块边界上时保持不变
+        let boundary = PartitionUnit::Day.align_to_block(wednesday);
+        assert_eq!(PartitionUnit::Day.align_to_block(boundary), boundary);
+    }
+
+    #[test]
+    fn align_before_floors_cutoff() {
+        let cutoff = dt("2024-01-17 13:25:00");
+        let range = AlignedBlockRange::align(
+            BlockRange::Before { cutoff },
+            PartitionUnit::Day,
+            dt("1970-01-01 00:00:00"),
+        )
+        .unwrap()
+        .expect("before should always produce a range");
+        assert!(range.start.is_none());
+        assert_eq!(range.end, dt("2024-01-17 00:00:00"));
+    }
+
+    #[test]
+    fn align_between_uses_ceil_start_and_floor_end() {
+        let start = dt("2024-01-17 13:25:00"); // 周三午后
+        let end = dt("2024-01-20 16:13:00");
+        let range = AlignedBlockRange::align(
+            BlockRange::Between { start, end },
+            PartitionUnit::Day,
+            dt("1970-01-01 00:00:00"),
+        )
+        .unwrap()
+        .expect("between should produce a range");
+        // 起点向上对齐到下一个日界，终点向下对齐到所在日界
+        assert_eq!(range.start, Some(dt("2024-01-18 00:00:00")));
+        assert_eq!(range.end, dt("2024-01-20 00:00:00"));
+    }
+
+    #[test]
+    fn align_between_rejects_reversed_range_and_nops_empty() {
+        let t = dt("2024-01-17 13:25:00");
+        // start >= end 报参数错误
+        assert!(AlignedBlockRange::align(
+            BlockRange::Between { start: t, end: t },
+            PartitionUnit::Day,
+            dt("1970-01-01 00:00:00"),
+        )
+        .is_err());
+        // 同一天内的区间对齐后为空 → 安全 no-op
+        assert_eq!(
+            AlignedBlockRange::align(
+                BlockRange::Between {
+                    start: t,
+                    end: dt("2024-01-17 19:00:00")
+                },
+                PartitionUnit::Day,
+                dt("1970-01-01 00:00:00"),
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn align_retain_equals_before_now_minus_duration() {
+        let now = dt("2024-01-17 13:25:00");
+        let duration = std::time::Duration::from_secs(30 * 86_400);
+        let range = AlignedBlockRange::align(BlockRange::Retain { duration }, PartitionUnit::Day, now)
+            .unwrap()
+            .expect("retain produces a range");
+        assert!(range.start.is_none());
+        assert_eq!(
+            range.end,
+            PartitionUnit::Day.align_to_block(now - chrono::Duration::seconds(30 * 86_400))
+        );
+    }
+
+    #[test]
+    fn aligned_range_contains_only_complete_blocks() {
+        let range = AlignedBlockRange {
+            start: Some(dt("2024-01-17 00:00:00")),
+            end: dt("2024-01-18 00:00:00"),
+        };
+        assert!(!range.contains_block(dt("2024-01-16 00:00:00"))); // 前一天
+        assert!(range.contains_block(dt("2024-01-17 00:00:00")));
+        assert!(!range.contains_block(dt("2024-01-18 00:00:00"))); // 下一天
+    }
+
+    #[test]
+    fn parse_clickhouse_partition_by_recognizes_time_functions() {
+        assert_eq!(
+            PartitionUnit::parse_clickhouse_partition_by("toYYYYMM(ts)"),
+            Some((PartitionUnit::Month, "ts".to_string()))
+        );
+        assert_eq!(
+            PartitionUnit::parse_clickhouse_partition_by("toStartOfHour( time )"),
+            Some((PartitionUnit::Hour, "time".to_string()))
+        );
+        assert_eq!(
+            PartitionUnit::parse_clickhouse_partition_by("toMonday(date_col)"),
+            Some((PartitionUnit::Week, "date_col".to_string()))
+        );
+        // 非映射表列出的时间函数不可识别
+        assert_eq!(
+            PartitionUnit::parse_clickhouse_partition_by("intDiv(ts, 86400)"),
+            None
+        );
+        assert_eq!(PartitionUnit::parse_clickhouse_partition_by("ts"), None);
+    }
+
+    #[test]
+    fn parse_clickhouse_partition_key_parses_all_units() {
+        assert_eq!(
+            PartitionUnit::Hour.parse_clickhouse_partition_key("2024-01-17 05:00:00"),
+            Some(dt("2024-01-17 05:00:00"))
+        );
+        assert_eq!(
+            PartitionUnit::Day.parse_clickhouse_partition_key("20240117"),
+            Some(dt("2024-01-17 00:00:00"))
+        );
+        assert_eq!(
+            PartitionUnit::Week.parse_clickhouse_partition_key("2024-01-15"),
+            Some(dt("2024-01-15 00:00:00"))
+        );
+        assert_eq!(
+            PartitionUnit::Month.parse_clickhouse_partition_key("202401"),
+            Some(dt("2024-01-01 00:00:00"))
+        );
+        assert_eq!(
+            PartitionUnit::Year.parse_clickhouse_partition_key("2024"),
+            Some(dt("2024-01-01 00:00:00"))
+        );
+        assert_eq!(PartitionUnit::Day.parse_clickhouse_partition_key("not-a-key"), None);
+    }
+
 }

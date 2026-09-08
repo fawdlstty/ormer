@@ -16,6 +16,36 @@ use std::marker::PhantomData;
 
 pub const MIGRATION_TABLE_NAME: &str = "__ormer_migrations";
 
+/// [`Database::ensure_table`] 的执行结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableEnsureOutcome {
+    /// 表原本不存在并已创建，或已存在且结构校验通过。
+    Ready,
+    /// 存在结构差异，已通过增量迁移对齐。
+    Migrated,
+    /// 存在无法增量迁移的结构差异（如主键变更、超表分区约束冲突），
+    /// 已按约定删除表并按当前模型重建。
+    Recreated,
+}
+
+/// 判断错误是否属于"应当删除重建"的结构性差异。
+///
+/// 包括：ormer 自身报告的不可迁移 schema / 结构不匹配，以及 TimescaleDB
+/// 在超表分区列与唯一索引（主键）冲突时抛出的建表错误。后者的典型场景是
+/// 旧版本建出的表结构与当前模型的主键定义不一致，导致 create_hypertable
+/// 无法完成，此时删除重建是唯一出路。
+fn is_schema_rebuild_error(err: &crate::OrmerError) -> bool {
+    match err {
+        crate::OrmerError::UnmigratableSchema { .. } => true,
+        crate::OrmerError::Other { message } => message.contains("Schema mismatch"),
+        crate::OrmerError::Database { message, .. } => {
+            message.contains("cannot create a unique index without the column")
+                && message.contains("used in partitioning")
+        }
+        _ => false,
+    }
+}
+
 /// A single migration operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationStep {
@@ -39,6 +69,11 @@ pub enum MigrationStep {
     DropColumn {
         table: String,
         column: String,
+    },
+    RenameColumn {
+        table: String,
+        old_name: String,
+        new_name: String,
     },
     BackfillColumn {
         table: String,
@@ -103,12 +138,34 @@ impl MigrationStep {
                     DbType::Sqlite => Err(crate::ormer_error!(
                         "SQLite does not support DROP COLUMN; use a hand-written table rebuild"
                     )),
-                    #[cfg(feature = "questdb")]
-                    DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
-                        backend: db_type,
-                        feature: "DROP COLUMN migrations",
-                    }),
+                    // 仅启用部分 feature 时通配分支可能不可达
+                    #[allow(unreachable_patterns)]
                     _ => Ok(format!("ALTER TABLE {table} DROP COLUMN {column}")),
+                }
+            }
+            Self::RenameColumn {
+                old_name,
+                new_name,
+                ..
+            } => {
+                let old_name = crate::model::quote_identifier(db_type, old_name);
+                let new_name = crate::model::quote_identifier(db_type, new_name);
+                match db_type {
+                    #[cfg(feature = "mssql")]
+                    DbType::MSSQL => Err(crate::ormer_error!(
+                        "MSSQL renames columns with sp_rename; write the step as Sql {{ .. }}"
+                    )),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "RENAME COLUMN migrations",
+                    }),
+                    // PostgreSQL / QuestDB / MySQL 8+ / SQLite 3.25+ / DuckDB / ClickHouse
+                    // 均支持 `ALTER TABLE t RENAME COLUMN old TO new`
+                    #[allow(unreachable_patterns)]
+                    _ => Ok(format!(
+                        "ALTER TABLE {table} RENAME COLUMN {old_name} TO {new_name}"
+                    )),
                 }
             }
             Self::BackfillColumn {
@@ -174,6 +231,11 @@ impl MigrationStep {
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
                         backend: db_type,
+                        feature: "ALTER COLUMN migrations (QuestDB cannot change column types; rebuild the table via a new table + INSERT SELECT in a hand-written migration)",
+                    }),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
                         feature: "ALTER COLUMN migrations",
                     }),
                 }
@@ -197,7 +259,7 @@ impl MigrationStep {
                     DbType::Sqlite => " IF NOT EXISTS",
                     #[cfg(feature = "postgresql")]
                     DbType::PostgreSQL => " IF NOT EXISTS",
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+                    #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
                     _ => " IF NOT EXISTS",
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => " IF NOT EXISTS",
@@ -236,6 +298,7 @@ fn table_name(step: &MigrationStep) -> &str {
     match step {
         MigrationStep::AddColumn { table, .. }
         | MigrationStep::DropColumn { table, .. }
+        | MigrationStep::RenameColumn { table, .. }
         | MigrationStep::BackfillColumn { table, .. }
         | MigrationStep::AlterColumn { table, .. }
         | MigrationStep::AddConstraint { table, .. }
@@ -603,6 +666,11 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
 
     pub async fn plan(&self) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
+        // QuestDB 没有主键/NOT NULL 约束，自省结果不参与这两项比较
+        #[cfg(feature = "questdb")]
+        let questdb = matches!(db_type, DbType::QuestDB);
+        #[cfg(not(feature = "questdb"))]
+        let questdb = false;
         let table_name = T::table_name_for_db(db_type);
         let mut plan = MigrationPlan::new(table_name, db_type);
         let actual = self.db.schema_columns(table_name).await?;
@@ -655,20 +723,26 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         for column in T::COLUMN_SCHEMA {
             if !actual_names.contains(column.name) {
                 if column.is_primary {
-                    return Err(crate::ormer_error!(
-                        "Cannot infer adding primary key column {}; write an explicit migration",
-                        column.name
+                    return Err(crate::OrmerError::unmigratable_schema(
+                        table_name,
+                        format!(
+                            "Cannot infer adding primary key column {}; write an explicit migration",
+                            column.name
+                        ),
                     ));
                 }
                 if !column.is_nullable
                     && column.default.is_none()
                     && self.db.table_row_count(table_name).await? > 0
                 {
-                    return Err(crate::ormer_error!(
-                        "Cannot add NOT NULL column {} to populated table {}; \
-                         write an explicit migration with a backfill",
-                        column.name,
-                        table_name
+                    return Err(crate::OrmerError::unmigratable_schema(
+                        table_name,
+                        format!(
+                            "Cannot add NOT NULL column {} to populated table {}; \
+                             write an explicit migration with a backfill",
+                            column.name,
+                            table_name
+                        ),
                     ));
                 }
                 plan.push(MigrationStep::AddColumn {
@@ -763,10 +837,13 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         }
                     };
                     if sqlite_backend {
-                        return Err(crate::ormer_error!(
-                            "Cannot add foreign key column {} to SQLite table {}; write an explicit table-rebuild migration",
-                            column.name,
-                            table_name
+                        return Err(crate::OrmerError::unmigratable_schema(
+                            table_name,
+                            format!(
+                                "Cannot add foreign key column {} to SQLite table {}; write an explicit table-rebuild migration",
+                                column.name,
+                                table_name
+                            ),
                         ));
                     }
                     plan.push(MigrationStep::AddForeignKey {
@@ -783,14 +860,20 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
         }
 
+        // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
+        let effective_primary_keys = crate::model::effective_primary_key_columns::<T>(db_type);
         for expected in T::COLUMN_SCHEMA {
             let Some(actual) = actual_by_name.get(expected.name) else {
                 continue;
             };
-            if actual.primary_key != expected.is_primary {
-                return Err(crate::ormer_error!(
-                    "Cannot infer primary-key migration for column {}; write an explicit migration",
-                    expected.name
+            let expected_primary = effective_primary_keys.contains(&expected.name);
+            if !questdb && actual.primary_key != expected_primary {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table_name,
+                    format!(
+                        "Cannot infer primary-key migration for column {}; write an explicit migration",
+                        expected.name
+                    ),
                 ));
             }
 
@@ -803,7 +886,8 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
 
             let expected_type = column_type_definition(db_type, expected);
             let type_changed = !types_equivalent(db_type, &actual.type_name, &expected_type);
-            let nullable_changed = !expected.is_primary && actual.nullable != expected.is_nullable;
+            let nullable_changed =
+                !expected.is_primary && !questdb && actual.nullable != expected.is_nullable;
             let compression_changed = {
                 #[cfg(feature = "postgresql")]
                 if matches!(db_type, DbType::PostgreSQL) {
@@ -824,9 +908,12 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
 
             if expected.is_primary && type_changed {
-                return Err(crate::ormer_error!(
-                    "Cannot infer primary-key type migration for column {}; write an explicit migration",
-                    expected.name
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table_name,
+                    format!(
+                        "Cannot infer primary-key type migration for column {}; write an explicit migration",
+                        expected.name
+                    ),
                 ));
             }
 
@@ -837,6 +924,13 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
             #[cfg(feature = "questdb")]
             if matches!(db_type, DbType::QuestDB) {
+                return Err(crate::OrmerError::UnsupportedFeature {
+                    backend: db_type,
+                    feature: "column type migration (QuestDB cannot ALTER COLUMN types; rebuild the table via a new table + INSERT SELECT in a hand-written migration)",
+                });
+            }
+            #[cfg(feature = "influxdb")]
+            if matches!(db_type, DbType::InfluxDB) {
                 return Err(crate::OrmerError::UnsupportedFeature {
                     backend: db_type,
                     feature: "column metadata migrations",
@@ -869,6 +963,9 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         DbType::ClickHouse => (column_definition(db_type, expected)?, None),
                         #[cfg(feature = "questdb")]
                         DbType::QuestDB => (String::new(), None),
+                        // 不可达：InfluxDB 已提前报错，仅为 match 穷尽性保留
+                        #[cfg(feature = "influxdb")]
+                        DbType::InfluxDB => (String::new(), None),
                     };
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
@@ -906,6 +1003,9 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         DbType::ClickHouse => column_definition(db_type, expected)?,
                         #[cfg(feature = "questdb")]
                         DbType::QuestDB => String::new(),
+                        // 不可达：InfluxDB 已提前报错，仅为 match 穷尽性保留
+                        #[cfg(feature = "influxdb")]
+                        DbType::InfluxDB => String::new(),
                     };
                     plan.push(MigrationStep::AlterColumn {
                         table: table_name.to_string(),
@@ -1101,6 +1201,13 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
                 feature: "column compression",
             });
         }
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "column compression",
+            });
+        }
     }
     #[cfg(any(feature = "postgresql", feature = "mysql"))]
     Ok(())
@@ -1202,7 +1309,7 @@ fn index_migration_step(
         DbType::PostgreSQL => " IF NOT EXISTS",
         #[cfg(feature = "questdb")]
         DbType::QuestDB => " IF NOT EXISTS",
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
         _ => " IF NOT EXISTS",
     };
     let columns_sql = columns
@@ -1333,7 +1440,7 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 _ => base.to_string(),
             }
         }
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
         _ => upper,
     }
 }
@@ -1768,6 +1875,8 @@ impl Database {
             Database::DuckDB(_) => DbType::DuckDB,
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(_) => DbType::ClickHouse,
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => DbType::InfluxDB,
         }
     }
 
@@ -1776,6 +1885,56 @@ impl Database {
             db: self,
             marker: PhantomData,
         }
+    }
+
+    /// 确保表结构与模型一致，返回实际执行的动作。
+    ///
+    /// 1. 表不存在时直接创建；
+    /// 2. 存在结构差异时优先尝试增量迁移；
+    /// 3. 差异无法增量迁移（主键变更、超表分区约束冲突等）时删除重建。
+    pub async fn ensure_table<T: WritableModel>(
+        &self,
+    ) -> crate::Result<TableEnsureOutcome> {
+        let table_exists = self
+            .schema_columns(T::table_name_for_db(self.db_type()))
+            .await?
+            .is_some();
+        if !table_exists {
+            self.create_table::<T>().execute().await?;
+            return Ok(TableEnsureOutcome::Ready);
+        }
+
+        let validation_error = match self.validate_table::<T>().await {
+            Ok(()) => return Ok(TableEnsureOutcome::Ready),
+            Err(err) => err,
+        };
+        if !is_schema_rebuild_error(&validation_error) {
+            return Err(validation_error);
+        }
+
+        match self.migrate_table::<T>().execute().await {
+            Ok(()) => match self.validate_table::<T>().await {
+                Ok(()) => Ok(TableEnsureOutcome::Migrated),
+                Err(_) => {
+                    self.recreate_table_internal::<T>().await?;
+                    Ok(TableEnsureOutcome::Recreated)
+                }
+            },
+            Err(migration_error)
+                if migration_error.is_unmigratable_schema()
+                    || is_schema_rebuild_error(&migration_error) =>
+            {
+                self.recreate_table_internal::<T>().await?;
+                Ok(TableEnsureOutcome::Recreated)
+            }
+            Err(migration_error) => Err(migration_error),
+        }
+    }
+
+    async fn recreate_table_internal<T: WritableModel>(&self) -> crate::Result<()> {
+        self.drop_table::<T>().execute().await?;
+        self.create_table::<T>().execute().await?;
+        self.validate_table::<T>().await
     }
 
     pub fn migrations<'a, M: Migration>(&'a self, migrations: &'a [M]) -> MigrationRunner<'a, M> {
@@ -1830,6 +1989,10 @@ impl Database {
     pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> crate::Result<usize> {
         #[cfg(feature = "clickhouse")]
         if let Database::ClickHouse(db) = self {
+            return db.apply_migrations(migrations).await;
+        }
+        #[cfg(feature = "influxdb")]
+        if let Database::InfluxDB(db) = self {
             return db.apply_migrations(migrations).await;
         }
         self.ensure_migration_table().await?;
@@ -1907,6 +2070,11 @@ impl Database {
         if let Database::ClickHouse(db) = self {
             return db.ensure_migration_table().await;
         }
+        #[cfg(feature = "influxdb")]
+        if let Database::InfluxDB(_) = self {
+            // measurement 由首条写入自动创建
+            return Ok(());
+        }
         let sql = match self.db_type() {
             #[cfg(feature = "sqlite")]
             DbType::Sqlite => format!(
@@ -1941,6 +2109,9 @@ impl Database {
                 "CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE_NAME} \
                  (version LONG, name STRING, checksum STRING, rolled_back BOOLEAN)"
             ),
+            // 不可达：InfluxDB 已在函数开头提前报错，仅为 match 穷尽性保留
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => String::new(),
         };
         self.execute_sql(&sql).await?;
         Ok(())
@@ -1965,6 +2136,13 @@ impl Database {
                 .into_iter()
                 .map(|migration| (migration.version, migration.name, migration.checksum))
                 .collect()),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => Ok(db
+                .migration_history()
+                .await?
+                .into_iter()
+                .map(|migration| (migration.version, migration.name, migration.checksum))
+                .collect()),
         }
     }
 
@@ -1975,10 +2153,7 @@ impl Database {
         match self {
             #[cfg(feature = "questdb")]
             Database::PostgreSQL(db) if db.db_type().is_questdb() => {
-                Err(crate::OrmerError::UnsupportedFeature {
-                    backend: DbType::QuestDB,
-                    feature: "migrate_table schema introspection",
-                })
+                db.questdb_schema_columns(table_name).await
             }
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.schema_columns(table_name).await,
@@ -1995,11 +2170,66 @@ impl Database {
                 backend: DbType::ClickHouse,
                 feature: "migrate_table schema introspection",
             }),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "migrate_table schema introspection",
+            }),
         }
+    }
+
+    /// QuestDB 表结构校验：基于 `table_columns` 自省结果逐列比对。
+    ///
+    /// QuestDB 没有主键/NOT NULL 约束，这两项不参与比较；类型不一致按
+    /// UnmigratableSchema 报告，由 `ensure_table` 引导到增量迁移路径。
+    #[cfg(feature = "questdb")]
+    pub(crate) async fn validate_table_questdb<T: WritableModel>(&self) -> crate::Result<()> {
+        let db_type = self.db_type();
+        let table_name = T::table_name_for_db(db_type);
+        let Some(actual) = self.schema_columns(table_name).await? else {
+            return Err(crate::ormer_error!(
+                "Schema mismatch: table {table_name}, reason: Table does not exist"
+            ));
+        };
+        let actual_by_name: BTreeMap<&str, &SchemaColumn> = actual
+            .iter()
+            .map(|column| (column.name.as_str(), column))
+            .collect();
+        for expected in T::COLUMN_SCHEMA {
+            let Some(actual) = actual_by_name.get(expected.name) else {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table_name,
+                    format!("Column {} is missing", expected.name),
+                ));
+            };
+            if actual.type_name.is_empty() {
+                return Err(crate::ormer_error!(
+                    "Cannot determine the database type of column {}",
+                    expected.name
+                ));
+            }
+            let expected_type = column_type_definition(db_type, expected);
+            if !types_equivalent(db_type, &actual.type_name, &expected_type) {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table_name,
+                    format!(
+                        "Column {} has type {}, expected {}",
+                        expected.name, actual.type_name, expected_type
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn validate_hypertable_for_migration<T: WritableModel>(&self) -> crate::Result<()> {
         match self {
+            #[cfg(feature = "questdb")]
+            Database::PostgreSQL(db) if db.db_type().is_questdb() => {
+                // QuestDB 无 TimescaleDB 元数据，designated timestamp 随建表生成，无需校验
+                let _ = db;
+                Ok(())
+            }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => db.validate_hypertable_for_migration::<T>().await,
             #[cfg(feature = "sqlite")]
@@ -2012,6 +2242,8 @@ impl Database {
             Database::DuckDB(_) => Ok(()),
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(_) => Ok(()),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => Ok(()),
         }
     }
 }

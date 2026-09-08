@@ -134,6 +134,19 @@ struct Event {
 }
 ```
 
+
+## 时间序列分块
+
+`#[hypertable(Duration)]` 是时序库分块的统一声明：TimescaleDB 用它设置 chunk 时长，QuestDB 建表按映射生成 `timestamp(col) PARTITION BY <单位>`，ClickHouse 未声明 `partition_by` 时按映射推导，`delete_blocks` 按块删除也依赖它。InfluxDB 的时间列同样优先取该声明，未声明时回退为唯一的 `DateTime` `#[primary]` 字段。时长到分区粒度的映射：
+
+| 时长 | 粒度 | QuestDB / ClickHouse |
+|---|---|---|
+| `< 1h` | 小时 | `HOUR` / `toStartOfHour(ts)` |
+| `1h ≤ d < 7d` | 天 | `DAY` / `toYYYYMMDD(ts)` |
+| `7d ≤ d < 30d` | 周 | `WEEK` / `toMonday(ts)` |
+| `30d ≤ d < 365d` | 月 | `MONTH` / `toYYYYMM(ts)` |
+| `≥ 365d` | 年 | `YEAR` / `toYYYY(ts)` |
+
 TimescaleDB 可用无参 `#[hypertable]` 标注 `String` 字段，让 PostgreSQL 按字段值拆成不同物理表；SQLite、MySQL、MSSQL 不启用该自动拆表。路由键使用字段的 SQL 列名（未配置 `#[column]` 时就是字段名），写入时自动从模型字段取值，查询和建表时显式传入 route。
 
 ```rust
@@ -160,6 +173,23 @@ let rows: Vec<Event> = db
     .route_table("tenant", "acme")
     .collect()
     .await?;
+```
+
+## InfluxDB 模型
+
+一个模型对应一个 measurement：时间戳复用 `#[primary]`（必须是时间类型，有且仅有一个，不支持 `auto`），标签复用 `#[index]`（类型必须为 `String`），其余字段是测量值。声明了 `#[influxdb(...)]` 的模型在派生时不满足上述约束会编译报错。表级保留策略：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "cpu_usage"]
+#[influxdb(retention = std::time::Duration::from_secs(30 * 86400))] // 可选，数据保留 30 天
+struct CpuUsage {
+    #[primary]
+    time: chrono::DateTime<chrono::Utc>,
+    #[index]
+    host: String,
+    usage: f64,
+}
 ```
 
 ## 字段属性

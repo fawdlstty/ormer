@@ -192,6 +192,8 @@ impl FilterFormatter {
             DbType::QuestDB => {
                 unreachable!("QuestDB full-text search is gated by validate_filter_for_db")
             }
+            #[cfg(feature = "influxdb")]
+            _ => unreachable!("InfluxDB full-text search is gated by validate_filter_for_db"),
         }
     }
 
@@ -576,7 +578,11 @@ impl FilterFormatter {
                     crate::DbType::Sqlite => format!("{} MATCH {}", expr_sql, query_sql),
                     #[cfg(feature = "mssql")]
                     crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+                    #[cfg(any(
+                        feature = "duckdb",
+                        feature = "clickhouse",
+                        feature = "influxdb"
+                    ))]
                     _ => format!("{} LIKE {}", expr_sql, query_sql),
                     #[cfg(feature = "questdb")]
                     crate::DbType::QuestDB => {

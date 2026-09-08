@@ -9,6 +9,7 @@
 - MSSQL
 - DuckDB (local connections, CRUD, transactions, raw SQL, streams, schema introspection, and connection pools)
 - ClickHouse (HTTP client, unified raw SQL, typed raw queries, health checks, table drops, schema introspection, and migrations)
+- InfluxDB (HTTP client, Line Protocol writes, InfluxQL/SQL queries, time-range deletes, health checks, table drops, and migrations)
 
 ## Enable Features
 
@@ -49,6 +50,10 @@ ormer = { version = "0.2", features = ["sqlite"] }
   `compression=none|lz4`, and other ClickHouse settings such as
   `max_execution_time=3`.
 
+**InfluxDB:**
+- 2.x: `http://localhost:8086?org=dev&bucket=metrics&token=my-token`
+- 1.x: `http://localhost:8086?database=telegraf&user=admin&password=secret`
+
 DuckDB can be used through `Database::connect(DbType::DuckDB, "app.duckdb")`.
 `Vec<i32>`, `Vec<i64>`, `Vec<Option<i64>>`, and `Vec<String>` fields map to
 DuckDB lists.
@@ -60,6 +65,15 @@ an engine such as `MergeTree ORDER BY (id)`; use `execute_sql(ormer::sql(...))`
 or `MigrationStep::Sql` for DDL that needs an engine. ClickHouse DDL is not
 transactional, so migration steps execute one at a time and do not automatically
 roll back earlier steps when a later step fails.
+InfluxDB is used through `Database::connect(DbType::InfluxDB, "...")`.
+`insert` renders Line Protocol batch writes and `select` reuses the unified query
+builder to render an InfluxQL/SQL subset. Transactions, JOINs, relation loading,
+row updates, upserts, `RETURNING`, and auto-increment return `UnsupportedFeature`;
+deletes only support time ranges (`delete_blocks`).
+The timestamp reuses `#[primary]` (exactly one time-typed field) and tags reuse
+`#[index]` (must be `String`). Declare a retention policy with
+`#[influxdb(retention = std::time::Duration::from_secs(30 * 86400))]`; `create_table`
+then emits `CREATE RETENTION POLICY`.
 
 ## Example
 

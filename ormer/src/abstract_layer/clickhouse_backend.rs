@@ -971,6 +971,176 @@ fn nullable_type(base: &str, nullable: bool) -> String {
     }
 }
 
+/// 解析 ClickHouse 按块删除的分块声明：优先 `#[clickhouse(partition_by = ...)]`
+/// 时间函数表达式，未声明时由 `#[hypertable]` 时长按公共映射推导；
+/// 两处都声明且粒度不一致时报错，表达式不可识别时报错并建议 `execute_sql`。
+pub(crate) fn resolve_clickhouse_block_key<T: crate::model::Model>(
+) -> crate::Result<crate::abstract_layer::common::common_helpers::BlockKey> {
+    use crate::abstract_layer::common::common_helpers::{
+        BlockKey, PartitionUnit, resolve_block_key,
+    };
+
+    const BACKEND: crate::abstract_layer::DbType = crate::abstract_layer::DbType::ClickHouse;
+    let declared = T::table_options().and_then(|options| options.clickhouse_partition_by);
+    let Some(expr) = declared else {
+        return resolve_block_key::<T>(BACKEND);
+    };
+    let Some((unit, column)) = PartitionUnit::parse_clickhouse_partition_by(expr) else {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: BACKEND,
+            feature:
+                "block delete with an unrecognized clickhouse(partition_by) expression; use execute_sql instead",
+        });
+    };
+    if let Some(duration) = T::ts_block_interval()
+        && PartitionUnit::from_duration(duration) != unit
+    {
+        return Err(crate::OrmerError::invalid_operation(format!(
+            "ClickHouse partition_by {expr:?} granularity does not match the #[hypertable] duration granularity"
+        )));
+    }
+    Ok(BlockKey {
+        time_column: column,
+        unit,
+    })
+}
+
+/// 按块删除执行器：从 `system.parts` 枚举既有分区，只保留完整落在目标
+/// 区间内的分区，合并为一条 `ALTER TABLE ... DROP PARTITION` 提交。
+pub struct BlockDeleteExecutor<'a, T: crate::model::Model> {
+    db: &'a Database,
+    key: Option<crate::abstract_layer::common::common_helpers::BlockKey>,
+    range: Option<crate::abstract_layer::common::common_helpers::BlockRange>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: crate::model::Model> BlockDeleteExecutor<'a, T> {
+    pub(crate) fn new(db: &'a Database) -> Self {
+        Self {
+            db,
+            key: resolve_clickhouse_block_key::<T>().ok(),
+            range: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn with_range(
+        mut self,
+        range: crate::abstract_layer::common::common_helpers::BlockRange,
+    ) -> Self {
+        self.range = Some(range);
+        self
+    }
+
+    fn missing_key_error() -> crate::OrmerError {
+        crate::OrmerError::UnsupportedFeature {
+            backend: crate::abstract_layer::DbType::ClickHouse,
+            feature: "block delete (declare #[hypertable(Duration)] or a recognized clickhouse(partition_by) time function on the model)",
+        }
+    }
+
+    /// 输出可观测的 discovery 语句；执行协议先通过该语句枚举分区，
+    /// 再把筛选出的分区合并为一条 `ALTER TABLE ... DROP PARTITION`。
+    pub fn to_sql(&self) -> crate::Result<crate::abstract_layer::common::SqlStatement> {
+        let table_name = T::table_name_for_db(crate::abstract_layer::DbType::ClickHouse)
+            .replace('\'', "''");
+        Ok(crate::abstract_layer::common::SqlStatement::single(
+            crate::abstract_layer::DbType::ClickHouse,
+            format!(
+                "SELECT DISTINCT partition FROM system.parts \
+                 WHERE database = currentDatabase() AND table = '{table_name}' AND active"
+            ),
+            Vec::new(),
+        ))
+    }
+
+    /// 执行按块删除并返回删除的分区数。
+    pub async fn execute(
+        self,
+    ) -> crate::Result<crate::abstract_layer::common::BlockDeleteResult> {
+        let sql = self.to_sql()?;
+        self.execute_with_sql(sql).await
+    }
+
+    /// 执行 discovery 语句并只对完整落在区间内的分区下发一条 ALTER。
+    pub(crate) async fn execute_with_sql(
+        self,
+        sql: crate::abstract_layer::common::SqlStatement,
+    ) -> crate::Result<crate::abstract_layer::common::BlockDeleteResult> {
+        use crate::abstract_layer::common::common_helpers::AlignedBlockRange;
+        use crate::abstract_layer::common::BlockDeleteResult;
+
+        let _ = sql;
+        let Some(key) = self.key.clone() else {
+            return Err(Self::missing_key_error());
+        };
+        let Some(range) = self.range else {
+            return Err(crate::OrmerError::invalid_operation(
+                "block delete requires before(), between() or retain()",
+            ));
+        };
+        let Some(range) = AlignedBlockRange::align(range, key.unit, chrono::Utc::now())? else {
+            return Ok(BlockDeleteResult::default());
+        };
+
+        let keys = self.list_partition_keys::<T>(&key, &range).await?;
+        if keys.is_empty() {
+            return Ok(BlockDeleteResult::default());
+        }
+
+        let table_name = T::table_name_for_db(crate::abstract_layer::DbType::ClickHouse)
+            .replace('\'', "''");
+        let drops = keys
+            .iter()
+            .map(|key| format!("DROP PARTITION '{}'", key.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.db
+            .execute_sql(format!("ALTER TABLE {} {drops}", table_name))
+            .await?;
+        Ok(BlockDeleteResult {
+            blocks_dropped: keys.len() as u64,
+            rows_deleted: None,
+        })
+    }
+
+    /// 从 `system.parts` 枚举 active 分区，过滤出完整落在目标区间内的分区。
+    async fn list_partition_keys<T2: crate::model::Model>(
+        &self,
+        key: &crate::abstract_layer::common::common_helpers::BlockKey,
+        range: &crate::abstract_layer::common::common_helpers::AlignedBlockRange,
+    ) -> crate::Result<Vec<String>> {
+        use crate::model::Value;
+
+        let table_name = T2::table_name_for_db(crate::abstract_layer::DbType::ClickHouse)
+            .replace('\'', "''");
+        let rows = self
+            .db
+            .select_values(
+                format!(
+                    "SELECT DISTINCT partition FROM system.parts \
+                     WHERE database = currentDatabase() AND table = '{table_name}' AND active"
+                ),
+                Some(&["partition"]),
+            )
+            .await?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let Some(Value::Text(partition)) = row.into_iter().next() else {
+                continue;
+            };
+            let Some(block_start) = key.unit.parse_clickhouse_partition_key(&partition) else {
+                continue;
+            };
+            if range.contains_block(block_start) {
+                keys.push(partition);
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1106,5 +1276,196 @@ mod tests {
         assert!(code.contains("pub id: u64"), "{code}");
         assert!(code.contains("pub tags: Vec<i32>"), "{code}");
         assert!(code.contains("pub score: Option<f64>"), "{code}");
+    }
+}
+
+#[cfg(test)]
+mod block_delete_tests {
+    use super::resolve_clickhouse_block_key;
+    use crate::model::{ColumnSchema, Model, Row, TableOptions, Value};
+
+    fn column(name: &'static str, hypertable: Option<std::time::Duration>) -> ColumnSchema {
+        ColumnSchema {
+            rust_name: name,
+            name,
+            rust_type: "DateTime<Utc>",
+            hypertable,
+            ..empty_column(name)
+        }
+    }
+
+    fn empty_column(name: &'static str) -> ColumnSchema {
+        ColumnSchema {
+            rust_name: name,
+            name,
+            rust_type: "",
+            is_primary: false,
+            is_auto_increment: false,
+            is_nullable: false,
+            unique_group: None,
+            unique_name: None,
+            is_indexed: false,
+            index_group: None,
+            index_name: None,
+            index_order: None,
+            index_where: None,
+            foreign_key: None,
+            enum_variants: None,
+            data_type: None,
+            db_value_type: None,
+            default: None,
+            check: None,
+            hypertable: None,
+            hypertable_space: None,
+            compress: false,
+            compression: None,
+            index_method: None,
+            index_expression: None,
+            index_columns: None,
+        }
+    }
+
+    struct DeclaredPartition;
+
+    impl Model for DeclaredPartition {
+        const TABLE_NAME: &'static str = "ch_declared";
+        const COLUMNS: &'static [&'static str] = &["time"];
+        const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+        const TABLE_OPTIONS: Option<TableOptions> = Some(TableOptions {
+            clickhouse_partition_by: Some("toYYYYMM(time)"),
+            ..TableOptions::empty()
+        });
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn column_schema() -> Vec<ColumnSchema> {
+            vec![column("time", Some(std::time::Duration::from_secs(30 * 86_400)))]
+        }
+        fn query() -> Self::QueryBuilder {}
+        fn select() -> Self::QueryBuilder {}
+        fn from_row(_row: &Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn field_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn primary_key_columns() -> &'static [&'static str] {
+            &[]
+        }
+        fn primary_key_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    struct MismatchedPartition;
+
+    impl Model for MismatchedPartition {
+        const TABLE_NAME: &'static str = "ch_mismatched";
+        const COLUMNS: &'static [&'static str] = &["time"];
+        const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+        const TABLE_OPTIONS: Option<TableOptions> = Some(TableOptions {
+            clickhouse_partition_by: Some("toYYYY(time)"),
+            ..TableOptions::empty()
+        });
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn column_schema() -> Vec<ColumnSchema> {
+            vec![column("time", Some(std::time::Duration::from_secs(86_400)))]
+        }
+        fn query() -> Self::QueryBuilder {}
+        fn select() -> Self::QueryBuilder {}
+        fn from_row(_row: &Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn field_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn primary_key_columns() -> &'static [&'static str] {
+            &[]
+        }
+        fn primary_key_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    struct CustomPartition;
+
+    impl Model for CustomPartition {
+        const TABLE_NAME: &'static str = "ch_custom";
+        const COLUMNS: &'static [&'static str] = &["time"];
+        const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+        const TABLE_OPTIONS: Option<TableOptions> = Some(TableOptions {
+            clickhouse_partition_by: Some("intDiv(time, 86400)"),
+            ..TableOptions::empty()
+        });
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn column_schema() -> Vec<ColumnSchema> {
+            vec![column("time", None)]
+        }
+        fn query() -> Self::QueryBuilder {}
+        fn select() -> Self::QueryBuilder {}
+        fn from_row(_row: &Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+        fn field_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        fn primary_key_columns() -> &'static [&'static str] {
+            &[]
+        }
+        fn primary_key_values(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn declared_partition_by_is_preferred_and_consistent() {
+        // toYYYYMM(time) → 月粒度，与 30d 时长映射一致
+        let key = resolve_clickhouse_block_key::<DeclaredPartition>().unwrap();
+        assert_eq!(key.time_column, "time");
+        assert_eq!(
+            key.unit,
+            crate::abstract_layer::common::common_helpers::PartitionUnit::Month
+        );
+    }
+
+    #[test]
+    fn partition_by_mismatching_hypertable_duration_is_rejected() {
+        // toYYYY(time) 是年粒度，与按天分块的 #[hypertable] 声明不一致
+        let error = resolve_clickhouse_block_key::<MismatchedPartition>().unwrap_err();
+        assert!(matches!(error, crate::OrmerError::InvalidOperation { .. }));
+    }
+
+    #[test]
+    fn unrecognized_partition_expression_is_rejected_with_guidance() {
+        let error = resolve_clickhouse_block_key::<CustomPartition>().unwrap_err();
+        match error {
+            crate::OrmerError::UnsupportedFeature { feature, .. } => {
+                assert!(feature.contains("partition_by"), "unexpected: {feature}");
+                assert!(feature.contains("execute_sql"), "unexpected: {feature}");
+            }
+            other => panic!("expected UnsupportedFeature, got {other:?}"),
+        }
     }
 }

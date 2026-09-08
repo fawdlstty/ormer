@@ -181,7 +181,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
@@ -204,7 +204,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS INT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
@@ -218,7 +218,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
@@ -232,7 +232,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0.0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS FLOAT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "0.0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0.0".to_string(),
@@ -246,7 +246,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "FALSE".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "FALSE".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "FALSE".to_string(),
@@ -260,7 +260,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
@@ -277,7 +277,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "X''".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('' AS VARBINARY(MAX))".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "X''".to_string(),
@@ -291,7 +291,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
@@ -310,7 +310,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
@@ -324,7 +324,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("1970-01-01T00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
@@ -338,7 +338,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("1970-01-01T00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
@@ -352,7 +352,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01' AS DATE)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01' AS DATE)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("1970-01-01"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01"),
@@ -366,7 +366,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('00:00:00' AS TIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('00:00:00' AS TIME)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("00:00:00"),
@@ -380,7 +380,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('null' AS JSON)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => quote_sql_string("null"),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("null"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("null"),
@@ -398,7 +398,7 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => {
                 "CAST('00000000-0000-0000-0000-000000000000' AS UNIQUEIDENTIFIER)".to_string()
             }
-            #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
             _ => quote_sql_string("00000000-0000-0000-0000-000000000000"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("00000000-0000-0000-0000-000000000000"),
@@ -524,6 +524,16 @@ pub(crate) fn default_db_type() -> DbType {
     ))]
     {
         DbType::MSSQL
+    }
+    #[cfg(all(
+        not(feature = "sqlite"),
+        not(feature = "postgresql"),
+        not(feature = "mysql"),
+        not(feature = "mssql"),
+        feature = "influxdb"
+    ))]
+    {
+        DbType::InfluxDB
     }
 }
 
@@ -742,6 +752,11 @@ fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()
             backend: db_type,
             feature: "row locking",
         }),
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        }),
     }
 }
 
@@ -812,6 +827,8 @@ fn distinct_on_native(db_type: DbType) -> bool {
         DbType::ClickHouse => false,
         #[cfg(feature = "questdb")]
         DbType::QuestDB => false,
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => false,
     }
 }
 
@@ -920,6 +937,11 @@ fn validate_grouping_clause(
         }),
         #[cfg(feature = "questdb")]
         DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "advanced GROUP BY syntax",
+        }),
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "advanced GROUP BY syntax",
         }),
@@ -4067,6 +4089,8 @@ impl<T: Model> Select<T> {
             DbType::MySQL => "WITH RECURSIVE",
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "WITH RECURSIVE",
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => "WITH RECURSIVE",
         };
 
         write!(

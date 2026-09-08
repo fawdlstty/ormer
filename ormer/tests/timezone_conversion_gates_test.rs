@@ -53,6 +53,15 @@ fn clickhouse_rejects_timezone_conversion() {
 
 #[test]
 #[cfg(feature = "questdb")]
-fn questdb_rejects_timezone_conversion() {
-    assert_timezone_conversion_is_rejected(DbType::QuestDB);
+fn questdb_generates_to_timezone_conversion() {
+    // QuestDB 提供原生 to_timezone，时区转换不再被门禁拦截
+    let (sql, _) = ormer::Select::<TimezoneEvent>::new()
+        .map_to(|event| event.occurred_at.at_time_zone("Asia/Shanghai"))
+        .try_to_sql_with_params(DbType::QuestDB)
+        .expect("QuestDB must support timezone conversion via to_timezone");
+
+    assert!(
+        sql.contains("to_timezone(") && sql.contains("'Asia/Shanghai'"),
+        "unexpected SQL: {sql}"
+    );
 }

@@ -311,13 +311,53 @@ db.delete::<User>()
     .await?;
 ```
 
+## 按块删除 (Block Delete)
+
+时序数据按整块清理：只删完整落在目标时间范围之外的块（TimescaleDB chunk、QuestDB 分区、ClickHouse partition），边界所在的块保留。模型需要 `#[hypertable(Duration)]` 声明（见模型定义）。
+
+```rust
+// 删除 30 天前的整块数据
+let result = db
+    .delete_blocks::<CpuUsage>()
+    .before(chrono::Utc::now() - chrono::Duration::days(30))
+    .execute()
+    .await?;
+
+result.blocks_dropped;          // 删除的块数（尽力而为，回退路径为 0）
+result.rows_deleted;            // 影响行数（仅回退路径有值）
+
+// 保留最近 30 天（等价于 before(now - 30d)）
+db.delete_blocks::<CpuUsage>().retain(std::time::Duration::from_secs(30 * 86400)).execute().await?;
+
+// 删除指定时间段内的完整块（两端对齐到块边界）
+db.delete_blocks::<CpuUsage>().between(start, end).execute().await?;
+```
+
+后端差异：
+
+| 后端 | 执行方式 |
+|---|---|
+| PostgreSQL（装 TimescaleDB） | `drop_chunks`，服务端整块语义 |
+| PostgreSQL（无 TimescaleDB） | 回退为对齐边界行删除 |
+| QuestDB | `ALTER TABLE ... DROP PARTITION`（分区粒度由 `#[hypertable]` 时长映射，建表时生效） |
+| ClickHouse | 枚举分区后合并一条 `ALTER TABLE ... DROP PARTITION`（`partition_by` 须为 `toStartOfHour`/`toYYYYMMDD`/`toMonday`/`toYYYYMM`/`toYYYY`） |
+| InfluxDB | v2 `/api/v2/delete` 按时间范围删除（服务端 shard 语义，时间列为 `#[hypertable]` 列或唯一的 `DateTime` `#[primary]` 列） |
+| SQLite / MySQL / MSSQL / DuckDB | 回退为对齐边界行删除 |
+
 ## 表管理
 
 ```rust
 db.create_table::<User>().execute().await?;
 
+// 清空表数据（PostgreSQL / QuestDB 生成 TRUNCATE TABLE）
+db.truncate_table::<User>().execute().await?;
+
 db.drop_table::<User>().execute().await?;
 ```
+
+QuestDB 说明：不支持行级 `DELETE`，清空数据用 `truncate_table`，按时间清理用 `delete_blocks`（见上文）；
+`UPDATE` 不能修改 `#[hypertable]` 声明的 designated timestamp 列，尝试更新会返回 `UnsupportedFeature`；
+查询中的 `at_time_zone("Asia/Shanghai")` 会生成 QuestDB 原生的 `to_timezone(ts, 'Asia/Shanghai')`。
 
 ## Typed DSL raw 表达式
 

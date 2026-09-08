@@ -312,13 +312,55 @@ db.delete::<User>()
     .await?;
 ```
 
+## Block Delete
+
+Time-series data can be cleaned up in whole blocks: only blocks fully outside the target time range are dropped (TimescaleDB chunks, QuestDB partitions, ClickHouse partitions); the block containing the boundary is kept. The model needs a `#[hypertable(Duration)]` declaration (see model definition).
+
+```rust
+// Drop whole blocks older than 30 days
+let result = db
+    .delete_blocks::<CpuUsage>()
+    .before(chrono::Utc::now() - chrono::Duration::days(30))
+    .execute()
+    .await?;
+
+result.blocks_dropped;          // blocks dropped (best effort; 0 on the fallback path)
+result.rows_deleted;            // affected rows (fallback path only)
+
+// Retain the last 30 days (equivalent to before(now - 30d))
+db.delete_blocks::<CpuUsage>().retain(std::time::Duration::from_secs(30 * 86400)).execute().await?;
+
+// Drop whole blocks inside a time window (both ends aligned to block boundaries)
+db.delete_blocks::<CpuUsage>().between(start, end).execute().await?;
+```
+
+Backend differences:
+
+| Backend | Execution |
+|---|---|
+| PostgreSQL (with TimescaleDB) | `drop_chunks`, server-side whole-block semantics |
+| PostgreSQL (without TimescaleDB) | falls back to aligned range row deletion |
+| QuestDB | `ALTER TABLE ... DROP PARTITION` (partition unit mapped from the `#[hypertable]` duration at table creation) |
+| ClickHouse | enumerates partitions then merges into one `ALTER TABLE ... DROP PARTITION` (`partition_by` must be `toStartOfHour`/`toYYYYMMDD`/`toMonday`/`toYYYYMM`/`toYYYY`) |
+| InfluxDB | v2 `/api/v2/delete` by time range (server-side shard semantics; the time column is the `#[hypertable]` column or the single `DateTime` `#[primary]` column) |
+| SQLite / MySQL / MSSQL / DuckDB | falls back to aligned range row deletion |
+
 ## Table Management
 
 ```rust
 db.create_table::<User>().execute().await?;
 
+// Clear table data (PostgreSQL / QuestDB render TRUNCATE TABLE)
+db.truncate_table::<User>().execute().await?;
+
 db.drop_table::<User>().execute().await?;
 ```
+
+QuestDB notes: row-level `DELETE` is unsupported — use `truncate_table` to clear
+data and `delete_blocks` for time-based retention (see above). `UPDATE` cannot
+modify the designated timestamp column declared via `#[hypertable]`; attempts
+return `UnsupportedFeature`. `at_time_zone("Asia/Shanghai")` in queries renders
+the native `to_timezone(ts, 'Asia/Shanghai')`.
 
 ## Typed DSL Raw Expressions
 

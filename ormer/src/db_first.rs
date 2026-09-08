@@ -622,6 +622,8 @@ fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> String {
         DbType::DuckDB => duckdb_rust_type(raw),
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => clickhouse_rust_type(raw),
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => unreachable!("InfluxDB does not support db-first generation"),
     }
 }
 

@@ -19,6 +19,8 @@ db.migrate_table::<User>().execute().await?;
 
 If a target conversion cannot be proven safe, `plan()` or `execute()` returns an error. SQLite complex changes are applied by rebuilding the table, and invalid legacy values fail the migration and roll back.
 
+Schema evolution that cannot be inferred in place (primary-key changes, NOT NULL columns added to populated tables, and so on) returns `OrmerError::UnmigratableSchema`; check it with `err.is_unmigratable_schema()` so callers can choose a drop-and-recreate strategy instead of treating it like any other migration failure.
+
 ## Versioned Migrations
 
 Implement `Migration` and pass migrations to `db.migrations()`:
@@ -104,6 +106,25 @@ ClickHouse CREATE TABLE DDL that must specify an engine.
 
 On populated DuckDB and ClickHouse tables, inferred column type changes are
 rejected during planning; use an explicit staged migration for those tables.
+
+InfluxDB uses the same migration entry point: there is no table-creation DDL
+(the measurement is created by the first write), migration steps execute one at
+a time without rollback, and history is recorded in the `__ormer_migrations`
+measurement.
+
+## QuestDB migrations
+
+QuestDB (8.3+ required) executes migrations one by one and keeps history in
+`__ormer_migrations` (with a `rolled_back` flag):
+
+- `AddColumn` and `DropColumn` work; `RenameColumn` renders
+  `ALTER TABLE t RENAME COLUMN old TO new`.
+- QuestDB cannot change column types, so `AlterColumn` and type-change
+  migrations stay gated; hand-write a "new table + INSERT SELECT" rebuild.
+- `migrate_table` introspects schemas via `table_columns('name')`. QuestDB has
+  no primary-key or NOT NULL constraints, so those are not compared; the
+  designated timestamp clause is generated at create-table time and existing
+  tables are never rebuilt destructively by auto migration.
 
 `migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
 

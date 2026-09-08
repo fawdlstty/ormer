@@ -44,6 +44,8 @@ async fn test_data_type_override_impl(
         ormer::DbType::DuckDB => {}
         #[cfg(feature = "clickhouse")]
         ormer::DbType::ClickHouse => {}
+        #[cfg(feature = "influxdb")]
+        ormer::DbType::InfluxDB => {}
     }
 
     Ok(())

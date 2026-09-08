@@ -9,6 +9,7 @@
 - MSSQL
 - DuckDB（支持本地连接、建表、CRUD、事务、原生 SQL、流式查询、schema introspection 和连接池）
 - ClickHouse（支持 HTTP 客户端、统一原生 SQL、类型化原生查询、健康检查、删表、schema introspection 和迁移）
+- InfluxDB（支持 HTTP 客户端、Line Protocol 写入、InfluxQL/SQL 查询、按时间范围删除、健康检查、删表和迁移）
 
 ## 启用特性
 
@@ -48,12 +49,23 @@ ormer = { version = "0.2", features = ["sqlite"] }
 - 可选 query 参数：`user`、`password`、`access_token`、`compression=none|lz4`
   以及其他 ClickHouse settings（例如 `max_execution_time=3`）。
 
+**InfluxDB:**
+- 2.x：`http://localhost:8086?org=dev&bucket=metrics&token=my-token`
+- 1.x：`http://localhost:8086?database=telegraf&user=admin&password=secret`
+
 DuckDB 可通过统一的 `Database::connect(DbType::DuckDB, "app.duckdb")` 使用。
 `Vec<i32>`、`Vec<i64>`、`Vec<Option<i64>>` 和 `Vec<String>` 字段会映射为 DuckDB list。
 ClickHouse 同样通过统一的 `Database::connect(DbType::ClickHouse, "...")` 使用。
 原生操作使用 `execute_sql` 和 `select_sql<T>`；事务、关系写入、行式更新、冲突写入和没有 engine 元数据的 `create_table::<T>()` 会返回 `UnsupportedFeature`。
 ClickHouse 建表必须显式指定 engine，例如 `MergeTree ORDER BY (id)`；需要 engine 的 DDL 请使用 `execute_sql(ormer::sql(...))` 或 `MigrationStep::Sql`。
 ClickHouse DDL 不支持事务，迁移步骤逐条执行；中途失败时已执行的步骤不会自动回滚。
+InfluxDB 通过 `Database::connect(DbType::InfluxDB, "...")` 使用。
+`insert` 会被渲染为 Line Protocol 批量写入，`select` 复用统一查询构建器渲染为 InfluxQL/SQL 子集；
+事务、JOIN、关系加载、行级更新、upsert、`RETURNING` 与自增会返回 `UnsupportedFeature`，
+删除仅支持按时间范围（`delete_blocks`）。
+时间戳复用 `#[primary]`（必须是时间类型，有且仅有一个），标签复用 `#[index]`（类型必须为 `String`）；
+表级保留策略使用 `#[influxdb(retention = std::time::Duration::from_secs(30 * 86400))]`，
+`create_table` 时生成 `CREATE RETENTION POLICY`。
 
 ## 示例
 

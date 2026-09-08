@@ -547,7 +547,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.filter(f))
                     }
@@ -576,7 +576,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.append_filter_expr(expr))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.append_filter_expr(expr))
                     }
@@ -608,7 +608,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.with_context_filters(filters))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.with_context_filters(filters))
                     }
@@ -633,7 +633,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.without_filter(name))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.without_filter(name))
                     }
@@ -657,7 +657,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter_dynamic(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter_dynamic(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.filter_dynamic(f))
                     }
@@ -690,7 +690,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.route_table(key, value))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.route_table(key, value))
                     }
@@ -719,7 +719,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.with_table_route(route))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.with_table_route(route))
                     }
@@ -744,7 +744,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.order_by(f))
                     }
@@ -769,7 +769,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.order_by_desc(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.order_by_desc(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.order_by_desc(f))
                     }
@@ -797,7 +797,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.order_by_dynamic(f))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.order_by_dynamic(f))
                     }
@@ -822,7 +822,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.cursor_by(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.cursor_by(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.cursor_by(f))
                     }
@@ -846,7 +846,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.after(cursor)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.after(cursor)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.after(cursor))
                     }
@@ -870,7 +870,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.before(cursor)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.before(cursor)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.before(cursor))
                     }
@@ -891,7 +891,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.limit(limit)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.limit(limit)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.limit(limit))
                     }
@@ -912,7 +912,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.range(range))
                     }
@@ -945,7 +945,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.descendants(f, root_id))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.descendants(f, root_id))
                     }
@@ -978,7 +978,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::DuckDB(exec) => {
                         $executor_name::DuckDB(exec.ancestors(f, leaf_id))
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.ancestors(f, leaf_id))
                     }
@@ -1000,10 +1000,12 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => exec.fetch_page().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.fetch_page().await,
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
-                        $crate::abstract_layer::common::unified::clickhouse_fetch_page(db, select)
-                            .await
+                        $crate::abstract_layer::common::unified::clickhouse_fetch_page_on_backend(
+                            db, select,
+                        )
+                        .await
                     }
                 }
             }
@@ -1021,7 +1023,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.distinct()),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.distinct()),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.distinct())
                     }
@@ -1044,7 +1046,7 @@ macro_rules! impl_unified_select_executor_methods {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.ignore(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.ignore(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::ClickHouse(db, select) => {
                         $executor_name::ClickHouse(db, select.ignore(f))
                     }
@@ -1077,7 +1079,7 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1098,7 +1100,7 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.model(model)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.model(model)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1115,7 +1117,7 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.to_sql(),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.to_sql(),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature {
@@ -1137,7 +1139,7 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.execute().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.execute().await,
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1206,7 +1208,7 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.returning().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.returning().await,
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1221,6 +1223,122 @@ macro_rules! impl_unified_delete_executor {
 
             fn into_future(self) -> Self::IntoFuture {
                 Box::pin(async move { self.execute().await })
+            }
+        }
+    };
+}
+
+/// 为统一的 BlockDeleteExecutor 生成 before/between/retain/to_sql/execute 链式 API
+#[macro_export]
+macro_rules! impl_unified_block_delete_executor {
+    ($executor_name:ident) => {
+        impl<'a, T: $crate::Model> $executor_name<'a, T> {
+            /// 删除所有「块结束时间 ≤ cutoff」的完整块（cutoff 向下对齐到块边界）。
+            pub fn before(self, cutoff: chrono::DateTime<chrono::Utc>) -> Self {
+                let range = $crate::abstract_layer::common::common_helpers::BlockRange::Before {
+                    cutoff,
+                };
+                self.with_range(range)
+            }
+
+            /// 删除完整落在 `[start, end)` 内的块（两端对齐到块边界）。
+            pub fn between(
+                self,
+                start: chrono::DateTime<chrono::Utc>,
+                end: chrono::DateTime<chrono::Utc>,
+            ) -> Self {
+                let range = $crate::abstract_layer::common::common_helpers::BlockRange::Between {
+                    start,
+                    end,
+                };
+                self.with_range(range)
+            }
+
+            /// 保留最近 `duration` 的数据，等价于 `before(now - duration)`，
+            /// `now` 取客户端执行时刻。
+            pub fn retain(self, duration: std::time::Duration) -> Self {
+                let range = $crate::abstract_layer::common::common_helpers::BlockRange::Retain {
+                    duration,
+                };
+                self.with_range(range)
+            }
+
+            fn with_range(
+                self,
+                range: $crate::abstract_layer::common::common_helpers::BlockRange,
+            ) -> Self {
+                match self {
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => $executor_name::PostgreSQL(exec.with_range(range)),
+                    #[cfg(feature = "clickhouse")]
+                    $executor_name::ClickHouse(exec) => $executor_name::ClickHouse(exec.with_range(range)),
+                    #[cfg(feature = "influxdb")]
+                    $executor_name::InfluxDB(exec) => $executor_name::InfluxDB(exec.with_range(range)),
+                    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql", feature = "duckdb"))]
+                    $executor_name::Fallback {
+                        db_type,
+                        key,
+                        range: _,
+                        delete,
+                    } => $executor_name::Fallback {
+                        db_type,
+                        key,
+                        range: Some(range),
+                        delete,
+                    },
+                }
+            }
+
+            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
+                match self {
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.to_sql(),
+                    #[cfg(feature = "clickhouse")]
+                    $executor_name::ClickHouse(exec) => exec.to_sql(),
+                    #[cfg(feature = "influxdb")]
+                    $executor_name::InfluxDB(exec) => exec.to_sql(),
+                    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql", feature = "duckdb"))]
+                    $executor_name::Fallback {
+                        db_type,
+                        key,
+                        range,
+                        ..
+                    } => {
+                        let key = key.as_ref().ok_or_else(|| $crate::OrmerError::UnsupportedFeature {
+                            backend: *db_type,
+                            feature: "block delete (declare #[hypertable(Duration)] on the model's time column)",
+                        })?;
+                        let range = range.ok_or_else(|| $crate::OrmerError::invalid_operation(
+                            "block delete requires before(), between() or retain()",
+                        ))?;
+                        let Some(range) = $crate::abstract_layer::common::common_helpers::AlignedBlockRange::align(range, key.unit, chrono::Utc::now())? else {
+                            return Ok($crate::SqlStatement::batch(*db_type, Vec::new()));
+                        };
+                        match $crate::abstract_layer::common::common_helpers::build_block_delete_fallback_sql::<T>(*db_type, key, &range)? {
+                            Some((sql, params)) => Ok($crate::SqlStatement::batch(
+                                *db_type,
+                                vec![$crate::SingleSqlStatement::new(sql, params)],
+                            )),
+                            None => Ok($crate::SqlStatement::batch(*db_type, Vec::new())),
+                        }
+                    }
+                }
+            }
+
+            pub async fn execute(self) -> crate::Result<$crate::abstract_layer::common::BlockDeleteResult> {
+                match self {
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.execute().await,
+                    #[cfg(feature = "clickhouse")]
+                    $executor_name::ClickHouse(exec) => exec.execute().await,
+                    #[cfg(feature = "influxdb")]
+                    $executor_name::InfluxDB(exec) => exec.execute().await,
+                    #[cfg(any(feature = "sqlite", feature = "mysql", feature = "mssql", feature = "duckdb"))]
+                    fallback @ $executor_name::Fallback { .. } => {
+                        let sql = fallback.to_sql()?;
+                        <$executor_name<'a, T> as $crate::SqlExecutor>::execute_with_sql(fallback, sql).await
+                    }
+                }
             }
         }
     };
@@ -1249,7 +1367,7 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1271,7 +1389,7 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.set(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.set(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1314,7 +1432,7 @@ macro_rules! impl_unified_update_executor {
                         $executor_name::DuckDB(exec) => {
                             result = $executor_name::DuckDB(exec.set_model(model_ref));
                         }
-                        #[cfg(feature = "clickhouse")]
+                        #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                         $executor_name::Unsupported { .. } => return result,
                     }
                 }
@@ -1361,7 +1479,7 @@ macro_rules! impl_unified_update_executor {
                             result =
                                 $executor_name::DuckDB(exec.set_model_fields(model_ref, &fields));
                         }
-                        #[cfg(feature = "clickhouse")]
+                        #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                         $executor_name::Unsupported { .. } => return result,
                     }
                 }
@@ -1380,7 +1498,7 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MSSQL(exec) => exec.to_sql(),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.to_sql(),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature {
@@ -1402,7 +1520,7 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MSSQL(exec) => exec.execute().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.execute().await,
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1471,7 +1589,7 @@ macro_rules! impl_unified_update_executor {
                     $executor_name::MSSQL(exec) => exec.returning().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.returning().await,
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1517,14 +1635,14 @@ macro_rules! impl_unified_collect_future {
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(future.into_future()),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::ClickHouse(db, select, _) => Box::pin(async move {
-                        $crate::abstract_layer::common::unified::clickhouse_select_models(
+                        $crate::abstract_layer::common::unified::clickhouse_select_models_on_backend(
                             db, select,
                         )
                         .await
                     }),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {
                         backend, feature, ..
                     } => Box::pin(async move {
@@ -1562,7 +1680,7 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::MSSQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(async move { future.await }),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {
                         backend, feature, ..
                     } => Box::pin(async move {
@@ -1597,7 +1715,7 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1618,7 +1736,7 @@ macro_rules! impl_unified_join_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1652,7 +1770,7 @@ macro_rules! impl_unified_join_collect_future {
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(future.into_future()),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {
                         backend, feature, ..
                     } => Box::pin(async move {
@@ -1687,7 +1805,7 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1708,7 +1826,7 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.range(range)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.range(range)),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1739,7 +1857,7 @@ macro_rules! impl_unified_related_select_executor {
                     $executor_name::DuckDB(exec) => {
                         RelatedCollectFuture::DuckDB(exec.into_collect_future())
                     }
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => RelatedCollectFuture::Unsupported {
@@ -1781,7 +1899,7 @@ macro_rules! impl_unified_related_collect_future {
                     $future_name::MSSQL(future) => Box::pin(future.into_future()),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(future.into_future()),
-                    #[cfg(feature = "clickhouse")]
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {
                         backend, feature, ..
                     } => Box::pin(async move {

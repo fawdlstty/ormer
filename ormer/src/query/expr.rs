@@ -975,6 +975,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB JSON text extraction is gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonPathText { expr, path } => {
@@ -1021,6 +1023,8 @@ impl SqlExpr {
                     DbType::QuestDB => unreachable!(
                         "QuestDB JSON path text extraction is gated by validate_for_db"
                     ),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonPathValue {
@@ -1131,6 +1135,8 @@ impl SqlExpr {
                     DbType::QuestDB => unreachable!(
                         "QuestDB JSON path value extraction is gated by validate_for_db"
                     ),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonPathExists { expr, path } => {
@@ -1177,6 +1183,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB JSON path existence is gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonContains { left, right } => {
@@ -1212,6 +1220,8 @@ impl SqlExpr {
                     DbType::DuckDB => unreachable!("{unsupported}"),
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => unreachable!("{unsupported}"),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonSet { expr, path, value } => {
@@ -1273,6 +1283,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB JSON updates are gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::ArrayContains { left, right } => {
@@ -1301,6 +1313,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB array containment is gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::JsonRemove { expr, path } => {
@@ -1336,6 +1350,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB JSON updates are gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::ArrayOverlaps { left, right } => {
@@ -1364,6 +1380,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB array overlap is gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::ArrayLen { expr } => {
@@ -1385,6 +1403,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         unreachable!("QuestDB array length is gated by validate_for_db")
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::WindowFunction {
@@ -1456,6 +1476,8 @@ impl SqlExpr {
                     DbType::DuckDB => format!("date_trunc('{}', {})", unit.pg_name(), value),
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => format!("date_trunc('{}', {})", unit.pg_name(), value),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::DatePart { expr, part } => {
@@ -1479,6 +1501,8 @@ impl SqlExpr {
                     DbType::DuckDB => format!("date_part('{}', {})", part.name(), value),
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => format!("EXTRACT({} FROM {})", part.name_upper(), value),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::AtTimeZone { expr, timezone } => {
@@ -1492,12 +1516,13 @@ impl SqlExpr {
                     DbType::MSSQL => format!("{value} AT TIME ZONE '{zone}'"),
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => format!("CONVERT_TZ({value}, 'UTC', '{zone}')"),
+                    // QuestDB 原生支持 to_timezone(ts, tz)，语义为把 UTC 时间戳转为目标时区
+                    #[cfg(feature = "questdb")]
+                    DbType::QuestDB => format!("to_timezone({value}, '{zone}')"),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                     #[cfg(any(feature = "sqlite", feature = "duckdb", feature = "clickhouse"))]
                     _ => unreachable!("timezone conversion is gated by validate_for_db"),
-                    #[cfg(feature = "questdb")]
-                    DbType::QuestDB => {
-                        unreachable!("QuestDB timezone conversion is gated by validate_for_db")
-                    }
                 }
             }
             SqlExpr::DateAdd {
@@ -1543,6 +1568,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         format!("dateadd('{}', {}, {})", unit.pg_name(), delta, value)
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::DateDiff { left, right, part } => {
@@ -1587,6 +1614,8 @@ impl SqlExpr {
                     DbType::QuestDB => {
                         format!("datediff('{}', {}, {})", part.name(), left_sql, right_sql)
                     }
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
                 }
             }
             SqlExpr::Now => match db_type {
@@ -1604,6 +1633,8 @@ impl SqlExpr {
                 DbType::DuckDB => "now()".to_string(),
                 #[cfg(feature = "questdb")]
                 DbType::QuestDB => "NOW()".to_string(),
+                #[cfg(feature = "influxdb")]
+                DbType::InfluxDB => unreachable!("InfluxDB does not use SQL expressions"),
             },
             SqlExpr::Row(exprs) => {
                 let values = exprs
@@ -1716,6 +1747,11 @@ impl SqlExpr {
                     DbType::DuckDB => unsupported(),
                     #[cfg(feature = "questdb")]
                     DbType::QuestDB => unsupported(),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "JSON containment predicates",
+                    }),
                 }
             }
             SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
@@ -1746,8 +1782,7 @@ impl SqlExpr {
                 #[cfg(any(
                     feature = "sqlite",
                     feature = "duckdb",
-                    feature = "clickhouse",
-                    feature = "questdb"
+                    feature = "clickhouse"
                 ))]
                 let unsupported = || -> crate::Result<()> {
                     Err(crate::OrmerError::UnsupportedFeature {
@@ -1768,8 +1803,14 @@ impl SqlExpr {
                     DbType::DuckDB => unsupported(),
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => unsupported(),
+                    // QuestDB 提供 to_timezone / to_utc 原生函数
                     #[cfg(feature = "questdb")]
-                    DbType::QuestDB => unsupported(),
+                    DbType::QuestDB => Ok(()),
+                    #[cfg(feature = "influxdb")]
+                    DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "timezone conversion",
+                    }),
                 }
             }
             SqlExpr::DateAdd { amount, .. } => amount.validate_for_db(db_type),
@@ -1961,6 +2002,8 @@ pub(crate) fn aggregate_filter_native(db_type: DbType) -> bool {
         DbType::ClickHouse => false,
         #[cfg(feature = "questdb")]
         DbType::QuestDB => true,
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => false,
     }
 }
 

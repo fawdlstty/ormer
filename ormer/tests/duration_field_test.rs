@@ -41,6 +41,8 @@ async fn test_duration_sql_type_impl(
         ormer::DbType::DuckDB => {}
         #[cfg(feature = "clickhouse")]
         ormer::DbType::ClickHouse => {}
+        #[cfg(feature = "influxdb")]
+        ormer::DbType::InfluxDB => {}
     }
 
     Ok(())

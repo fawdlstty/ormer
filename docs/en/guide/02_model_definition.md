@@ -137,6 +137,19 @@ struct Event {
 }
 ```
 
+
+## Time-series Chunking
+
+`#[hypertable(Duration)]` is the unified chunking declaration for time-series backends: TimescaleDB uses it as the chunk interval, QuestDB maps it to `timestamp(col) PARTITION BY <unit>` at table creation, ClickHouse derives `PARTITION BY` from it when `partition_by` is not declared, and `delete_blocks` depends on it. InfluxDB resolves its timestamp column from the same declaration, falling back to the single `DateTime` `#[primary]` field. Duration to partition-unit mapping:
+
+| Duration | Unit | QuestDB / ClickHouse |
+|---|---|---|
+| `< 1h` | hour | `HOUR` / `toStartOfHour(ts)` |
+| `1h ≤ d < 7d` | day | `DAY` / `toYYYYMMDD(ts)` |
+| `7d ≤ d < 30d` | week | `WEEK` / `toMonday(ts)` |
+| `30d ≤ d < 365d` | month | `MONTH` / `toYYYYMM(ts)` |
+| `≥ 365d` | year | `YEAR` / `toYYYY(ts)` |
+
 For TimescaleDB, bare `#[hypertable]` can mark a `String` field so PostgreSQL routes different string values to different physical tables; SQLite, MySQL, and MSSQL do not enable this automatic split. The route key is the field's SQL column name (or the Rust field name when `#[column]` is not set). Inserts read it from the model value; queries and table creation pass it explicitly with `route_table`.
 
 ```rust
@@ -163,6 +176,23 @@ let rows: Vec<Event> = db
     .route_table("tenant", "acme")
     .collect()
     .await?;
+```
+
+## InfluxDB Models
+
+One model maps to one measurement: the timestamp reuses `#[primary]` (exactly one time-typed field, no `auto`), tags reuse `#[index]` (must be `String`), and the remaining fields are measurements. Models declaring `#[influxdb(...)]` fail to compile when these constraints are violated. Table-level retention policy:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "cpu_usage"]
+#[influxdb(retention = std::time::Duration::from_secs(30 * 86400))] // optional, 30-day retention
+struct CpuUsage {
+    #[primary]
+    time: chrono::DateTime<chrono::Utc>,
+    #[index]
+    host: String,
+    usage: f64,
+}
 ```
 
 ## Field Attributes

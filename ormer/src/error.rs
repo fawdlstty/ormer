@@ -44,6 +44,10 @@ pub enum OrmerError {
     Migration {
         message: String,
     },
+    UnmigratableSchema {
+        table: String,
+        message: String,
+    },
     Pool {
         backend: DbType,
         message: String,
@@ -87,6 +91,19 @@ impl OrmerError {
         Self::Migration {
             message: message.into(),
         }
+    }
+
+    /// 自动迁移无法就地演进的 schema（如主键变更、缺省值的非空新列）。
+    /// 调用方通常以此决定是否删表重建；与普通迁移失败区分开。
+    pub fn unmigratable_schema(table: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::UnmigratableSchema {
+            table: table.into(),
+            message: message.into(),
+        }
+    }
+
+    pub fn is_unmigratable_schema(&self) -> bool {
+        matches!(self, Self::UnmigratableSchema { .. })
     }
 
     pub fn invalid_operation(message: impl Into<String>) -> Self {
@@ -156,6 +173,10 @@ impl OrmerError {
         if type_name.contains("clickhouse") {
             return Self::database(DbType::ClickHouse, message);
         }
+        #[cfg(feature = "influxdb")]
+        if type_name.contains("reqwest") {
+            return Self::database(DbType::InfluxDB, message);
+        }
         #[cfg(feature = "duckdb")]
         if type_name.contains("duckdb") || type_name.contains("duckcompat") {
             return Self::database(DbType::DuckDB, message);
@@ -218,6 +239,9 @@ impl fmt::Display for OrmerError {
                 write!(formatter, ": {message}")
             }
             Self::Migration { message } => write!(formatter, "migration error: {message}"),
+            Self::UnmigratableSchema { table, message } => {
+                write!(formatter, "unmigratable schema for table {table}: {message}")
+            }
             Self::Pool { backend, message } => {
                 write!(
                     formatter,
@@ -344,6 +368,8 @@ fn backend_name(backend: DbType) -> &'static str {
         DbType::DuckDB => "DuckDB",
         #[cfg(feature = "clickhouse")]
         DbType::ClickHouse => "ClickHouse",
+        #[cfg(feature = "influxdb")]
+        DbType::InfluxDB => "InfluxDB",
     }
 }
 

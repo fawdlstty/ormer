@@ -19,19 +19,20 @@ mod unified;
 pub use crate::hooks::WithoutHooksExecutor;
 pub use unified::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
-    CollectFuture, CreateTableExecutor, Database, DeleteExecutor, DerivedTableCollectFuture,
-    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
-    DropTableExecutor, GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture,
-    IncludedSelectExecutor, InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor,
-    InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture,
-    LeftJoinedSelectExecutor, MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture,
-    NestedInclude, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
-    RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder,
-    SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
+    BlockDeleteExecutor, BlockDeleteResult, CollectFuture, CreateTableExecutor, Database,
+    DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
+    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
+    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
+    InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
+    InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
+    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
+    RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder, SaveExecutor,
+    ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
     SelectStreamIterator, Transaction, TransactionFuture, TransactionInsertExecutor,
     TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
     TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
-    UpdateExecutor, UpdateGraphExecutor,
+    TruncateTableExecutor, UpdateExecutor, UpdateGraphExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出

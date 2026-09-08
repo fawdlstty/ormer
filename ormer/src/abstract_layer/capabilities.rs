@@ -9,11 +9,14 @@ pub struct Capabilities {
     pub insert_conflict: bool,
     pub insert_ignore: bool,
     pub row_delete: bool,
+    pub block_delete: bool,
     pub copy: bool,
     pub row_lock: bool,
     pub constraints: bool,
     pub schema_introspection: bool,
     pub advanced_grouping: bool,
+    /// 是否提供 `truncate_table` 执行器（当前为 PostgreSQL/QuestDB）。
+    pub truncate: bool,
 }
 
 impl Capabilities {
@@ -27,7 +30,10 @@ impl Capabilities {
                 ..Self::full_oltp()
             },
             #[cfg(feature = "postgresql")]
-            DbType::PostgreSQL => Self::full_oltp(),
+            DbType::PostgreSQL => Self {
+                truncate: true,
+                ..Self::full_oltp()
+            },
             #[cfg(feature = "questdb")]
             DbType::QuestDB => Self {
                 transactions: false,
@@ -36,11 +42,13 @@ impl Capabilities {
                 insert_conflict: false,
                 insert_ignore: false,
                 row_delete: false,
+                block_delete: true,
                 copy: false,
                 row_lock: false,
                 constraints: false,
-                schema_introspection: false,
+                schema_introspection: true,
                 advanced_grouping: false,
+                truncate: true,
             },
             #[cfg(feature = "mysql")]
             DbType::MySQL => Self {
@@ -68,10 +76,27 @@ impl Capabilities {
                 insert_conflict: false,
                 insert_ignore: false,
                 row_delete: false,
+                block_delete: true,
                 row_lock: false,
                 constraints: false,
                 schema_introspection: false,
                 ..Self::full_oltp()
+            },
+            #[cfg(feature = "influxdb")]
+            DbType::InfluxDB => Self {
+                transactions: false,
+                auto_increment: false,
+                dml_returning: false,
+                insert_conflict: false,
+                insert_ignore: false,
+                row_delete: false,
+                block_delete: true,
+                copy: false,
+                row_lock: false,
+                constraints: false,
+                schema_introspection: false,
+                advanced_grouping: false,
+                truncate: false,
             },
         }
     }
@@ -84,11 +109,13 @@ impl Capabilities {
             insert_conflict: true,
             insert_ignore: true,
             row_delete: true,
+            block_delete: true,
             copy: true,
             row_lock: true,
             constraints: true,
             schema_introspection: true,
             advanced_grouping: true,
+            truncate: false,
         }
     }
 }

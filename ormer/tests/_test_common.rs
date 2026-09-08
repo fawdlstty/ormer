@@ -154,6 +154,8 @@ macro_rules! test_on_all_dbs {
                         ormer::DbType::DuckDB => "DuckDB",
                         #[cfg(feature = "clickhouse")]
                         ormer::DbType::ClickHouse => "ClickHouse",
+                        #[cfg(feature = "influxdb")]
+                        ormer::DbType::InfluxDB => "InfluxDB",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);
@@ -190,6 +192,8 @@ macro_rules! test_on_all_dbs_result {
                         ormer::DbType::DuckDB => "DuckDB",
                         #[cfg(feature = "clickhouse")]
                         ormer::DbType::ClickHouse => "ClickHouse",
+                        #[cfg(feature = "influxdb")]
+                        ormer::DbType::InfluxDB => "InfluxDB",
                     };
 
                     println!("\n=== Testing on {} (config {}) ===", db_type_name, idx);

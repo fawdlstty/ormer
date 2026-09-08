@@ -34,6 +34,8 @@ rust_decimal = "1.42.1"
 bigdecimal = "0.4"
 # clickhouse HTTP client (optional; execution remains explicitly gated)
 clickhouse = { version = "~0.15.2", default-features = false, features = ["lz4", "chrono", "uuid"], optional = true }
+# InfluxDB v2 HTTP API
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 # sqlite
 turso = { version = "0.7.2", optional = true }
 # duckdb
@@ -67,7 +69,7 @@ all-features = true
 
 [features]
 default = ["sqlite"]
-full = ["sqlite", "postgresql", "questdb", "mysql", "mssql", "duckdb", "clickhouse"]
+full = ["sqlite", "postgresql", "questdb", "mysql", "mssql", "duckdb", "clickhouse", "influxdb"]
 sqlite = ["dep:turso"]
 postgresql = ["dep:tokio-postgres", "dep:postgres-types", "dep:bb8", "dep:bb8-postgres"]
 questdb = ["postgresql"]
@@ -75,6 +77,7 @@ mysql = ["dep:mysql_async"]
 mssql = ["dep:tiberius", "dep:tokio-util"]
 duckdb = ["sqlite", "dep:duckdb"]
 clickhouse = ["sqlite", "dep:clickhouse", "dep:serde"]
+influxdb = ["dep:reqwest"]
 
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io

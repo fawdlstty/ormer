@@ -12,7 +12,7 @@ use crate::model::{
     RelationSelection, TableRouteValue, ThroughRelation, Tracked, Value, WritableModel,
     normalize_table_name_for_db, routed_model_table_name_for_db,
 };
-#[cfg(feature = "clickhouse")]
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
 use crate::query::builder::Select;
 use crate::query::builder::{ContextFilter, DerivedSelect, DerivedTableSelect};
 use crate::query::builder::{FilterQuery, NamedFilterQuery, WhereExpr, WithoutFilterQuery};
@@ -191,6 +191,9 @@ use super::super::duckdb_backend;
 
 #[cfg(feature = "clickhouse")]
 use super::super::clickhouse_backend;
+
+#[cfg(feature = "influxdb")]
+use super::super::influxdb_backend;
 
 fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value> {
     let mut seen = std::collections::HashSet::new();
@@ -442,7 +445,11 @@ fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
         super::super::DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
         #[cfg(feature = "mysql")]
         super::super::DbType::MySQL => crate::model::quote_identifier(db_type, normalized),
-        #[cfg(any(feature = "duckdb", feature = "clickhouse"))]
+        #[cfg(any(
+            feature = "duckdb",
+            feature = "clickhouse",
+            feature = "influxdb"
+        ))]
         _ => crate::model::quote_identifier(db_type, normalized),
     }
 }
@@ -461,6 +468,8 @@ pub enum Database {
     DuckDB(duckdb_backend::Database),
     #[cfg(feature = "clickhouse")]
     ClickHouse(super::super::clickhouse_backend::Database),
+    #[cfg(feature = "influxdb")]
+    InfluxDB(super::super::influxdb_backend::Database),
 }
 
 pub struct ReplicatedDatabaseBuilder {
@@ -710,6 +719,117 @@ where
     Ok(crate::query::builder::CursorPage::new(items, next_cursor))
 }
 
+/// 渲染 InfluxQL 并解析结果为模型集合（与 ClickHouse 路径共用统一查询构建器）。
+#[cfg(feature = "influxdb")]
+async fn influx_select_models<T, C>(
+    db: &influxdb_backend::Database,
+    select: Select<T>,
+) -> crate::Result<C>
+where
+    T: Model + Send + Sync,
+    C: FromIterator<T>,
+{
+    let (sql, params) = select.try_to_sql_with_params(super::super::DbType::InfluxDB)?;
+    let columns = T::columns();
+    let rows = db
+        .select_values(RawSql::new(sql).with_params(params), Some(&columns))
+        .await?;
+    rows.iter()
+        .map(|values| T::from_row_values(values))
+        .collect()
+}
+
+#[cfg(feature = "influxdb")]
+async fn influx_select_models_buffered<T>(
+    db: &influxdb_backend::Database,
+    select: Select<T>,
+) -> crate::Result<Vec<T>>
+where
+    T: Model,
+{
+    let (sql, params) = select.try_to_sql_with_params(super::super::DbType::InfluxDB)?;
+    let columns = T::columns();
+    let rows = db
+        .select_values(RawSql::new(sql).with_params(params), Some(&columns))
+        .await?;
+    rows.iter()
+        .map(|values| T::from_row_values(values))
+        .collect()
+}
+
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+async fn clickhouse_select_models_buffered_on_backend<T>(
+    db: ClickHouseSelectBackend<'_>,
+    select: Select<T>,
+) -> crate::Result<Vec<T>>
+where
+    T: Model,
+{
+    match db {
+        #[cfg(feature = "clickhouse")]
+        ClickHouseSelectBackend::ClickHouse(db) => {
+            clickhouse_select_models_buffered(db, select).await
+        }
+        #[cfg(feature = "influxdb")]
+        ClickHouseSelectBackend::Influx(db) => {
+            influx_select_models_buffered(db, select).await
+        }
+    }
+}
+
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+async fn clickhouse_select_models_on_backend<T, C>(
+    db: ClickHouseSelectBackend<'_>,
+    select: Select<T>,
+) -> crate::Result<C>
+where
+    T: Model + Send + Sync,
+    C: FromIterator<T>,
+{
+    match db {
+        #[cfg(feature = "clickhouse")]
+        ClickHouseSelectBackend::ClickHouse(db) => {
+            clickhouse_select_models::<T, C>(db, select).await
+        }
+        #[cfg(feature = "influxdb")]
+        ClickHouseSelectBackend::Influx(db) => influx_select_models::<T, C>(db, select).await,
+    }
+}
+
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+async fn clickhouse_select_first_on_backend<T>(
+    db: ClickHouseSelectBackend<'_>,
+    select: Select<T>,
+) -> crate::Result<Option<T>>
+where
+    T: Model + Send + Sync,
+{
+    Ok(
+        clickhouse_select_models_on_backend::<T, Vec<T>>(db, select)
+            .await?
+            .into_iter()
+            .next(),
+    )
+}
+
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+async fn clickhouse_fetch_page_on_backend<T>(
+    db: ClickHouseSelectBackend<'_>,
+    select: Select<T>,
+) -> crate::Result<crate::query::builder::CursorPage<T>>
+where
+    T: Model + Send + Sync,
+{
+    let (select, cursor_columns) = select.prepare_cursor_page()?;
+    let items =
+        clickhouse_select_models_on_backend::<T, Vec<T>>(db, select.clone()).await?;
+    let next_cursor = items
+        .last()
+        .map(|model| select.cursor_values_from_model(model, &cursor_columns))
+        .transpose()?;
+    Ok(crate::query::builder::CursorPage::new(items, next_cursor))
+}
+
 impl<'a, T: Model> NamedFilterQuery<T> for DatabaseScope<'a> {
     fn apply_named_filter(mut self, name: &'static str, expr: WhereExpr) -> Self {
         self.context_filters
@@ -730,13 +850,18 @@ pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
     MSSQL(mssql_backend::CreateTableExecutor<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::CreateTableExecutor<'a, T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
         feature: &'static str,
         _marker: std::marker::PhantomData<&'a T>,
     },
+    #[cfg(feature = "influxdb")]
+    InfluxDB(
+        &'a influxdb_backend::Database,
+        std::marker::PhantomData<&'a T>,
+    ),
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
@@ -762,8 +887,11 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::DuckDB(exec) => {
                 CreateTableExecutor::DuckDB(exec.with_table_name(table_name))
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ CreateTableExecutor::Unsupported { .. } => unsupported,
+            // InfluxDB measurement 名称由模型固定，表路由不生效
+            #[cfg(feature = "influxdb")]
+            unsupported @ CreateTableExecutor::InfluxDB(..) => unsupported,
         }
     }
 
@@ -785,8 +913,10 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MSSQL(_) => crate::abstract_layer::DbType::MSSQL,
             #[cfg(feature = "duckdb")]
             CreateTableExecutor::DuckDB(_) => crate::abstract_layer::DbType::DuckDB,
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             CreateTableExecutor::Unsupported { backend, .. } => *backend,
+            #[cfg(feature = "influxdb")]
+            CreateTableExecutor::InfluxDB(..) => super::super::DbType::InfluxDB,
         };
         let table_name = routed_model_table_name_for_db::<T>(db_type, &route)
             .unwrap_or_else(|err| panic!("Failed to render table route: {}", err));
@@ -805,10 +935,15 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             CreateTableExecutor::DuckDB(exec) => exec.to_sql(),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             CreateTableExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
+            #[cfg(feature = "influxdb")]
+            CreateTableExecutor::InfluxDB(..) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "create_table to_sql (retention policy is applied over HTTP)",
+            )),
         }
     }
 
@@ -824,12 +959,12 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             CreateTableExecutor::MSSQL(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             CreateTableExecutor::DuckDB(exec) => exec.execute().await,
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             CreateTableExecutor::Unsupported {
                 backend, feature, ..
-            } => {
-                return Err(unsupported_feature(backend, feature));
-            }
+            } => Err(unsupported_feature(backend, feature)),
+            #[cfg(feature = "influxdb")]
+            CreateTableExecutor::InfluxDB(db, _) => db.create_table::<T>().await,
         }?;
         crate::model::clear_version_snapshots::<T>();
         Ok(())
@@ -852,6 +987,18 @@ pub enum DropTableExecutor<'a, T: crate::model::WritableModel> {
     ClickHouse(
         &'a super::super::clickhouse_backend::Database,
         std::marker::PhantomData<T>,
+    ),
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+    #[doc(hidden)]
+    Unsupported {
+        backend: super::super::DbType,
+        feature: &'static str,
+        _marker: std::marker::PhantomData<&'a T>,
+    },
+    #[cfg(feature = "influxdb")]
+    InfluxDB(
+        &'a influxdb_backend::Database,
+        std::marker::PhantomData<&'a T>,
     ),
 }
 
@@ -880,6 +1027,22 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
                     Vec::new(),
                 ))
             }
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            DropTableExecutor::Unsupported {
+                backend, feature, ..
+            } => Err(unsupported_feature(*backend, *feature)),
+            #[cfg(feature = "influxdb")]
+            DropTableExecutor::InfluxDB(..) => {
+                let table = crate::model::quote_qualified_identifier(
+                    super::super::DbType::InfluxDB,
+                    T::table_name_for_db(super::super::DbType::InfluxDB),
+                );
+                Ok(SqlStatement::single(
+                    super::super::DbType::InfluxDB,
+                    format!("DROP MEASUREMENT {table}"),
+                    Vec::new(),
+                ))
+            }
         }
     }
 
@@ -897,6 +1060,75 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
             DropTableExecutor::DuckDB(exec) => exec.execute().await,
             #[cfg(feature = "clickhouse")]
             DropTableExecutor::ClickHouse(db, _) => db.drop_table::<T>().await,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            DropTableExecutor::Unsupported {
+                backend, feature, ..
+            } => Err(unsupported_feature(backend, feature)),
+            #[cfg(feature = "influxdb")]
+            DropTableExecutor::InfluxDB(db, _) => db.drop_table::<T>().await,
+        }?;
+        crate::model::clear_version_snapshots::<T>();
+        Ok(())
+    }
+}
+
+/// 统一的 TruncateTableExecutor 枚举：`TRUNCATE TABLE t`。
+///
+/// QuestDB 不支持行级 DELETE，`truncate_table` 是唯一的清空表数据手段；
+/// PostgreSQL 同样支持。其余后端暂未提供该执行器。
+pub enum TruncateTableExecutor<'a, T: crate::model::WritableModel> {
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::TruncateTableExecutor<'a, T>),
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse",
+        feature = "influxdb"
+    ))]
+    #[doc(hidden)]
+    Unsupported {
+        backend: super::super::DbType,
+        feature: &'static str,
+        _marker: std::marker::PhantomData<&'a T>,
+    },
+}
+
+impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            TruncateTableExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb",
+                feature = "clickhouse",
+                feature = "influxdb"
+            ))]
+            TruncateTableExecutor::Unsupported {
+                backend, feature, ..
+            } => Err(unsupported_feature(*backend, *feature)),
+        }
+    }
+
+    pub async fn execute(self) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            TruncateTableExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb",
+                feature = "clickhouse",
+                feature = "influxdb"
+            ))]
+            TruncateTableExecutor::Unsupported {
+                backend, feature, ..
+            } => Err(unsupported_feature(backend, feature)),
         }?;
         crate::model::clear_version_snapshots::<T>();
         Ok(())
@@ -922,6 +1154,21 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
         Option<crate::query::insert::InsertConflict>,
         std::marker::PhantomData<I::Model>,
     ),
+    #[cfg(feature = "influxdb")]
+    #[doc(hidden)]
+    Unsupported {
+        backend: super::super::DbType,
+        feature: &'static str,
+        models: I,
+        _marker: std::marker::PhantomData<I::Model>,
+        _lifetime: std::marker::PhantomData<&'a ()>,
+    },
+    #[cfg(feature = "influxdb")]
+    InfluxDB(
+        &'a influxdb_backend::Database,
+        I,
+        std::marker::PhantomData<I::Model>,
+    ),
 }
 
 pub enum InsertPartialExecutor<'a, T: Model> {
@@ -938,7 +1185,7 @@ pub enum InsertPartialExecutor<'a, T: Model> {
     MSSQL(mssql_backend::InsertPartialExecutor<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertPartialExecutor<'a, T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -968,7 +1215,7 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.set(f)),
             #[cfg(feature = "duckdb")]
             InsertPartialExecutor::DuckDB(exec) => InsertPartialExecutor::DuckDB(exec.set(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ InsertPartialExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -993,7 +1240,7 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MSSQL(exec) => InsertPartialExecutor::MSSQL(exec.default(f)),
             #[cfg(feature = "duckdb")]
             InsertPartialExecutor::DuckDB(exec) => InsertPartialExecutor::DuckDB(exec.default(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ InsertPartialExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -1010,7 +1257,7 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertPartialExecutor::DuckDB(exec) => exec.to_sql(),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertPartialExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1029,7 +1276,7 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             InsertPartialExecutor::MSSQL(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             InsertPartialExecutor::DuckDB(exec) => exec.execute().await,
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertPartialExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -1056,6 +1303,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_conflict(f)),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1078,6 +1329,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_constraint(target)),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1099,6 +1354,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.conflict_where(f)),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1116,6 +1375,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_nothing()),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1133,6 +1396,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update()),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1154,6 +1421,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update_if(f)),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1174,6 +1445,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.set(f)),
             #[cfg(feature = "clickhouse")]
             unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
+            #[cfg(feature = "influxdb")]
+            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -1205,6 +1480,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                         .collect(),
                 ))
             }
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::Unsupported {
+                backend,
+                feature,
+                ..
+            } => Err(unsupported_feature(*backend, *feature)),
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::InfluxDB(..) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "insert to_sql (InfluxDB writes use Line Protocol over HTTP)",
+            )),
         }
     }
 
@@ -1243,6 +1529,35 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 models.run_after_insert(ctx).await?;
                 Ok(<I::Model as Model>::AutoIncrementKeyType::default())
             }
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::Unsupported {
+                backend,
+                feature,
+                models,
+                ..
+            } => {
+                drop(models);
+                Err(unsupported_feature(backend, feature))
+            }
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::InfluxDB(db, mut models, _) => {
+                let refs = models.as_refs();
+                if refs.is_empty() {
+                    return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
+                }
+
+                crate::abstract_layer::influxdb_backend::validate_influx_model::<I::Model>(
+                    super::super::DbType::InfluxDB,
+                )?;
+                let lines = crate::abstract_layer::influxdb_backend::render_line_protocol::<
+                    I::Model,
+                >(&refs)?;
+                let ctx = crate::HookContext::new(crate::HookOperation::Insert);
+                models.run_before_insert(ctx).await?;
+                db.write_lines(&lines).await?;
+                models.run_after_insert(ctx).await?;
+                Ok(<I::Model as Model>::AutoIncrementKeyType::default())
+            }
         }
     }
 
@@ -1267,6 +1582,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 super::super::DbType::ClickHouse,
                 "DML RETURNING",
             )),
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::Unsupported {
+                backend,
+                feature,
+                ..
+            } => Err(unsupported_feature(backend, feature)),
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::InfluxDB(..) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "DML RETURNING",
+            )),
         }
     }
 }
@@ -1283,7 +1609,7 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertOrUpdateExecutor<'a, I>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -1315,7 +1641,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             InsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertOrUpdateExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1334,7 +1660,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             InsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
             #[cfg(feature = "duckdb")]
             InsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertOrUpdateExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -1532,7 +1858,7 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::InsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertOrIgnoreExecutor<'a, I>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -1554,7 +1880,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertOrIgnoreExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1573,7 +1899,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
             #[cfg(feature = "duckdb")]
             InsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertOrIgnoreExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -1635,6 +1961,11 @@ impl Database {
                 let db = super::super::clickhouse_backend::Database::connect(connection_string)?;
                 Ok(Database::ClickHouse(db))
             }
+            #[cfg(feature = "influxdb")]
+            super::super::DbType::InfluxDB => {
+                let db = super::super::influxdb_backend::Database::connect(connection_string)?;
+                Ok(Database::InfluxDB(db))
+            }
         }
     }
 
@@ -1657,12 +1988,21 @@ impl Database {
                 feature: "CREATE TABLE without explicit ClickHouse engine settings",
                 _marker: std::marker::PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => {
+                CreateTableExecutor::InfluxDB(db, std::marker::PhantomData)
+            }
         }
     }
 
     /// 验证表结构
     pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
         match self {
+            #[cfg(feature = "questdb")]
+            Database::PostgreSQL(db) if db.db_type().is_questdb() => {
+                let _ = db;
+                self.validate_table_questdb::<T>().await
+            }
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.validate_table::<T>().await,
             #[cfg(feature = "postgresql")]
@@ -1678,11 +2018,23 @@ impl Database {
                 super::super::DbType::ClickHouse,
                 "validate_table",
             )),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "validate_table",
+            )),
         }
     }
 
     /// Generate Rust model definitions from the database schema.
     pub async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
+        #[cfg(feature = "influxdb")]
+        if let Database::InfluxDB(_) = self {
+            return Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "generate_entities",
+            ));
+        }
         let tables = match self {
             #[cfg(feature = "sqlite")]
             Database::Sqlite(db) => db.db_first_tables(schema).await?,
@@ -1696,6 +2048,9 @@ impl Database {
             Database::DuckDB(db) => db.db_first_tables(schema).await?,
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(db) => db.db_first_tables(schema).await?,
+            // 不可达：InfluxDB 已在函数开头提前报错，仅为 match 穷尽性保留
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => Vec::new(),
         };
         Ok(db_first::generate_entities(self.db_type(), &tables))
     }
@@ -1717,6 +2072,12 @@ impl Database {
             Database::ClickHouse(db) => {
                 InsertExecutor::ClickHouse(db, models, None, std::marker::PhantomData)
             }
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => InsertExecutor::InfluxDB(
+                db,
+                models,
+                std::marker::PhantomData,
+            ),
         }
     }
 
@@ -1738,6 +2099,12 @@ impl Database {
             Database::ClickHouse(_) => InsertPartialExecutor::Unsupported {
                 backend: super::super::DbType::ClickHouse,
                 feature: "partial Model insert on ClickHouse",
+                _marker: std::marker::PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => InsertPartialExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "insert_partial",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -1769,6 +2136,12 @@ impl Database {
             Database::ClickHouse(_) => InsertPartialExecutor::Unsupported {
                 backend: super::super::DbType::ClickHouse,
                 feature: "partial Model insert on ClickHouse",
+                _marker: std::marker::PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => InsertPartialExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "insert_model",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -1809,6 +2182,12 @@ impl Database {
                 feature: "conflict writes on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => InsertOrUpdateExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "insert_or_update",
+                _marker: std::marker::PhantomData,
+            },
         }
     }
 
@@ -1842,6 +2221,12 @@ impl Database {
             Database::ClickHouse(_) => InsertOrIgnoreExecutor::Unsupported {
                 backend: super::super::DbType::ClickHouse,
                 feature: "conflict writes on ClickHouse",
+                _marker: std::marker::PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => InsertOrIgnoreExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "insert_or_ignore",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -1942,8 +2327,16 @@ impl Database {
             Database::DuckDB(db) => SelectExecutor::DuckDB(db.select::<T>()),
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(db) => {
-                SelectExecutor::ClickHouse(db, crate::query::builder::Select::default())
+                SelectExecutor::ClickHouse(
+                    ClickHouseSelectBackend::ClickHouse(db),
+                    crate::query::builder::Select::default(),
+                )
             }
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => SelectExecutor::ClickHouse(
+                ClickHouseSelectBackend::Influx(db),
+                crate::query::builder::Select::default(),
+            ),
         }
     }
 
@@ -1985,6 +2378,12 @@ impl Database {
                 feature: "Model select_column on ClickHouse; use select_sql",
                 _marker: std::marker::PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => GroupedSelectExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "select_column",
+                _marker: std::marker::PhantomData,
+            },
         }
     }
 
@@ -2009,6 +2408,48 @@ impl Database {
                 feature: "row delete on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => DeleteExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "row delete",
+                _marker: std::marker::PhantomData,
+            },
+        }
+    }
+
+    /// 创建按块删除执行器（时序数据整块清理，各后端语义见各执行器文档）
+    pub fn delete_blocks<T: WritableModel>(&self) -> BlockDeleteExecutor<'_, T> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Database::Sqlite(db) => BlockDeleteExecutor::fallback(
+                super::super::DbType::Sqlite,
+                DeleteExecutor::Sqlite(db.delete::<T>(), std::marker::PhantomData),
+            ),
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => BlockDeleteExecutor::PostgreSQL(db.delete_blocks::<T>()),
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => BlockDeleteExecutor::fallback(
+                super::super::DbType::MySQL,
+                DeleteExecutor::MySQL(db.delete::<T>()),
+            ),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => BlockDeleteExecutor::fallback(
+                super::super::DbType::MSSQL,
+                DeleteExecutor::MSSQL(db.delete::<T>()),
+            ),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => BlockDeleteExecutor::fallback(
+                super::super::DbType::DuckDB,
+                DeleteExecutor::DuckDB(db.delete::<T>()),
+            ),
+            #[cfg(feature = "clickhouse")]
+            Database::ClickHouse(db) => {
+                BlockDeleteExecutor::ClickHouse(clickhouse_backend::BlockDeleteExecutor::new(db))
+            }
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => {
+                BlockDeleteExecutor::InfluxDB(influxdb_backend::BlockDeleteExecutor::new(db))
+            }
         }
     }
 
@@ -2031,6 +2472,12 @@ impl Database {
             Database::ClickHouse(_) => UpdateExecutor::Unsupported {
                 backend: super::super::DbType::ClickHouse,
                 feature: "row update on ClickHouse; use execute_sql",
+                _marker: std::marker::PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => UpdateExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "row update",
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2071,6 +2518,12 @@ impl Database {
                 feature: "relation select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => RelatedSelectExecutor::Unsupported {
+                backend: super::super::DbType::InfluxDB,
+                feature: "relation select",
+                _marker: std::marker::PhantomData,
+            },
         }
     }
 
@@ -2106,6 +2559,11 @@ impl Database {
             Database::ClickHouse(_) => Err(unsupported_feature(
                 super::super::DbType::ClickHouse,
                 "transactions on ClickHouse",
+            )),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(_) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "transactions",
             )),
         }
     }
@@ -2158,6 +2616,36 @@ impl Database {
             Database::DuckDB(db) => DropTableExecutor::DuckDB(db.drop_table::<T>()),
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(db) => DropTableExecutor::ClickHouse(db, std::marker::PhantomData),
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => {
+                DropTableExecutor::InfluxDB(db, std::marker::PhantomData)
+            }
+        }
+    }
+
+    /// 清空表数据 - 返回执行器（`TRUNCATE TABLE`）
+    ///
+    /// QuestDB 不支持行级 DELETE，这是清空表数据的唯一受支持手段。
+    pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            Database::PostgreSQL(db) => {
+                TruncateTableExecutor::PostgreSQL(db.truncate_table::<T>())
+            }
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb",
+                feature = "clickhouse",
+                feature = "influxdb"
+            ))]
+            #[allow(unreachable_patterns)]
+            _ => TruncateTableExecutor::Unsupported {
+                backend: self.db_type(),
+                feature: "truncate_table",
+                _marker: std::marker::PhantomData,
+            },
         }
     }
 
@@ -2200,6 +2688,11 @@ impl Database {
             }
             #[cfg(feature = "clickhouse")]
             Database::ClickHouse(db) => {
+                db.execute_sql(sql).await?;
+                Ok(0)
+            }
+            #[cfg(feature = "influxdb")]
+            Database::InfluxDB(db) => {
                 db.execute_sql(sql).await?;
                 Ok(0)
             }
@@ -2351,8 +2844,8 @@ where
                     db.select_raw::<R, C>(&sql, params).await
                 }
                 #[cfg(feature = "clickhouse")]
-                Database::ClickHouse(db) => {
-                    let (sql, params) = self.select.to_sql_with_params(db_type);
+            Database::ClickHouse(db) => {
+                let (sql, params) = self.select.to_sql_with_params(db_type);
                     let rows = db
                         .select_values(RawSql::new(sql).with_params(params), R::row_columns())
                         .await?;
@@ -2360,6 +2853,11 @@ where
                         .map(|values| <R as crate::model::FromRowValues>::from_row_values(&values))
                         .collect::<crate::Result<C>>()
                 }
+                #[cfg(feature = "influxdb")]
+                Database::InfluxDB(_) => Err(unsupported_feature(
+                    super::super::DbType::InfluxDB,
+                    "derived table select",
+                )),
             }
         })
     }
@@ -2429,11 +2927,23 @@ where
                     db.select_raw::<T, C>(&sql, params).await
                 }
                 #[cfg(feature = "clickhouse")]
-                Database::ClickHouse(db) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::ClickHouse)?;
+            Database::ClickHouse(db) => {
+                let (sql, params) = self.sql.render(super::super::DbType::ClickHouse)?;
                     let rows = db
                         .select_values(
                             crate::raw_sql::RawSql::new(sql).with_params(params),
+                            <T as crate::model::FromRowValues>::row_columns(),
+                        )
+                        .await?;
+                    rows.into_iter()
+                        .map(|values| T::from_row_values(&values))
+                        .collect::<crate::Result<C>>()
+                }
+                #[cfg(feature = "influxdb")]
+                Database::InfluxDB(db) => {
+                    let rows = db
+                        .select_values(
+                            self.sql,
                             <T as crate::model::FromRowValues>::row_columns(),
                         )
                         .await?;
@@ -2527,11 +3037,32 @@ pub enum SelectExecutor<'a, T: Model> {
     MSSQL(mssql_backend::SelectExecutor<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectExecutor<'a, T>),
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+    ClickHouse(crate::abstract_layer::common::unified::ClickHouseSelectBackend<'a>, crate::query::builder::Select<T>),
+}
+
+/// ClickHouse protocol backend handle; InfluxDB reuses it only as a hidden
+/// unsupported placeholder so builder APIs remain compilable without a DB.
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+#[derive(Clone, Copy)]
+pub enum ClickHouseSelectBackend<'a> {
     #[cfg(feature = "clickhouse")]
-    ClickHouse(
-        &'a clickhouse_backend::Database,
-        crate::query::builder::Select<T>,
-    ),
+    ClickHouse(&'a clickhouse_backend::Database),
+    #[cfg(feature = "influxdb")]
+    #[doc(hidden)]
+    Influx(&'a influxdb_backend::Database),
+}
+
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+fn clickhouse_select_backend_db_type(
+    db: ClickHouseSelectBackend<'_>,
+) -> super::super::DbType {
+    match db {
+        #[cfg(feature = "clickhouse")]
+        ClickHouseSelectBackend::ClickHouse(_) => super::super::DbType::ClickHouse,
+        #[cfg(feature = "influxdb")]
+        ClickHouseSelectBackend::Influx(_) => super::super::DbType::InfluxDB,
+    }
 }
 
 crate::impl_unified_select_executor_methods!(SelectExecutor);
@@ -2553,7 +3084,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.fields(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.fields(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 SelectExecutor::ClickHouse(db, select.fields(f))
             }
@@ -2572,7 +3103,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.query(query)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.query(query)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 SelectExecutor::ClickHouse(db, select.query(query))
             }
@@ -2591,7 +3122,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.mode(mode)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.mode(mode)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 SelectExecutor::ClickHouse(db, select.mode(mode))
             }
@@ -2610,7 +3141,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.language(language)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.language(language)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 SelectExecutor::ClickHouse(db, select.language(language))
             }
@@ -2629,7 +3160,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.rank(rank)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.rank(rank)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 SelectExecutor::ClickHouse(db, select.rank(rank))
             }
@@ -2670,9 +3201,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectExecutor::MSSQL(exec.select_model::<R>()),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectExecutor::DuckDB(exec.select_model::<R>()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => SelectExecutor::ClickHouse(
-                db,
+                *db,
                 Select::default().with_context_filters(select.context_filters()),
             ),
         }
@@ -2690,15 +3221,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => exec.to_sql(),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(_, select) => {
-                let (sql, params) =
-                    select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
-                Ok(SqlStatement::single(
-                    super::super::DbType::ClickHouse,
-                    sql,
-                    params,
-                ))
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, select) => {
+                let backend = clickhouse_select_backend_db_type(*db);
+                let (sql, params) = select.try_to_sql_with_params(backend)?;
+                Ok(SqlStatement::single(backend, sql, params))
             }
         }
     }
@@ -2951,9 +3478,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => RelatedSelectExecutor::MSSQL(exec.from::<T2, R>()),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => RelatedSelectExecutor::DuckDB(exec.from::<T2, R>()),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => RelatedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => RelatedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "related table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -2989,9 +3516,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 exec.from3::<T2, R1, R2>(),
                 std::marker::PhantomData,
             ),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => MultiTableSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => MultiTableSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "multi-table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3029,9 +3556,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                 exec.from4::<T2, R1, R2, R3>(),
                 std::marker::PhantomData,
             ),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => FourTableSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => FourTableSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "four-table select on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3060,9 +3587,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 LeftJoinedSelectExecutor::DuckDB(exec.left_join::<J>(f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => LeftJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => LeftJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "left join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3095,9 +3622,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 InnerJoinedSelectExecutor::DuckDB(exec.inner_join::<J>(f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => InnerJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => InnerJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "inner join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3130,9 +3657,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 RightJoinedSelectExecutor::DuckDB(exec.right_join::<J>(f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => RightJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => RightJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "right join on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3166,9 +3693,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 LeftJoinedSelectExecutor::DuckDB(exec.left_join_derived::<J>(derived, f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => LeftJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => LeftJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3202,9 +3729,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 InnerJoinedSelectExecutor::DuckDB(exec.inner_join_derived::<J>(derived, f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => InnerJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => InnerJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3238,9 +3765,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::DuckDB(exec) => {
                 RightJoinedSelectExecutor::DuckDB(exec.right_join_derived::<J>(derived, f))
             }
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => RightJoinedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => RightJoinedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3268,9 +3795,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             }
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => CollectFuture::DuckDB(exec.clone().collect::<C>()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
-                CollectFuture::ClickHouse(db, select.clone(), std::marker::PhantomData)
+                CollectFuture::ClickHouse(
+                    db.clone(),
+                    select.clone(),
+                    std::marker::PhantomData,
+                )
             }
         }
     }
@@ -3291,7 +3822,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => FirstFuture::MSSQL(exec.first()),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => FirstFuture::DuckDB(exec.first()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => FirstFuture::ClickHouse(db, select),
         }
     }
@@ -3314,9 +3845,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.count(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.count(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => AggregateFuture::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3342,9 +3873,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.sum(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.sum(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => AggregateFuture::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3370,9 +3901,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.avg(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.avg(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => AggregateFuture::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3398,9 +3929,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.max(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.max(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => AggregateFuture::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3426,9 +3957,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => AggregateFuture::MSSQL(exec.min(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => AggregateFuture::DuckDB(exec.min(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => AggregateFuture::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => AggregateFuture::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -3451,7 +3982,7 @@ pub enum DeleteExecutor<'a, T: Model> {
     MSSQL(mssql_backend::DeleteExecutor<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::DeleteExecutor<T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3487,11 +4018,123 @@ impl<'a, T: Model> super::SqlExecutor for DeleteExecutor<'a, T> {
             DeleteExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
             #[cfg(feature = "duckdb")]
             DeleteExecutor::DuckDB(exec) => exec.execute_with_sql(sql).await,
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             DeleteExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
         }
+    }
+}
+
+/// 按块删除结果。
+///
+/// `blocks_dropped` 尽力而为（回退路径为 0）；`rows_deleted` 仅回退路径
+/// （行删除实现）能报告。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockDeleteResult {
+    /// 删除的块数。
+    pub blocks_dropped: u64,
+    /// 影响行数（仅回退路径有值）。
+    pub rows_deleted: Option<u64>,
+}
+
+impl BlockDeleteResult {
+    /// 回退路径结果：仅报告行数。
+    pub(crate) fn from_row_count(rows: u64) -> Self {
+        Self {
+            blocks_dropped: 0,
+            rows_deleted: Some(rows),
+        }
+    }
+}
+
+/// 统一的按块删除执行器。
+///
+/// - `PostgreSQL` 变体同时服务 PostgreSQL/TimescaleDB（`drop_chunks`，无扩展时
+///   回退行删除）与 QuestDB（`DROP PARTITION`）。
+/// - `ClickHouse` 变体枚举既有分区后合并为一条 `ALTER TABLE ... DROP PARTITION`。
+/// - 其余 OLTP 后端走 `Fallback`：按对齐边界执行行删除。
+pub enum BlockDeleteExecutor<'a, T: Model> {
+    #[cfg(feature = "postgresql")]
+    PostgreSQL(postgresql_backend::BlockDeleteExecutor<'a, T>),
+    #[cfg(feature = "clickhouse")]
+    ClickHouse(clickhouse_backend::BlockDeleteExecutor<'a, T>),
+    #[cfg(feature = "influxdb")]
+    InfluxDB(influxdb_backend::BlockDeleteExecutor<'a, T>),
+    /// OLTP 后端回退路径：`DELETE FROM t WHERE <对齐时间边界>`。
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    ))]
+    Fallback {
+        db_type: super::super::DbType,
+        key: Option<crate::abstract_layer::common::common_helpers::BlockKey>,
+        range: Option<crate::abstract_layer::common::common_helpers::BlockRange>,
+        delete: DeleteExecutor<'a, T>,
+    },
+}
+
+crate::impl_unified_block_delete_executor!(BlockDeleteExecutor);
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "duckdb"
+))]
+impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
+    pub(crate) fn fallback(
+        db_type: super::super::DbType,
+        delete: DeleteExecutor<'a, T>,
+    ) -> Self {
+        BlockDeleteExecutor::Fallback {
+            db_type,
+            key: crate::abstract_layer::common::common_helpers::resolve_block_key::<T>(db_type)
+                .ok(),
+            range: None,
+            delete,
+        }
+    }
+}
+
+impl<'a, T: Model> super::SqlExecutor for BlockDeleteExecutor<'a, T> {
+    type Output = BlockDeleteResult;
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        BlockDeleteExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            BlockDeleteExecutor::PostgreSQL(exec) => exec
+                .execute_with_sql(sql)
+                .await
+                .map(BlockDeleteResult::from_row_count),
+            #[cfg(feature = "clickhouse")]
+            BlockDeleteExecutor::ClickHouse(exec) => exec.execute_with_sql(sql).await,
+            #[cfg(feature = "influxdb")]
+            BlockDeleteExecutor::InfluxDB(_) => Err(unsupported_feature(
+                super::super::DbType::InfluxDB,
+                "block delete execute_with_sql (the native backend uses the HTTP delete API)",
+            )),
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb"
+            ))]
+            BlockDeleteExecutor::Fallback { delete, .. } => delete
+                .execute_with_sql(sql)
+                .await
+                .map(BlockDeleteResult::from_row_count),
+        }
+    }
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        BlockDeleteExecutor::execute(self).await
     }
 }
 
@@ -3510,7 +4153,7 @@ pub enum UpdateExecutor<'a, T: Model> {
     MSSQL(mssql_backend::UpdateExecutor<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::UpdateExecutor<T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3544,7 +4187,7 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             UpdateExecutor::DuckDB(exec) => {
                 UpdateExecutor::DuckDB(exec.set_model_fields(model, fields))
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ UpdateExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -3575,7 +4218,7 @@ impl<'a, T: Model> super::SqlExecutor for UpdateExecutor<'a, T> {
             UpdateExecutor::MSSQL(exec) => exec.execute_with_sql(sql).await,
             #[cfg(feature = "duckdb")]
             UpdateExecutor::DuckDB(exec) => exec.execute_with_sql(sql).await,
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             UpdateExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -3796,13 +4439,13 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
     MSSQL(mssql_backend::CollectFuture<'a, T, C>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::CollectFuture<'a, T, C>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     ClickHouse(
-        &'a clickhouse_backend::Database,
+        ClickHouseSelectBackend<'a>,
         crate::query::builder::Select<T>,
         std::marker::PhantomData<C>,
     ),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3823,12 +4466,12 @@ pub enum FirstFuture<'a, T: Model> {
     MSSQL(mssql_backend::FirstFuture<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::FirstFuture<'a, T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     ClickHouse(
-        &'a clickhouse_backend::Database,
+        ClickHouseSelectBackend<'a>,
         crate::query::builder::Select<T>,
     ),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3852,7 +4495,7 @@ pub enum AggregateFuture<'a, T: Model, R> {
     MSSQL(mssql_backend::AggregateFuture<'a, T, R>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::AggregateFuture<T, R>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3878,7 +4521,7 @@ pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
     MSSQL(mssql_backend::RelatedSelectExecutor<'a, T, R>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::RelatedSelectExecutor<T, R>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3905,7 +4548,7 @@ pub enum MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
         duckdb_backend::MultiTableSelectExecutor<T, R1, R2>,
         std::marker::PhantomData<&'a ()>,
     ),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3932,7 +4575,7 @@ pub enum FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> 
         duckdb_backend::FourTableSelectExecutor<T, R1, R2, R3>,
         std::marker::PhantomData<&'a ()>,
     ),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3956,7 +4599,7 @@ pub enum InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::InnerJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InnerJoinedSelectExecutor<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -3980,7 +4623,7 @@ pub enum RightJoinedSelectExecutor<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::RightJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::RightJoinedSelectExecutor<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4004,7 +4647,7 @@ pub enum LeftJoinedSelectExecutor<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::LeftJoinedSelectExecutor<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::LeftJoinedSelectExecutor<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4028,7 +4671,7 @@ pub enum LeftJoinCollectFuture<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::LeftJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::LeftJoinCollectFuture<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4052,7 +4695,7 @@ pub enum InnerJoinCollectFuture<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::InnerJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InnerJoinCollectFuture<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4076,7 +4719,7 @@ pub enum RightJoinCollectFuture<'a, T: Model, J: Model> {
     MSSQL(mssql_backend::RightJoinCollectFuture<'a, T, J>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::RightJoinCollectFuture<T, J>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4106,11 +4749,11 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
             FirstFuture::MSSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "duckdb")]
             FirstFuture::DuckDB(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             FirstFuture::ClickHouse(db, select) => {
-                Box::pin(async move { clickhouse_select_first(db, select).await })
+                Box::pin(async move { clickhouse_select_first_on_backend(db, select).await })
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             FirstFuture::Unsupported {
                 backend, feature, ..
             } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
@@ -4135,7 +4778,7 @@ pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
     MSSQL(mssql_backend::RelatedCollectFuture<'a, T, R>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::RelatedCollectFuture<T, R>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -4241,6 +4884,8 @@ pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::TransactionInsertExecutor<'a, I>),
+    // 使用 PhantomData 确保泛型参数在所有 feature 组合下都被使用
+    _Phantom(std::marker::PhantomData<&'a I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
@@ -4270,6 +4915,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.on_conflict(f))
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4298,6 +4944,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.on_constraint(target))
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4327,6 +4974,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.conflict_where(f))
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4352,6 +5000,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.do_nothing())
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4377,6 +5026,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.do_update())
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4406,6 +5056,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.do_update_if(f))
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4430,6 +5081,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::DuckDB(exec) => {
                 TransactionInsertExecutor::DuckDB(exec.set(f))
             }
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4445,6 +5097,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             TransactionInsertExecutor::DuckDB(exec) => exec.to_sql(),
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4462,6 +5115,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             TransactionInsertExecutor::MSSQL(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             TransactionInsertExecutor::DuckDB(exec) => exec.execute().await,
+            TransactionInsertExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4482,6 +5136,8 @@ pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::TransactionInsertOrUpdateExecutor<'a, I>),
+    // 使用 PhantomData 确保泛型参数在所有 feature 组合下都被使用
+    _Phantom(std::marker::PhantomData<&'a I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
@@ -4497,6 +5153,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
+            TransactionInsertOrUpdateExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4512,6 +5169,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await,
+            TransactionInsertOrUpdateExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4532,6 +5190,8 @@ pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     MSSQL(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
+    // 使用 PhantomData 确保泛型参数在所有 feature 组合下都被使用
+    _Phantom(std::marker::PhantomData<&'a I>),
 }
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
@@ -4547,6 +5207,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
+            TransactionInsertOrIgnoreExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4562,6 +5223,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
             TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await,
+            TransactionInsertOrIgnoreExecutor::_Phantom(_) => unreachable!(),
         }
     }
 
@@ -4659,6 +5321,11 @@ pub(crate) async fn apply_transaction_options(
         super::super::DbType::ClickHouse => Err(unsupported_feature(
             super::super::DbType::ClickHouse,
             "transactions on ClickHouse",
+        )),
+        #[cfg(feature = "influxdb")]
+        super::super::DbType::InfluxDB => Err(unsupported_feature(
+            super::super::DbType::InfluxDB,
+            "transactions",
         )),
     }
 }
@@ -5062,7 +5729,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
             LeftJoinedSelectExecutor::DuckDB(exec) => {
                 LeftJoinCollectFuture::DuckDB(exec.collect::<C>())
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             LeftJoinedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => LeftJoinCollectFuture::Unsupported {
@@ -5103,7 +5770,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
             InnerJoinedSelectExecutor::DuckDB(exec) => {
                 InnerJoinCollectFuture::DuckDB(exec.collect::<C>())
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InnerJoinedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => InnerJoinCollectFuture::Unsupported {
@@ -5146,7 +5813,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
             RightJoinedSelectExecutor::DuckDB(exec) => {
                 RightJoinCollectFuture::DuckDB(exec.collect::<C>())
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             RightJoinedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => RightJoinCollectFuture::Unsupported {
@@ -5179,7 +5846,7 @@ pub enum MappedSelectExecutor<'a, T: Model, V> {
     MSSQL(mssql_backend::MappedSelectExecutor<'a, T, V>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::MappedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -5200,7 +5867,7 @@ pub enum GroupedSelectExecutor<'a, T: Model, V> {
     MSSQL(mssql_backend::GroupedSelectExecutor<'a, T, V>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -5229,7 +5896,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.group_by(f)),
             #[cfg(feature = "duckdb")]
             GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.group_by(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -5253,7 +5920,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.having(f)),
             #[cfg(feature = "duckdb")]
             GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.having(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -5277,7 +5944,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.filter(f)),
             #[cfg(feature = "duckdb")]
             GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.filter(f)),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
@@ -5306,7 +5973,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::DuckDB(exec) => {
                 GroupedCollectFuture::DuckDB(exec.collect::<C>())
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             GroupedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => GroupedCollectFuture::Unsupported {
@@ -5333,7 +6000,7 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
             GroupedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "duckdb")]
             GroupedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             GroupedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -5360,7 +6027,7 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "duckdb")]
             MappedSelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.clone()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => MappedSelectExecutor::Unsupported {
@@ -5384,7 +6051,7 @@ pub enum MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator
     MSSQL(mssql_backend::MappedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::MappedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -5405,7 +6072,7 @@ pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     MSSQL(mssql_backend::GroupedCollectFuture<'a, T, V, C>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -5437,7 +6104,7 @@ impl<
             GroupedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "duckdb")]
             GroupedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             GroupedCollectFuture::Unsupported {
                 backend, feature, ..
             } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
@@ -5469,7 +6136,7 @@ pub enum ModelCollectWithFuture<'a, T: Model + 'static, V: 'static, C, M, F> {
     ),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::ModelCollectWithFuture<'a, T, V, C, M, F>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
         backend: super::super::DbType,
@@ -5499,9 +6166,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => MappedSelectExecutor::MSSQL(exec.map_to(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.map_to(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => MappedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => MappedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -5527,9 +6194,9 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.select_column(f)),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.select_column(f)),
-            #[cfg(feature = "clickhouse")]
-            SelectExecutor::ClickHouse(..) => GroupedSelectExecutor::Unsupported {
-                backend: super::super::DbType::ClickHouse,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => GroupedSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
             },
@@ -5700,7 +6367,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "duckdb")]
             MappedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -5730,7 +6397,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "duckdb")]
             MappedSelectExecutor::DuckDB(exec) => MappedCollectFuture::DuckDB(exec.collect::<C>()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => MappedCollectFuture::Unsupported {
@@ -5782,7 +6449,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::DuckDB(exec) => {
                 ModelCollectWithFuture::DuckDB(exec.collect_with::<C, F, M>(f))
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => ModelCollectWithFuture::Unsupported {
@@ -5814,7 +6481,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
             MappedSelectExecutor::MSSQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "duckdb")]
             MappedSelectExecutor::DuckDB(exec) => in_subquery(exec.to_subquery_sql()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedSelectExecutor::Unsupported {
                 backend, feature, ..
             } => in_subquery(Err(crate::OrmerError::UnsupportedFeature {
@@ -5866,7 +6533,7 @@ impl<
             MappedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "duckdb")]
             MappedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             MappedCollectFuture::Unsupported {
                 backend, feature, ..
             } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
@@ -5907,7 +6574,7 @@ where
             }),
             #[cfg(feature = "duckdb")]
             ModelCollectWithFuture::DuckDB(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             ModelCollectWithFuture::Unsupported {
                 backend, feature, ..
             } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
@@ -6086,9 +6753,9 @@ pub enum SelectStream<'a, T: Model> {
     MSSQL(mssql_backend::SelectStream<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectStream<'a, T>),
-    #[cfg(feature = "clickhouse")]
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     ClickHouse(
-        &'a clickhouse_backend::Database,
+        ClickHouseSelectBackend<'a>,
         crate::query::builder::Select<T>,
     ),
 }
@@ -6107,7 +6774,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             SelectExecutor::MSSQL(exec) => SelectStream::MSSQL(exec.stream()),
             #[cfg(feature = "duckdb")]
             SelectExecutor::DuckDB(exec) => SelectStream::DuckDB(exec.stream()),
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => SelectStream::ClickHouse(db, select),
         }
     }
@@ -6125,8 +6792,8 @@ pub enum SelectStreamIterator<'a, T: Model> {
     MSSQL(mssql_backend::SelectStreamIterator<'a, T>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::SelectStreamIterator<'a, T>),
-    #[cfg(feature = "clickhouse")]
-    ClickHouse(std::vec::IntoIter<T>),
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+    ClickHouse(std::vec::IntoIter<T>, std::marker::PhantomData<&'a ()>),
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
@@ -6158,10 +6825,13 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 let iter = stream.into_iter().await?;
                 Ok(SelectStreamIterator::DuckDB(iter))
             }
-            #[cfg(feature = "clickhouse")]
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectStream::ClickHouse(db, select) => {
-                let rows = clickhouse_select_models_buffered(db, select).await?;
-                Ok(SelectStreamIterator::ClickHouse(rows.into_iter()))
+                let rows = clickhouse_select_models_buffered_on_backend(db, select).await?;
+                Ok(SelectStreamIterator::ClickHouse(
+                rows.into_iter(),
+                std::marker::PhantomData,
+            ))
             }
         }
     }
@@ -6181,8 +6851,8 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             SelectStreamIterator::MSSQL(iter) => iter.next().await,
             #[cfg(feature = "duckdb")]
             SelectStreamIterator::DuckDB(iter) => iter.next().await,
-            #[cfg(feature = "clickhouse")]
-            SelectStreamIterator::ClickHouse(rows) => rows.next().map(Ok),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectStreamIterator::ClickHouse(rows, _) => rows.next().map(Ok),
         }
     }
 }

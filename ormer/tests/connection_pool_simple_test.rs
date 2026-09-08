@@ -67,6 +67,14 @@ async fn test_pool_basic_impl(
             }
             .into());
         }
+        #[cfg(feature = "influxdb")]
+        ormer::DbType::InfluxDB => {
+            return Err(ormer::OrmerError::UnsupportedFeature {
+                backend: ormer::DbType::InfluxDB,
+                feature: "ConnectionPool",
+            }
+            .into());
+        }
     };
 
     println!("Pool created successfully");

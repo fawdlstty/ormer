@@ -34,6 +34,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
     let mut field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
     let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
+    let hypertable_space_info_method = hypertable_space_info_method(&field_infos);
     let mut normal_index = 0;
     for info in &mut field_infos {
         if !info.is_relation() && !info.is_ignored {
@@ -100,14 +101,31 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     };
 
     // 生成主键列名列表（支持复合主键）
-    let primary_key_field_names: Vec<_> = primary_keys
+    // TimescaleDB 空间分区超表要求所有唯一索引（含主键）都包含分区列，
+    // 因此同时声明了时间分片与空间分区的模型，主键自动补齐空间分区列，
+    // 使 ON CONFLICT、按主键更新/删除等行身份操作与数据库实际约束保持一致。
+    let mut effective_primary_keys: Vec<_> = primary_keys.clone();
+    if let Some(space_field) = normal_fields
+        .iter()
+        .copied()
+        .find(|info| info.hypertable_space_count.is_some())
+        && normal_fields
+            .iter()
+            .any(|info| info.has_hypertable_time)
+        && !primary_keys
+            .iter()
+            .any(|info| info.column_name == space_field.column_name)
+    {
+        effective_primary_keys.push(space_field);
+    }
+    let primary_key_field_names: Vec<_> = effective_primary_keys
         .iter()
         .map(|info| {
             let column_name = &info.column_name;
             quote! { #column_name }
         })
         .collect();
-    let primary_field_names: Vec<_> = primary_keys
+    let primary_field_names: Vec<_> = effective_primary_keys
         .iter()
         .map(|info| {
             let field_name = info.field_name.to_string();
@@ -117,12 +135,15 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let primary_key_column_name = primary_keys[0].column_name.clone();
 
     // 生成主键值获取（支持复合主键）
-    let primary_key_values: Vec<_> = primary_keys
+    let primary_key_values: Vec<_> = effective_primary_keys
         .iter()
         .map(|info| field_to_value_expr(info))
         .collect();
-    let primary_field_types: Vec<_> = primary_keys.iter().map(|info| info.field_type).collect();
-    let primary_field_values: Vec<_> = primary_keys
+    let primary_field_types: Vec<_> = effective_primary_keys
+        .iter()
+        .map(|info| info.field_type)
+        .collect();
+    let primary_field_values: Vec<_> = effective_primary_keys
         .iter()
         .map(|info| {
             let field_name = info.field_name;
@@ -198,6 +219,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             // 检查 hypertable 属性
             let hypertable = &info.hypertable;
+            let hypertable_space = &info.hypertable_space;
 
             // 检查 compress 属性
             let compress = info.compress;
@@ -248,6 +270,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                     default: #default,
                     check: #check,
                     hypertable: #hypertable,
+                    hypertable_space: #hypertable_space,
                     compress: #compress,
                     compression: #compression,
                 }
@@ -282,6 +305,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 default: Some(::ormer::model::ColumnDefault::Number("1")),
                 check: None,
                 hypertable: None,
+                hypertable_space: None,
                 compress: false,
                 compression: None,
             }
@@ -1458,6 +1482,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                             default: None,
                             check: None,
                             hypertable: None,
+                            hypertable_space: None,
                             compress: schema.compress,
                             compression: schema.compression,
                         });
@@ -1744,6 +1769,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
             #version_info_method
             #hypertable_route_key_method
+            #hypertable_space_info_method
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -2312,6 +2338,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
 
     let field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
     let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
+    let hypertable_space_info_method = hypertable_space_info_method(&field_infos);
     if field_infos
         .iter()
         .any(|info| info.is_primary || info.is_relation())
@@ -2387,6 +2414,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                     default: None,
                     check: None,
                     hypertable: None,
+                    hypertable_space: None,
                     compress: false,
                     compression: None,
                 }
@@ -2599,6 +2627,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
             type Update = ();
 
             #hypertable_route_key_method
+            #hypertable_space_info_method
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -2768,7 +2797,10 @@ struct FieldInfo<'a> {
     default: proc_macro2::TokenStream,
     check: proc_macro2::TokenStream,
     hypertable: proc_macro2::TokenStream,
+    has_hypertable_time: bool,
     hypertable_route: bool,
+    hypertable_space: proc_macro2::TokenStream,
+    hypertable_space_count: Option<u16>,
     compress: bool,
     compression: proc_macro2::TokenStream,
     json_paths: Vec<JsonPathSchema>,
@@ -2880,7 +2912,10 @@ impl<'a> FieldInfo<'a> {
             default: extract_default(field),
             check: extract_check(field),
             hypertable: hypertable.duration,
+            has_hypertable_time: hypertable.is_time,
             hypertable_route: hypertable.route,
+            hypertable_space: hypertable.space,
+            hypertable_space_count: hypertable.space_count,
             compress: extract_compress_attr(field).is_some(),
             compression: extract_compress_attr(field)
                 .map(|algorithm| {
@@ -3813,12 +3848,81 @@ impl DialectTableOptions {
     }
 }
 
+/// InfluxDB 模型标注校验（声明了 `#[influxdb(...)]` 时启用）：
+/// 必须有且仅有一个时间类型 `#[primary]` 字段（不支持 auto），
+/// `#[index]` 字段必须为 `String` 类型。
+fn validate_influxdb_fields(input: &DeriveInput) {
+    let syn::Data::Struct(syn::DataStruct {
+        fields: syn::Fields::Named(fields),
+        ..
+    }) = &input.data
+    else {
+        return;
+    };
+    let mut primary_count = 0usize;
+    let mut primary_is_time = false;
+    let mut primary_is_auto = false;
+    for field in &fields.named {
+        let field_name = field
+            .ident
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let type_string = quote!(#field.ty).to_string();
+        let mut is_primary = false;
+        for attr in &field.attrs {
+            if attr.path().is_ident("primary") {
+                is_primary = true;
+                if let syn::Meta::List(list) = &attr.meta {
+                    if list.tokens.to_string().contains("auto") {
+                        primary_is_auto = true;
+                    }
+                }
+            } else if attr.path().is_ident("index") {
+                // group/name/order/where 参数对 InfluxDB 无意义，忽略
+                let normalized = type_string.replace(' ', "");
+                if normalized != "String" {
+                    panic!(
+                        "#[index] field `{field_name}` must be String when the model declares #[influxdb(...)] (tags cannot be Option<String> or numeric)"
+                    );
+                }
+            }
+        }
+        if is_primary {
+            primary_count += 1;
+            primary_is_time = type_string.replace(' ', "").contains("DateTime");
+        }
+    }
+    if primary_count != 1 || !primary_is_time {
+        panic!(
+            "models declaring #[influxdb(...)] require exactly one time-typed #[primary] field as the timestamp (found {primary_count})"
+        );
+    }
+    if primary_is_auto {
+        panic!(
+            "#[primary(auto)] is not allowed on models declaring #[influxdb(...)]: the timestamp must be provided by the application"
+        );
+    }
+}
+
 #[derive(Default)]
 struct ModelTableOptions {
     mysql: DialectTableOptions,
     postgresql: DialectTableOptions,
     mssql: DialectTableOptions,
     clickhouse: DialectTableOptions,
+    influxdb: InfluxTableOptions,
+}
+
+#[derive(Default)]
+struct InfluxTableOptions {
+    retention: Option<syn::Expr>,
+}
+
+impl InfluxTableOptions {
+    fn is_empty(&self) -> bool {
+        self.retention.is_none()
+    }
 }
 
 impl ModelTableOptions {
@@ -3827,6 +3931,7 @@ impl ModelTableOptions {
             && self.postgresql.is_empty()
             && self.mssql.is_empty()
             && self.clickhouse.is_empty()
+            && self.influxdb.is_empty()
     }
 }
 
@@ -3834,6 +3939,13 @@ fn extract_table_options(
     input: &DeriveInput,
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
     let mut options = ModelTableOptions::default();
+    let has_influxdb_attr = input
+        .attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("influxdb"));
+    if has_influxdb_attr {
+        validate_influxdb_fields(input);
+    }
     for attr in &input.attrs {
         let dialect = if attr.path().is_ident("mysql") {
             &mut options.mysql
@@ -3843,6 +3955,35 @@ fn extract_table_options(
             &mut options.mssql
         } else if attr.path().is_ident("clickhouse") {
             &mut options.clickhouse
+        } else if attr.path().is_ident("influxdb") {
+            let Meta::List(_) = &attr.meta else {
+                panic!("influxdb table options must use #[influxdb(...)]");
+            };
+            attr.parse_nested_meta(|meta| {
+                let name = meta
+                    .path
+                    .get_ident()
+                    .map(|ident| ident.to_string())
+                    .unwrap_or_else(|| meta.path.to_token_stream().to_string());
+                if name != "retention" {
+                    return Err(syn::Error::new(
+                        meta.path.span(),
+                        "unsupported influxdb table option (expected retention)",
+                    ));
+                }
+                let value = meta.value()?;
+                let expr: syn::Expr = value.parse()?;
+                if options.influxdb.retention.is_some() {
+                    return Err(syn::Error::new(
+                        meta.path.span(),
+                        "duplicate retention table option",
+                    ));
+                }
+                options.influxdb.retention = Some(expr);
+                Ok(())
+            })
+            .expect("Failed to parse influxdb table options");
+            continue;
         } else {
             continue;
         };
@@ -3978,9 +4119,20 @@ fn extract_table_options(
             ::ormer::model::clickhouse_table_options(#engine, #order_by, #partition_by, #ttl, #settings)
         }
     };
+    let influxdb = if options.influxdb.is_empty() {
+        quote! { ::core::option::Option::None }
+    } else {
+        let retention = match &options.influxdb.retention {
+            Some(expr) => quote!(::core::option::Option::Some(#expr)),
+            None => quote!(::core::option::Option::None),
+        };
+        quote! {
+            ::ormer::model::influxdb_table_options(#retention)
+        }
+    };
 
     let table_options = quote! {
-        ::ormer::model::merge_table_options(#mysql, #postgresql, #mssql, #clickhouse)
+        ::ormer::model::merge_table_options(#mysql, #postgresql, #mssql, #clickhouse, #influxdb)
     };
     let warning_ident = syn::Ident::new(
         &format!(
@@ -4744,7 +4896,32 @@ mod view_model_tests {
 
 struct HypertableAttr {
     duration: proc_macro2::TokenStream,
+    is_time: bool,
     route: bool,
+    space: proc_macro2::TokenStream,
+    space_count: Option<u16>,
+}
+
+fn hypertable_space_info_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::TokenStream {
+    let space_fields = field_infos
+        .iter()
+        .filter(|info| info.hypertable_space_count.is_some())
+        .collect::<Vec<_>>();
+    if space_fields.len() > 1 {
+        panic!("only one field can use #[hypertable_space] per model");
+    }
+
+    if let Some(info) = space_fields.first() {
+        let key = info.column_name.as_str();
+        let partitions = info.hypertable_space_count.expect("space partition count");
+        quote! {
+            fn hypertable_space_info() -> Option<(&'static str, u16)> {
+                Some((#key, #partitions))
+            }
+        }
+    } else {
+        quote! {}
+    }
 }
 
 fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::TokenStream {
@@ -4768,7 +4945,7 @@ fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::To
     }
 }
 
-fn validate_hypertable_route_field(field: &syn::Field, field_type: &syn::Type) {
+fn validate_hypertable_space_field(field: &syn::Field, field_type: &syn::Type) {
     if is_string_type(field_type) {
         return;
     }
@@ -4784,7 +4961,7 @@ fn validate_hypertable_route_field(field: &syn::Field, field_type: &syn::Type) {
 /// 提取 hypertable 属性信息。
 /// 支持语法：
 /// - #[hypertable(Duration::from_hours(1))]：TimescaleDB 时间分片时长
-/// - #[hypertable]：PostgreSQL/TimescaleDB 字符串拆表路由
+/// - #[hypertable]：TimescaleDB 空间分区，默认 4 个分区
 fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> HypertableAttr {
     for attr in &field.attrs {
         if attr.path().is_ident("hypertable") {
@@ -4793,15 +4970,24 @@ fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> HypertableA
                     let tokens = &list.tokens;
                     return HypertableAttr {
                         duration: quote! { Some(#tokens) },
+                        is_time: true,
                         route: false,
+                        space: quote! { None },
+                        space_count: None,
                     };
                 }
-                Meta::List(_) | Meta::Path(_) => {
-                    validate_hypertable_route_field(field, field_type);
+                Meta::Path(_) => {
+                    validate_hypertable_space_field(field, field_type);
                     return HypertableAttr {
                         duration: quote! { None },
-                        route: true,
+                        is_time: false,
+                        route: false,
+                        space: quote! { Some(4_u16) },
+                        space_count: Some(4),
                     };
+                }
+                Meta::List(_) => {
+                    panic!("#[hypertable(...)] requires a std::time::Duration");
                 }
                 _ => panic!("#[hypertable] must use #[hypertable] or #[hypertable(...)]"),
             }
@@ -4809,7 +4995,10 @@ fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> HypertableA
     }
     HypertableAttr {
         duration: quote! { None },
+        is_time: false,
         route: false,
+        space: quote! { None },
+        space_count: None,
     }
 }
 

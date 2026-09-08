@@ -19,6 +19,8 @@ db.migrate_table::<User>().execute().await?;
 
 如果目标转换无法安全证明，`plan()` 或 `execute()` 会返回错误。SQLite 的复杂变更通过重建表完成，非法旧数据会在迁移阶段失败并回滚。
 
+无法就地推断的 schema 演进（主键变更、有数据时的非空新增列等）返回 `OrmerError::UnmigratableSchema`，可用 `err.is_unmigratable_schema()` 判定，以便调用方选择删表重建等策略，与其他迁移失败区分。
+
 ## 版本化迁移
 
 实现 `Migration`，并将迁移按版本交给 `db.migrations()`：
@@ -102,6 +104,17 @@ ClickHouse 使用 `MergeTree` 保存迁移历史，不提供事务或自动回�
 DuckDB 和 ClickHouse 的已有数据表在迁移计划阶段会拒绝自动推断的列类型转换；
 这类表需要显式的分阶段迁移。
 
+InfluxDB 使用同一迁移入口：没有建表 DDL（measurement 由首条写入自动创建），
+迁移步骤逐条执行、失败不回滚，历史记录写入 `__ormer_migrations` measurement。
+
 `migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
 
 模型中的 `#[compress(...)]` 也会参与表结构校验和迁移。PostgreSQL 会生成列级 `SET COMPRESSION`，MySQL 会生成表级 `COMPRESSION` 选项；MySQL 同一张表的压缩列必须使用同一种算法。
+
+## QuestDB 迁移
+
+QuestDB（最低支持 8.3+）逐条执行迁移并使用 `__ormer_migrations` 记录历史（含 `rolled_back` 标记）：
+
+- `AddColumn`、`DropColumn` 可用；`RenameColumn` 生成 `ALTER TABLE t RENAME COLUMN old TO new`。
+- QuestDB 不支持改列类型，`AlterColumn` 与类型变更迁移保持报错，需手写"新表 + INSERT SELECT"重建迁移。
+- `migrate_table` 已支持自动对比：通过 `table_columns('表名')` 自省表结构；QuestDB 没有主键/非空约束，这两项不参与比较，designated timestamp 子句随建表生成、迁移不会破坏已有表。

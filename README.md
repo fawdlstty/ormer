@@ -5,9 +5,9 @@
 
 English | [简体中文](README.zh.md)
 
-A minimalist ORM framework that supports SQLite, PostgreSQL, QuestDB, MySQL, and SqlServer.
+A minimalist ORM framework that supports SQLite, PostgreSQL, QuestDB, MySQL, SqlServer, ClickHouse, and InfluxDB. QuestDB (8.3+) reuses the PostgreSQL wire protocol: insert/select/update, `TRUNCATE TABLE`, block delete via partition drop, and schema introspection are supported; transactions, row delete, RETURNING, and column type changes remain unsupported. InfluxDB writes Line Protocol batches and queries an InfluxQL/SQL subset with time-series semantics.
 
-It also includes raw SQL and typed raw expression parameter binding, relation loading, object graph writes, tracked dirty-field saves, optimized batch insert/update paths, embedded value objects, decimal types, typed derived tables, model filters, dynamic table routing, hooks, global SQL trace callbacks, and versioned migration support.
+It also includes raw SQL and typed raw expression parameter binding, relation loading, object graph writes, tracked dirty-field saves, optimized batch insert/update paths, embedded value objects, decimal types, typed derived tables, model filters, dynamic table routing, hooks, global SQL trace callbacks, time-series block delete, and versioned migration support.
 
 [Online Documentation](https://ormer.fawdlstty.com/en/)
 
