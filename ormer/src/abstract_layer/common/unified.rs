@@ -2632,16 +2632,9 @@ impl Database {
                 let txn = db.begin().await?;
                 Ok(Transaction::DuckDB(txn))
             }
-            #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(_) => Err(unsupported_feature(
-                super::super::DbType::ClickHouse,
-                "transactions on ClickHouse",
-            )),
-            #[cfg(feature = "influxdb")]
-            Database::InfluxDB(_) => Err(unsupported_feature(
-                super::super::DbType::InfluxDB,
-                "transactions",
-            )),
+            // 矩阵兜底：正常不可达（transactions=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(unsupported_feature(self.db_type(), "transactions")),
         }
     }
 

@@ -164,6 +164,19 @@ fn questdb_nonce_sql(db_type: DbType, sql: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("{sql} /* ormer-qdb-nonce:{nanos}-{sequence} */"))
 }
 
+/// 能力矩阵门控：`auto_increment: false` 的连接（QuestDB 复用本后端）拒绝
+/// 含自增列的模型写入。PostgreSQL 直接放行；无自增列时不做任何判定。
+fn ensure_auto_increment_supported<T: Model>(db_type: DbType) -> crate::Result<()> {
+    if T::COLUMN_SCHEMA.iter().any(|column| column.is_auto_increment) {
+        crate::Capabilities::ensure(
+            db_type,
+            |caps| caps.auto_increment,
+            "auto-increment insert returning",
+        )?;
+    }
+    Ok(())
+}
+
 fn pg_column_rust_type<T: Model>(column: &str) -> Option<&'static str> {
     let column = column.rsplit('.').next().unwrap_or(column);
     T::COLUMN_SCHEMA
@@ -1915,19 +1928,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let db_type = self.db.db_type();
         // 能力矩阵按运行时 db_type 判定：QuestDB 复用本连接，insert_conflict /
         // auto_increment 均为 false，PostgreSQL 直接放行。
-        let caps = crate::Capabilities::of(db_type);
-        if !caps.insert_conflict && self.conflict.is_some() {
+        if !crate::Capabilities::of(db_type).insert_conflict && self.conflict.is_some() {
             return Err(crate::OrmerError::UnsupportedFeature {
                 backend: db_type,
                 feature: "insert conflict handling",
             });
         }
-        if !caps.auto_increment && common_helpers::auto_increment_column::<I::Model>().is_some() {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "auto-increment insert returning",
-            });
-        }
+        ensure_auto_increment_supported::<I::Model>(db_type)?;
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
@@ -2078,14 +2085,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
     }
 
     async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
-        if self.db.db_type().is_questdb()
-            && I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment)
-        {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db.db_type(),
-                feature: "auto-increment insert returning",
-            });
-        }
+        ensure_auto_increment_supported::<I::Model>(self.db.db_type())?;
         if sql.statements.is_empty() {
             return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
         }
@@ -2191,16 +2191,7 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        if self.db.db_type().is_questdb()
-            && T::COLUMN_SCHEMA
-                .iter()
-                .any(|column| column.is_auto_increment)
-        {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db.db_type(),
-                feature: "auto-increment insert returning",
-            });
-        }
+        ensure_auto_increment_supported::<T>(self.db.db_type())?;
         common_helpers::validate_insert_model_table::<T>(DbType::PostgreSQL, self.source_table)?;
         let statement =
             common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
@@ -2236,16 +2227,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
     }
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
-        if self.db.db_type().is_questdb()
-            && T::COLUMN_SCHEMA
-                .iter()
-                .any(|column| column.is_auto_increment)
-        {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db.db_type(),
-                feature: "auto-increment insert returning",
-            });
-        }
+        ensure_auto_increment_supported::<T>(self.db.db_type())?;
         if sql.statements.is_empty() {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
         }
@@ -2301,12 +2283,13 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        if self.db.db_type().is_questdb() {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db.db_type(),
-                feature: "INSERT ON CONFLICT DO UPDATE",
-            });
-        }
+        // 能力矩阵：QuestDB 连接 insert_conflict=false（统一层已先行拦截，
+        // 此处为直接使用后端 API 的防线）。
+        crate::Capabilities::ensure(
+            self.db.db_type(),
+            |caps| caps.insert_conflict,
+            "insert conflict handling",
+        )?;
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -2377,12 +2360,9 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        if self.db.db_type().is_questdb() {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db.db_type(),
-                feature: "INSERT ON CONFLICT DO NOTHING",
-            });
-        }
+        // 能力矩阵：QuestDB 连接 insert_ignore=false（统一层已先行拦截，
+        // 此处为直接使用后端 API 的防线）。
+        crate::Capabilities::ensure(self.db.db_type(), |caps| caps.insert_ignore, "insert ignore")?;
         let refs = self.models.as_refs();
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
@@ -2505,6 +2485,9 @@ impl Database {
         &self,
         schema: Option<&str>,
     ) -> crate::Result<Vec<DbFirstTable>> {
+        // 保留硬编码：db-first 实体生成不在 Capabilities::schema_introspection
+        // 覆盖范围内（该字段只门控 validate_table，QuestDB 为 true），
+        // QuestDB 无 information_schema，此处按运行时 db_type 单独拒绝。
         if self.db_type.is_questdb() {
             return Err(crate::OrmerError::UnsupportedFeature {
                 backend: self.db_type,
@@ -2812,6 +2795,9 @@ impl Database {
 
     /// 验证表结构是否与模型定义匹配
     pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
+        // 保留 is_questdb 路由（非能力拒绝）：Capabilities::schema_introspection
+        // 对 QuestDB 为 true，统一层放行后在此分流到 table_columns 专用校验；
+        // 矩阵只覆盖“能否校验”的粗粒度门控，不表达校验 SQL 的方言差异。
         if self.db_type.is_questdb() {
             // QuestDB 无 information_schema，基于 table_columns 元函数自省比对
             #[cfg(feature = "questdb")]
@@ -3468,7 +3454,7 @@ impl Database {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
-            questdb: self.db_type.is_questdb().then_some(self.db_type),
+            db_type: self.db_type,
             client: &self.client,
             _marker: PhantomData,
         }
@@ -3517,12 +3503,9 @@ impl Database {
     /// drop 兜底回滚后归还），事务期间同一池上的其他操作不会混入事务；
     /// 直连模式下连接本就为该 `Database` 独占，直接复用。
     pub async fn begin(&self) -> crate::Result<Transaction<'_>> {
-        if self.db_type.is_questdb() {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: self.db_type,
-                feature: "transactions",
-            });
-        }
+        // 能力矩阵：QuestDB 连接 transactions=false（统一层 Database::begin
+        // 已先行拦截，此处为直接使用后端 API 的防线）。
+        crate::Capabilities::ensure(self.db_type, |caps| caps.transactions, "transactions")?;
         let conn = match &self.pool {
             Some(pool) => {
                 let pooled = FutureTraceExt::trace(pool.get_owned()).await?;
@@ -3881,7 +3864,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
     /// 自增主键回填约定（跨后端统一）：仅单行插入时返回的 id 有明确语义；
     /// 批量插入多条时取 RETURNING 首行 id，不应依赖批量插入返回的 id。
     pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
-        let use_copy = {
+        // 事务只在 transactions=true 的 PostgreSQL 连接上存在，此处仍统一经
+        // 能力矩阵 copy 判定，与非事务路径保持同一门控入口。
+        let use_copy = crate::Capabilities::of(DbType::PostgreSQL).copy && {
             let refs = self.models.as_refs();
             pg_should_use_copy_insert::<I::Model>(&refs, self.conflict.as_ref())
         };
@@ -4166,7 +4151,8 @@ impl<'a> Transaction<'a> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
-            questdb: None,
+            // 事务只在 PostgreSQL 连接上存在（QuestDB transactions=false）
+            db_type: DbType::PostgreSQL,
             client: self.client(),
             _marker: PhantomData,
         }
@@ -4981,12 +4967,18 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
     versioned: bool,
-    questdb: Option<DbType>,
+    /// 运行时后端类型（PostgreSQL 或复用本连接的 QuestDB），驱动能力矩阵判定。
+    db_type: DbType,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> DeleteExecutor<'a, T> {
+    /// 运行时后端类型，供统一层能力门控使用。
+    pub(crate) fn db_type(&self) -> DbType {
+        self.db_type
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
@@ -5000,12 +4992,9 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        if let Some(backend) = self.questdb {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend,
-                feature: "row delete",
-            });
-        }
+        // 能力矩阵：QuestDB 连接 row_delete=false（统一层 Database::delete 已先行
+        // 拦截为 Unsupported 变体，此处为直接使用后端 API 的防线）。
+        crate::Capabilities::ensure(self.db_type, |caps| caps.row_delete, "row delete")?;
         let (sql, params) = self.build_sql_with_params();
         let rust_types = self.filter_param_rust_types();
         Ok(SqlStatement::batch(
@@ -5421,6 +5410,11 @@ pub struct UpdateExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
+    /// 运行时后端类型（PostgreSQL 或复用本连接的 QuestDB），供统一层能力门控使用。
+    pub(crate) fn db_type(&self) -> DbType {
+        self.db_type
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F, W>(mut self, f: F) -> Self
     where

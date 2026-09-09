@@ -1053,6 +1053,10 @@ fn drop_retention_policy_statement(database: &str, policy: &str) -> String {
 
 /// InfluxDB 模型约束：有且仅有一个时间类型 `#[primary]`（不支持 auto），
 /// `#[index]` 字段必须为 String。不满足时报错。
+///
+/// 自增列拒绝与 `Capabilities::of(DbType::InfluxDB).auto_increment=false` 一致，
+/// 但保留在 Line Protocol 写入前校验（含 InfluxDB 特有的提示文案），矩阵只
+/// 覆盖粗粒度门控。
 pub(crate) fn validate_influx_model<T: Model>(db_type: crate::abstract_layer::DbType) -> crate::Result<()> {
     let schema = T::column_schema();
     if schema.iter().any(|column| column.is_auto_increment) {

@@ -3409,10 +3409,12 @@ fn generate_questdb_create_table_sql_with_name<T: Model>(
             sql.push_str(", ");
         }
         if column.is_auto_increment {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "auto-increment columns",
-            });
+            // 能力矩阵：QuestDB auto_increment=false，拒绝含自增列的建表。
+            crate::Capabilities::ensure(
+                db_type,
+                |caps| caps.auto_increment,
+                "auto-increment columns",
+            )?;
         }
         if column.rust_type.starts_with("Vec<")
             || column.rust_type.starts_with("std::vec::Vec<")
@@ -3514,6 +3516,10 @@ fn generate_create_table_sql_with_engine<T: Model>(
     let is_clickhouse = matches!(db_type, crate::abstract_layer::DbType::ClickHouse);
     #[cfg(not(feature = "clickhouse"))]
     let is_clickhouse = false;
+    // 能力矩阵：constraints=false 的后端建表时不输出 PRIMARY KEY/UNIQUE/CHECK/
+    // FOREIGN KEY 约束（当前为 ClickHouse；QuestDB 走专用建表函数，InfluxDB 不
+    // 生成 SQL DDL）。`is_clickhouse` 仅保留给 ENGINE 子句等方言细节。
+    let supports_constraints = crate::Capabilities::of(db_type).constraints;
 
     let table_options = T::table_options();
     if is_clickhouse {
@@ -3593,7 +3599,7 @@ fn generate_create_table_sql_with_engine<T: Model>(
             )
         } else {
             let effective_rust_type = column.data_type.unwrap_or(column.rust_type);
-            if !is_clickhouse && is_composite_primary && column.is_primary {
+            if supports_constraints && is_composite_primary && column.is_primary {
                 db_type.sql_type(
                     effective_rust_type,
                     false, // 不在列级别标记为主键
@@ -3604,7 +3610,7 @@ fn generate_create_table_sql_with_engine<T: Model>(
             } else {
                 db_type.sql_type(
                     effective_rust_type,
-                    column.is_primary && !is_clickhouse,
+                    column.is_primary && supports_constraints,
                     column.is_auto_increment,
                     column.is_nullable,
                     column.enum_variants,
@@ -3671,7 +3677,7 @@ fn generate_create_table_sql_with_engine<T: Model>(
         }
 
         // 添加单列 UNIQUE 约束（group 中只有一个字段的情况）
-        if !is_clickhouse && column.unique_group.is_some() {
+        if supports_constraints && column.unique_group.is_some() {
             // 检查这个 group 中是否有多个字段
             let group_count = column_schema
                 .iter()
@@ -3686,7 +3692,7 @@ fn generate_create_table_sql_with_engine<T: Model>(
             }
         }
 
-        if !is_clickhouse {
+        if supports_constraints {
             if let Some(check) = column.check {
                 sql.push(' ');
                 if let Some(name) = check.name {
@@ -3697,7 +3703,7 @@ fn generate_create_table_sql_with_engine<T: Model>(
         }
     }
 
-    if !is_clickhouse {
+    if supports_constraints {
         // 添加外键约束
         let foreign_key_constraints = generate_foreign_key_constraints::<T>(db_type);
         if !foreign_key_constraints.is_empty() {

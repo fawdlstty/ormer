@@ -84,6 +84,9 @@ impl ExecutorConnLease<'_> {
     }
 }
 
+/// MySQL `dml_returning=false`（见 `Capabilities::of(DbType::MySQL)`）：统一层
+/// `*Executor::returning` 已按矩阵先行拦截，此处为直接使用后端 API 的防线，
+/// 文案与统一层保持一致。
 fn mysql_returning_unsupported() -> crate::OrmerError {
     crate::OrmerError::UnsupportedFeature {
         backend: DbType::MySQL,

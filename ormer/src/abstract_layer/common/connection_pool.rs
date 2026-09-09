@@ -345,12 +345,17 @@ pub struct PooledInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        // 能力矩阵优先：insert_conflict=false 的后端（ClickHouse/InfluxDB/QuestDB）
+        // 统一拒绝；QuestDB 复用 PostgreSQL 连接，按运行时 db_type 判定。
+        let db_type = db_type_for_connection(self.pooled_conn.get_connection());
+        crate::Capabilities::ensure(
+            db_type,
+            |caps| caps.insert_conflict,
+            "insert conflict handling",
+        )?;
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(
-                db_type_for_connection(self.pooled_conn.get_connection()),
-                Vec::new(),
-            ));
+            return Ok(SqlStatement::batch(db_type, Vec::new()));
         }
 
         match self.pooled_conn.get_connection() {
@@ -473,15 +478,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                 }
                 Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
             }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "conflict writes on ClickHouse",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
-                feature: "conflict writes",
+            // 矩阵兜底：正常不可达（insert_conflict=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "insert conflict handling",
             }),
         }
     }
@@ -503,6 +504,12 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
     }
 
     async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
+        let db_type = db_type_for_connection(self.pooled_conn.get_connection());
+        crate::Capabilities::ensure(
+            db_type,
+            |caps| caps.insert_conflict,
+            "insert conflict handling",
+        )?;
         let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
@@ -515,15 +522,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
             ConnectionWrapper::MSSQL(db) => db.insert_or_update_impl::<I::Model>(&refs).await,
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.insert_or_update_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "conflict writes on ClickHouse",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
-                feature: "conflict writes",
+            // 矩阵兜底：正常不可达（insert_conflict=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "insert conflict handling",
             }),
         }
     }
@@ -538,12 +541,13 @@ pub struct PooledInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        // 能力矩阵优先：insert_ignore=false 的后端（ClickHouse/InfluxDB/QuestDB）
+        // 统一拒绝；QuestDB 复用 PostgreSQL 连接，按运行时 db_type 判定。
+        let db_type = db_type_for_connection(self.pooled_conn.get_connection());
+        crate::Capabilities::ensure(db_type, |caps| caps.insert_ignore, "insert ignore")?;
         let refs = self.models.as_refs();
         if refs.is_empty() {
-            return Ok(SqlStatement::batch(
-                db_type_for_connection(self.pooled_conn.get_connection()),
-                Vec::new(),
-            ));
+            return Ok(SqlStatement::batch(db_type, Vec::new()));
         }
 
         match self.pooled_conn.get_connection() {
@@ -627,15 +631,11 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
                 Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
             }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "conflict writes on ClickHouse",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
-                feature: "conflict writes",
+            // 矩阵兜底：正常不可达（insert_ignore=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "insert ignore",
             }),
         }
     }
@@ -676,6 +676,8 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
     }
 
     async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
+        let db_type = db_type_for_connection(self.pooled_conn.get_connection());
+        crate::Capabilities::ensure(db_type, |caps| caps.insert_ignore, "insert ignore")?;
         let refs = self.models.as_refs();
         match self.pooled_conn.get_connection() {
             #[cfg(feature = "sqlite")]
@@ -691,15 +693,11 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
                 .map(|_| ()),
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.insert_or_ignore_batch::<I::Model>(&refs).await,
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "conflict writes on ClickHouse",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
-                feature: "conflict writes",
+            // 矩阵兜底：正常不可达（insert_ignore=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "insert ignore",
             }),
         }
     }
@@ -1844,7 +1842,13 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 验证表结构
+    ///
+    /// 以 [`crate::Capabilities::schema_introspection`] 为准：ClickHouse/InfluxDB
+    /// 统一拒绝；QuestDB 为 true，由 PostgreSQL 后端按运行时 db_type 分流到
+    /// `table_columns()` 专用校验。
     pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
+        let db_type = db_type_for_connection(self.get_connection());
+        crate::Capabilities::ensure(db_type, |caps| caps.schema_introspection, "validate_table")?;
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
@@ -1856,14 +1860,10 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::MSSQL(db) => db.validate_table::<T>().await,
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "validate_table",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
+            // 矩阵兜底：正常不可达（schema_introspection=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
                 feature: "validate_table",
             }),
         }
@@ -1955,7 +1955,19 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 创建 Delete 执行器
+    ///
+    /// 以 [`crate::Capabilities::row_delete`] 为准：ClickHouse/InfluxDB/QuestDB
+    /// 统一落入 `Unsupported` 变体；QuestDB 复用 PostgreSQL 连接，按运行时
+    /// db_type 判定。
     pub fn delete<T: WritableModel>(&self) -> super::unified::DeleteExecutor<'_, T> {
+        let db_type = db_type_for_connection(self.get_connection());
+        if !crate::Capabilities::of(db_type).row_delete {
+            return super::unified::DeleteExecutor::Unsupported {
+                backend: db_type,
+                feature: "row delete",
+                _marker: PhantomData,
+            };
+        }
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -1973,15 +1985,10 @@ impl<'a> PooledConnection<'a> {
             ConnectionWrapper::DuckDB(db) => {
                 super::unified::DeleteExecutor::DuckDB(db.delete::<T>())
             }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => super::unified::DeleteExecutor::Unsupported {
-                backend: DbType::ClickHouse,
-                feature: "row delete on ClickHouse",
-                _marker: PhantomData,
-            },
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => super::unified::DeleteExecutor::Unsupported {
-                backend: DbType::InfluxDB,
+            // 矩阵兜底：正常不可达（row_delete=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => super::unified::DeleteExecutor::Unsupported {
+                backend: db_type,
                 feature: "row delete",
                 _marker: PhantomData,
             },
@@ -2111,7 +2118,12 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 按各后端默认方式开启事务（不应用任何选项）
+    ///
+    /// 以 [`crate::Capabilities::transactions`] 为准：ClickHouse/InfluxDB/QuestDB
+    /// 统一拒绝，QuestDB 复用 PostgreSQL 连接、按运行时 db_type 判定。
     async fn begin_raw(&self) -> crate::Result<super::unified::Transaction<'_>> {
+        let db_type = db_type_for_connection(self.get_connection());
+        crate::Capabilities::ensure(db_type, |caps| caps.transactions, "transactions")?;
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -2138,14 +2150,10 @@ impl<'a> PooledConnection<'a> {
                 let txn = crate::utils::FutureTraceExt::trace(db.begin()).await?;
                 Ok(super::unified::Transaction::DuckDB(txn))
             }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::ClickHouse,
-                feature: "transactions",
-            }),
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
-                backend: DbType::InfluxDB,
+            // 矩阵兜底：正常不可达（transactions=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
                 feature: "transactions",
             }),
         }
