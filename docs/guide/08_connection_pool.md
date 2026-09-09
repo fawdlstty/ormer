@@ -28,6 +28,20 @@ let conn = pool.get().await?;
 let users: Vec<User> = conn.select::<User>().collect().await?;
 ```
 
+## 池配置项
+
+内置手工连接池的后端（sqlite/mssql/duckdb/clickhouse/influxdb）支持获取超时、空闲回收与最大寿命：
+
+```rust
+let pool = Database::create_pool(DbType::MSSQL, "mssql://user:pass@localhost/db")
+    .range(2..10)
+    .acquire_timeout(std::time::Duration::from_secs(30)) // 获取连接最长等待，None 为无限
+    .idle_timeout(Some(std::time::Duration::from_secs(300))) // 空闲超过 5 分钟的连接取用时退役
+    .max_lifetime(Some(std::time::Duration::from_secs(1800))) // 连接寿命 30 分钟，到期重建
+    .build()
+    .await?;
+```
+
 ## 读写分离
 
 同一种数据库类型下可以显式配置主库和只读库。查询通过 `.read()` 获取读库，写入和强一致读取通过 `.write()` 获取主库：

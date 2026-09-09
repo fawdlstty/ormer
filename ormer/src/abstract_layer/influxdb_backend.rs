@@ -6,6 +6,25 @@ use crate::migration::{MIGRATION_TABLE_NAME, Migration, MigrationInfo};
 use crate::model::{Model, Value};
 use crate::raw_sql::IntoRawSql;
 
+/// HTTP 连接超时（TCP/TLS 建连阶段）。
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// HTTP 请求总超时（连接 + 服务端执行 + 响应传输）。
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 单次写入分块的最大行数（Line Protocol）。
+const WRITE_CHUNK_LINES: usize = 5_000;
+/// 单次写入分块的最大字节数（InfluxDB 默认请求体上限约 50MB，取安全下限）。
+const WRITE_CHUNK_BYTES: usize = 5 * 1024 * 1024;
+/// 幂等写（Line Protocol 天然幂等：同 measurement+tags+timestamp 覆盖）的
+/// 最大尝试次数（含首次）。
+const WRITE_MAX_ATTEMPTS: usize = 3;
+/// 重试退避基数：第 n 次重试等待 `WRITE_RETRY_BACKOFF_MS * 2^n` 毫秒。
+const WRITE_RETRY_BACKOFF_MS: u64 = 100;
+
+/// 判断是否为可安全重试的网络错误（连接失败/超时等传输层错误）。
+fn is_network_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
+}
+
 /// InfluxDB 服务端版本与对应的认证信息。
 #[derive(Clone, Debug)]
 pub(crate) enum InfluxMode {
@@ -85,8 +104,15 @@ impl Database {
         let mut base = url.clone();
         base.set_query(None);
         base.set_fragment(None);
+        let http = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| {
+                crate::OrmerError::from_external("reqwest::Client::builder (InfluxDB)", error)
+            })?;
         Ok(Self {
-            http: reqwest::Client::new(),
+            http,
             url: base.to_string(),
             mode,
         })
@@ -158,6 +184,22 @@ impl Database {
         params
     }
 
+    /// 写入请求参数；`policy` 为 Some 时写入指定（非默认）保留策略。
+    ///
+    /// 仅 1.x 写入端点支持 `rp` 参数；2.x 的 bucket 自带保留策略，
+    /// 声明 retention 的模型在 2.x 上本就无法创建专属 RP（建表即报错），
+    /// 因此这里对 2.x 静默忽略 `policy`。
+    fn write_query_params_with_policy(
+        &self,
+        policy: Option<&str>,
+    ) -> Vec<(&'static str, String)> {
+        let mut params = self.write_query_params();
+        if let (InfluxMode::V1 { .. }, Some(policy)) = (&self.mode, policy) {
+            params.push(("rp", policy.to_string()));
+        }
+        params
+    }
+
     fn query_request_params(&self, q: &str) -> Vec<(&'static str, String)> {
         let mut params: Vec<(&'static str, String)> =
             vec![("db", self.database_name().to_string()), ("q", q.to_string()), ("epoch", "ns".to_string())];
@@ -190,6 +232,8 @@ impl Database {
     }
 
     /// 执行一条 InfluxQL/SQL 查询，返回所有 series（列名与行值）。
+    ///
+    /// 读查询不重试业务错误，仅对网络错误重试一次。
     pub(crate) async fn query_influxql(
         &self,
         q: &str,
@@ -201,20 +245,42 @@ impl Database {
         for (name, value) in self.query_request_params(q) {
             request = request.query(&[(name, value)]);
         }
-        let response = request.send().await.map_err(|error| {
-            crate::OrmerError::from_external("reqwest::Client::send (InfluxDB query)", error)
-        })?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(crate::ormer_error!(
-                "InfluxDB query failed: {status}: {body}"
-            ));
+        let mut send_error = None;
+        for attempt in 0..2 {
+            let request = request
+                .try_clone()
+                .expect("query request must be cloneable");
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(crate::ormer_error!(
+                            "InfluxDB query failed: {status}: {body}"
+                        ));
+                    }
+                    return parse_query_response(&body);
+                }
+                // 读查询仅对网络错误重试一次，业务错误不重试
+                Err(error) => {
+                    let retryable = is_network_error(&error);
+                    send_error = Some(error);
+                    if retryable && attempt == 0 {
+                        continue;
+                    }
+                    break;
+                }
+            }
         }
-        parse_query_response(&body)
+        Err(crate::OrmerError::from_external(
+            "reqwest::Client::send (InfluxDB query)",
+            send_error.expect("error path always carries a send error"),
+        ))
     }
 
     /// 执行一条语句（DDL/DML），返回受影响行数（InfluxDB 恒为 0）。
+    ///
+    /// 语句可能与写入耦合（非幂等），仅对网络错误重试一次。
     pub(crate) async fn execute_influxql(&self, q: &str) -> crate::Result<u64> {
         let mut request = self.http.post(self.query_path());
         if let Some(auth) = self.auth_header() {
@@ -225,28 +291,97 @@ impl Database {
         for (name, value) in params {
             request = request.query(&[(name, value)]);
         }
-        let response = request.send().await.map_err(|error| {
-            crate::OrmerError::from_external("reqwest::Client::send (InfluxDB statement)", error)
-        })?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(crate::ormer_error!(
-                "InfluxDB statement failed: {status}: {body}"
-            ));
+        let mut send_error = None;
+        for attempt in 0..2 {
+            let request = request
+                .try_clone()
+                .expect("statement request must be cloneable");
+            match request.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    if !status.is_success() {
+                        return Err(crate::ormer_error!(
+                            "InfluxDB statement failed: {status}: {body}"
+                        ));
+                    }
+                    // 查询结果中可能内嵌 error 字段
+                    for error in parse_query_errors(&body) {
+                        return Err(error);
+                    }
+                    return Ok(0);
+                }
+                Err(error) => {
+                    let retryable = is_network_error(&error);
+                    send_error = Some(error);
+                    if retryable && attempt == 0 {
+                        continue;
+                    }
+                    break;
+                }
+            }
         }
-        // 查询结果中可能内嵌 error 字段
-        for error in parse_query_errors(&body) {
-            return Err(error);
-        }
-        Ok(0)
+        Err(crate::OrmerError::from_external(
+            "reqwest::Client::send (InfluxDB statement)",
+            send_error.expect("error path always carries a send error"),
+        ))
     }
 
-    /// Line Protocol 批量写入。
+    /// Line Protocol 批量写入（数据库默认保留策略）。
     pub(crate) async fn write_lines(&self, lines: &str) -> crate::Result<()> {
+        self.write_lines_with_policy(lines, None).await
+    }
+
+    /// Line Protocol 批量写入；`policy` 为 Some 时写入该非默认保留策略
+    /// （仅 1.x 生效，见 [`Database::write_query_params_with_policy`]）。
+    ///
+    /// 写入按行数/字节数分块（每 [`WRITE_CHUNK_LINES`] 行或
+    /// [`WRITE_CHUNK_BYTES`] 字节，先到为准），避免超过服务端请求体上限；
+    /// Line Protocol 幂等（同 measurement+tags+timestamp 覆盖），对
+    /// 429/5xx/网络错误做有限次指数退避重试。
+    pub(crate) async fn write_lines_with_policy(
+        &self,
+        lines: &str,
+        policy: Option<&str>,
+    ) -> crate::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
+        for chunk in chunk_line_protocol(lines) {
+            self.write_chunk_with_retry(&chunk, policy).await?;
+        }
+        Ok(())
+    }
+
+    /// 发送单个写入分块；幂等写允许对 429/5xx/网络错误重试。
+    async fn write_chunk_with_retry(&self, chunk: &str, policy: Option<&str>) -> crate::Result<()> {
+        let mut last_error: Option<crate::OrmerError> = None;
+        for attempt in 0..WRITE_MAX_ATTEMPTS {
+            let failure = match self.write_chunk_once(chunk, policy).await {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+            let (error, retryable) = failure.into_parts();
+            last_error = Some(error);
+            if retryable && attempt + 1 < WRITE_MAX_ATTEMPTS {
+                let backoff =
+                    std::time::Duration::from_millis(WRITE_RETRY_BACKOFF_MS << attempt);
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            break;
+        }
+        Err(last_error.take().unwrap_or_else(|| {
+            crate::ormer_error!("InfluxDB write failed after {WRITE_MAX_ATTEMPTS} attempts")
+        }))
+    }
+
+    /// 单次写入请求（不重试）；返回错误与“是否可安全重试”标记。
+    async fn write_chunk_once(
+        &self,
+        chunk: &str,
+        policy: Option<&str>,
+    ) -> Result<(), WriteChunkFailure> {
         let mut request = self
             .http
             .post(self.write_path())
@@ -254,12 +389,23 @@ impl Database {
         if let Some(auth) = self.auth_header() {
             request = request.header("Authorization", auth);
         }
-        for (name, value) in self.write_query_params() {
+        for (name, value) in self.write_query_params_with_policy(policy) {
             request = request.query(&[(name, value)]);
         }
-        let response = request.body(lines.to_string()).send().await.map_err(|error| {
-            crate::OrmerError::from_external("reqwest::Client::send (InfluxDB write)", error)
-        })?;
+        let response = request
+            .body(chunk.to_string())
+            .send()
+            .await
+            .map_err(|error| {
+                let retryable = is_network_error(&error);
+                WriteChunkFailure(
+                    crate::OrmerError::from_external(
+                        "reqwest::Client::send (InfluxDB write)",
+                        error,
+                    ),
+                    retryable,
+                )
+            })?;
         if response.status().is_success() {
             return Ok(());
         }
@@ -268,8 +414,11 @@ impl Database {
             .text()
             .await
             .unwrap_or_else(|_| "InfluxDB write request failed".to_string());
-        Err(crate::ormer_error!(
-            "InfluxDB write failed: {status}: {message}"
+        // 幂等写可安全重试：429（限流）与 5xx（服务端故障）
+        let retryable = status.as_u16() == 429 || status.is_server_error();
+        Err(WriteChunkFailure(
+            crate::ormer_error!("InfluxDB write failed: {status}: {message}"),
+            retryable,
         ))
     }
 
@@ -335,42 +484,62 @@ impl Database {
 
     /// 把模型渲染为 Line Protocol 并批量写入。
     /// 同测量 + 同标签 + 同时间戳的重复写入由 InfluxDB 自然覆盖。
+    /// 模型声明 retention 时写入其专属保留策略，未声明时写默认保留策略。
     pub(crate) async fn insert_models<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
         validate_influx_model::<T>(crate::abstract_layer::DbType::InfluxDB)?;
         let lines = render_line_protocol(models)?;
-        self.write_lines(&lines).await
+        let policy = model_retention_policy_name::<T>();
+        self.write_lines_with_policy(&lines, policy.as_deref()).await
     }
 
-    /// 建表：无建表 DDL；声明 `#[influxdb(retention = ...)]` 时创建保留策略。
+    /// 建表：无建表 DDL；声明 `#[influxdb(retention = ...)]` 时创建模型专属
+    /// 保留策略。该策略是非默认 RP，不抢占数据库默认保留策略：多个声明
+    /// retention 的模型互不覆盖，迁移历史（固定存放在默认 RP）也不随
+    /// "当时的默认 RP" 漂移。
     pub(crate) async fn create_table<T: Model>(&self) -> crate::Result<()> {
         let Some(retention) = T::TABLE_OPTIONS.and_then(|options| options.influxdb_retention)
         else {
             return Ok(());
         };
-        let database = quote_influx_identifier(self.database_name());
-        let policy = retention_policy_name(T::TABLE_NAME);
-        let statement = format!(
-            "CREATE RETENTION POLICY {policy} ON {database} \
-             DURATION {} REPLICATION 1 DEFAULT",
-            format_influx_duration(retention)?
-        );
+        let statement = create_retention_policy_statement(
+            &quote_influx_identifier(self.database_name()),
+            &retention_policy_name(T::TABLE_NAME),
+            retention,
+        )?;
         self.execute_influxql(&statement).await.map(|_| ())
     }
 
-    /// 删除 measurement。
+    /// 删除 measurement；声明 retention 时顺带删除该模型的专属保留策略。
+    ///
+    /// 专属 RP 以 `ormer_<table>` 命名且仅由本模型的建表创建（非默认），
+    /// 因此归属可判定、drop 时直接删除；注意删除 RP 会连带清理其中该模型
+    /// 的全部数据。InfluxQL 的 `DROP MEASUREMENT` 不支持 `"rp"."measurement"`
+    /// 限定写法，未限定语句负责清理默认 RP 中的同名 measurement。
     pub(crate) async fn drop_table<T: Model>(&self) -> crate::Result<()> {
         let measurement = T::table_name_for_db(crate::abstract_layer::DbType::InfluxDB);
         let statement = format!(
             "DROP MEASUREMENT {}",
             quote_influx_identifier(measurement)
         );
-        self.execute_influxql(&statement).await.map(|_| ())
+        self.execute_influxql(&statement).await?;
+        if let Some(policy) = model_retention_policy_name::<T>() {
+            let statement = drop_retention_policy_statement(
+                &quote_influx_identifier(self.database_name()),
+                &quote_influx_identifier(&policy),
+            );
+            self.execute_influxql(&statement).await?;
+        }
+        Ok(())
     }
 
     /// 读取 `__ormer_migrations` measurement 中的迁移历史。
+    ///
+    /// 历史表固定存放在数据库默认保留策略：读取不限定 RP，写入（Line
+    /// Protocol）也不携带 `rp` 参数，读写两侧始终一致；模型 retention 创建
+    /// 的是非默认专属 RP，不会再改变这一位置。
     pub(crate) async fn migration_history(&self) -> crate::Result<Vec<MigrationInfo>> {
         let measurement = quote_influx_identifier(MIGRATION_TABLE_NAME);
         let series = self
@@ -404,38 +573,11 @@ impl Database {
         &self,
         migrations: &[M],
     ) -> crate::Result<usize> {
-        let applied = self
-            .migration_history()
-            .await?
-            .into_iter()
-            .map(|migration| (migration.version, migration.checksum))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut sorted = migrations.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|migration| migration.version());
-        let mut seen = std::collections::BTreeSet::new();
-        let mut pending = Vec::new();
-        for migration in sorted {
-            if !seen.insert(migration.version()) {
-                return Err(crate::ormer_error!(
-                    "Duplicate migration version {}",
-                    migration.version()
-                ));
-            }
-            if let Some(checksum) = applied.get(&migration.version()) {
-                if *checksum != migration.checksum() {
-                    return Err(crate::ormer_error!(
-                        "Migration {} checksum changed after it was applied",
-                        migration.version()
-                    ));
-                }
-                continue;
-            }
-            pending.push(MigrationInfo {
-                version: migration.version(),
-                name: migration.name().to_string(),
-                checksum: migration.checksum(),
-            });
-        }
+        let applied = self.migration_history().await?;
+        let pending = crate::abstract_layer::common::compute_pending_migrations(
+            applied,
+            migrations,
+        )?;
         if pending.is_empty() {
             return Ok(0);
         }
@@ -462,6 +604,7 @@ impl Database {
                 record.checksum,
                 timestamp
             );
+            // 不携带 rp 参数，写入默认保留策略，与 migration_history 的读取位置一致。
             self.write_lines(&line).await?;
         }
         Ok(pending.len())
@@ -480,21 +623,16 @@ impl Database {
             return Ok(BlockDeleteResult::default());
         };
         let Some(delete_path) = self.delete_path() else {
-            // 1.x 只能走 InfluxQL DELETE
-            let measurement = T::table_name_for_db(crate::abstract_layer::DbType::InfluxDB);
-            let predicate = format!("_measurement = '{}'", measurement.replace('\'', "\\'"));
+            // 1.x 只能走 InfluxQL DELETE；声明 retention 的模型限定其专属 RP
+            let measurement = influx_measurement_for_model::<T>();
             let start = start
                 .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
                 .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             let stop = stop.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             self.execute_influxql(&format!(
-                "DELETE FROM {} WHERE time >= '{}' AND time <= '{}'",
-                quote_influx_identifier(measurement),
-                start,
-                stop
+                "DELETE FROM {measurement} WHERE time >= '{start}' AND time <= '{stop}'"
             ))
             .await?;
-            let _ = predicate;
             return Ok(BlockDeleteResult::default());
         };
         let measurement = T::table_name_for_db(crate::abstract_layer::DbType::InfluxDB);
@@ -534,11 +672,43 @@ impl Database {
     }
 }
 
+/// 写入分块失败：错误 + 是否可安全重试（429/5xx/网络错误）。
+struct WriteChunkFailure(crate::OrmerError, bool);
+
+impl WriteChunkFailure {
+    fn into_parts(self) -> (crate::OrmerError, bool) {
+        (self.0, self.1)
+    }
+}
+
 /// 一个 InfluxQL 查询返回的 series（含 tags 与按列名组织的行）。
 #[derive(Debug, Clone)]
 pub(crate) struct InfluxSeries {
     pub tags: std::collections::BTreeMap<String, String>,
     pub rows: Vec<std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+/// 把 Line Protocol 按行数/字节数分块（先到为准），每块保留完整行。
+fn chunk_line_protocol(lines: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_lines = 0usize;
+    for line in lines.lines() {
+        if current_lines >= WRITE_CHUNK_LINES || current.len() + line.len() + 1 > WRITE_CHUNK_BYTES
+        {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+                current_lines = 0;
+            }
+        }
+        current.push_str(line);
+        current.push('\n');
+        current_lines += 1;
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn parse_query_response(body: &str) -> crate::Result<Vec<InfluxSeries>> {
@@ -728,6 +898,32 @@ fn quote_influxql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "\\'"))
 }
 
+/// 校验 Decimal/BigDecimal 文本是合法数字字面量后才允许内联。
+///
+/// InfluxQL 与 Line Protocol 都不支持绑定参数，Decimal 以原始文本拼进
+/// 查询；不校验的话 `RawSql::bind(Value::Decimal("1;DROP SERIES ..."))`
+/// 即构成注入向量。
+fn validate_decimal_literal(value: &str) -> crate::Result<&str> {
+    let bytes = value.as_bytes();
+    let is_valid = !bytes.is_empty()
+        && bytes.iter().enumerate().all(|(index, byte)| match byte {
+            b'0'..=b'9' | b'.' => true,
+            b'e' | b'E' => true,
+            b'+' | b'-' => {
+                index == 0 || matches!(bytes[index - 1], b'e' | b'E')
+            }
+            _ => false,
+        })
+        && bytes.iter().any(|byte| byte.is_ascii_digit());
+    if is_valid {
+        Ok(value)
+    } else {
+        Err(crate::ormer_error!(
+            "InfluxDB decimal value is not a valid numeric literal: {value}"
+        ))
+    }
+}
+
 /// 模型值 → InfluxQL 字面量（InfluxQL 不支持绑定参数，需内联）。
 pub(crate) fn value_to_influxql_literal(value: &Value) -> crate::Result<String> {
     Ok(match value {
@@ -737,7 +933,9 @@ pub(crate) fn value_to_influxql_literal(value: &Value) -> crate::Result<String> 
         Value::BigInt(value) => value.to_string(),
         Value::Duration(value) => value.as_micros().to_string(),
         Value::Real(value) => format_influx_float(*value),
-        Value::Decimal(value) | Value::BigDecimal(value) => value.clone(),
+        Value::Decimal(value) | Value::BigDecimal(value) => {
+            validate_decimal_literal(value)?.to_string()
+        }
         Value::Text(value) => quote_influxql_string(value),
         Value::Uuid(value) => quote_influxql_string(&value.to_string()),
         Value::Json(value) => quote_influxql_string(&value.to_string()),
@@ -791,8 +989,66 @@ pub(crate) fn format_influx_duration(duration: std::time::Duration) -> crate::Re
     Ok(format!("{value}{unit}"))
 }
 
+/// 模型专属保留策略的原始名（不带引号）：`ormer_<table>`。
+fn raw_retention_policy_name(table_name: &str) -> String {
+    format!("ormer_{table_name}")
+}
+
 pub(crate) fn retention_policy_name(table_name: &str) -> String {
-    quote_influx_identifier(&format!("ormer_{table_name}"))
+    quote_influx_identifier(&raw_retention_policy_name(table_name))
+}
+
+/// 声明了 retention 时返回专属保留策略原始名，否则 `None`。
+fn retention_policy_for(
+    options: Option<crate::model::TableOptions>,
+    table_name: &str,
+) -> Option<String> {
+    options.and_then(|options| options.influxdb_retention)?;
+    Some(raw_retention_policy_name(table_name))
+}
+
+/// 模型声明 `#[influxdb(retention = ...)]` 时对应的专属保留策略名
+/// （不带引号）；未声明 retention 时为 `None`（使用数据库默认 RP）。
+pub(crate) fn model_retention_policy_name<T: Model>() -> Option<String> {
+    retention_policy_for(T::TABLE_OPTIONS, T::TABLE_NAME)
+}
+
+/// InfluxQL 中的 measurement 引用：有限定策略时为 `"rp"."measurement"`，
+/// 否则为未限定名（数据库默认 RP）。
+fn qualified_measurement(policy: Option<&str>, measurement: &str) -> String {
+    match policy {
+        Some(policy) => format!(
+            "{}.{}",
+            quote_influx_identifier(policy),
+            quote_influx_identifier(measurement)
+        ),
+        None => quote_influx_identifier(measurement),
+    }
+}
+
+/// InfluxQL 中引用模型 measurement：声明 retention 时限定为
+/// `"rp"."measurement"`，未声明时保持未限定（数据库默认 RP）。
+pub(crate) fn influx_measurement_for_model<T: Model>() -> String {
+    let measurement = T::table_name_for_db(crate::abstract_layer::DbType::InfluxDB);
+    qualified_measurement(model_retention_policy_name::<T>().as_deref(), measurement)
+}
+
+/// 创建模型专属保留策略的语句。刻意不带 `DEFAULT`：抢占库级默认会让
+/// 多个声明 retention 的模型互相覆盖，并让迁移历史随"当时的默认 RP"漂移。
+fn create_retention_policy_statement(
+    database: &str,
+    policy: &str,
+    retention: std::time::Duration,
+) -> crate::Result<String> {
+    Ok(format!(
+        "CREATE RETENTION POLICY {policy} ON {database} DURATION {} REPLICATION 1",
+        format_influx_duration(retention)?
+    ))
+}
+
+/// 删除模型专属保留策略的语句（drop_table 时清理非默认 RP）。
+fn drop_retention_policy_statement(database: &str, policy: &str) -> String {
+    format!("DROP RETENTION POLICY {policy} ON {database}")
 }
 
 /// InfluxDB 模型约束：有且仅有一个时间类型 `#[primary]`（不支持 auto），
@@ -834,6 +1090,8 @@ pub(crate) fn validate_influx_model<T: Model>(db_type: crate::abstract_layer::Db
 
 /// 把模型集合渲染为 Line Protocol。
 /// `#[index]` 字段构成 tag set，时间字段为时间戳，其余字段为 field。
+/// Line Protocol 本身无法表达保留策略：声明 retention 的模型由写入端
+/// （`write_lines_with_policy`）通过 `rp` 参数选择专属 RP。
 pub(crate) fn render_line_protocol<T: Model>(models: &[&T]) -> crate::Result<String> {
     let db_type = crate::abstract_layer::DbType::InfluxDB;
     let measurement = T::table_name_for_db(db_type);
@@ -943,7 +1201,9 @@ fn value_to_field_literal(value: &Value) -> crate::Result<String> {
         Value::BigInt(value) => format!("{value}i"),
         Value::Duration(value) => format!("{}i", value.as_micros()),
         Value::Real(value) => format_influx_float(*value),
-        Value::Decimal(value) | Value::BigDecimal(value) => value.clone(),
+        Value::Decimal(value) | Value::BigDecimal(value) => {
+            validate_decimal_literal(value)?.to_string()
+        }
         Value::Boolean(value) => value.to_string(),
         Value::Text(value) => format!("\"{}\"", escape_field_string(value)),
         Value::Uuid(value) => format!("\"{}\"", escape_field_string(&value.to_string())),
@@ -1085,6 +1345,26 @@ mod tests {
     }
 
     #[test]
+    fn line_protocol_writes_are_chunked_by_lines_and_bytes() {
+        let line = "cpu_usage,host=server-1 usage=62.5 1700000000000000123";
+        // 行数上限触发分块
+        let many = vec![line; WRITE_CHUNK_LINES + 1].join("\n");
+        let chunks = chunk_line_protocol(&many);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].lines().count(), WRITE_CHUNK_LINES);
+        assert_eq!(chunks[1].lines().count(), 1);
+        // 字节数上限触发分块（单行很长时按字节切块，行保持完整）
+        let long_line = format!("cpu_usage value=1 {}", "0".repeat(WRITE_CHUNK_BYTES));
+        let chunks = chunk_line_protocol(&format!("{long_line}\n{long_line}"));
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= long_line.len() + 1));
+        // 小载荷不分块且保持行完整
+        let chunks = chunk_line_protocol("a v=1 1\nb v=2 2\n");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], "a v=1 1\nb v=2 2\n");
+    }
+
+    #[test]
     fn inline_sql_substitutes_placeholders() {
         let sql = "SELECT * FROM cpu WHERE host = ? AND usage > ?";
         let params = vec![Value::Text("server-1".to_string()), Value::Real(62.5)];
@@ -1136,6 +1416,60 @@ mod tests {
             "90s"
         );
         assert!(format_influx_duration(std::time::Duration::ZERO).is_err());
+    }
+
+    #[test]
+    fn retention_policy_is_created_non_default() {
+        // 专属 RP 不得携带 DEFAULT：抢占库级默认会让多个声明 retention 的
+        // 模型互相覆盖，并让迁移历史随“当时的默认 RP”漂移后重复执行。
+        let statement = create_retention_policy_statement(
+            &quote_influx_identifier("metrics"),
+            &retention_policy_name("cpu_retained"),
+            std::time::Duration::from_secs(30 * 86_400),
+        )
+        .unwrap();
+        assert_eq!(
+            statement,
+            "CREATE RETENTION POLICY \"ormer_cpu_retained\" ON \"metrics\" \
+             DURATION 30d REPLICATION 1"
+        );
+        assert!(!statement.contains("DEFAULT"));
+    }
+
+    #[test]
+    fn declared_retention_qualifies_model_measurement() {
+        // 声明 retention（#[influxdb(retention = ...)] 生成的 TABLE_OPTIONS）
+        // 时，模型引用限定为专属 RP 下的 measurement
+        let retained =
+            crate::model::influxdb_table_options(Some(std::time::Duration::from_secs(
+                30 * 86_400,
+            )));
+        assert_eq!(
+            retention_policy_for(retained, "cpu_retained").as_deref(),
+            Some("ormer_cpu_retained")
+        );
+        assert_eq!(
+            qualified_measurement(Some("ormer_cpu_retained"), "cpu_retained"),
+            "\"ormer_cpu_retained\".\"cpu_retained\""
+        );
+        // 未声明 retention 的模型保持现状：未限定名即数据库默认 RP
+        assert_eq!(retention_policy_for(None, "cpu_usage"), None);
+        assert_eq!(
+            retention_policy_for(crate::model::influxdb_table_options(None), "cpu_usage"),
+            None
+        );
+        assert_eq!(qualified_measurement(None, "cpu_usage"), "\"cpu_usage\"");
+    }
+
+    #[test]
+    fn drop_policy_statement_targets_model_owned_policy() {
+        assert_eq!(
+            drop_retention_policy_statement(
+                &quote_influx_identifier("metrics"),
+                &quote_influx_identifier("ormer_cpu_retained"),
+            ),
+            "DROP RETENTION POLICY \"ormer_cpu_retained\" ON \"metrics\""
+        );
     }
 
     #[test]

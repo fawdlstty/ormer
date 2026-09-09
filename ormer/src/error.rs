@@ -87,6 +87,23 @@ impl OrmerError {
         }
     }
 
+    /// 带定位信息的解码错误（列名 + 目标 Rust 类型）。
+    ///
+    /// 供行/列解码失败路径迁移使用：相比裸 [`Self::decode`]，调用方应尽量
+    /// 传入列名与 `std::any::type_name` 等类型信息，避免解码错误退化为
+    /// 无定位的 [`Self::Other`]（`ormer_error!`）。
+    pub fn decode_at(
+        column: impl Into<String>,
+        rust_type: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Decode {
+            column: Some(column.into()),
+            rust_type: Some(rust_type),
+            message: message.into(),
+        }
+    }
+
     pub fn migration(message: impl Into<String>) -> Self {
         Self::Migration {
             message: message.into(),
@@ -414,6 +431,8 @@ fn classify_database_error(message: &str) -> (DatabaseErrorKind, Option<String>)
         DatabaseErrorKind::SerializationFailure
     } else if matches!(code.as_deref(), Some("40P01") | Some("1213")) || lower.contains("deadlock")
     {
+        // 40P01（PG SQLSTATE，含字母）依赖 extract_code 的放宽规则按 code 命中；
+        // 1213（MySQL 4 位厂商码）不会被提取为 code，由消息文本兜底。
         DatabaseErrorKind::Deadlock
     } else if matches!(code.as_deref(), Some("1205") | Some("1222")) || lower.contains("timeout") {
         DatabaseErrorKind::Timeout
@@ -427,10 +446,17 @@ fn classify_database_error(message: &str) -> (DatabaseErrorKind, Option<String>)
     (kind, code)
 }
 
+/// 从错误消息中提取 SQLSTATE 风格的错误码：5 位、首字符为数字的
+/// 字母数字 token（标准 SQLSTATE 为 5 字符且类别位为数字，如 `23505`、
+/// PG 死锁 `40P01`；首字符为数字可排除普通英文单词）。
+///
+/// 注意：MySQL/MSSQL 的 4 位厂商错误码（`1062`、`1213` 等）不符合该形状，
+/// 不会被提取，`classify_database_error` 中对它们的 code 匹配仅作兜底记录，
+/// 实际依赖消息文本（"duplicate key"/"deadlock" 等）命中分类。
 fn extract_code(message: &str) -> Option<String> {
     message
         .split(|character: char| !character.is_ascii_alphanumeric())
-        .find(|word| word.len() == 5 && word.chars().all(|character| character.is_ascii_digit()))
+        .find(|word| word.len() == 5 && word.as_bytes()[0].is_ascii_digit())
         .map(str::to_string)
 }
 

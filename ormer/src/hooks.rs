@@ -152,6 +152,18 @@ impl<'a, T: Model> HookExecutable for crate::abstract_layer::ScopedUpdateExecuto
 }
 
 #[async_trait::async_trait(?Send)]
+impl<'a, T> HookExecutable for crate::abstract_layer::SaveExecutor<'a, T>
+where
+    T: crate::model::WritableModel + crate::model::GraphWritable + Send + Sync,
+{
+    type Output = u64;
+
+    async fn execute(self) -> crate::Result<Self::Output> {
+        crate::abstract_layer::SaveExecutor::execute(self).await
+    }
+}
+
+#[async_trait::async_trait(?Send)]
 impl<'a, I> HookExecutable
     for crate::abstract_layer::common::connection_pool::PooledInsertExecutor<'a, I>
 where

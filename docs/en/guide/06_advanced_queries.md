@@ -280,7 +280,17 @@ let user_roles: Vec<(User, Option<Role>)> = db
 
 Supported JOIN types: `left_join`, `inner_join`, `right_join`.
 
-Can be combined with `filter`, `range`, and other methods on the main query.
+Can be combined with `filter`, `order_by` / `order_by_desc`, `limit` / `range`, `for_update`, and other methods on the main query:
+
+```rust
+let page: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id))
+    .order_by(|u| u.name)
+    .limit(10)
+    .collect()
+    .await?;
+```
 
 ### Derived Table JOIN
 
@@ -325,7 +335,7 @@ let hot_users: Vec<UserTotal> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from::<User, Role>()
+    .from::<Role>()
     .filter(|u, r| u.id.eq(r.user_id))
     .filter(|_, r| r.role_name.eq("admin".to_string()))
     .collect()
@@ -337,7 +347,7 @@ let users: Vec<User> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from3::<User, Role, Permission>()
+    .from3::<Role, Permission>()
     .filter(|u, r, p| u.id.eq(r.user_id).and(r.id.eq(p.role_id)))
     .collect()
     .await?;
@@ -348,7 +358,7 @@ let users: Vec<User> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from4::<User, Role, Permission, Department>()
+    .from4::<Role, Permission, Department>()
     .filter(|u, r, p, d| {
         u.id.eq(r.user_id)
             .and(r.id.eq(p.role_id))
@@ -483,7 +493,7 @@ let sql = Select::<User>::new()
     .to_sql();
 ```
 
-Set operations support chained `order_by` and `range`:
+Each operand supports its own `order_by` and `range`; both operands are rendered parenthesized (`(SELECT ...) UNION (SELECT ...)`), so ORDER BY/LIMIT inside an operand stays within its parentheses and applies to that operand:
 
 ```rust
 let sql = Select::<User>::new()
@@ -498,6 +508,34 @@ let sql = Select::<User>::new()
     )
     .to_sql();
 ```
+
+Set operations execute via `select_union`:
+
+```rust
+let union = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .union(Select::<User>::new().filter(|u| u.age.lt(18)));
+let users: Vec<User> = db.select_union(union).collect().await?;
+```
+
+### count() on Related Queries
+
+`from` / `from3` / `from4` related queries provide `count()`, rendering
+`SELECT COUNT(*) FROM (<the atomic query>)` with the identical predicate.
+It ignores `range()` / `order_by()` and fits the `total_count` of list pagination:
+
+```rust
+let total = db
+    .select::<User>()
+    .from::<Role>()
+    .filter(|u, r| u.id.eq(r.uid))
+    .filter(|_, r| r.name.eq("admin".to_string()))
+    .count()
+    .await?; // i64
+```
+
+Combining the same predicate with `range()` yields "page data + total count"
+whose predicates can never drift apart.
 
 ## Complete Example
 
@@ -552,7 +590,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Multi-table
     let admin_users: Vec<User> = db
         .select::<User>()
-        .from::<User, Role>()
+        .from::<Role>()
         .filter(|u, r| u.id.eq(r.user_id))
         .filter(|_, r| r.role_name.eq("admin".to_string()))
         .collect()

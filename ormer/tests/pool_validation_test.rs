@@ -78,6 +78,7 @@ async fn explicit_close_releases_pool_capacity() {
 #[test]
 fn drop_outside_runtime_does_not_leak_pool_capacity() {
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap();
     let pool = runtime.block_on(async {
@@ -91,7 +92,9 @@ fn drop_outside_runtime_does_not_leak_pool_capacity() {
     drop(conn);
     drop(runtime);
 
+    // 池的 acquire_timeout 依赖 tokio 计时器，测试 runtime 需启用
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .unwrap();
     runtime

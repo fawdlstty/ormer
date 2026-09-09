@@ -1,9 +1,10 @@
 use crate::time::{naive_local_to_utc, utc_to_naive_local};
 use std::any::Any;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub type RustDecimal = rust_decimal::Decimal;
 
@@ -28,6 +29,183 @@ struct VersionObjectKey {
     address: usize,
 }
 
+/// 版本快照注册表的安全阈值。
+///
+/// 乐观锁版本快照的两个全局注册表若无限常驻，长驻进程会随加载过的
+/// 行内容 / 对象地址持续增长。这里统一加三重护栏：
+/// - TTL：条目写入 `VERSION_SNAPSHOT_TTL` 后过期，读取时惰性判为未命中；
+/// - 每表上限：单表条目超过 `VERSION_SNAPSHOT_TABLE_CAP` 后按插入顺序淘汰；
+/// - 全局上限：注册表总量超过 `VERSION_SNAPSHOT_GLOBAL_CAP` 后按插入顺序淘汰。
+///
+/// 过期清理由写入操作顺带触发（节流到每 `VERSION_SNAPSHOT_PURGE_INTERVAL`
+/// 一次），不需要后台线程。写入既有 key 会刷新其在淘汰队列中的位置
+/// （近似 LRU）；读取不刷新，保证读取路径 O(1)。
+const VERSION_SNAPSHOT_TTL: Duration = Duration::from_secs(60 * 60);
+const VERSION_SNAPSHOT_PURGE_INTERVAL: Duration = Duration::from_secs(60);
+const VERSION_SNAPSHOT_TABLE_CAP: usize = 4096;
+const VERSION_SNAPSHOT_GLOBAL_CAP: usize = 65536;
+
+#[derive(Debug, Clone)]
+struct VersionSnapshotEntry {
+    version: u64,
+    stored_at: Instant,
+}
+
+/// 快照 key 到所属表的映射，供有界缓存按表计数与按表清空。
+trait VersionSnapshotTableOf {
+    fn table(&self) -> &'static str;
+}
+
+impl VersionSnapshotTableOf for VersionSnapshotKey {
+    fn table(&self) -> &'static str {
+        self.table
+    }
+}
+
+impl VersionSnapshotTableOf for VersionObjectKey {
+    fn table(&self) -> &'static str {
+        self.table
+    }
+}
+
+/// 有界版本快照缓存：HashMap 主体 + 插入顺序队列（写入刷新位置，近似 LRU）
+/// + 每表计数。淘汰与过期清理只发生在写入路径。
+struct BoundedVersionSnapshots<K> {
+    entries: HashMap<K, VersionSnapshotEntry>,
+    insertion_order: VecDeque<K>,
+    table_counts: HashMap<&'static str, usize>,
+    last_purge: Instant,
+}
+
+impl<K> BoundedVersionSnapshots<K>
+where
+    K: VersionSnapshotTableOf + Eq + std::hash::Hash + Clone,
+{
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            table_counts: HashMap::new(),
+            last_purge: Instant::now(),
+        }
+    }
+
+    /// 读取快照。过期条目惰性移除，不参与淘汰队列刷新。
+    fn get(&mut self, key: &K) -> Option<u64> {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.stored_at.elapsed() >= VERSION_SNAPSHOT_TTL)
+        {
+            self.remove(key);
+            return None;
+        }
+        self.entries.get(key).map(|entry| entry.version)
+    }
+
+    fn insert(&mut self, key: K, version: u64) {
+        self.purge_expired();
+        let table = key.table();
+        if self.entries.contains_key(&key) {
+            // 写入视为一次访问：把该 key 移到淘汰队列尾部，近似 LRU。
+            match self.insertion_order.iter().position(|queued| *queued == key) {
+                Some(position) => {
+                    if let Some(queued) = self.insertion_order.remove(position) {
+                        self.insertion_order.push_back(queued);
+                    }
+                }
+                // 队列与主体失配时兜底补齐，维持“每个 key 至多入队一次”。
+                None => self.insertion_order.push_back(key.clone()),
+            }
+        } else {
+            self.insertion_order.push_back(key.clone());
+            *self.table_counts.entry(table).or_insert(0) += 1;
+        }
+        self.entries.insert(
+            key,
+            VersionSnapshotEntry {
+                version,
+                stored_at: Instant::now(),
+            },
+        );
+        self.evict_over_caps(table);
+    }
+
+    fn remove(&mut self, key: &K) {
+        if self.entries.remove(key).is_none() {
+            return;
+        }
+        if let Some(position) = self.insertion_order.iter().position(|queued| queued == key) {
+            self.insertion_order.remove(position);
+        }
+        self.drop_table_count(key.table());
+    }
+
+    fn clear_table(&mut self, table: &str) {
+        self.entries.retain(|key, _| key.table() != table);
+        self.insertion_order.retain(|key| key.table() != table);
+        self.table_counts.retain(|cached, _| *cached != table);
+    }
+
+    /// 写入路径顺带执行的过期清理（按时间间隔节流）。
+    fn purge_expired(&mut self) {
+        if self.last_purge.elapsed() < VERSION_SNAPSHOT_PURGE_INTERVAL {
+            return;
+        }
+        let now = Instant::now();
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.stored_at) < VERSION_SNAPSHOT_TTL);
+        self.insertion_order
+            .retain(|key| self.entries.contains_key(key));
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        for key in self.entries.keys() {
+            *counts.entry(key.table()).or_insert(0) += 1;
+        }
+        self.table_counts = counts;
+        self.last_purge = now;
+    }
+
+    /// 超过全局上限时淘汰队首；再针对当前写入的表收敛到每表上限。
+    fn evict_over_caps(&mut self, table: &'static str) {
+        while self.entries.len() > VERSION_SNAPSHOT_GLOBAL_CAP {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.drop_entry(&oldest);
+        }
+        let mut excess = self
+            .table_counts
+            .get(&table)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(VERSION_SNAPSHOT_TABLE_CAP);
+        if excess == 0 {
+            return;
+        }
+        let mut remaining_order = VecDeque::with_capacity(self.insertion_order.len());
+        while let Some(key) = self.insertion_order.pop_front() {
+            if excess > 0 && key.table() == table {
+                self.drop_entry(&key);
+                excess -= 1;
+            } else {
+                remaining_order.push_back(key);
+            }
+        }
+        self.insertion_order = remaining_order;
+    }
+
+    fn drop_entry(&mut self, key: &K) {
+        self.entries.remove(key);
+        self.drop_table_count(key.table());
+    }
+
+    fn drop_table_count(&mut self, table: &'static str) {
+        if let Some(count) = self.table_counts.get_mut(&table) {
+            *count = count.saturating_sub(1);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VersionSnapshotUpdate {
     key: VersionSnapshotKey,
@@ -41,14 +219,16 @@ impl VersionSnapshotUpdate {
     }
 }
 
-fn version_snapshots() -> &'static Mutex<HashMap<VersionSnapshotKey, u64>> {
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<VersionSnapshotKey, u64>>> = OnceLock::new();
-    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+fn version_snapshots() -> &'static Mutex<BoundedVersionSnapshots<VersionSnapshotKey>> {
+    static SNAPSHOTS: OnceLock<Mutex<BoundedVersionSnapshots<VersionSnapshotKey>>> =
+        OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(BoundedVersionSnapshots::new()))
 }
 
-fn version_object_snapshots() -> &'static Mutex<HashMap<VersionObjectKey, u64>> {
-    static SNAPSHOTS: OnceLock<Mutex<HashMap<VersionObjectKey, u64>>> = OnceLock::new();
-    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+fn version_object_snapshots() -> &'static Mutex<BoundedVersionSnapshots<VersionObjectKey>> {
+    static SNAPSHOTS: OnceLock<Mutex<BoundedVersionSnapshots<VersionObjectKey>>> =
+        OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(BoundedVersionSnapshots::new()))
 }
 
 fn version_snapshot_key<T: Model>(model: &T) -> VersionSnapshotKey {
@@ -64,6 +244,17 @@ fn version_snapshot_key<T: Model>(model: &T) -> VersionSnapshotKey {
     }
 }
 
+/// NOTE(ABA 残余风险)：派生宏无法给用户结构体注入隐藏字段，对象身份只能用
+/// `(表名, 地址)` 近似。对象释放后若新对象复用同一地址，`model_version` 可能
+/// 读到上一个对象的版本号（ABA）。缓解措施：
+/// 1. 对象快照带 TTL 与容量上限，陈旧条目最多存活 `VERSION_SNAPSHOT_TTL`，
+///    且冷条目会先于热条目被淘汰，污染窗口有界；
+/// 2. 对象快照未命中时回退到按字段内容索引的 `VersionSnapshotKey` 快照，
+///    内容一致即可恢复正确版本；
+/// 3. 最终回退到 `VersionInfo::initial`，此时乐观锁 UPDATE 因版本不匹配
+///    影响 0 行而失败（fail-safe，不会静默用错版本写库）。
+/// 残余风险：TTL 窗口内复用同一地址的新对象仍可能读到旧版本号，表现为
+/// 一次多余的乐观锁冲突错误，而非数据损坏。
 fn version_object_key<T: Model>(model: &T) -> VersionObjectKey {
     VersionObjectKey {
         table: T::TABLE_NAME,
@@ -88,22 +279,22 @@ fn snapshot_version(key: &VersionSnapshotKey) -> Option<u64> {
     version_snapshots()
         .lock()
         .ok()
-        .and_then(|snapshots| snapshots.get(key).copied())
+        .and_then(|mut snapshots| snapshots.get(key))
 }
 
 fn object_snapshot_version(object_key: VersionObjectKey) -> Option<u64> {
     version_object_snapshots()
         .lock()
         .ok()
-        .and_then(|snapshots| snapshots.get(&object_key).copied())
+        .and_then(|mut snapshots| snapshots.get(&object_key))
 }
 
 pub fn clear_version_snapshots<T: Model>() {
     if let Ok(mut snapshots) = version_snapshots().lock() {
-        snapshots.retain(|key, _| key.table != T::TABLE_NAME);
+        snapshots.clear_table(T::TABLE_NAME);
     }
     if let Ok(mut snapshots) = version_object_snapshots().lock() {
-        snapshots.retain(|key, _| key.table != T::TABLE_NAME);
+        snapshots.clear_table(T::TABLE_NAME);
     }
 }
 
@@ -828,6 +1019,22 @@ pub struct RelationInfo {
     pub through: Option<ThroughInfo>,
 }
 
+/// 派生宏在 `RELATIONS` 常量中解析关系默认 `target_key` 时使用：
+/// 取目标模型 `COLUMN_SCHEMA` 中第一个主键列的列名，使目标主键列不叫
+/// `id`（如 `#[column(name = "uid")]`）时也能生成正确的关联 SQL。
+/// 未找到主键列时回退为 `"id"`（保持手工实现 Model 类型的旧行为）。
+#[doc(hidden)]
+pub const fn relation_default_target_key(schema: &'static [ColumnSchema]) -> &'static str {
+    let mut index = 0;
+    while index < schema.len() {
+        if schema[index].is_primary {
+            return schema[index].name;
+        }
+        index += 1;
+    }
+    "id"
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RelationPathInfo {
     Direct {
@@ -1365,7 +1572,13 @@ pub trait PrimaryFields {
     type Fields;
 
     fn primary_field_names() -> Vec<&'static str>;
-    fn promary_fields(&self) -> Self::Fields;
+    fn primary_fields(&self) -> Self::Fields;
+
+    /// 拼写错误的历史名称，仅作过渡兼容。
+    #[deprecated(since = "0.2.11", note = "renamed to `primary_fields`")]
+    fn promary_fields(&self) -> Self::Fields {
+        self.primary_fields()
+    }
 }
 
 /// 只读模型 trait，用于 view、DTO、raw SQL 结果和查询投影。
@@ -1808,6 +2021,24 @@ fn tracked_field_values<T: Model>(model: &T) -> Vec<(&'static str, Value)> {
         .collect()
 }
 
+/// 归一化十进制文本用于相等比较：去除小数尾随零与尾随小数点，
+/// 保证 "1.0" 与 "1.00" 判等。Decimal/BigDecimal 以字符串为载体，
+/// 直接字符串比较会让 `Tracked::dirty_columns` 产生假脏值；
+/// 用字符串归一化而不是 parse 成数值，避免超出 i128 精度的值出错。
+fn normalize_decimal_text_for_compare(raw: &str) -> &str {
+    let raw = raw.trim();
+    if !raw.contains('.') {
+        return raw;
+    }
+    let trimmed = raw.trim_end_matches('0');
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        "0"
+    } else {
+        trimmed
+    }
+}
+
 fn values_equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Integer(left), Value::Integer(right)) => left == right,
@@ -1816,8 +2047,14 @@ fn values_equal(left: &Value, right: &Value) -> bool {
         (Value::Text(left), Value::Text(right)) => left == right,
         (Value::TextArray(left), Value::TextArray(right)) => left == right,
         (Value::Real(left), Value::Real(right)) => left == right,
-        (Value::Decimal(left), Value::Decimal(right)) => left == right,
-        (Value::BigDecimal(left), Value::BigDecimal(right)) => left == right,
+        (Value::Decimal(left), Value::Decimal(right)) => {
+            normalize_decimal_text_for_compare(left)
+                == normalize_decimal_text_for_compare(right)
+        }
+        (Value::BigDecimal(left), Value::BigDecimal(right)) => {
+            normalize_decimal_text_for_compare(left)
+                == normalize_decimal_text_for_compare(right)
+        }
         (Value::Boolean(left), Value::Boolean(right)) => left == right,
         (Value::Bytes(left), Value::Bytes(right)) => left == right,
         (Value::IntegerArray(left), Value::IntegerArray(right)) => left == right,
@@ -3114,7 +3351,7 @@ pub fn quote_column_reference(db_type: crate::abstract_layer::DbType, column: &s
 }
 
 /// 运行时动态生成 CREATE TABLE SQL
-pub fn generate_create_table_sql<T: WritableModel>(
+pub fn generate_create_table_sql<T: Model>(
     db_type: crate::abstract_layer::DbType,
 ) -> crate::Result<String> {
     generate_create_table_sql_with_name::<T>(db_type, None)
@@ -3127,7 +3364,7 @@ pub fn generate_create_table_sql<T: WritableModel>(
 /// so the generic create-table helper intentionally remains unsupported for
 /// this backend unless this function is used.
 #[cfg(feature = "clickhouse")]
-pub fn generate_clickhouse_create_table_sql<T: WritableModel>(
+pub fn generate_clickhouse_create_table_sql<T: Model>(
     engine: &str,
 ) -> crate::Result<String> {
     generate_clickhouse_create_table_sql_with_name::<T>(engine, None)
@@ -3135,7 +3372,7 @@ pub fn generate_clickhouse_create_table_sql<T: WritableModel>(
 
 /// Generate ClickHouse CREATE TABLE SQL with an explicit engine and table name.
 #[cfg(feature = "clickhouse")]
-pub fn generate_clickhouse_create_table_sql_with_name<T: WritableModel>(
+pub fn generate_clickhouse_create_table_sql_with_name<T: Model>(
     engine: &str,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
@@ -3147,7 +3384,7 @@ pub fn generate_clickhouse_create_table_sql_with_name<T: WritableModel>(
 }
 
 /// 生成 CREATE TABLE SQL 语句，支持自定义表名
-pub fn generate_create_table_sql_with_name<T: WritableModel>(
+pub fn generate_create_table_sql_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
@@ -3159,7 +3396,7 @@ pub fn generate_create_table_sql_with_name<T: WritableModel>(
 }
 
 #[cfg(feature = "questdb")]
-fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
+fn generate_questdb_create_table_sql_with_name<T: Model>(
     table_name: Option<&str>,
 ) -> crate::Result<String> {
     let db_type = crate::abstract_layer::DbType::QuestDB;
@@ -3186,7 +3423,7 @@ fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
                 feature: "array columns",
             });
         }
-        let sql_type = if let Some(db_value_type) = column.db_value_type {
+        let mut sql_type = if let Some(db_value_type) = column.db_value_type {
             db_value_type(db_type).to_string()
         } else {
             let sql_type = db_type.sql_type(
@@ -3198,9 +3435,21 @@ fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
             );
             sql_type.trim_end_matches(" NOT NULL").to_string()
         };
+        // QuestDB 只允许对 SYMBOL 列建索引：`#[index]` 的 String 列（默认或
+        // 类型覆盖映射为 STRING）改为 SYMBOL 类型，并在列定义处内联 INDEX，
+        // 过滤查询才能走索引；同时迁移路径无需再对该列生成 QuestDB 不支持的
+        // CREATE INDEX 语句。非 String 列的 `#[index]` 已在派生宏层拒绝。
+        // INDEX 不带容量参数，使用 QuestDB 服务端默认容量（最保守形式）。
+        let inline_symbol_index = column.is_indexed && sql_type.eq_ignore_ascii_case("STRING");
+        if inline_symbol_index {
+            sql_type = "SYMBOL".to_string();
+        }
         sql.push_str(&quote_identifier(db_type, column.name));
         sql.push(' ');
         sql.push_str(&sql_type);
+        if inline_symbol_index {
+            sql.push_str(" INDEX");
+        }
         if let Some(default) = column.default {
             sql.push_str(" DEFAULT ");
             sql.push_str(&default.to_sql(db_type));
@@ -3225,7 +3474,7 @@ fn generate_questdb_create_table_sql_with_name<T: WritableModel>(
 /// ClickHouse 建表 `PARTITION BY` 子句的生效值：优先 `#[clickhouse(partition_by = ...)]`
 /// 声明；未声明时由 `#[hypertable]` 时长按公共映射推导（补写分区子句）；
 /// 两处都声明且粒度不一致时报错。
-fn derive_clickhouse_partition_by<T: WritableModel>(
+fn derive_clickhouse_partition_by<T: Model>(
     table_options: Option<TableOptions>,
 ) -> crate::Result<Option<String>> {
     use crate::abstract_layer::common::common_helpers::PartitionUnit;
@@ -3256,7 +3505,7 @@ fn derive_clickhouse_partition_by<T: WritableModel>(
     }
 }
 
-fn generate_create_table_sql_with_engine<T: WritableModel>(
+fn generate_create_table_sql_with_engine<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
     mut clickhouse_engine: Option<&str>,
@@ -3556,7 +3805,7 @@ pub(crate) fn table_compression_algorithm<T: Model>() -> crate::Result<Option<Co
 }
 
 /// 生成 UNIQUE 约束
-fn generate_unique_constraints<T: WritableModel>(
+fn generate_unique_constraints<T: Model>(
     db_type: crate::abstract_layer::DbType,
 ) -> Vec<String> {
     let mut constraints = Vec::new();
@@ -3595,7 +3844,7 @@ fn generate_unique_constraints<T: WritableModel>(
 }
 
 /// 生成索引 SQL，支持自定义表名
-fn generate_indexes_with_name<T: WritableModel>(
+fn generate_indexes_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: &str,
 ) -> crate::Result<String> {
@@ -3842,7 +4091,7 @@ fn render_sqlite_fulltext(table_name: &str, columns: &[&str]) -> crate::Result<S
 }
 
 /// 生成外键约束 SQL
-fn generate_foreign_key_constraints<T: WritableModel>(
+fn generate_foreign_key_constraints<T: Model>(
     db_type: crate::abstract_layer::DbType,
 ) -> Vec<String> {
     let mut constraints = Vec::new();
@@ -3908,7 +4157,7 @@ pub fn effective_primary_key_columns<T: Model>(
 }
 
 /// 生成复合主键约束 SQL
-fn generate_composite_primary_key_constraint<T: WritableModel>(
+fn generate_composite_primary_key_constraint<T: Model>(
     db_type: crate::abstract_layer::DbType,
 ) -> String {
     let primary_keys = effective_primary_key_columns::<T>(db_type);
@@ -4197,25 +4446,6 @@ impl<T: ViewModel> FromRowValues for T {
     }
 }
 
-/// FromSingleValue trait - 用于从单个值构建Model(用于map_to后的转换)
-/// 当查询单列结果并想转换为Model时使用
-pub trait FromSingleValue<V>: Sized {
-    fn from_single_value(value: V, column_name: &str) -> crate::Result<Self>;
-}
-
-// 为所有可以转换为Value的类型实现FromSingleValue的blanket implementation
-impl<T, V> FromSingleValue<V> for T
-where
-    T: Model,
-    V: Into<Value>,
-    T: FromValue,
-{
-    fn from_single_value(value: V, _column_name: &str) -> crate::Result<Self> {
-        let ormer_value: Value = value.into();
-        Self::from_value(&ormer_value)
-    }
-}
-
 fn parse_integral_decimal_text<T>(raw: &str, expected: &str) -> crate::Result<T>
 where
     T: std::str::FromStr,
@@ -4231,14 +4461,29 @@ where
         .map_err(|err| crate::ormer_error!("Type mismatch: expected {}: {}", expected, err))
 }
 
-// 使用宏生成 FromValue 实现，减少重复代码
+// 使用宏生成 FromValue 实现，减少重复代码。
+// Integer 与 BigInt 均通过 TryFrom 做范围检查：越界（包括负数到无符号
+// 目标、大整数到窄类型）返回解码错误，不再 `as` 截断/回绕。
 macro_rules! impl_from_value_for {
-    ($($type:ty => $variant:ident),* $(,)?) => {
+    ($($type:ty),* $(,)?) => {
         $(
             impl FromValue for $type {
                 fn from_value(value: &Value) -> crate::Result<Self> {
                     match value {
-                        Value::$variant(v) => Ok(*v as $type),
+                        Value::Integer(v) => <$type>::try_from(*v).map_err(|_| {
+                            crate::ormer_error!(
+                                "Type mismatch: integer value {} out of range for {}",
+                                v,
+                                stringify!($type)
+                            )
+                        }),
+                        Value::BigInt(v) => <$type>::try_from(*v).map_err(|_| {
+                            crate::ormer_error!(
+                                "Type mismatch: integer value {} out of range for {}",
+                                v,
+                                stringify!($type)
+                            )
+                        }),
                         Value::Decimal(v) | Value::BigDecimal(v) | Value::Text(v) => {
                             parse_integral_decimal_text::<$type>(v, stringify!($type))
                         }
@@ -4252,16 +4497,16 @@ macro_rules! impl_from_value_for {
 
 // 为基本类型生成 FromValue 实现
 impl_from_value_for!(
-    i8 => Integer,
-    i16 => Integer,
-    i32 => Integer,
-    i64 => Integer,
-    u8 => Integer,
-    u16 => Integer,
-    u32 => Integer,
-    u64 => Integer,
-    isize => Integer,
-    usize => Integer,
+    i8,
+    i16,
+    i32,
+    i64,
+    u8,
+    u16,
+    u32,
+    u64,
+    isize,
+    usize,
 );
 
 macro_rules! impl_from_row_values_single {
@@ -4289,6 +4534,7 @@ impl_from_row_values_single!(
     isize => "isize",
     usize => "usize",
     std::time::Duration => "Duration",
+    f32 => "f32",
     f64 => "f64",
     rust_decimal::Decimal => "rust_decimal::Decimal",
     bigdecimal::BigDecimal => "bigdecimal::BigDecimal",
@@ -4323,6 +4569,17 @@ impl FromValue for f64 {
             Value::Real(v) => Ok(*v),
             Value::Integer(v) => Ok(*v as f64),
             _ => Err(crate::ormer_error!("Type mismatch: expected f64")),
+        }
+    }
+}
+
+// f32 特殊处理（与 f64 对齐：支持 Integer 和 Real；Real 载体按 f32 精度截断）
+impl FromValue for f32 {
+    fn from_value(value: &Value) -> crate::Result<Self> {
+        match value {
+            Value::Real(v) => Ok(*v as f32),
+            Value::Integer(v) => Ok(*v as f32),
+            _ => Err(crate::ormer_error!("Type mismatch: expected f32")),
         }
     }
 }
@@ -4371,6 +4628,16 @@ impl FromValue for String {
     }
 }
 
+/// `Vec<T>` 列读到 NULL 的统一解码错误（P2-5）：空集合会静默丢失 NULL
+/// 与空数组的语义差异，可空数组列应声明为 `Option<Vec<T>>`。
+fn null_array_decode_error(expected: &str) -> crate::OrmerError {
+    crate::ormer_error!(
+        "Type mismatch: expected {}, got NULL; use Option<{}> for nullable columns",
+        expected,
+        expected
+    )
+}
+
 impl From<Vec<String>> for Value {
     fn from(v: Vec<String>) -> Self {
         Value::TextArray(v)
@@ -4380,7 +4647,9 @@ impl From<Vec<String>> for Value {
 impl FromValue for Vec<String> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
-            Value::Null => Ok(Vec::new()),
+            // NULL 列统一报解码错误：静默退化为空 Vec 会丢失 NULL 与空集合
+            // 的语义差异；可空列应使用 Option<Vec<String>>
+            Value::Null => Err(null_array_decode_error("Vec<String>")),
             Value::TextArray(v) => Ok(normalize_string_vec(v.clone())),
             Value::Text(v) => Ok(parse_string_vec_text(v)),
             Value::Json(v) => {
@@ -4466,13 +4735,20 @@ impl<T: FromValue> FromRowValues for Option<T> {
     }
 }
 
-// 使用宏生成 From<T> for Value 实现
+// 使用宏生成 From<T> for Value 实现。
+// 整数统一先尝试 i64：放得下用 Integer；放不下（如大于 i64::MAX 的
+// u64/usize）升级为 BigInt(i128) 作为无符号大值载体，不再 `as` 静默回绕。
+// 兜底分支只对超出 i64 范围的无符号值可达，usize/isize 虽无 From<i128>
+// 实现，但所有支持的平台指针宽度不超过 64 位，`as i128` 无损。
 macro_rules! impl_from_for_value {
-    ($($type:ty => $variant:ident),* $(,)?) => {
+    ($($type:ty),* $(,)?) => {
         $(
             impl From<$type> for Value {
                 fn from(v: $type) -> Self {
-                    Value::$variant(v as i64)
+                    match i64::try_from(v) {
+                        Ok(small) => Value::Integer(small),
+                        Err(_) => Value::BigInt(v as i128),
+                    }
                 }
             }
         )*
@@ -4481,22 +4757,20 @@ macro_rules! impl_from_for_value {
 
 // 为整数类型生成 From 实现
 impl_from_for_value!(
-    i8 => Integer,
-    i16 => Integer,
-    i32 => Integer,
-    i64 => Integer,
-    u8 => Integer,
-    u16 => Integer,
-    u32 => Integer,
-    u64 => Integer,
-    isize => Integer,
-    usize => Integer,
+    i8, i16, i32, i64, isize, u8, u16, u32, u64, usize,
 );
 
 // f64 特殊处理
 impl From<f64> for Value {
     fn from(v: f64) -> Self {
         Value::Real(v)
+    }
+}
+
+// f32 以 Real(f64) 为载体：f32 -> f64 无损，读回时 `as f32` 恢复原精度
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        Value::Real(v as f64)
     }
 }
 
@@ -4543,6 +4817,7 @@ impl FromValue for Vec<u8> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Bytes(v) => Ok(v.clone()),
+            Value::Null => Err(null_array_decode_error("Vec<u8>")),
             _ => Err(crate::ormer_error!("Type mismatch: expected Vec<u8>")),
         }
     }
@@ -4557,7 +4832,7 @@ impl From<Vec<i32>> for Value {
 impl FromValue for Vec<i32> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
-            Value::Null => Ok(Vec::new()),
+            Value::Null => Err(null_array_decode_error("Vec<i32>")),
             Value::IntegerArray(v) => Ok(v.clone()),
             _ => Err(crate::ormer_error!("Type mismatch: expected Vec<i32>")),
         }
@@ -4573,7 +4848,7 @@ impl From<Vec<i64>> for Value {
 impl FromValue for Vec<i64> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
-            Value::Null => Ok(Vec::new()),
+            Value::Null => Err(null_array_decode_error("Vec<i64>")),
             Value::BigIntArray(v) => Ok(v.clone()),
             Value::NullableBigIntArray(v) => v
                 .iter()
@@ -4594,7 +4869,7 @@ impl From<Vec<Option<i64>>> for Value {
 impl FromValue for Vec<Option<i64>> {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
-            Value::Null => Ok(Vec::new()),
+            Value::Null => Err(null_array_decode_error("Vec<Option<i64>>")),
             Value::BigIntArray(v) => Ok(v.iter().copied().map(Some).collect()),
             Value::NullableBigIntArray(v) => Ok(v.clone()),
             _ => Err(crate::ormer_error!(

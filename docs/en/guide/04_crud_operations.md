@@ -45,6 +45,9 @@ db.insert(&[user1, user2])
 
 Large inserts are automatically split by backend parameter limits; PostgreSQL uses `COPY FROM STDIN` when there is no conflict handling, no auto-increment key return, and all values can be serialized safely.
 
+### 
+
+> The auto-increment id returned by a batch insert is not reliable: MySQL reports the last statement's `last_insert_id`, SQLite the `last_insert_rowid`, PostgreSQL the first RETURNING row. Only single-row inserts return a meaningful id; use `RETURNING` (PostgreSQL/SQLite) or insert one by one in batch scenarios.
 ### Partial Insert and Form Models
 
 `insert_partial::<User>()` writes only columns selected with `set`; `default` omits the column from the INSERT so the database default is used:

@@ -41,19 +41,23 @@ Can be combined with other conditions:
 .filter(|u| u.name.contains("li").and(u.age.gt(29)))
 ```
 
-### PostgreSQL String-Array Membership
+### Array Membership (SQL-level pushdown)
 
-For a PostgreSQL `Vec<String>` field, use `contains` to test whether an array contains an element:
+For `Vec<String>` fields, `contains` / `contains_all` / `overlaps` push down to SQL predicates and participate in pagination and counting:
 
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .filter(|u| u.tags.contains("admin"))
+    .filter(|u| u.tags.contains("admin"))          // contains the element
+    .filter(|u| u.tags.contains_all(vec!["admin".to_string(), "ops".to_string()])) // contains all
+    .filter(|u| u.tags.overlaps(vec!["ops".to_string(), "dev".to_string()]))       // any overlap
     .collect()
     .await?;
 ```
 
-This uses PostgreSQL's array-containment operator; other backends do not provide this array-specific condition.
+Each backend renders equivalent dialect SQL: PostgreSQL `@>` / `&&`, MySQL `JSON_CONTAINS` / `JSON_OVERLAPS`, SQLite `json_each`, MSSQL `OPENJSON`, ClickHouse `has`/`hasAll`, DuckDB `list_contains`/`list_has_any`.
+
+QuestDB and InfluxDB do not support array predicates; building such a query returns an `UnsupportedFeature` error.
 
 ### NULL Checks
 

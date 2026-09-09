@@ -2,6 +2,10 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, LitStr};
 
+/// `#[db_type]` 支持的后端与 `DbType` 一一对应。注意：InfluxDB 不参与
+/// SQL 列类型映射（后端在运行时按 `Value` 推断字段类型，从不读取
+/// `DB_VALUE_TYPE`），因此没有 `influxdb` 参数；在 InfluxDB 连接上使用
+/// 自定义 DbValue 类型时无需提供该后端的类型名。
 #[derive(Default)]
 struct DbTypeAttrs {
     sqlite: Option<String>,

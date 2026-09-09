@@ -171,5 +171,5 @@ fn test_view_model_primary_field_methods_are_empty() {
     };
 
     assert_eq!(UserTotal::primary_field_names(), Vec::<&'static str>::new());
-    assert_eq!(total.promary_fields(), ());
+    assert_eq!(total.primary_fields(), ());
 }

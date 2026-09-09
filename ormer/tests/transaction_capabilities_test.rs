@@ -66,11 +66,12 @@ async fn clickhouse_transactions_are_capability_gated() -> Result<(), Box<dyn st
         .transaction(|_txn| Box::pin(async { Ok(()) }))
         .await
         .expect_err("ClickHouse transactions must be capability gated");
+    // P1-14：事务门控统一由 Capabilities::of 决定，feature 文案为通用 "transactions"
     assert!(matches!(
         error,
         OrmerError::UnsupportedFeature {
             backend: DbType::ClickHouse,
-            feature: "transactions on ClickHouse",
+            feature: "transactions",
         }
     ));
 
@@ -80,11 +81,12 @@ async fn clickhouse_transactions_are_capability_gated() -> Result<(), Box<dyn st
         })
         .await
         .expect_err("ClickHouse transaction_opts must be capability gated");
+    // P1-14：事务门控统一由 Capabilities::of 决定，feature 文案为通用 "transactions"
     assert!(matches!(
         error,
         OrmerError::UnsupportedFeature {
             backend: DbType::ClickHouse,
-            feature: "transactions on ClickHouse",
+            feature: "transactions",
         }
     ));
 
@@ -97,11 +99,12 @@ async fn clickhouse_transactions_are_capability_gated() -> Result<(), Box<dyn st
         .transaction(|_txn| Box::pin(async { Ok(()) }))
         .await
         .expect_err("ClickHouse pooled transactions must be capability gated");
+    // P1-14：事务门控统一由 Capabilities::of 决定，feature 文案为通用 "transactions"
     assert!(matches!(
         error,
         OrmerError::UnsupportedFeature {
             backend: DbType::ClickHouse,
-            feature: "transactions on ClickHouse",
+            feature: "transactions",
         }
     ));
 
@@ -111,11 +114,12 @@ async fn clickhouse_transactions_are_capability_gated() -> Result<(), Box<dyn st
         })
         .await
         .expect_err("ClickHouse pooled transaction_opts must be capability gated");
+    // P1-14：事务门控统一由 Capabilities::of 决定，feature 文案为通用 "transactions"
     assert!(matches!(
         error,
         OrmerError::UnsupportedFeature {
             backend: DbType::ClickHouse,
-            feature: "transactions on ClickHouse",
+            feature: "transactions",
         }
     ));
 

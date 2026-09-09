@@ -7,6 +7,14 @@ use serde::ser::Serializer;
 /// ClickHouse SQL type mapping for schema generation and SQL rendering.
 pub struct ClickHouseTypeMapper;
 
+/// HTTP 查询总超时：覆盖连接、服务端执行与响应传输（clickhouse 客户端
+/// 本身不提供 client 级 timeout，这里在每次查询外层包一层总超时）。
+const HTTP_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 原生流式 INSERT 单块发送超时。
+const HTTP_INSERT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// 原生流式 INSERT 等待服务端收尾（物化视图等）的超时。
+const HTTP_INSERT_END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Minimal ClickHouse HTTP database handle.
 ///
 /// ClickHouse does not expose transactions or row values through the same
@@ -18,7 +26,6 @@ pub struct Database {
     client: clickhouse::Client,
 }
 
-#[allow(dead_code)]
 impl Database {
     /// Connect to a ClickHouse HTTP endpoint.
     ///
@@ -77,12 +84,17 @@ impl Database {
         for param in &params {
             query = query.bind(clickhouse_bind_value(param));
         }
-        match query.execute().await {
-            Ok(()) => {
+        let result = tokio::time::timeout(HTTP_QUERY_TIMEOUT, query.execute()).await;
+        match result {
+            Ok(Ok(())) => {
                 trace.finish_ok();
                 Ok(())
             }
-            Err(error) => Err(trace.finish_external_error("clickhouse::Client::query", error)),
+            Ok(Err(error)) => Err(trace.finish_external_error("clickhouse::Client::query", error)),
+            Err(_) => Err(trace.finish_error(crate::ormer_error!(
+                "ClickHouse query timed out after {}s",
+                HTTP_QUERY_TIMEOUT.as_secs()
+            ))),
         }
     }
 
@@ -110,10 +122,17 @@ impl Database {
                 return Err(trace.finish_external_error("clickhouse::Query::fetch_bytes", error));
             }
         };
-        let bytes = match cursor.collect().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
+        let collected = tokio::time::timeout(HTTP_QUERY_TIMEOUT, cursor.collect()).await;
+        let bytes = match collected {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
                 return Err(trace.finish_external_error("clickhouse::BytesCursor::collect", error));
+            }
+            Err(_) => {
+                return Err(trace.finish_error(crate::ormer_error!(
+                    "ClickHouse query timed out after {}s",
+                    HTTP_QUERY_TIMEOUT.as_secs()
+                )));
             }
         };
         let result = match parse_json_each_row(&bytes) {
@@ -124,8 +143,59 @@ impl Database {
         Ok(result)
     }
 
+    /// Execute a SELECT query and return rows as value tuples in projection
+    /// order, along with the output column names.
+    ///
+    /// Uses ClickHouse's `JSONEachRowWithNames` format so aggregated /
+    /// aliased projections can be decoded positionally even when the ORM does
+    /// not know the rendered expression names in advance (grouped selects).
+    pub(crate) async fn select_named_values(
+        &self,
+        sql: impl IntoRawSql,
+    ) -> crate::Result<(Vec<String>, Vec<Vec<crate::model::Value>>)> {
+        let sql = sql.into_raw_sql();
+        let (sql, params) = sql.render(crate::abstract_layer::DbType::ClickHouse)?;
+
+        let trace = crate::sql_trace::start_sql_trace(&sql, &params);
+        let mut query = self.client.query(&sql);
+        for param in &params {
+            query = query.bind(clickhouse_bind_value(param));
+        }
+
+        let mut cursor = match query.fetch_bytes("JSONEachRowWithNames") {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                return Err(trace.finish_external_error("clickhouse::Query::fetch_bytes", error));
+            }
+        };
+        let collected = tokio::time::timeout(HTTP_QUERY_TIMEOUT, cursor.collect()).await;
+        let bytes = match collected {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                return Err(trace.finish_external_error("clickhouse::BytesCursor::collect", error));
+            }
+            Err(_) => {
+                return Err(trace.finish_error(crate::ormer_error!(
+                    "ClickHouse query timed out after {}s",
+                    HTTP_QUERY_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        let result = match parse_json_each_row_with_names(&bytes) {
+            Ok(result) => result,
+            Err(error) => return Err(trace.finish_error(error)),
+        };
+        trace.finish_ok();
+        Ok(result)
+    }
+
     /// Execute a SELECT query and decode rows using ClickHouse's native
     /// RowBinary decoder.
+    ///
+    /// Requires a static `clickhouse::Row` type, which the unified ORM's
+    /// dynamic `Model` values cannot provide; reserved for callers with
+    /// derive-generated row types.
+    #[allow(dead_code)]
     pub(crate) async fn select<T>(&self, sql: impl IntoRawSql) -> crate::Result<Vec<T>>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
@@ -148,6 +218,11 @@ impl Database {
     }
 
     /// Execute a SELECT query and return a streaming RowBinary cursor.
+    ///
+    /// Requires a static `clickhouse::Row` type; the unified stream executor
+    /// uses [`Database::select_json_stream`] instead because ormer models are
+    /// decoded dynamically from JSONEachRow.
+    #[allow(dead_code)]
     pub(crate) fn select_stream<T>(
         &self,
         sql: impl IntoRawSql,
@@ -167,6 +242,9 @@ impl Database {
     }
 
     /// Execute a SELECT query and return a streaming JSONEachRow cursor.
+    ///
+    /// The cursor emits raw response chunks; callers decode lines on the fly,
+    /// which keeps memory bounded for large result sets (true streaming).
     pub(crate) fn select_json_stream(
         &self,
         sql: impl IntoRawSql,
@@ -183,6 +261,9 @@ impl Database {
     }
 
     /// Execute a SELECT query and return at most one row.
+    ///
+    /// Requires a static `clickhouse::Row` type (see [`Database::select`]).
+    #[allow(dead_code)]
     pub(crate) async fn select_optional<T>(&self, sql: impl IntoRawSql) -> crate::Result<Option<T>>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
@@ -200,6 +281,9 @@ impl Database {
 
     /// Execute a SELECT query and decode one row using ClickHouse's native
     /// RowBinary decoder.
+    ///
+    /// Requires a static `clickhouse::Row` type (see [`Database::select`]).
+    #[allow(dead_code)]
     pub(crate) async fn select_one<T>(&self, sql: impl IntoRawSql) -> crate::Result<T>
     where
         T: clickhouse::RowOwned + clickhouse::RowRead,
@@ -222,6 +306,11 @@ impl Database {
     }
 
     /// Insert typed rows using ClickHouse's native RowBinary protocol.
+    ///
+    /// Requires a static `clickhouse::Row` type, which the unified ORM's
+    /// dynamic `Model` values cannot provide; the unified insert path uses
+    /// [`Database::insert_model_rows`] instead.
+    #[allow(dead_code)]
     pub(crate) async fn insert_rows<T, I>(&self, table: &str, rows: I) -> crate::Result<()>
     where
         T: clickhouse::RowOwned + clickhouse::RowWrite,
@@ -249,12 +338,63 @@ impl Database {
             .map_err(|error| crate::OrmerError::from_external("clickhouse::Insert::end", error))
     }
 
+    /// Insert dynamic model rows through ClickHouse's native streaming INSERT
+    /// endpoint (`INSERT ... FORMAT JSONEachRow`).
+    ///
+    /// The whole batch is sent as one progressively-streamed HTTP request with
+    /// client-side buffering (`InsertFormatted::buffered`), replacing the
+    /// former per-statement text VALUES round trips. Typed RowBinary inserts
+    /// ([`Database::insert_rows`]) require static `clickhouse::Row` types and
+    /// therefore cannot serve the ORM's dynamic models.
+    pub(crate) async fn insert_model_rows<T: crate::model::Model>(
+        &self,
+        models: &[&T],
+    ) -> crate::Result<()> {
+        if models.is_empty() {
+            return Ok(());
+        }
+        let routed = crate::abstract_layer::common::common_helpers::routed_insert_table_name::<T>(
+            crate::abstract_layer::DbType::ClickHouse,
+            models,
+        )?;
+        let table =
+            crate::model::quote_qualified_identifier(crate::abstract_layer::DbType::ClickHouse, &routed);
+        let trace = crate::sql_trace::start_sql_trace(
+            &format!("INSERT INTO {table} FORMAT JSONEachRow ({} rows)", models.len()),
+            &[],
+        );
+        let mut insert = self
+            .client
+            .insert_formatted_with(format!("INSERT INTO {table} FORMAT JSONEachRow"))
+            .with_timeouts(Some(HTTP_INSERT_SEND_TIMEOUT), Some(HTTP_INSERT_END_TIMEOUT))
+            .buffered_with_capacity(64 * 1024);
+        for model in models {
+            let line = model_to_json_each_row(*model)?;
+            insert
+                .write(line.as_bytes())
+                .await
+                .map_err(|error| {
+                    crate::OrmerError::from_external("clickhouse::InsertFormatted::write", error)
+                })?;
+        }
+        match insert.end().await {
+            Ok(()) => {
+                trace.finish_ok();
+                Ok(())
+            }
+            Err(error) => {
+                Err(trace.finish_external_error("clickhouse::InsertFormatted::end", error))
+            }
+        }
+    }
+
     /// Check whether the ClickHouse endpoint accepts a trivial query.
     pub(crate) async fn is_valid(&self) -> bool {
         self.select_json("SELECT 1").await.is_ok()
     }
 
     /// Generate and execute a ClickHouse CREATE TABLE statement.
+    #[allow(dead_code)] // 保留给 db-first / 建表入口待接线
     pub(crate) async fn create_table<T: crate::model::WritableModel>(
         &self,
         engine: &str,
@@ -279,12 +419,13 @@ impl Database {
     ///
     /// ClickHouse databases are treated as the schema selector. When omitted,
     /// the database configured on this client is used.
+    #[allow(dead_code)] // 保留给 db-first 实体生成入口待接线
     pub(crate) async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
         let tables = self.db_first_tables(schema).await?;
-        Ok(crate::db_first::generate_entities(
+        crate::db_first::generate_entities(
             crate::abstract_layer::DbType::ClickHouse,
             &tables,
-        ))
+        )
     }
 
     pub(crate) async fn db_first_tables(
@@ -384,39 +525,8 @@ impl Database {
         &self,
         migrations: &[M],
     ) -> crate::Result<Vec<MigrationInfo>> {
-        let applied = self
-            .migration_history()
-            .await?
-            .into_iter()
-            .map(|migration| (migration.version, migration.checksum))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut sorted = migrations.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|migration| migration.version());
-        let mut seen = std::collections::BTreeSet::new();
-        let mut pending = Vec::new();
-        for migration in sorted {
-            if !seen.insert(migration.version()) {
-                return Err(crate::ormer_error!(
-                    "Duplicate migration version {}",
-                    migration.version()
-                ));
-            }
-            if let Some(checksum) = applied.get(&migration.version()) {
-                if *checksum != migration.checksum() {
-                    return Err(crate::ormer_error!(
-                        "Migration {} checksum changed after it was applied",
-                        migration.version()
-                    ));
-                }
-                continue;
-            }
-            pending.push(MigrationInfo {
-                version: migration.version(),
-                name: migration.name().to_string(),
-                checksum: migration.checksum(),
-            });
-        }
-        Ok(pending)
+        let applied = self.migration_history().await?;
+        crate::abstract_layer::common::compute_pending_migrations(applied, migrations)
     }
 
     /// Apply native ClickHouse migrations one statement at a time.
@@ -916,6 +1026,72 @@ fn parse_json_each_row(bytes: &[u8]) -> crate::Result<Vec<serde_json::Value>> {
         .collect()
 }
 
+/// 解析 `JSONEachRowWithNames` 响应：首行为输出列名数组（投影顺序），
+/// 其后每行按列名映射为值元组，保证与投影顺序一致。
+fn parse_json_each_row_with_names(
+    bytes: &[u8],
+) -> crate::Result<(Vec<String>, Vec<Vec<crate::model::Value>>)> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        crate::ormer_error!("Invalid ClickHouse JSONEachRowWithNames response: {error}")
+    })?;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(names_line) = lines.next() else {
+        return Err(crate::ormer_error!(
+            "ClickHouse JSONEachRowWithNames response is missing the header line"
+        ));
+    };
+    let names: Vec<String> = serde_json::from_str(names_line)
+        .map_err(|error| crate::ormer_error!("Invalid ClickHouse column header: {error}"))?;
+    let name_refs = names.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    for line in lines {
+        let row: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| crate::ormer_error!("Invalid ClickHouse JSONEachRow row: {error}"))?;
+        rows.push(named_json_row_values(&row, &name_refs)?);
+    }
+    Ok((names, rows))
+}
+
+/// 按输出列名顺序提取一行 JSON 对象的值（分组投影解码用）。
+pub(crate) fn named_json_row_values(
+    row: &serde_json::Value,
+    columns: &[&str],
+) -> crate::Result<Vec<crate::model::Value>> {
+    let object = row
+        .as_object()
+        .ok_or_else(|| crate::ormer_error!("ClickHouse row is not a JSON object"))?;
+    columns
+        .iter()
+        .map(|column| {
+            object
+                .get(*column)
+                .map(clickhouse_json_value)
+                .transpose()?
+                .ok_or_else(|| crate::ormer_error!("Missing ClickHouse column: {column}"))
+        })
+        .collect()
+}
+
+/// 把模型渲染为一行 JSONEachRow 文本（含结尾换行），列与值均排除自增主键，
+/// 与既有文本 INSERT 语句的列选择保持一致。
+fn model_to_json_each_row<T: crate::model::Model>(model: &T) -> crate::Result<String> {
+    use serde_json::Map;
+
+    let columns = T::insert_columns();
+    let values = model.insert_values();
+    let mut object = Map::new();
+    for (column, value) in columns.iter().zip(values.iter()) {
+        object.insert(
+            (*column).to_string(),
+            model_value_to_json(value.clone()),
+        );
+    }
+    let mut line = serde_json::to_string(&object)
+        .map_err(|error| crate::ormer_error!("Invalid ClickHouse insert row: {error}"))?;
+    line.push('\n');
+    Ok(line)
+}
+
 impl DbBackendTypeMapper for ClickHouseTypeMapper {
     fn sql_type(
         rust_type: &str,
@@ -1088,8 +1264,11 @@ impl<'a, T: crate::model::Model> BlockDeleteExecutor<'a, T> {
             return Ok(BlockDeleteResult::default());
         }
 
-        let table_name = T::table_name_for_db(crate::abstract_layer::DbType::ClickHouse)
-            .replace('\'', "''");
+        // 标识符位置必须用标识符引用，不能套字符串字面量转义
+        let table_name = crate::model::quote_qualified_identifier(
+            crate::abstract_layer::DbType::ClickHouse,
+            T::table_name_for_db(crate::abstract_layer::DbType::ClickHouse),
+        );
         let drops = keys
             .iter()
             .map(|key| format!("DROP PARTITION '{}'", key.replace('\'', "\\'")))
@@ -1144,8 +1323,9 @@ impl<'a, T: crate::model::Model> BlockDeleteExecutor<'a, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_clickhouse_db_first_column, parse_compression, parse_connection_string,
-        parse_json_each_row, parse_migration_info,
+        model_to_json_each_row, parse_clickhouse_db_first_column, parse_compression,
+        parse_connection_string, parse_json_each_row, parse_json_each_row_with_names,
+        parse_migration_info,
     };
 
     #[test]
@@ -1158,6 +1338,42 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1]["id"], 2);
+    }
+
+    #[test]
+    fn parses_json_each_row_with_names_in_projection_order() {
+        let (names, rows) = parse_json_each_row_with_names(
+            br#"["count(uid)","name"]
+{"count(uid)":3,"name":"a"}
+"#,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["count(uid)", "name"]);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(
+            rows[0].as_slice(),
+            [crate::model::Value::Integer(3), crate::model::Value::Text(name)] if name == "a"
+        ));
+    }
+
+    #[test]
+    fn insert_row_json_matches_insert_columns() {
+        #[derive(Debug, ormer::Model, Clone)]
+        #[table = "ch_insert_rows_json"]
+        struct Sample {
+            #[primary(auto)]
+            id: i64,
+            name: String,
+        }
+        let model = Sample {
+            id: 0,
+            name: "alice".to_string(),
+        };
+        // 自增主键不参与 JSONEachRow 载荷，与文本 INSERT 的列选择一致
+        let line = model_to_json_each_row(&model).unwrap();
+        assert!(!line.contains("\"id\""), "{line}");
+        assert!(line.contains("\"name\":\"alice\""), "{line}");
+        assert!(line.ends_with('\n'));
     }
 
     #[test]
@@ -1272,7 +1488,8 @@ mod tests {
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
             }],
-        );
+        )
+        .unwrap();
         assert!(code.contains("pub id: u64"), "{code}");
         assert!(code.contains("pub tags: Vec<i32>"), "{code}");
         assert!(code.contains("pub score: Option<f64>"), "{code}");

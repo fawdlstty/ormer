@@ -28,6 +28,20 @@ let conn = pool.get().await?;
 let users: Vec<User> = conn.select::<User>().collect().await?;
 ```
 
+## Pool Options
+
+Backends on the built-in manual pool (sqlite/mssql/duckdb/clickhouse/influxdb) support acquire timeout, idle reclamation and max lifetime:
+
+```rust
+let pool = Database::create_pool(DbType::MSSQL, "mssql://user:pass@localhost/db")
+    .range(2..10)
+    .acquire_timeout(std::time::Duration::from_secs(30)) // max wait to acquire; None waits forever
+    .idle_timeout(Some(std::time::Duration::from_secs(300))) // retire connections idle over 5 minutes
+    .max_lifetime(Some(std::time::Duration::from_secs(1800))) // rebuild connections older than 30 minutes
+    .build()
+    .await?;
+```
+
 ## Read/Write Splitting
 
 For one database type, configure a primary connection and one or more read replicas. Use `.read()` for replica queries and `.write()` for writes or strongly consistent reads:

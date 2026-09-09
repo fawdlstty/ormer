@@ -51,8 +51,9 @@ fn temporal_sql_types_match_backend_mappings() {
         let sql = ormer::generate_create_table_sql::<TemporalModel>(ormer::DbType::MySQL).unwrap();
         assert!(sql.contains("business_date DATE NOT NULL"));
         assert!(sql.contains("business_time TIME NOT NULL"));
-        assert!(sql.contains("event_at DATETIME NOT NULL"));
-        assert!(sql.contains("local_at DATETIME NOT NULL"));
+        // MySQL DATETIME 需要 fsp=6 才能保留微秒
+        assert!(sql.contains("event_at DATETIME(6) NOT NULL"));
+        assert!(sql.contains("local_at DATETIME(6) NOT NULL"));
         assert!(sql.contains("optional_date DATE"));
         assert!(sql.contains("optional_time TIME"));
     }

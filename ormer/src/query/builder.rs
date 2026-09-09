@@ -19,6 +19,11 @@ use std::ops::{Add as StdAdd, Sub as StdSub};
 use std::sync::Arc;
 
 fn table_name_for<T: Model>(db_type: DbType) -> String {
+    // InfluxDB：模型声明 retention 时，读写都显式限定到专属 RP（"rp"."measurement"）
+    #[cfg(feature = "influxdb")]
+    if db_type == DbType::InfluxDB {
+        return crate::abstract_layer::influxdb_backend::influx_measurement_for_model::<T>();
+    }
     quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
 }
 
@@ -117,6 +122,37 @@ fn push_disabled_context_filter<T: Model>(
     }
 }
 
+/// 为查询构建器生成可追踪的命名过滤器实现。
+///
+/// 查询级命名过滤器（`filter_xxx()`）以 `ContextFilter` 形式保存到
+/// `context_filters`，与 scope 级 context filter 共用同一份
+/// `(model_table, name)` 键；`without_filter(name)`（`unset_xxx()`）因此
+/// 同时撤销查询级同名命名过滤器与 scope 级 context filter，渲染时由
+/// `context_filter_exprs_for` 统一合并（已禁用的不渲染）。
+macro_rules! impl_named_filter_tracking {
+    (
+        impl<$($generic:ident $(: $bound:path)?),*> $ty:ident<$($param:tt),*> for $model:ident
+    ) => {
+        impl<$($generic $(: $bound)?),*> NamedFilterQuery<$model> for $ty<$($param),*> {
+            fn apply_named_filter(mut self, name: &'static str, expr: WhereExpr) -> Self {
+                self.context_filters
+                    .push(ContextFilter::new::<$model>(name, expr));
+                self
+            }
+        }
+
+        impl<$($generic $(: $bound)?),*> WithoutFilterQuery<$model> for $ty<$($param),*> {
+            fn without_filter(mut self, name: &'static str) -> Self {
+                push_disabled_context_filter::<$model>(
+                    &mut self.disabled_context_filters,
+                    name,
+                );
+                self
+            }
+        }
+    };
+}
+
 fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -181,10 +217,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "NULL".to_string(),
         };
     }
 
@@ -204,10 +240,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS INT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "0".to_string(),
         },
         "i64" | "u64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -218,10 +254,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "0".to_string(),
         },
         "f32" | "f64" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -232,10 +268,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0.0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS FLOAT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "0.0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0.0".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "0.0".to_string(),
         },
         "bool" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -246,10 +282,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "FALSE".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "FALSE".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "FALSE".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "FALSE".to_string(),
         },
         "Duration" | "std::time::Duration" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -260,10 +296,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "0".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST(0 AS BIGINT)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "0".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "0".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "0".to_string(),
         },
         "String" | "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => {
             quote_sql_string("")
@@ -277,10 +313,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "X''".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('' AS VARBINARY(MAX))".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "X''".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "NULL".to_string(),
         },
         "Vec<i32>" | "std::vec::Vec<i32>" | "alloc::vec::Vec<i32>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -291,10 +327,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "NULL".to_string(),
         },
         "Vec<i64>"
         | "std::vec::Vec<i64>"
@@ -310,10 +346,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "NULL".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "NULL".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => "NULL".to_string(),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => "NULL".to_string(),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => "NULL".to_string(),
         },
         "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -324,10 +360,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("1970-01-01T00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDateTime" | "chrono::NaiveDateTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -338,10 +374,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01 00:00:00' AS DATETIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01T00:00:00' AS DATETIME2)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("1970-01-01T00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01T00:00:00"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("1970-01-01T00:00:00"),
         },
         "NaiveDate" | "chrono::NaiveDate" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -352,10 +388,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('1970-01-01' AS DATE)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('1970-01-01' AS DATE)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("1970-01-01"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("1970-01-01"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("1970-01-01"),
         },
         "NaiveTime" | "chrono::NaiveTime" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -366,10 +402,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('00:00:00' AS TIME)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => "CAST('00:00:00' AS TIME)".to_string(),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("00:00:00"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("00:00:00"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("00:00:00"),
         },
         "JsonValue" | "serde_json::Value" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -380,10 +416,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MySQL => "CAST('null' AS JSON)".to_string(),
             #[cfg(feature = "mssql")]
             DbType::MSSQL => quote_sql_string("null"),
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("null"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("null"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("null"),
         },
         "Uuid" | "uuid::Uuid" => match db_type {
             #[cfg(feature = "postgresql")]
@@ -398,10 +434,10 @@ fn ignored_column_default_expr(column: &ColumnSchema, db_type: DbType) -> String
             DbType::MSSQL => {
                 "CAST('00000000-0000-0000-0000-000000000000' AS UNIQUEIDENTIFIER)".to_string()
             }
-            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-            _ => quote_sql_string("00000000-0000-0000-0000-000000000000"),
             #[cfg(feature = "questdb")]
             DbType::QuestDB => quote_sql_string("00000000-0000-0000-0000-000000000000"),
+            #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+            _ => quote_sql_string("00000000-0000-0000-0000-000000000000"),
         },
         _ => quote_sql_string(""),
     }
@@ -619,11 +655,84 @@ fn append_select_tail(
     params: &mut Vec<crate::model::Value>,
 ) {
     append_filter_clause(sql, filter_keyword, filters, formatter, param_idx, params);
+    append_select_tail_suffix(
+        sql,
+        order_by,
+        range_start,
+        range_end,
+        lock,
+        db_type,
+        param_idx,
+        params,
+    );
+}
+
+/// 关联/多表查询的过滤尾部：上下文过滤与闭包过滤分组渲染。
+///
+/// 上下文过滤按主表语义（t0）渲染，闭包过滤允许把命中关联表列清单的
+/// 过滤列限定到关联表别名（t1/t2/t3），避免上下文过滤列被误解析到关联表。
+#[allow(clippy::too_many_arguments)]
+fn append_select_tail_grouped(
+    sql: &mut String,
+    context_filters: &[FilterExpr],
+    context_formatter: FilterFormatter,
+    filters: &[FilterExpr],
+    formatter: FilterFormatter,
+    order_by: &[OrderBy],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    lock: Option<RowLock>,
+    db_type: DbType,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
+    append_filter_clause(
+        sql,
+        " WHERE ",
+        context_filters,
+        context_formatter,
+        param_idx,
+        params,
+    );
+    let closure_keyword = if context_filters.is_empty() {
+        " WHERE "
+    } else {
+        " AND "
+    };
+    append_filter_clause(sql, closure_keyword, filters, formatter, param_idx, params);
+    append_select_tail_suffix(
+        sql,
+        order_by,
+        range_start,
+        range_end,
+        lock,
+        db_type,
+        param_idx,
+        params,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_select_tail_suffix(
+    sql: &mut String,
+    order_by: &[OrderBy],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    lock: Option<RowLock>,
+    db_type: DbType,
+    param_idx: &mut i32,
+    params: &mut Vec<crate::model::Value>,
+) {
     append_order_by_clause(sql, order_by, db_type, param_idx, params);
     append_range_clause(sql, range_start, range_end, !order_by.is_empty(), db_type);
     if !is_mssql_db(db_type) {
         append_lock_clause(sql, lock);
     }
+}
+
+/// 收集模型的全部 SQL 列名，供关联查询解析过滤列的表归属。
+fn related_table_columns<M: Model>() -> Vec<&'static str> {
+    M::COLUMN_SCHEMA.iter().map(|column| column.name).collect()
 }
 
 fn append_order_by_clause(
@@ -679,6 +788,9 @@ fn invalid_dynamic_field(model: &'static str, field: impl Into<String>) -> Filte
 }
 
 fn validate_filter_expr(filter: &FilterExpr, db_type: DbType) -> crate::Result<()> {
+    // NULL 与非等值操作符组合在三值逻辑下恒为 UNKNOWN（恒假 SQL 且无
+    // 警告），先于后端能力校验拦截（P2-4）。
+    filter.validate_null_usage()?;
     crate::query::expr::validate_filter_for_db(filter, db_type)
 }
 
@@ -707,57 +819,77 @@ fn validate_select_parts(
     validate_order_by(order_by)
 }
 
+/// 查询尾部的后端预检（当前覆盖 InfluxQL）。
+///
+/// InfluxQL 约束：
+/// - `ORDER BY` 仅允许时间列（正/倒序）；
+/// - `OFFSET` 必须伴随 `LIMIT`（只有 start 没有 end 的 range 会生成裸
+///   `OFFSET`，直接返回 `UnsupportedFeature` 而不是生成非法语句）。
+fn validate_backend_select_tail<T: Model>(
+    order_by: &[OrderBy],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+    db_type: DbType,
+) -> crate::Result<()> {
+    #[cfg(feature = "influxdb")]
+    if matches!(db_type, DbType::InfluxDB) {
+        return validate_influxdb_select_tail::<T>(order_by, range_start, range_end);
+    }
+    #[cfg(not(feature = "influxdb"))]
+    let _ = (order_by, range_start, range_end, db_type);
+    Ok(())
+}
+
+/// InfluxQL 的 ORDER BY / 分页约束校验。
+#[cfg(feature = "influxdb")]
+fn validate_influxdb_select_tail<T: Model>(
+    order_by: &[OrderBy],
+    range_start: Option<usize>,
+    range_end: Option<usize>,
+) -> crate::Result<()> {
+    let time_key =
+        crate::abstract_layer::common::common_helpers::resolve_influx_time_key::<T>(
+            DbType::InfluxDB,
+        )?;
+    for order in order_by {
+        if order.cloned_expr().is_some() || order.column != time_key {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: DbType::InfluxDB,
+                feature: "ORDER BY columns other than the time key",
+            });
+        }
+    }
+    if range_start.is_some() && range_end.is_none() {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: DbType::InfluxDB,
+            feature: "OFFSET without LIMIT (InfluxQL requires LIMIT when OFFSET is used)",
+        });
+    }
+    Ok(())
+}
+
 fn validate_row_lock(lock: Option<RowLock>, db_type: DbType) -> crate::Result<()> {
     let Some(lock) = lock else {
         return Ok(());
     };
-    #[cfg(not(any(feature = "postgresql", feature = "mysql", feature = "mssql")))]
-    let _ = &lock;
-
-    match db_type {
-        #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => {
-            let _ = &lock;
-            Ok(())
-        }
-        #[cfg(feature = "mysql")]
-        DbType::MySQL => {
-            let _ = &lock;
-            Ok(())
-        }
-        #[cfg(feature = "mssql")]
-        DbType::MSSQL if lock.no_wait => Err(crate::OrmerError::UnsupportedFeature {
+    // 能力矩阵优先：row_lock=false 的后端统一以 "row locking" 拒绝；
+    // MSSQL 的 NOWAIT 细粒度限制在矩阵之后单独校验（矩阵只覆盖粗粒度门控）。
+    if !crate::Capabilities::of(db_type).row_lock {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "row locking",
+        });
+    }
+    #[cfg(feature = "mssql")]
+    if matches!(db_type, DbType::MSSQL) && lock.no_wait {
+        return Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "NOWAIT row locking",
-        }),
-        #[cfg(feature = "mssql")]
-        DbType::MSSQL => Ok(()),
-        #[cfg(feature = "sqlite")]
-        DbType::Sqlite => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "row locking",
-        }),
-        #[cfg(feature = "duckdb")]
-        DbType::DuckDB => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "row locking",
-        }),
-        #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "row locking",
-        }),
-        #[cfg(feature = "questdb")]
-        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "row locking",
-        }),
-        #[cfg(feature = "influxdb")]
-        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "row locking",
-        }),
+        });
     }
+    #[cfg(not(feature = "mssql"))]
+    let _ = &lock;
+    Ok(())
 }
 
 fn validate_distinct_on(distinct_on: &[SqlExpr], order_by: &[OrderBy]) -> crate::Result<()> {
@@ -1272,12 +1404,13 @@ fn assert_derived_model_column_count<R: Model>(actual: usize) {
     );
 }
 
+/// 计算范围内的行数上限。
+///
+/// `start > end` 时返回 0（生成 `LIMIT 0`，即空范围）：查询构建器的
+/// `range()` 族 API 是链式的、返回 `Self`，不携带 `Result`，因此用钳制
+/// 语义替代下溢 panic。
 fn range_limit(start: Option<usize>, end: usize) -> usize {
-    if let Some(start) = start {
-        end - start
-    } else {
-        end
-    }
+    end.checked_sub(start.unwrap_or(0)).unwrap_or(0)
 }
 
 fn append_limit_offset_clause(
@@ -1331,7 +1464,7 @@ fn format_from_table_list(tables: &[String]) -> String {
         .join(", ")
 }
 
-fn append_join_condition(
+fn append_join_condition<J: Model>(
     db_type: DbType,
     filter: &FilterExpr,
     sql: &mut String,
@@ -1341,6 +1474,7 @@ fn append_join_condition(
     let condition = FilterFormatter::new(db_type)
         .with_table_prefix("t0")
         .with_right_table_prefix("t1")
+        .with_related_tables(vec![("t1", related_table_columns::<J>())])
         .format(filter, param_idx, params);
     sql.push_str(&condition);
 }
@@ -1364,8 +1498,10 @@ impl JoinKind {
 
 struct JoinSqlParts<'a> {
     filters: &'a [FilterExpr],
+    order_by: &'a [OrderBy],
     range_start: Option<usize>,
     range_end: Option<usize>,
+    lock: Option<RowLock>,
     ignored_columns: &'a [String],
     join_source: &'a JoinSource,
     join_alias: &'a str,
@@ -1412,10 +1548,12 @@ impl JoinSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn joined_select_header<T: Model, J: Model>(
     sql: &mut String,
     db_type: DbType,
     join_kind: JoinKind,
+    lock: Option<RowLock>,
     ignored_columns: &[String],
     join_source: &JoinSource,
     join_alias: &str,
@@ -1429,12 +1567,19 @@ fn joined_select_header<T: Model, J: Model>(
         " "
     };
     let join_source_sql = join_source.to_sql_with_params(db_type, param_idx, params);
+    // MSSQL 的锁提示跟在表别名之后：FROM t AS t0 WITH (UPDLOCK, HOLDLOCK)
+    let lock_hint = if is_mssql_db(db_type) {
+        mssql_lock_table_hint(lock)
+    } else {
+        ""
+    };
     write!(
         sql,
-        "SELECT {}, {} FROM {} AS t0 {}{}{}",
+        "SELECT {}, {} FROM {} AS t0{} {}{}{}",
         select_exprs_for_model::<T>(db_type, ignored_columns, Some("t0")),
         select_exprs_for_model::<J>(db_type, &[], Some("t1")),
         table_name_for::<T>(db_type),
+        lock_hint,
         join_kind.keyword(),
         lateral_sql,
         join_source_sql,
@@ -1459,6 +1604,7 @@ fn plain_join_sql_with_params<T: Model, J: Model>(
         &mut sql,
         db_type,
         join_kind,
+        parts.lock,
         parts.ignored_columns,
         parts.join_source,
         parts.join_alias,
@@ -1468,7 +1614,7 @@ fn plain_join_sql_with_params<T: Model, J: Model>(
     );
 
     sql.push_str(" ON ");
-    append_join_condition(
+    append_join_condition::<J>(
         db_type,
         parts.on_condition,
         &mut sql,
@@ -1476,17 +1622,22 @@ fn plain_join_sql_with_params<T: Model, J: Model>(
         &mut params,
     );
 
-    append_filter_clause(
+    // 公共尾部：WHERE + ORDER BY + 分页 + 行锁（MSSQL 锁提示已在表头）
+    append_select_tail(
         &mut sql,
-        " WHERE ",
         parts.filters,
+        " WHERE ",
         FilterFormatter::new(db_type)
             .with_table_prefix("t0")
             .with_right_table_prefix("t1"),
+        parts.order_by,
+        parts.range_start,
+        parts.range_end,
+        parts.lock,
+        db_type,
         &mut param_idx,
         &mut params,
     );
-    append_range_clause(&mut sql, parts.range_start, parts.range_end, false, db_type);
 
     (sql, params)
 }
@@ -1504,6 +1655,7 @@ fn lateral_join_sql_with_params<T: Model, J: Model>(
         &mut sql,
         db_type,
         join_kind,
+        parts.lock,
         parts.ignored_columns,
         parts.join_source,
         parts.join_alias,
@@ -1529,17 +1681,22 @@ fn lateral_join_sql_with_params<T: Model, J: Model>(
     write!(&mut sql, ") AS {} ON true", parts.join_alias)
         .unwrap_or_else(|e| panic!("Failed to write lateral JOIN closing: {}", e));
 
-    append_filter_clause(
+    // 外层查询公共尾部：WHERE + ORDER BY + 分页 + 行锁
+    append_select_tail(
         &mut sql,
-        " WHERE ",
         parts.filters,
+        " WHERE ",
         FilterFormatter::new(db_type)
             .with_table_prefix("t0")
             .with_right_table_prefix("t1"),
+        parts.order_by,
+        parts.range_start,
+        parts.range_end,
+        parts.lock,
+        db_type,
         &mut param_idx,
         &mut params,
     );
-    append_limit_offset_clause(&mut sql, parts.range_start, parts.range_end);
 
     (sql, params)
 }
@@ -1585,6 +1742,27 @@ impl From<std::ops::RangeFrom<usize>> for RangeBounds {
     fn from(range: std::ops::RangeFrom<usize>) -> Self {
         RangeBounds {
             start: Some(range.start),
+            end: None,
+        }
+    }
+}
+
+impl From<std::ops::RangeInclusive<usize>> for RangeBounds {
+    fn from(range: std::ops::RangeInclusive<usize>) -> Self {
+        // 闭区间右端计入行数：0..=10 与 0..11 生成相同的 LIMIT。
+        // `usize::MAX..=usize::MAX` 溢出时退化为无上限（不生成 LIMIT）。
+        RangeBounds {
+            start: Some(*range.start()),
+            end: range.end().checked_add(1),
+        }
+    }
+}
+
+impl From<std::ops::RangeFull> for RangeBounds {
+    fn from(_: std::ops::RangeFull) -> Self {
+        // `..` 表示不加任何 LIMIT/OFFSET，取全量结果。
+        RangeBounds {
+            start: None,
             end: None,
         }
     }
@@ -1641,6 +1819,12 @@ fn collect_filter_param_rust_types<T: Model>(
             operator,
             value,
         } => {
+            // NULL 比较不产生绑定参数（等值改写为 IS NULL / IS NOT NULL，
+            // 非等值渲染恒假 1 = 0），类型列表必须与参数列表保持对齐，
+            // 否则 PG 会整体退化为无类型绑定
+            if matches!(value, crate::query::filter::Value::Null) {
+                return;
+            }
             let rust_type = model_column_rust_type::<T>(column)
                 .unwrap_or_else(|| infer_filter_value_rust_type(value));
             rust_types.push(
@@ -1943,6 +2127,8 @@ pub struct Select<T: Model> {
     ctes: Vec<CteDefinition>,
     cte_joins: Vec<CteJoin>,
     full_text_search: Option<crate::query::filter::FullTextQuery>,
+    /// before() 游标分页反转过排序方向，执行层取回后需把结果反转回原顺序
+    cursor_results_reversed: bool,
     _marker: PhantomData<T>,
 }
 
@@ -1999,6 +2185,7 @@ impl_clone_without_bounds!(
             ctes,
             cte_joins,
             full_text_search,
+            cursor_results_reversed,
         ],
         marker: PhantomData,
     }
@@ -2440,9 +2627,17 @@ impl<T: Model, V> MappedSelect<T, V> {
             .join(", ");
 
         if !self.distinct_on.is_empty() && !distinct_on_native(db_type) {
+            // 内层投影必须带 __ormer_c{index} 别名，外层 __ormer_ranked 引用才能解析
             let selected = column_exprs
                 .iter()
-                .map(|expr| expr.to_sql(db_type, &mut param_idx, &mut params, None))
+                .enumerate()
+                .map(|(index, expr)| {
+                    format!(
+                        "{} AS {}",
+                        expr.to_sql(db_type, &mut param_idx, &mut params, None),
+                        quote_column_reference(db_type, &format!("__ormer_c{index}"))
+                    )
+                })
                 .collect::<Vec<_>>();
             let order_projection_sql = self
                 .order_by
@@ -2543,6 +2738,12 @@ impl<T: Model, V> MappedSelect<T, V> {
         validate_row_lock(self.lock, db_type)?;
         validate_distinct_on(&self.distinct_on, &self.order_by)?;
         validate_projection_exprs(&self.column_exprs, db_type)?;
+        validate_backend_select_tail::<T>(
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            db_type,
+        )?;
         Ok(self.to_sql_with_params(db_type))
     }
 }
@@ -2554,18 +2755,7 @@ impl<T: Model, V> FilterQuery<T> for MappedSelect<T, V> {
     }
 }
 
-impl<T: Model, V> NamedFilterQuery<T> for MappedSelect<T, V> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.append_filter_expr(expr)
-    }
-}
-
-impl<T: Model, V> WithoutFilterQuery<T> for MappedSelect<T, V> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
+impl_named_filter_tracking!(impl<T: Model, V> MappedSelect<T, V> for T);
 
 impl<T: Model, V> GroupedSelect<T, V> {
     /// 创建新的 GroupedSelect 实例
@@ -2780,7 +2970,7 @@ impl<T: Model, V> GroupedSelect<T, V> {
                 .zip(self.aggregate_funcs.iter())
                 .map(|(col, agg)| match agg {
                     Some(func) => SqlExpr::Aggregate {
-                        name: Box::leak(func.clone().into_boxed_str()),
+                        name: func.clone(),
                         expr: Box::new(SqlExpr::Column(col.clone())),
                         filter: None,
                         order_by: Vec::new(),
@@ -2935,12 +3125,13 @@ impl<T: Model, V> GroupedSelect<T, V> {
         for filter in &self.having_filters {
             validate_filter_expr(filter, db_type)?;
         }
+        validate_backend_select_tail::<T>(
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            db_type,
+        )?;
         Ok(self.to_sql_with_params(db_type))
-    }
-
-    /// 生成 SQL（公共方法，供执行器使用）
-    pub fn build_sql(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
-        self.to_sql_with_params(db_type)
     }
 
     #[cfg(feature = "postgresql")]
@@ -2975,18 +3166,7 @@ impl<T: Model, V> FilterQuery<T> for GroupedSelect<T, V> {
     }
 }
 
-impl<T: Model, V> NamedFilterQuery<T> for GroupedSelect<T, V> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.append_filter_expr(expr)
-    }
-}
-
-impl<T: Model, V> WithoutFilterQuery<T> for GroupedSelect<T, V> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
+impl_named_filter_tracking!(impl<T: Model, V> GroupedSelect<T, V> for T);
 
 impl<T: Model> Select<T> {
     pub fn new() -> Self {
@@ -3010,6 +3190,7 @@ impl<T: Model> Select<T> {
             ctes: Vec::new(),
             cte_joins: Vec::new(),
             full_text_search: None,
+            cursor_results_reversed: false,
             _marker: PhantomData,
         }
     }
@@ -3157,14 +3338,45 @@ impl<T: Model> Select<T> {
         self
     }
 
-    /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
-    /// `select::<User>`().from::<User, Role>()
-    pub fn from<T2, R: Model>(self) -> RelatedSelect<T, R>
-    where
-        T2: Model + 'static,
-    {
-        // 通过类型约束确保 T2 == T
-        // 如果 T2 != T,编译器会在类型推导时报错
+    /// 检查转换为目标查询类型（RelatedSelect/MultiTableSelect/FourTableSelect/
+    /// AggregateSelect）时会被丢弃的非默认状态。
+    ///
+    /// 这些目标类型不携带 route_table/lock/cursor/distinct/cte 等字段；
+    /// 若已设置仍继续转换，会把查询静默打到未拆分的基础表或丢失语义，
+    /// 因此调用方必须显式报错。
+    fn lost_state_on_conversion(&self, include_table_route: bool) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
+        if include_table_route && !self.table_route.is_empty() {
+            dropped.push("route_table");
+        }
+        if self.lock.is_some() {
+            dropped.push("lock");
+        }
+        if self.cursor_after.is_some() || self.cursor_before.is_some() {
+            dropped.push("after/before cursor");
+        }
+        if self.distinct || !self.distinct_on.is_empty() {
+            dropped.push("distinct");
+        }
+        if !self.ctes.is_empty() || !self.cte_joins.is_empty() || self.recursive_cte.is_some() {
+            dropped.push("cte");
+        }
+        if self.full_text_search.is_some() {
+            dropped.push("full-text search");
+        }
+        dropped
+    }
+
+    /// 添加关联表查询（转换为双表查询构建器）
+    /// `select::<User>()`.from::<Role>()
+    pub fn from<R: Model>(self) -> RelatedSelect<T, R> {
+        let dropped = self.lost_state_on_conversion(true);
+        assert!(
+            dropped.is_empty(),
+            "Select::from(): RelatedSelect does not carry the following states: {}; \
+             use a plain Select for queries that need them",
+            dropped.join(", ")
+        );
         RelatedSelect {
             filters: self.filters,
             context_filters: self.context_filters,
@@ -3178,11 +3390,15 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加关联表查询（支持3个表）
-    /// `select::<User>`().from3::<User, Role, Permission>()
-    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2>
-    where
-        T2: Model + 'static,
-    {
+    /// `select::<User>()`.from3::<Role, Permission>()
+    pub fn from3<R1: Model, R2: Model>(self) -> MultiTableSelect<T, R1, R2> {
+        let dropped = self.lost_state_on_conversion(true);
+        assert!(
+            dropped.is_empty(),
+            "Select::from3(): MultiTableSelect does not carry the following states: {}; \
+             use a plain Select for queries that need them",
+            dropped.join(", ")
+        );
         MultiTableSelect {
             filters: self.filters,
             context_filters: self.context_filters,
@@ -3196,11 +3412,15 @@ impl<T: Model> Select<T> {
     }
 
     /// 添加关联表查询（支持4个表）
-    /// `select::<User>`().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3>
-    where
-        T2: Model + 'static,
-    {
+    /// `select::<User>()`.from4::<Role, Permission, Department>()
+    pub fn from4<R1: Model, R2: Model, R3: Model>(self) -> FourTableSelect<T, R1, R2, R3> {
+        let dropped = self.lost_state_on_conversion(true);
+        assert!(
+            dropped.is_empty(),
+            "Select::from4(): FourTableSelect does not carry the following states: {}; \
+             use a plain Select for queries that need them",
+            dropped.join(", ")
+        );
         FourTableSelect {
             filters: self.filters,
             context_filters: self.context_filters,
@@ -3215,6 +3435,14 @@ impl<T: Model> Select<T> {
 
     /// 创建带类型参数的聚合查询
     fn aggregate_typed<R>(self, func: &str, column: &str) -> AggregateSelect<T, R> {
+        let dropped = self.lost_state_on_conversion(false);
+        assert!(
+            dropped.is_empty(),
+            "Select::{}(): AggregateSelect does not carry the following states: {}; \
+             use a plain Select for queries that need them",
+            func.to_ascii_lowercase(),
+            dropped.join(", ")
+        );
         AggregateSelect {
             aggregate_func: func.to_string(),
             column_name: column.to_string(),
@@ -3444,16 +3672,6 @@ impl<T: Model> Select<T> {
         self
     }
 
-    /// 添加 WHERE 条件 (使用宏支持 >= 和 > 运算符语法)
-    #[doc(hidden)]
-    pub fn filter_cmp<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        self.filter(f)
-    }
-
     pub fn filter_dynamic<F, W>(mut self, f: F) -> Self
     where
         F: FnOnce(DynamicColumnSet<T>) -> W,
@@ -3660,11 +3878,15 @@ impl<T: Model> Select<T> {
     }
 
     /// 生成 EXISTS 子查询专用 SQL（SELECT 1 FROM ...）
+    ///
+    /// 与主查询路径一致，使用 `effective_filters()`：scope 级 context
+    /// filter（如软删除）不会被 EXISTS 子查询遗漏。
     fn to_exists_sql_with_params_for(
         &self,
         db_type: DbType,
     ) -> crate::Result<(String, Vec<crate::model::Value>)> {
-        validate_filters(&self.filters, db_type)?;
+        let filters = self.effective_filters();
+        validate_filters(&filters, db_type)?;
         let mut sql = String::new();
         let mut params = Vec::new();
 
@@ -3679,7 +3901,7 @@ impl<T: Model> Select<T> {
         append_filter_clause(
             &mut sql,
             " WHERE ",
-            &self.filters,
+            &filters,
             FilterFormatter::new(db_type),
             &mut param_idx,
             &mut params,
@@ -3701,6 +3923,13 @@ impl<T: Model> Select<T> {
         validate_select_parts(&self.effective_filters(), &self.order_by, db_type)?;
         validate_row_lock(self.lock, db_type)?;
         validate_distinct_on(&self.distinct_on, &self.order_by)?;
+        validate_projection_exprs(&self.projection_columns, db_type)?;
+        validate_backend_select_tail::<T>(
+            &self.order_by,
+            self.range_start,
+            self.range_end,
+            db_type,
+        )?;
         Ok(self.to_sql_with_params(db_type))
     }
 
@@ -4332,6 +4561,17 @@ impl<T: Model> Select<T> {
             let filter = build_cursor_seek_filter(&order_by, cursor.values(), kind)?;
             select.filters.push(FilterExpr::from(filter));
             select.range_start = None;
+            if kind == CursorSeekKind::Before {
+                // before() 取"游标前 N 行"必须反转排序方向才能拿到离游标最近的
+                // N 行；执行层取回后再按 cursor_results_reversed 反转回原顺序
+                for order in order_by.iter_mut() {
+                    order.direction = match order.direction {
+                        OrderDirection::Asc => OrderDirection::Desc,
+                        OrderDirection::Desc => OrderDirection::Asc,
+                    };
+                }
+                select.cursor_results_reversed = true;
+            }
         }
 
         select.order_by = order_by;
@@ -4355,6 +4595,27 @@ impl<T: Model> Select<T> {
         }
         Ok(PageCursor::new(values))
     }
+
+    /// fetch_page 取回结果后的统一后处理。
+    ///
+    /// before() 分页在 prepare_cursor_page 中反转过排序方向，这里把结果
+    /// 反转回原顺序；此时"继续向前翻页"的游标是原顺序的第一行。
+    pub(crate) fn finish_cursor_page(
+        &self,
+        mut items: Vec<T>,
+        cursor_columns: &[String],
+    ) -> crate::Result<CursorPage<T>> {
+        let anchor = if self.cursor_results_reversed {
+            items.reverse();
+            items.first()
+        } else {
+            items.last()
+        };
+        let next_cursor = anchor
+            .map(|item| self.cursor_values_from_model(item, cursor_columns))
+            .transpose()?;
+        Ok(CursorPage::new(items, next_cursor))
+    }
 }
 
 impl<T: Model> FilterQuery<T> for Select<T> {
@@ -4364,18 +4625,7 @@ impl<T: Model> FilterQuery<T> for Select<T> {
     }
 }
 
-impl<T: Model> NamedFilterQuery<T> for Select<T> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.append_filter_expr(expr)
-    }
-}
-
-impl<T: Model> WithoutFilterQuery<T> for Select<T> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
+impl_named_filter_tracking!(impl<T: Model> Select<T> for T);
 
 pub fn from_derived<R: Model>(derived: DerivedSelect<R>) -> DerivedTableSelect<R> {
     DerivedTableSelect {
@@ -4500,7 +4750,7 @@ impl<R: Model> FilterQuery<R> for DerivedTableSelect<R> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorSeekKind {
     After,
     Before,
@@ -4596,6 +4846,10 @@ impl SetOp {
 ///
 /// 将两个 SELECT 查询通过 UNION/INTERSECT/EXCEPT 组合
 ///
+/// 渲染规则：两个操作数各自括号包装为 `(SELECT ...) UNION (SELECT ...)`，
+/// 这是各数据库普遍支持的合法形式；仅最外层允许追加 ORDER BY/LIMIT，
+/// 操作数自带的 ORDER BY/LIMIT 保留在括号内（对括号内的子 SELECT 生效）。
+///
 /// # 示例
 /// ```ignore
 /// let combined = db.select::<User>()
@@ -4604,7 +4858,7 @@ impl SetOp {
 ///         db.select::<User>().filter(|p| p.name.like("%admin%"))
 ///     )
 ///     .collect::<Vec<_>>().await?;
-/// // 生成: SELECT ... WHERE age > 30 UNION SELECT ... WHERE name LIKE '%admin%'
+/// // 生成: (SELECT ... WHERE age > 30) UNION (SELECT ... WHERE name LIKE '%admin%')
 /// ```
 pub struct UnionSelect<T: Model> {
     left: Select<T>,
@@ -4626,11 +4880,37 @@ impl<T: Model> UnionSelect<T> {
     }
 
     /// 生成 SQL 和参数
+    ///
+    /// 操作数以括号包装，避免操作数自带的 ORDER BY/LIMIT 生成
+    /// `... ORDER BY x LIMIT n UNION ...` 这类语法错误。
     pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
         let (left_sql, mut params) = self.left.to_sql_with_params(db_type);
         let (right_sql, right_params) = self.right.to_sql_with_params(db_type);
         params.extend(right_params);
 
+        let sql = format!("({}) {} ({})", left_sql, self.op.as_sql(), right_sql);
+        (sql, params)
+    }
+
+    /// 校验并生成 SQL 和参数（供执行器接入使用）
+    pub fn try_to_sql_with_params(
+        &self,
+        db_type: DbType,
+    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+        self.left.try_to_sql_with_params(db_type)?;
+        self.right.try_to_sql_with_params(db_type)?;
+        Ok(self.to_sql_with_params(db_type))
+    }
+
+    /// MSSQL 专用：操作数不加括号直接拼接。
+    /// SQL Server 的 T-SQL 方言不支持 `(SELECT ...) UNION (SELECT ...)` 形态。
+    pub fn to_sql_with_params_unparenthesized(
+        &self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>) {
+        let (left_sql, mut params) = self.left.to_sql_with_params(db_type);
+        let (right_sql, right_params) = self.right.to_sql_with_params(db_type);
+        params.extend(right_params);
         let sql = format!("{} {} {}", left_sql, self.op.as_sql(), right_sql);
         (sql, params)
     }
@@ -4675,6 +4955,7 @@ impl<T: Model> Select<T> {
 }
 
 impl<T: Model, R: Model> RelatedSelect<T, R> {
+    #[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
     fn effective_filters(&self) -> Vec<FilterExpr> {
         let mut filters =
             context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
@@ -4736,14 +5017,19 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        let filters = self.effective_filters();
-        append_select_tail(
+        let context_filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        append_select_tail_grouped(
             &mut sql,
-            &filters,
-            " WHERE ",
+            &context_filters,
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
                 .with_right_table_prefix("t1"),
+            &self.filters,
+            FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1")
+                .with_related_tables(vec![("t1", related_table_columns::<R>())]),
             &self.order_by,
             self.range_start,
             self.range_end,
@@ -4755,9 +5041,23 @@ impl<T: Model, R: Model> RelatedSelect<T, R> {
 
         (sql, params)
     }
+
+    /// 生成与原子查询同谓词的 `SELECT COUNT(*)` SQL 和参数（外层包装），
+    /// 供列表分页场景计算 total_count；排序与分页不影响总数，先剥离。
+    pub fn to_count_sql_with_params(
+        mut self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>) {
+        self.order_by.clear();
+        self.range_start = None;
+        self.range_end = None;
+        let (sql, params) = self.to_sql_with_params(db_type);
+        (format!("SELECT COUNT(*) FROM ({sql}) AS count_sub"), params)
+    }
 }
 
 impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
+    #[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
     fn effective_filters(&self) -> Vec<FilterExpr> {
         let mut filters =
             context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
@@ -4823,14 +5123,22 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        let filters = self.effective_filters();
-        append_select_tail(
+        let context_filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        append_select_tail_grouped(
             &mut sql,
-            &filters,
-            " WHERE ",
+            &context_filters,
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
                 .with_right_table_prefix("t1"),
+            &self.filters,
+            FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1")
+                .with_related_tables(vec![
+                    ("t1", related_table_columns::<R1>()),
+                    ("t2", related_table_columns::<R2>()),
+                ]),
             &self.order_by,
             self.range_start,
             self.range_end,
@@ -4842,9 +5150,23 @@ impl<T: Model, R1: Model, R2: Model> MultiTableSelect<T, R1, R2> {
 
         (sql, params)
     }
+
+    /// 生成与原子查询同谓词的 `SELECT COUNT(*)` SQL 和参数（外层包装），
+    /// 供列表分页场景计算 total_count；排序与分页不影响总数，先剥离。
+    pub fn to_count_sql_with_params(
+        mut self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>) {
+        self.order_by.clear();
+        self.range_start = None;
+        self.range_end = None;
+        let (sql, params) = self.to_sql_with_params(db_type);
+        (format!("SELECT COUNT(*) FROM ({sql}) AS count_sub"), params)
+    }
 }
 
 impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
+    #[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
     fn effective_filters(&self) -> Vec<FilterExpr> {
         let mut filters =
             context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
@@ -4912,14 +5234,23 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
 
-        let filters = self.effective_filters();
-        append_select_tail(
+        let context_filters =
+            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
+        append_select_tail_grouped(
             &mut sql,
-            &filters,
-            " WHERE ",
+            &context_filters,
             FilterFormatter::new(db_type)
                 .with_table_prefix("t0")
                 .with_right_table_prefix("t1"),
+            &self.filters,
+            FilterFormatter::new(db_type)
+                .with_table_prefix("t0")
+                .with_right_table_prefix("t1")
+                .with_related_tables(vec![
+                    ("t1", related_table_columns::<R1>()),
+                    ("t2", related_table_columns::<R2>()),
+                    ("t3", related_table_columns::<R3>()),
+                ]),
             &self.order_by,
             self.range_start,
             self.range_end,
@@ -4930,6 +5261,19 @@ impl<T: Model, R1: Model, R2: Model, R3: Model> FourTableSelect<T, R1, R2, R3> {
         );
 
         (sql, params)
+    }
+
+    /// 生成与原子查询同谓词的 `SELECT COUNT(*)` SQL 和参数（外层包装），
+    /// 供列表分页场景计算 total_count；排序与分页不影响总数，先剥离。
+    pub fn to_count_sql_with_params(
+        mut self,
+        db_type: DbType,
+    ) -> (String, Vec<crate::model::Value>) {
+        self.order_by.clear();
+        self.range_start = None;
+        self.range_end = None;
+        let (sql, params) = self.to_sql_with_params(db_type);
+        (format!("SELECT COUNT(*) FROM ({sql}) AS count_sub"), params)
     }
 }
 
@@ -5221,67 +5565,6 @@ impl<T> From<RawExpr<T>> for OrderBy {
     }
 }
 
-/// 整数列代理(示例:针对 i32 类型的字段)
-/// 注意:完整实现需要通过过程宏为每个模型的每个字段生成对应的代理类型
-pub struct AgeColumn {
-    column_name: &'static str,
-}
-
-impl AgeColumn {
-    pub fn new(name: &'static str) -> Self {
-        Self { column_name: name }
-    }
-
-    pub fn column_name(&self) -> &'static str {
-        self.column_name
-    }
-
-    // 支持 .ge() .gt() 等方法调用
-    pub fn ge(self, value: i32) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">=".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-
-    pub fn gt(self, value: i32) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: ">".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-
-    pub fn le(self, value: i32) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<=".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-
-    pub fn lt(self, value: i32) -> WhereExpr {
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name.to_string(),
-                operator: "<".to_string(),
-                value: crate::query::filter::Value::Integer(value as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-}
-
 /// 聚合结果类型映射 trait
 pub trait AggregateResultType {
     /// 聚合函数返回的 Rust 类型
@@ -5310,7 +5593,7 @@ impl AggregateResultType for usize {
 }
 
 // ==================== ColumnValueType Trait ====================
-// 用于统一处理不同 Rust 类型到 FilterValue 的转换
+// 用于统一处理不同 Rust 类型到过滤值（`crate::query::filter::Value`）的转换
 
 /// MapToResult trait - 用于 map_to 方法的返回类型
 pub trait MapToResult {
@@ -5341,7 +5624,7 @@ pub trait SelectColumnResult {
             .zip(self.aggregate_funcs())
             .map(|(column, aggregate)| match aggregate {
                 Some(func) => SqlExpr::Aggregate {
-                    name: Box::leak(func.into_boxed_str()),
+                    name: func,
                     expr: Box::new(SqlExpr::Column(column)),
                     filter: None,
                     order_by: Vec::new(),
@@ -5737,9 +6020,9 @@ where
     }
 }
 
-/// 列值类型 trait - 定义 Rust 类型如何转换为 FilterValue
+/// 列值类型 trait - 定义 Rust 类型如何转换为过滤值
 pub trait ColumnValueType {
-    /// 将 Rust 值转换为 FilterValue
+    /// 将 Rust 值转换为过滤值
     fn to_filter_value(value: Self) -> crate::query::filter::Value;
 
     /// 是否支持数值比较操作（>, >=, <, <=）
@@ -6139,7 +6422,7 @@ impl<T, S> TypedColumn<T, S> {
     pub fn sql_expr(&self) -> SqlExpr {
         if let Some(func) = &self.aggregate_func {
             SqlExpr::Aggregate {
-                name: func,
+                name: (*func).to_string(),
                 expr: Box::new(SqlExpr::Column(self.column_name.to_string())),
                 filter: None,
                 order_by: Vec::new(),
@@ -7366,7 +7649,7 @@ impl<T: ColumnValueType + 'static, S> TypedColumn<T, S> {
 
     pub fn array_agg(self) -> TypedExpr<Vec<T>, S> {
         TypedExpr::new(SqlExpr::Aggregate {
-            name: "ARRAY_AGG",
+            name: "ARRAY_AGG".to_string(),
             expr: Box::new(SqlExpr::Column(self.column_name.to_string())),
             filter: None,
             order_by: Vec::new(),
@@ -7414,138 +7697,6 @@ impl_binary_expr_op!(Sub, sub, "-");
 impl_binary_expr_op!(Mul, mul, "*");
 impl_binary_expr_op!(Div, div, "/");
 
-// 关键设计:ColumnProxy 类型
-// 当 p.age 被访问时,返回这个代理对象
-// 代理对象实现了比较运算符的重载,记录比较操作
-pub struct ColumnProxy {
-    column_name: String,
-}
-
-impl ColumnProxy {
-    pub fn new(name: &str) -> Self {
-        Self {
-            column_name: name.to_string(),
-        }
-    }
-}
-
-// 实现运算符重载 - 这些方法在运算符被使用时调用
-// 关键:我们让它们返回 WhereExpr 而不是 bool
-impl std::ops::BitOr<i32> for ColumnProxy {
-    type Output = WhereExpr;
-
-    fn bitor(self, rhs: i32) -> WhereExpr {
-        // 使用 | 运算符表示 >=
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name,
-                operator: ">=".to_string(),
-                value: crate::query::filter::Value::Integer(rhs as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-}
-
-impl std::ops::Shr<i32> for ColumnProxy {
-    type Output = WhereExpr;
-
-    fn shr(self, rhs: i32) -> WhereExpr {
-        // 使用 >> 运算符表示 >
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name,
-                operator: ">".to_string(),
-                value: crate::query::filter::Value::Integer(rhs as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-}
-
-impl std::ops::Shl<i32> for ColumnProxy {
-    type Output = WhereExpr;
-
-    fn shl(self, rhs: i32) -> WhereExpr {
-        // 使用 << 运算符表示 <
-        WhereExpr {
-            inner: FilterExpr::Comparison {
-                column: self.column_name,
-                operator: "<".to_string(),
-                value: crate::query::filter::Value::Integer(rhs as i64),
-            },
-            ..WhereExpr::defaults()
-        }
-    }
-}
-
-// 为特定模型实现 WhereColumn 的字段访问
-// 注意：在完整实现中，这应该由过程宏自动生成
-
-/// 列构建器，用于构建过滤表达式
-pub trait ColumnBuilder {
-    type Output;
-
-    fn gt(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn ge(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn lt(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn le(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn eq(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn ne(self, value: impl Into<FilterValue>) -> FilterExpr;
-    fn like(self, pattern: &str) -> FilterExpr;
-    fn contains(self, pattern: &str) -> FilterExpr;
-    fn starts_with(self, pattern: &str) -> FilterExpr;
-    fn ends_with(self, pattern: &str) -> FilterExpr;
-    fn into_some(self) -> FilterExpr;
-    fn into_none(self) -> FilterExpr;
-    fn asc(self) -> OrderBy;
-    fn desc(self) -> OrderBy;
-}
-
-/// 过滤值
-#[derive(Debug, Clone)]
-pub struct FilterValue {
-    inner: crate::query::filter::Value,
-}
-
-impl From<i32> for FilterValue {
-    fn from(v: i32) -> Self {
-        Self {
-            inner: crate::query::filter::Value::Integer(v as i64),
-        }
-    }
-}
-
-impl From<i64> for FilterValue {
-    fn from(v: i64) -> Self {
-        Self {
-            inner: crate::query::filter::Value::Integer(v),
-        }
-    }
-}
-
-impl From<String> for FilterValue {
-    fn from(v: String) -> Self {
-        Self {
-            inner: crate::query::filter::Value::Text(v),
-        }
-    }
-}
-
-impl From<&str> for FilterValue {
-    fn from(v: &str) -> Self {
-        Self {
-            inner: crate::query::filter::Value::Text(v.to_string()),
-        }
-    }
-}
-
-impl From<FilterValue> for crate::query::filter::Value {
-    fn from(value: FilterValue) -> Self {
-        value.inner
-    }
-}
-
 // ==================== JOIN 功能 ====================
 
 /// LEFT JOIN 查询结构体
@@ -7556,6 +7707,7 @@ pub struct LeftJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    lock: Option<RowLock>,
     ignored_columns: Vec<String>,
     join_source: JoinSource,
     join_alias: String,
@@ -7580,6 +7732,7 @@ impl_clone_without_bounds!(
             order_by,
             range_start,
             range_end,
+            lock,
             ignored_columns,
             join_source,
             join_alias,
@@ -7601,6 +7754,7 @@ pub struct InnerJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    lock: Option<RowLock>,
     ignored_columns: Vec<String>,
     join_source: JoinSource,
     join_alias: String,
@@ -7625,6 +7779,7 @@ impl_clone_without_bounds!(
             order_by,
             range_start,
             range_end,
+            lock,
             ignored_columns,
             join_source,
             join_alias,
@@ -7646,6 +7801,7 @@ pub struct RightJoinedSelect<T: Model, J: Model> {
     order_by: Vec<OrderBy>,
     range_start: Option<usize>,
     range_end: Option<usize>,
+    lock: Option<RowLock>,
     ignored_columns: Vec<String>,
     join_source: JoinSource,
     join_alias: String,
@@ -7670,6 +7826,7 @@ impl_clone_without_bounds!(
             order_by,
             range_start,
             range_end,
+            lock,
             ignored_columns,
             join_source,
             join_alias,
@@ -7683,38 +7840,60 @@ impl_clone_without_bounds!(
     }
 );
 
+/// 为三个 JoinedSelect 类型生成统一构造器：从 `Select` 继承过滤/排序/
+/// 分页/锁状态，并解析 LATERAL JOIN 的子查询排序与范围。
+macro_rules! impl_joined_select_from_select {
+    ($ty:ident) => {
+        impl<T: Model, J: Model> $ty<T, J> {
+            fn from_source(
+                select: Select<T>,
+                join_source: JoinSource,
+                where_expr: WhereExpr,
+            ) -> Self {
+                let lateral = where_expr.is_lateral();
+                let join_order_by = where_expr.join_order_by.clone();
+                let join_range_start = where_expr.join_range_start;
+                let join_range_end = where_expr.join_range_end;
+
+                Self {
+                    filters: select.filters,
+                    context_filters: select.context_filters,
+                    disabled_context_filters: select.disabled_context_filters,
+                    order_by: select.order_by,
+                    range_start: select.range_start,
+                    range_end: select.range_end,
+                    lock: select.lock,
+                    ignored_columns: select.ignored_columns,
+                    join_source,
+                    join_alias: "t1".to_string(),
+                    on_condition: where_expr.into(),
+                    lateral,
+                    join_order_by,
+                    join_range_start,
+                    join_range_end,
+                    _marker: PhantomData,
+                }
+            }
+        }
+    };
+}
+
+impl_joined_select_from_select!(LeftJoinedSelect);
+impl_joined_select_from_select!(InnerJoinedSelect);
+impl_joined_select_from_select!(RightJoinedSelect);
+
 impl<T: Model> Select<T> {
     /// LEFT JOIN
     pub fn left_join<J: Model>(
         self,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> LeftJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
-
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
-
-        LeftJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
-        }
+        let expr = f(T::Where::default(), J::Where::default());
+        LeftJoinedSelect::from_source(
+            self,
+            JoinSource::Table(J::TABLE_NAME.to_string()),
+            expr,
+        )
     }
 
     /// INNER JOIN
@@ -7722,32 +7901,12 @@ impl<T: Model> Select<T> {
         self,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> InnerJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
-
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
-
-        InnerJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
-        }
+        let expr = f(T::Where::default(), J::Where::default());
+        InnerJoinedSelect::from_source(
+            self,
+            JoinSource::Table(J::TABLE_NAME.to_string()),
+            expr,
+        )
     }
 
     /// RIGHT JOIN
@@ -7755,362 +7914,193 @@ impl<T: Model> Select<T> {
         self,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> RightJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
-
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
-
-        RightJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Table(J::TABLE_NAME.to_string()),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
-        }
+        let expr = f(T::Where::default(), J::Where::default());
+        RightJoinedSelect::from_source(
+            self,
+            JoinSource::Table(J::TABLE_NAME.to_string()),
+            expr,
+        )
     }
 
+    /// LEFT JOIN 派生表
     pub fn left_join_derived<J: Model>(
         self,
         derived: DerivedSelect<J>,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> LeftJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
-
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
-
-        LeftJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Derived(derived.inner),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
-        }
+        let expr = f(T::Where::default(), J::Where::default());
+        LeftJoinedSelect::from_source(self, JoinSource::Derived(derived.inner), expr)
     }
 
+    /// INNER JOIN 派生表
     pub fn inner_join_derived<J: Model>(
         self,
         derived: DerivedSelect<J>,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> InnerJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
-
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
-
-        InnerJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Derived(derived.inner),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
-        }
+        let expr = f(T::Where::default(), J::Where::default());
+        InnerJoinedSelect::from_source(self, JoinSource::Derived(derived.inner), expr)
     }
 
+    /// RIGHT JOIN 派生表
     pub fn right_join_derived<J: Model>(
         self,
         derived: DerivedSelect<J>,
         f: impl FnOnce(T::Where, J::Where) -> WhereExpr,
     ) -> RightJoinedSelect<T, J> {
-        let t_where = T::Where::default();
-        let j_where = J::Where::default();
-        let expr = f(t_where, j_where);
+        let expr = f(T::Where::default(), J::Where::default());
+        RightJoinedSelect::from_source(self, JoinSource::Derived(derived.inner), expr)
+    }
+}
 
-        let lateral = expr.is_lateral();
-        let join_order_by = expr.join_order_by.clone();
-        let join_range_start = expr.join_range_start;
-        let join_range_end = expr.join_range_end;
+/// 为三个 JoinedSelect 类型生成同构的查询 API：filter/order_by/limit/
+/// range/行锁与 SQL 渲染（公共尾部 + `join_sql_with_params`）。
+macro_rules! impl_joined_select_query_api {
+    ($ty:ident, $kind:expr) => {
+        impl<T: Model, J: Model> $ty<T, J> {
+            fn effective_filters(&self) -> Vec<FilterExpr> {
+                let mut filters = context_filter_exprs_for::<T>(
+                    &self.context_filters,
+                    &self.disabled_context_filters,
+                );
+                filters.extend(self.filters.iter().cloned());
+                filters
+            }
 
-        RightJoinedSelect {
-            filters: self.filters,
-            context_filters: self.context_filters,
-            disabled_context_filters: self.disabled_context_filters,
-            order_by: self.order_by,
-            range_start: self.range_start,
-            range_end: self.range_end,
-            ignored_columns: self.ignored_columns,
-            join_source: JoinSource::Derived(derived.inner),
-            join_alias: "t1".to_string(),
-            on_condition: expr.into(),
-            lateral,
-            join_order_by,
-            join_range_start,
-            join_range_end,
-            _marker: PhantomData,
+            #[cfg(feature = "postgresql")]
+            pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
+                collect_join_param_rust_types::<T>(
+                    &self.join_source,
+                    &self.on_condition,
+                    &self.join_order_by,
+                    &self.effective_filters(),
+                )
+            }
+
+            pub fn filter<F, W>(mut self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> W,
+                W: Into<WhereExpr>,
+            {
+                let where_obj = T::Where::default();
+                let expr = FilterExpr::from(f(where_obj).into());
+                self.filters.push(expr);
+                self
+            }
+
+            /// 添加排序（join 后补排序，列限定主表 t0）
+            pub fn order_by<F, O>(mut self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> O,
+                O: Into<OrderBy>,
+            {
+                let where_obj = T::Where::default();
+                self.order_by.push(f(where_obj).into());
+                self
+            }
+
+            /// 添加降序排序
+            pub fn order_by_desc<F, O>(mut self, f: F) -> Self
+            where
+                F: FnOnce(T::Where) -> O,
+                O: Into<OrderBy>,
+            {
+                let where_obj = T::Where::default();
+                let mut order = f(where_obj).into();
+                order.direction = crate::query::filter::OrderDirection::Desc;
+                self.order_by.push(order);
+                self
+            }
+
+            /// 仅限制返回行数，不设置 offset
+            pub fn limit(mut self, limit: usize) -> Self {
+                self.range_start = None;
+                self.range_end = Some(limit);
+                self
+            }
+
+            pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
+                let bounds = range.into();
+                self.range_start = bounds.start;
+                self.range_end = bounds.end;
+                self
+            }
+
+            /// 行级锁（SELECT ... FOR UPDATE），与 Select::for_update 对齐
+            pub fn for_update(mut self) -> Self {
+                self.lock = Some(RowLock::for_update());
+                self
+            }
+
+            /// 共享行级锁（SELECT ... FOR SHARE）
+            pub fn for_share(mut self) -> Self {
+                self.lock = Some(RowLock::for_share());
+                self
+            }
+
+            pub fn skip_locked(mut self) -> Self {
+                let mut lock = self.lock.unwrap_or_else(RowLock::for_update);
+                lock.skip_locked = true;
+                self.lock = Some(lock);
+                self
+            }
+
+            pub fn nowait(mut self) -> Self {
+                let mut lock = self.lock.unwrap_or_else(RowLock::for_update);
+                lock.no_wait = true;
+                self.lock = Some(lock);
+                self
+            }
+
+            /// 生成 SQL 和参数
+            pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
+                let filters = self.effective_filters();
+                join_sql_with_params::<T, J>(
+                    db_type,
+                    $kind,
+                    self.lateral,
+                    JoinSqlParts {
+                        filters: &filters,
+                        order_by: &self.order_by,
+                        range_start: self.range_start,
+                        range_end: self.range_end,
+                        lock: self.lock,
+                        ignored_columns: &self.ignored_columns,
+                        join_source: &self.join_source,
+                        join_alias: &self.join_alias,
+                        on_condition: &self.on_condition,
+                        join_order_by: &self.join_order_by,
+                        join_range_start: self.join_range_start,
+                        join_range_end: self.join_range_end,
+                    },
+                )
+            }
+
+            pub fn try_to_sql_with_params(
+                &self,
+                db_type: DbType,
+            ) -> crate::Result<(String, Vec<crate::model::Value>)> {
+                let filters = self.effective_filters();
+                validate_join_parts(&filters, &self.on_condition, &self.join_order_by, db_type)?;
+                validate_order_by(&self.order_by)?;
+                validate_row_lock(self.lock, db_type)?;
+                validate_backend_select_tail::<T>(
+                    &self.order_by,
+                    self.range_start,
+                    self.range_end,
+                    db_type,
+                )?;
+                Ok(self.to_sql_with_params(db_type))
+            }
         }
-    }
+    };
 }
 
-impl<T: Model, J: Model> LeftJoinedSelect<T, J> {
-    fn effective_filters(&self) -> Vec<FilterExpr> {
-        let mut filters =
-            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
-        filters.extend(self.filters.iter().cloned());
-        filters
-    }
+impl_joined_select_query_api!(LeftJoinedSelect, JoinKind::Left);
+impl_named_filter_tracking!(impl<T: Model, J: Model> LeftJoinedSelect<T, J> for T);
 
-    #[cfg(feature = "postgresql")]
-    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(
-            &self.join_source,
-            &self.on_condition,
-            &self.join_order_by,
-            &self.effective_filters(),
-        )
-    }
+impl_joined_select_query_api!(InnerJoinedSelect, JoinKind::Inner);
+impl_named_filter_tracking!(impl<T: Model, J: Model> InnerJoinedSelect<T, J> for T);
 
-    pub fn filter<F, W>(mut self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        let where_obj = T::Where::default();
-        let expr = FilterExpr::from(f(where_obj).into());
-        self.filters.push(expr);
-        self
-    }
-
-    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
-        let bounds = range.into();
-        self.range_start = bounds.start;
-        self.range_end = bounds.end;
-        self
-    }
-
-    /// 生成 SQL 和参数
-    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
-        let filters = self.effective_filters();
-        join_sql_with_params::<T, J>(
-            db_type,
-            JoinKind::Left,
-            self.lateral,
-            JoinSqlParts {
-                filters: &filters,
-                range_start: self.range_start,
-                range_end: self.range_end,
-                ignored_columns: &self.ignored_columns,
-                join_source: &self.join_source,
-                join_alias: &self.join_alias,
-                on_condition: &self.on_condition,
-                join_order_by: &self.join_order_by,
-                join_range_start: self.join_range_start,
-                join_range_end: self.join_range_end,
-            },
-        )
-    }
-
-    pub fn try_to_sql_with_params(
-        &self,
-        db_type: DbType,
-    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
-        let filters = self.effective_filters();
-        validate_join_parts(&filters, &self.on_condition, &self.join_order_by, db_type)?;
-        Ok(self.to_sql_with_params(db_type))
-    }
-}
-
-impl<T: Model, J: Model> NamedFilterQuery<T> for LeftJoinedSelect<T, J> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.filter(|_| expr)
-    }
-}
-
-impl<T: Model, J: Model> WithoutFilterQuery<T> for LeftJoinedSelect<T, J> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
-
-impl<T: Model, J: Model> InnerJoinedSelect<T, J> {
-    fn effective_filters(&self) -> Vec<FilterExpr> {
-        let mut filters =
-            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
-        filters.extend(self.filters.iter().cloned());
-        filters
-    }
-
-    #[cfg(feature = "postgresql")]
-    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(
-            &self.join_source,
-            &self.on_condition,
-            &self.join_order_by,
-            &self.effective_filters(),
-        )
-    }
-
-    pub fn filter<F, W>(mut self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        let where_obj = T::Where::default();
-        let expr = FilterExpr::from(f(where_obj).into());
-        self.filters.push(expr);
-        self
-    }
-
-    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
-        let bounds = range.into();
-        self.range_start = bounds.start;
-        self.range_end = bounds.end;
-        self
-    }
-
-    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
-        let filters = self.effective_filters();
-        join_sql_with_params::<T, J>(
-            db_type,
-            JoinKind::Inner,
-            self.lateral,
-            JoinSqlParts {
-                filters: &filters,
-                range_start: self.range_start,
-                range_end: self.range_end,
-                ignored_columns: &self.ignored_columns,
-                join_source: &self.join_source,
-                join_alias: &self.join_alias,
-                on_condition: &self.on_condition,
-                join_order_by: &self.join_order_by,
-                join_range_start: self.join_range_start,
-                join_range_end: self.join_range_end,
-            },
-        )
-    }
-
-    pub fn try_to_sql_with_params(
-        &self,
-        db_type: DbType,
-    ) -> crate::Result<(String, Vec<crate::model::Value>)> {
-        let filters = self.effective_filters();
-        validate_join_parts(&filters, &self.on_condition, &self.join_order_by, db_type)?;
-        Ok(self.to_sql_with_params(db_type))
-    }
-}
-
-impl<T: Model, J: Model> NamedFilterQuery<T> for InnerJoinedSelect<T, J> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.filter(|_| expr)
-    }
-}
-
-impl<T: Model, J: Model> WithoutFilterQuery<T> for InnerJoinedSelect<T, J> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
-
-impl<T: Model, J: Model> RightJoinedSelect<T, J> {
-    fn effective_filters(&self) -> Vec<FilterExpr> {
-        let mut filters =
-            context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
-        filters.extend(self.filters.iter().cloned());
-        filters
-    }
-
-    #[cfg(feature = "postgresql")]
-    pub(crate) fn param_rust_types(&self) -> Vec<&'static str> {
-        collect_join_param_rust_types::<T>(
-            &self.join_source,
-            &self.on_condition,
-            &self.join_order_by,
-            &self.effective_filters(),
-        )
-    }
-
-    pub fn filter<F, W>(mut self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        let where_obj = T::Where::default();
-        let expr = FilterExpr::from(f(where_obj).into());
-        self.filters.push(expr);
-        self
-    }
-
-    pub fn range<RR: Into<RangeBounds>>(mut self, range: RR) -> Self {
-        let bounds = range.into();
-        self.range_start = bounds.start;
-        self.range_end = bounds.end;
-        self
-    }
-
-    pub fn to_sql_with_params(&self, db_type: DbType) -> (String, Vec<crate::model::Value>) {
-        let filters = self.effective_filters();
-        join_sql_with_params::<T, J>(
-            db_type,
-            JoinKind::Right,
-            self.lateral,
-            JoinSqlParts {
-                filters: &filters,
-                range_start: self.range_start,
-                range_end: self.range_end,
-                ignored_columns: &self.ignored_columns,
-                join_source: &self.join_source,
-                join_alias: &self.join_alias,
-                on_condition: &self.on_condition,
-                join_order_by: &self.join_order_by,
-                join_range_start: self.join_range_start,
-                join_range_end: self.join_range_end,
-            },
-        )
-    }
-}
-
-impl<T: Model, J: Model> NamedFilterQuery<T> for RightJoinedSelect<T, J> {
-    fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
-        self.filter(|_| expr)
-    }
-}
-
-impl<T: Model, J: Model> WithoutFilterQuery<T> for RightJoinedSelect<T, J> {
-    fn without_filter(mut self, name: &'static str) -> Self {
-        push_disabled_context_filter::<T>(&mut self.disabled_context_filters, name);
-        self
-    }
-}
+impl_joined_select_query_api!(RightJoinedSelect, JoinKind::Right);
+impl_named_filter_tracking!(impl<T: Model, J: Model> RightJoinedSelect<T, J> for T);

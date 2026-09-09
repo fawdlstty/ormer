@@ -43,6 +43,8 @@ pub(crate) mod duckcompat {
         Null,
         Integer(i64),
         Real(f64),
+        Boolean(bool),
+        DateTime(chrono::DateTime<chrono::Utc>),
         Text(String),
         Blob(Vec<u8>),
         List(Vec<Value>),
@@ -227,6 +229,11 @@ pub(crate) mod duckcompat {
             Value::Null => duckdb::types::Value::Null,
             Value::Integer(v) => duckdb::types::Value::BigInt(*v),
             Value::Real(v) => duckdb::types::Value::Double(*v),
+            Value::Boolean(v) => duckdb::types::Value::Boolean(*v),
+            Value::DateTime(v) => duckdb::types::Value::Timestamp(
+                duckdb::types::TimeUnit::Microsecond,
+                v.timestamp_micros(),
+            ),
             Value::Text(v) => duckdb::types::Value::Text(v.clone()),
             Value::Blob(v) => duckdb::types::Value::Blob(v.clone()),
             Value::List(values) => {
@@ -245,11 +252,36 @@ pub(crate) mod duckcompat {
         duckdb_value_to_value(value.to_owned())
     }
 
+    /// 将 DuckDB TIMESTAMP 的原始单位计数（按 Arrow TimeUnit）换算为 UTC DateTime。
+    /// 超出 chrono 可表示范围时返回 None（由调用方回退为文本）。
+    fn timestamp_to_datetime(
+        unit: duckdb::types::TimeUnit,
+        value: i64,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        // 除法与取余分开计算，避免纳秒/微秒计数直接换算秒时溢出。
+        let (secs, nanos) = match unit {
+            duckdb::types::TimeUnit::Second => (value, 0u32),
+            duckdb::types::TimeUnit::Millisecond => (
+                value.div_euclid(1_000),
+                value.rem_euclid(1_000) as u32 * 1_000_000,
+            ),
+            duckdb::types::TimeUnit::Microsecond => (
+                value.div_euclid(1_000_000),
+                value.rem_euclid(1_000_000) as u32 * 1_000,
+            ),
+            duckdb::types::TimeUnit::Nanosecond => (
+                value.div_euclid(1_000_000_000),
+                value.rem_euclid(1_000_000_000) as u32,
+            ),
+        };
+        chrono::DateTime::from_timestamp(secs, nanos)
+    }
+
     fn duckdb_value_to_value(value: duckdb::types::Value) -> Value {
         use duckdb::types::Value as DuckValue;
         match value {
             DuckValue::Null => Value::Null,
-            DuckValue::Boolean(v) => Value::Integer(if v { 1 } else { 0 }),
+            DuckValue::Boolean(v) => Value::Boolean(v),
             DuckValue::TinyInt(v) => Value::Integer(v as i64),
             DuckValue::SmallInt(v) => Value::Integer(v as i64),
             DuckValue::Int(v) => Value::Integer(v as i64),
@@ -263,7 +295,10 @@ pub(crate) mod duckcompat {
             DuckValue::Float(v) => Value::Real(v as f64),
             DuckValue::Double(v) => Value::Real(v),
             DuckValue::Decimal(v) => Value::Text(v.to_string()),
-            DuckValue::Timestamp(_, v) => Value::Text(v.to_string()),
+            DuckValue::Timestamp(unit, v) => match timestamp_to_datetime(unit, v) {
+                Some(datetime) => Value::DateTime(datetime),
+                None => Value::Text(v.to_string()),
+            },
             DuckValue::Text(v) => Value::Text(v),
             DuckValue::Blob(v) | DuckValue::Geometry(v) => Value::Blob(v),
             DuckValue::Date32(v) => Value::Integer(v as i64),
@@ -291,37 +326,34 @@ pub(crate) mod duckcompat {
         sql: &str,
         values: Vec<Value>,
     ) -> Result<(String, Vec<Value>), Error> {
+        // 按 char 遍历以保留多字节 UTF-8 字符（定界符均为 ASCII，语义不变）
         let mut output = String::with_capacity(sql.len());
         let mut remaining = values.into_iter();
         let mut bound_values = Vec::new();
-        let bytes = sql.as_bytes();
-        let mut index = 0;
-        let mut quote = None;
+        let mut chars = sql.char_indices().peekable();
+        let mut quote: Option<char> = None;
 
-        while index < bytes.len() {
-            let byte = bytes[index];
+        while let Some((_, ch)) = chars.next() {
             if let Some(delimiter) = quote {
-                output.push(byte as char);
-                if byte == delimiter {
-                    if bytes.get(index + 1) == Some(&delimiter) {
-                        output.push(delimiter as char);
-                        index += 2;
-                        continue;
+                output.push(ch);
+                if ch == delimiter {
+                    if matches!(chars.peek(), Some(&(_, next)) if next == delimiter) {
+                        output.push(delimiter);
+                        chars.next();
+                    } else {
+                        quote = None;
                     }
-                    quote = None;
                 }
-                index += 1;
                 continue;
             }
 
-            if matches!(byte, b'\'' | b'"' | b'`') {
-                quote = Some(byte);
-                output.push(byte as char);
-                index += 1;
+            if matches!(ch, '\'' | '"' | '`') {
+                quote = Some(ch);
+                output.push(ch);
                 continue;
             }
 
-            if byte == b'?' {
+            if ch == '?' {
                 let value = remaining
                     .next()
                     .ok_or_else(|| Error("missing DuckDB parameter".to_string()))?;
@@ -331,12 +363,10 @@ pub(crate) mod duckcompat {
                     output.push('?');
                     bound_values.push(value);
                 }
-                index += 1;
                 continue;
             }
 
-            output.push(byte as char);
-            index += 1;
+            output.push(ch);
         }
 
         if remaining.next().is_some() {
@@ -373,11 +403,14 @@ pub(crate) mod duckcompat {
             .map(|value| match value {
                 Value::Integer(_) => "BIGINT",
                 Value::Real(_) => "DOUBLE",
+                Value::Boolean(_) => "BOOLEAN",
                 Value::Text(_) => "VARCHAR",
                 Value::Blob(_) => "BLOB",
-                Value::List(_) | Value::Array(_) | Value::TypedArray(_, _) | Value::Null => {
-                    "VARCHAR"
-                }
+                Value::List(_)
+                | Value::Array(_)
+                | Value::TypedArray(_, _)
+                | Value::DateTime(_)
+                | Value::Null => "VARCHAR",
             })
             .unwrap_or("VARCHAR")
     }
@@ -388,6 +421,8 @@ pub(crate) mod duckcompat {
             Value::Integer(value) => Ok(value.to_string()),
             Value::Real(value) if value.is_finite() => Ok(value.to_string()),
             Value::Real(_) => Err(Error("non-finite DuckDB array parameter".to_string())),
+            Value::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
+            Value::DateTime(value) => Ok(format!("'{}'", value.to_rfc3339())),
             Value::Text(value) => Ok(format!("'{}'", value.replace('\'', "''"))),
             Value::Blob(value) => Ok(format!("X'{}'", hex_bytes(value))),
             Value::List(_) | Value::Array(_) | Value::TypedArray(_, _) => {
@@ -454,6 +489,16 @@ async fn traced_duckdb_query<P: duckcompat::IntoParams>(
             Ok(rows)
         }
         Err(error) => Err(trace.finish_external_error("duckcompat::Connection::query", error)),
+    }
+}
+
+/// PRAGMA table_info 的 notnull/pk 标志在 DuckDB 中是 BOOLEAN，
+/// 旧驱动路径可能产出 0/1 整数，两种形态都接受。
+fn duckdb_truthy_flag(value: &duckcompat::Value) -> bool {
+    match value {
+        duckcompat::Value::Boolean(v) => *v,
+        duckcompat::Value::Integer(v) => *v != 0,
+        _ => false,
     }
 }
 
@@ -629,19 +674,20 @@ impl DbBackendTypeMapper for DuckDBTypeMapper {
                 "Vec<i32>" => "INTEGER[]",
                 "Vec<i64>" | "Vec<Option<i64>>" => "BIGINT[]",
                 "Vec<String>" => "VARCHAR[]",
-                // 浮点类型
-                "f32" | "f64" => "REAL",
+                // 浮点类型（f64 保持双精度，不降级为 REAL）
+                "f32" => "REAL",
+                "f64" => "DOUBLE",
                 "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
                     "TEXT"
                 }
-                // 时长类型
-                "Duration" | "std::time::Duration" => "INTEGER",
+                // 时长类型（微秒计数，BIGINT 避免 32 位 INTEGER 溢出）
+                "Duration" | "std::time::Duration" => "BIGINT",
                 // 字符串类型
                 "String" => "TEXT",
                 // UUID 使用规范连字符字符串
                 "Uuid" | "uuid::Uuid" => "TEXT",
-                // 布尔类型（DuckDB 没有原生 bool，用 INTEGER 存储）
-                "bool" => "INTEGER",
+                // 布尔类型（DuckDB 原生支持 BOOLEAN）
+                "bool" => "BOOLEAN",
                 // 字节数组
                 "Vec<u8>" | "&[u8]" => "BLOB",
                 // 日期时间类型（DuckDB 存储为 TEXT 或 INTEGER）
@@ -1013,21 +1059,29 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::DuckDB,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
-            &I::Model::columns(),
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-        common_helpers::append_standard_upsert_clause::<I::Model>(
-            DbType::DuckDB,
-            &mut sql,
-            &I::Model::columns(),
-        )?;
+        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        let statements =
+            common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
+                DbType::DuckDB,
+                "INSERT INTO",
+                <I::Model as Model>::table_name_for_db(DbType::DuckDB),
+                &refs,
+                |sql, columns| {
+                    common_helpers::append_standard_upsert_clause::<I::Model>(
+                        DbType::DuckDB,
+                        sql,
+                        columns,
+                    )
+                },
+            )?;
 
-        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+        Ok(SqlStatement::batch(
+            DbType::DuckDB,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -1226,13 +1280,11 @@ impl Database {
                     duckcompat::Value::Text(value) => value,
                     _ => String::new(),
                 };
-                let nullable = !matches!(
-                    row.get_value(3).trace_for("duckcompat::Row::get_value")?,
-                    duckcompat::Value::Integer(value) if value != 0
+                let nullable = !duckdb_truthy_flag(
+                    &row.get_value(3).trace_for("duckcompat::Row::get_value")?,
                 );
-                let primary_key = matches!(
-                    row.get_value(5).trace_for("duckcompat::Row::get_value")?,
-                    duckcompat::Value::Integer(value) if value != 0
+                let primary_key = duckdb_truthy_flag(
+                    &row.get_value(5).trace_for("duckcompat::Row::get_value")?,
                 );
                 let auto_increment = primary_key
                     && matches!(
@@ -1363,9 +1415,7 @@ impl Database {
             if let (
                 duckcompat::Value::Text(name),
                 duckcompat::Value::Text(col_type),
-                duckcompat::Value::Integer(notnull),
-                duckcompat::Value::Integer(pk),
-            ) = (name, col_type, notnull, pk)
+            ) = (name, col_type)
             {
                 let default = match default {
                     duckcompat::Value::Text(value) => Some(value),
@@ -1373,7 +1423,13 @@ impl Database {
                     duckcompat::Value::Real(value) => Some(value.to_string()),
                     _ => None,
                 };
-                actual_columns.push((name, col_type, notnull != 0, pk != 0, default));
+                actual_columns.push((
+                    name,
+                    col_type,
+                    duckdb_truthy_flag(&notnull),
+                    duckdb_truthy_flag(&pk),
+                    default,
+                ));
             }
         }
 
@@ -1653,7 +1709,10 @@ impl Database {
                     "TEXT".to_string()
                 }
                 "BLOB" => "BLOB".to_string(),
-                "REAL" | "FLOAT" | "DOUBLE" | "DECIMAL" | "NUMERIC" => "REAL".to_string(),
+                "BOOLEAN" | "BOOL" | "LOGICAL" => "BOOLEAN".to_string(),
+                // 单精度别名归一为 REAL；FLOAT 在 DuckDB 中是 DOUBLE 的别名
+                "REAL" | "FLOAT4" => "REAL".to_string(),
+                "DOUBLE" | "FLOAT" | "FLOAT8" | "DECIMAL" | "NUMERIC" => "DOUBLE".to_string(),
                 _ => s.to_string(),
             }
         }
@@ -1722,19 +1781,19 @@ impl Database {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+        let statements = common_helpers::build_auto_increment_aware_upsert_statements::<T>(
             DbType::DuckDB,
             "INSERT INTO",
             T::table_name_for_db(DbType::DuckDB),
-            &columns,
             models,
-            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-        );
-        common_helpers::append_standard_upsert_clause::<T>(DbType::DuckDB, &mut sql, &columns)?;
-        let params = values_to_params(&all_values)?;
-        traced_duckdb_execute(&self.conn, &sql, params, &all_values).await?;
+            |sql, columns| {
+                common_helpers::append_standard_upsert_clause::<T>(DbType::DuckDB, sql, columns)
+            },
+        )?;
+        for statement in statements {
+            let params = values_to_params(&statement.params)?;
+            traced_duckdb_execute(&self.conn, &statement.sql, params, &statement.params).await?;
+        }
 
         Ok(())
     }
@@ -1804,13 +1863,16 @@ impl Database {
     /// 创建 Related 查询执行器
     pub fn related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<T, R> {
         RelatedSelectExecutor {
-            select: Select::<T>::new().from::<T, R>(),
+            select: Select::<T>::new().from::<R>(),
             conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
 
     /// 开始事务
+    ///
+    /// 事务期间禁止并发使用同一 Database 实例执行其他操作
+    /// （共享单连接，并发语句会混入事务）。
     pub async fn begin(&self) -> crate::Result<Transaction> {
         traced_duckdb_execute(&self.conn, "BEGIN", (), &[]).await?;
         Ok(Transaction {
@@ -1939,13 +2001,11 @@ impl Database {
                 duckcompat::Value::Text(value) => value,
                 _ => String::new(),
             };
-            let nullable = !matches!(
-                row.get_value(3).trace_for("duckcompat::Row::get_value")?,
-                duckcompat::Value::Integer(value) if value != 0
+            let nullable = !duckdb_truthy_flag(
+                &row.get_value(3).trace_for("duckcompat::Row::get_value")?,
             );
-            let primary_key = matches!(
-                row.get_value(5).trace_for("duckcompat::Row::get_value")?,
-                duckcompat::Value::Integer(value) if value != 0
+            let primary_key = duckdb_truthy_flag(
+                &row.get_value(5).trace_for("duckcompat::Row::get_value")?,
             );
             columns.push(schema_column(name, type_name, nullable, primary_key));
         }
@@ -1961,6 +2021,9 @@ impl Database {
 }
 
 /// DuckDB 事务对象
+///
+/// 事务期间禁止并发使用同一 Database 实例执行其他操作
+/// （共享单连接，并发语句会混入事务）。
 pub struct Transaction {
     conn: Arc<duckcompat::Connection>,
     state: common_helpers::TransactionState,
@@ -2078,21 +2141,29 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             return Ok(SqlStatement::batch(DbType::DuckDB, Vec::new()));
         }
 
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::DuckDB,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::DuckDB),
-            &I::Model::columns(),
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-        common_helpers::append_standard_upsert_clause::<I::Model>(
-            DbType::DuckDB,
-            &mut sql,
-            &I::Model::columns(),
-        )?;
+        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        let statements =
+            common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
+                DbType::DuckDB,
+                "INSERT INTO",
+                <I::Model as Model>::table_name_for_db(DbType::DuckDB),
+                &refs,
+                |sql, columns| {
+                    common_helpers::append_standard_upsert_clause::<I::Model>(
+                        DbType::DuckDB,
+                        sql,
+                        columns,
+                    )
+                },
+            )?;
 
-        Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+        Ok(SqlStatement::batch(
+            DbType::DuckDB,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -2654,27 +2725,21 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
-    /// select::<User>().from::<User, Role>()
-    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<T, R>
-    where
-        T2: Model + 'static,
-    {
+    /// 添加关联表查询
+    /// select::<User>().from::<Role>()
+    pub fn from<R: Model>(self) -> RelatedSelectExecutor<T, R> {
         RelatedSelectExecutor {
-            select: self.select.from::<T2, R>(),
+            select: self.select.from::<R>(),
             conn: self.conn,
             _marker: PhantomData,
         }
     }
 
     /// 添加关联表查询（支持3个表）
-    /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2>
-    where
-        T2: Model + 'static,
-    {
+    /// select::<User>().from3::<Role, Permission>()
+    pub fn from3<R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2> {
         MultiTableSelectExecutor {
-            select: self.select.from3::<T2, R1, R2>(),
+            select: self.select.from3::<R1, R2>(),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2682,14 +2747,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询(支持4个表)
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<R1: Model, R2: Model, R3: Model>(
         self,
-    ) -> FourTableSelectExecutor<T, R1, R2, R3>
-    where
-        T2: Model + 'static,
-    {
+    ) -> FourTableSelectExecutor<T, R1, R2, R3> {
         FourTableSelectExecutor {
-            select: self.select.from4::<T2, R1, R2, R3>(),
+            select: self.select.from4::<R1, R2, R3>(),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2969,6 +3031,8 @@ impl<
                 let ormer_value = match value {
                     duckcompat::Value::Integer(i) => crate::model::Value::Integer(i),
                     duckcompat::Value::Real(r) => crate::model::Value::Real(r),
+                    duckcompat::Value::Boolean(b) => crate::model::Value::Boolean(b),
+                    duckcompat::Value::DateTime(d) => crate::model::Value::DateTime(d),
                     duckcompat::Value::Text(t) => crate::model::Value::Text(t),
                     duckcompat::Value::Blob(b) => {
                         crate::model::Value::Text(String::from_utf8_lossy(&b).to_string())
@@ -3142,6 +3206,43 @@ pub struct RelatedCollectFuture<T: Model, R: Model> {
 
 // SAFETY: Contains executor which references Database (Send + Sync)
 unsafe impl<T: Model + Send, R: Model + Send> Send for RelatedCollectFuture<T, R> {}
+/// 关联/多表查询的同谓词行数统计（与 sqlite 后端同构，见 impl_related_count）。
+macro_rules! impl_related_count_duckdb {
+    ($executor:ident, [$($g:tt)*], [$($ty:tt)*]) => {
+        impl<$($g)*> $executor<$($ty)*> {
+            /// 统计同谓词总行数（列表分页 total_count 用）。
+            pub async fn count(self) -> crate::Result<i64> {
+                let (sql, params) = self.select.to_count_sql_with_params(DbType::DuckDB);
+                let duckdb_params = values_to_params(&params)?;
+                let mut rows = if duckdb_params.is_empty() {
+                    traced_duckdb_query(&self.conn, &sql, (), &params).await?
+                } else {
+                    traced_duckdb_query(&self.conn, &sql, duckdb_params, &params).await?
+                };
+                if let Some(row) = rows.next().trace().await? {
+                    match row.get_value(0).trace_for("duckcompat::Row::get_value")? {
+                        duckcompat::Value::Integer(i) => Ok(i),
+                        duckcompat::Value::Real(r) => Ok(r as i64),
+                        duckcompat::Value::Text(t) => t.parse::<i64>().map_err(|e| {
+                            crate::ormer_error!("Invalid COUNT value: {t} ({e})")
+                        }),
+                        _ => Err(crate::ormer_error!("COUNT returned a non-numeric value")),
+                    }
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+    };
+}
+impl_related_count_duckdb!(RelatedSelectExecutor, [T: Model, R: Model], [T, R]);
+impl_related_count_duckdb!(MultiTableSelectExecutor, [T: Model, R1: Model, R2: Model], [T, R1, R2]);
+impl_related_count_duckdb!(
+    FourTableSelectExecutor,
+    [T: Model, R1: Model, R2: Model, R3: Model],
+    [T, R1, R2, R3]
+);
+
 
 impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::Send>
     std::future::IntoFuture for RelatedCollectFuture<T, R>
@@ -3249,6 +3350,8 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     /// 执行删除操作并返回影响的行数（execute 的别名）
+    /// 同义词，等价于 [`Self::execute`]。
+    #[deprecated(since = "0.2.11", note = "use `execute()` instead")]
     pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
@@ -3385,6 +3488,8 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 执行更新操作（execute 的别名）
+    /// 同义词，等价于 [`Self::execute`]。
+    #[deprecated(since = "0.2.11", note = "use `execute()` instead")]
     pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
@@ -3460,8 +3565,8 @@ impl<T: Model + 'static + std::marker::Send> std::future::IntoFuture for UpdateE
 }
 
 /// 将 ormer Value 转换为 turso 参数
-fn value_to_turso_value(value: Value) -> duckcompat::Value {
-    match value {
+fn value_to_turso_value(value: Value) -> crate::Result<duckcompat::Value> {
+    Ok(match value {
         Value::Integer(v) => duckcompat::Value::Integer(v),
         Value::Text(v) => duckcompat::Value::Text(v),
         Value::TextArray(v) => duckcompat::Value::TypedArray(
@@ -3470,7 +3575,7 @@ fn value_to_turso_value(value: Value) -> duckcompat::Value {
         ),
         Value::Real(v) => duckcompat::Value::Real(v),
         Value::Decimal(v) | Value::BigDecimal(v) => duckcompat::Value::Text(v),
-        Value::Boolean(v) => duckcompat::Value::Integer(if v { 1 } else { 0 }),
+        Value::Boolean(v) => duckcompat::Value::Boolean(v),
         Value::Bytes(v) => duckcompat::Value::Blob(v),
         Value::Duration(v) => {
             duckcompat::Value::Integer(v.as_micros().min(i64::MAX as u128) as i64)
@@ -3480,7 +3585,14 @@ fn value_to_turso_value(value: Value) -> duckcompat::Value {
         Value::Time(time) => duckcompat::Value::Text(time.to_string()),
         Value::Json(v) => duckcompat::Value::Text(v.to_string()),
         Value::Uuid(v) => duckcompat::Value::Text(v.to_string()),
-        Value::BigInt(v) => duckcompat::Value::Integer(v as i64),
+        Value::BigInt(v) => match i64::try_from(v) {
+            Ok(v) => duckcompat::Value::Integer(v),
+            Err(_) => {
+                return Err(crate::OrmerError::decode(format!(
+                    "BigInt value {v} out of range for DuckDB BIGINT"
+                )))
+            }
+        },
         Value::IntegerArray(v) => duckcompat::Value::TypedArray(
             duckcompat::ArrayType::Integer,
             v.into_iter()
@@ -3502,11 +3614,11 @@ fn value_to_turso_value(value: Value) -> duckcompat::Value {
                 .collect(),
         ),
         Value::Null => duckcompat::Value::Null,
-    }
+    })
 }
 
 fn values_to_params(values: &[Value]) -> crate::Result<Vec<duckcompat::Value>> {
-    Ok(values.iter().cloned().map(value_to_turso_value).collect())
+    values.iter().cloned().map(value_to_turso_value).collect()
 }
 
 fn duckdb_auto_increment_id(value: duckcompat::Value) -> crate::Result<i64> {
@@ -3528,6 +3640,8 @@ fn convert_turso_value(value: &duckcompat::Value) -> crate::Result<Value> {
         duckcompat::Value::Integer(v) => Ok(Value::Integer(*v)),
         duckcompat::Value::Text(v) => Ok(Value::Text(v.clone())),
         duckcompat::Value::Real(v) => Ok(Value::Real(*v)),
+        duckcompat::Value::Boolean(v) => Ok(Value::Boolean(*v)),
+        duckcompat::Value::DateTime(v) => Ok(Value::DateTime(*v)),
         duckcompat::Value::Null => Ok(Value::Null),
         duckcompat::Value::Blob(v) => Ok(Value::Bytes(v.clone())),
         duckcompat::Value::List(values)
@@ -4285,3 +4399,4 @@ fn parse_duckdb_foreign_keys(create_sql: &str) -> Vec<DbFirstForeignKey> {
     }
     foreign_keys
 }
+

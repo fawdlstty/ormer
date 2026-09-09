@@ -280,7 +280,17 @@ let user_roles: Vec<(User, Option<Role>)> = db
 
 支持的 JOIN 类型：`left_join`、`inner_join`、`right_join`。
 
-可与主查询的 `filter`、`range` 等方法组合使用。
+可与主查询的 `filter`、`order_by` / `order_by_desc`、`limit` / `range`、`for_update` 等方法组合使用：
+
+```rust
+let page: Vec<(User, Option<Role>)> = db
+    .select::<User>()
+    .left_join::<Role>(|u, r| u.id.eq(r.user_id))
+    .order_by(|u| u.name)
+    .limit(10)
+    .collect()
+    .await?;
+```
 
 ### 派生表 JOIN
 
@@ -325,7 +335,7 @@ let hot_users: Vec<UserTotal> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from::<User, Role>()
+    .from::<Role>()
     .filter(|u, r| u.id.eq(r.user_id))
     .filter(|_, r| r.role_name.eq("admin".to_string()))
     .collect()
@@ -337,7 +347,7 @@ let users: Vec<User> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from3::<User, Role, Permission>()
+    .from3::<Role, Permission>()
     .filter(|u, r, p| u.id.eq(r.user_id).and(r.id.eq(p.role_id)))
     .collect()
     .await?;
@@ -348,7 +358,7 @@ let users: Vec<User> = db
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .from4::<User, Role, Permission, Department>()
+    .from4::<Role, Permission, Department>()
     .filter(|u, r, p, d| {
         u.id.eq(r.user_id)
             .and(r.id.eq(p.role_id))
@@ -483,7 +493,34 @@ let sql = Select::<User>::new()
     .to_sql();
 ```
 
-集合操作支持链式 `order_by` 和 `range`：
+操作数支持各自的 `order_by` 和 `range`；渲染时两个操作数都会括号包装（`(SELECT ...) UNION (SELECT ...)`），操作数内的 ORDER BY/LIMIT 保留在括号内、对其自身生效：
+
+集合查询通过 `select_union` 执行：
+
+```rust
+let union = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .union(Select::<User>::new().filter(|u| u.age.lt(18)));
+let users: Vec<User> = db.select_union(union).collect().await?;
+```
+
+### 关联查询的 count()
+
+`from` / `from3` / `from4` 关联查询提供 `count()`，生成与原子查询同谓词的
+`SELECT COUNT(*) FROM (<原子查询>)`，不受 `range()` / `order_by()` 影响，
+适合列表分页场景计算 `total_count`：
+
+```rust
+let total = db
+    .select::<User>()
+    .from::<Role>()
+    .filter(|u, r| u.id.eq(r.uid))
+    .filter(|_, r| r.name.eq("admin".to_string()))
+    .count()
+    .await?; // i64
+```
+
+同一谓词与 `range()` 组合即可实现"当页数据 + 总条数"，两者谓词一致、不会漂移。
 
 ```rust
 let sql = Select::<User>::new()
@@ -552,7 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 多表关联
     let admin_users: Vec<User> = db
         .select::<User>()
-        .from::<User, Role>()
+        .from::<Role>()
         .filter(|u, r| u.id.eq(r.user_id))
         .filter(|_, r| r.role_name.eq("admin".to_string()))
         .collect()

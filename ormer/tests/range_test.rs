@@ -73,7 +73,7 @@ async fn test_no_range_impl(config: &_test_common::DbConfig) {
 async fn test_related_select_range_impl(config: &_test_common::DbConfig) {
     // 测试 RelatedSelect 的 range 功能
     let select = Select::<User>::new()
-        .from::<User, Role>()
+        .from::<Role>()
         .filter(|p, q| p.id.eq(q.uid))
         .range(0..10);
     let (sql, _) = select.to_sql_with_params(config.0);

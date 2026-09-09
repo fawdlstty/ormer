@@ -98,7 +98,7 @@ let include_deleted: Vec<Order> = scoped
     .await?;
 ```
 
-`scope()` 上启用的过滤器会继承到查询、关系加载、更新和删除；`unset_filter_*()` 只关闭继承的同名过滤器，不移除当前查询手写的 `filter(...)`。
+`scope()` 上启用的过滤器会继承到查询、关系加载、更新和删除；`unset_filter_*()` 关闭同名过滤器——无论是从 scope 继承的还是当前查询通过 `filter_*()` 应用的，但不会移除手写的 `filter(...)`。
 
 ## 动态表路由
 

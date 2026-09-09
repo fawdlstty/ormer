@@ -119,7 +119,7 @@ async fn test_main_rs_usage_impl(
     // related query
     let users = db
         .select::<TestUser>()
-        .from::<TestUser, TestRole>()
+        .from::<TestRole>()
         .filter(|p, q| p.id.eq(q.uid))
         .filter(|_, q| q.name.eq("admin".to_string()))
         .range(..10)

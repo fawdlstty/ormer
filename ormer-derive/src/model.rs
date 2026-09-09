@@ -33,6 +33,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     };
 
     let mut field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    // #[embed] 字段上的列级约束会在嵌入展开时被静默丢弃，展开期直接报编译错误
+    if let Some(error) = field_infos
+        .iter()
+        .filter(|info| info.embed.is_some())
+        .find_map(|info| embed_constraint_error(info.field))
+    {
+        return error.to_compile_error();
+    }
     let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
     let hypertable_space_info_method = hypertable_space_info_method(&field_infos);
     let mut normal_index = 0;
@@ -83,7 +91,6 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     }
 
     // 获取第一个主键（用于向后兼容）
-    let primary_key_field = primary_keys[0].field_name;
     let is_auto_increment = primary_keys[0].primary_auto;
     if is_auto_increment && is_uuid_type(&primary_keys[0].rust_type) {
         panic!(
@@ -710,14 +717,23 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let relation_schema_entries = relation_fields.iter().map(|relation| {
         let field_name = &relation.field_name;
         let target_type = &relation.target_type;
+        // 默认 local_key 必须用主键字段的 SQL 列名（#[column(name)] 感知），
+        // 而不是 Rust 字段名，否则 relation_key_value/Relation::any 会查错列。
         let local_key = if relation.local_key.is_empty() {
-            quote! { stringify!(#primary_key_field) }
+            quote! { #primary_key_column_name }
         } else {
             let local_key = &relation.local_key;
             quote! { #local_key }
         };
+        // 默认 target_key 在展开期拿不到目标模型的列信息（可能是跨 crate 类型），
+        // 但目标模型的 COLUMN_SCHEMA 是关联常量，可以在常量求值期解析出
+        // 其第一个主键列的列名，避免硬编码 "id" 生成错误 SQL。
         let target_key = if relation.target_key.is_empty() {
-            quote! { "id" }
+            quote! {
+                ::ormer::model::relation_default_target_key(
+                    <#target_type as ::ormer::Model>::COLUMN_SCHEMA
+                )
+            }
         } else {
             let target_key = &relation.target_key;
             quote! { #target_key }
@@ -1916,7 +1932,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 vec![#(#primary_field_names),*]
             }
 
-            fn promary_fields(&self) -> Self::Fields {
+            fn primary_fields(&self) -> Self::Fields {
                 (#(#primary_field_values,)*)
             }
         }
@@ -1935,8 +1951,8 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 <Self as ::ormer::model::PrimaryFields>::primary_field_names()
             }
 
-            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
-                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
+            pub fn primary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::primary_fields(self)
             }
 
             pub fn version(&self) -> u64 {
@@ -2029,6 +2045,14 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         panic!("Embed cannot use #[primary], relation attributes, or nested #[embed]");
     }
     let normal_fields: Vec<_> = field_infos.iter().filter(|info| !info.is_ignored).collect();
+    // Embed 结构体成员字段上的列级约束同样会被静默丢弃（EmbedColumnSchema
+    // 不携带约束信息），展开期直接报编译错误
+    if let Some(error) = normal_fields
+        .iter()
+        .find_map(|info| embed_constraint_error(info.field))
+    {
+        return error.to_compile_error();
+    }
 
     let field_names: Vec<String> = normal_fields
         .iter()
@@ -2685,7 +2709,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                 Vec::new()
             }
 
-            fn promary_fields(&self) -> Self::Fields {}
+            fn primary_fields(&self) -> Self::Fields {}
         }
 
         impl #name {
@@ -2701,8 +2725,8 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                 <Self as ::ormer::model::PrimaryFields>::primary_field_names()
             }
 
-            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
-                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
+            pub fn primary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::primary_fields(self)
             }
         }
     }
@@ -2953,6 +2977,27 @@ impl<'a> FieldInfo<'a> {
             .as_ref()
             .expect("#[data_type(...)] is required for data type newtype fallback")
     }
+}
+
+/// `#[embed]` 字段（及 Embed 结构体成员字段）不支持的列级约束属性。
+/// 这些属性在嵌入展开时会被静默丢弃（嵌入列 schema 中约束字段全部置空），
+/// 因此在派生宏展开期直接产生 compile_error，避免用户误以为约束已生效。
+const UNSUPPORTED_EMBED_CONSTRAINT_ATTRS: [&str; 5] =
+    ["unique", "index", "default", "check", "foreign"];
+
+fn embed_constraint_error(field: &syn::Field) -> Option<syn::Error> {
+    field.attrs.iter().find_map(|attr| {
+        let attr_name = UNSUPPORTED_EMBED_CONSTRAINT_ATTRS
+            .iter()
+            .find(|name| attr.path().is_ident(name))?;
+        Some(syn::Error::new_spanned(
+            attr,
+            format!(
+                "#[{attr_name}] is not supported on #[embed] struct fields: \
+                 embedded columns do not carry unique/index/default/check/foreign constraints"
+            ),
+        ))
+    })
 }
 
 fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
@@ -3699,6 +3744,9 @@ fn derive_model_tuple_wrapper(
             type Where = <#inner_type as ::ormer::Model>::Where;
             type Update = <#inner_type as ::ormer::Model>::Update;
 
+            const RELATIONS: &'static [::ormer::model::RelationInfo] =
+                <#inner_type as ::ormer::Model>::RELATIONS;
+
             fn hypertable_route_key() -> Option<&'static str> {
                 <#inner_type as ::ormer::Model>::hypertable_route_key()
             }
@@ -3721,8 +3769,49 @@ fn derive_model_tuple_wrapper(
                 Ok(#name(inner))
             }
 
+            fn version_info() -> Option<::ormer::model::VersionInfo> {
+                <#inner_type as ::ormer::Model>::version_info()
+            }
+
             fn field_values(&self) -> Vec<::ormer::Value> {
                 self.0.field_values()
+            }
+
+            // 列值读写必须委托给内层模型：版本快照 key、graph 自增主键回填、
+            // table_route（默认实现依赖 column_value）、Tracked 脏列对比都走这两个入口。
+            fn column_value(&self, column: &str) -> Option<::ormer::Value> {
+                self.0.column_value(column)
+            }
+
+            fn assign_column_value(
+                &mut self,
+                column: &str,
+                value: ::ormer::Value,
+            ) -> ::ormer::Result<()> {
+                self.0.assign_column_value(column, value)
+            }
+
+            // table_route 不直接委托：包装器可能声明了与内层不同的表名模板，
+            // 默认实现用 Self::TABLE_NAME 提取路由变量，配合上面的 column_value
+            // 委托即可正确工作。
+
+            fn relation_key_value(
+                &self,
+                relation: &::ormer::model::RelationInfo,
+            ) -> ::ormer::Result<::ormer::Value> {
+                self.0.relation_key_value(relation)
+            }
+
+            fn assign_relation<Target: ::ormer::Model + 'static>(
+                &mut self,
+                relation_name: &'static str,
+                values: Vec<Target>,
+            ) -> ::ormer::Result<()> {
+                self.0.assign_relation(relation_name, values)
+            }
+
+            fn graph_relations_mut(&mut self) -> Vec<::ormer::model::GraphRelationMut<'_>> {
+                self.0.graph_relations_mut()
             }
 
             fn primary_key_columns() -> &'static [&'static str] {
@@ -3752,8 +3841,8 @@ fn derive_model_tuple_wrapper(
                 <#inner_type as ::ormer::model::PrimaryFields>::primary_field_names()
             }
 
-            fn promary_fields(&self) -> Self::Fields {
-                <#inner_type as ::ormer::model::PrimaryFields>::promary_fields(&self.0)
+            fn primary_fields(&self) -> Self::Fields {
+                <#inner_type as ::ormer::model::PrimaryFields>::primary_fields(&self.0)
             }
         }
 
@@ -3781,8 +3870,8 @@ fn derive_model_tuple_wrapper(
                 <Self as ::ormer::model::PrimaryFields>::primary_field_names()
             }
 
-            pub fn promary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
-                <Self as ::ormer::model::PrimaryFields>::promary_fields(self)
+            pub fn primary_fields(&self) -> <Self as ::ormer::model::PrimaryFields>::Fields {
+                <Self as ::ormer::model::PrimaryFields>::primary_fields(self)
             }
         }
 
@@ -3868,7 +3957,8 @@ fn validate_influxdb_fields(input: &DeriveInput) {
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        let type_string = quote!(#field.ty).to_string();
+        let field_ty = &field.ty;
+        let type_string = quote!(#field_ty).to_string();
         let mut is_primary = false;
         for attr in &field.attrs {
             if attr.path().is_ident("primary") {

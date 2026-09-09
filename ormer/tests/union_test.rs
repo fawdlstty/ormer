@@ -18,7 +18,10 @@ fn test_union_basic() {
     assert!(sql.contains("UNION"));
     assert!(sql.contains("WHERE age >"));
     assert!(sql.contains("WHERE name LIKE"));
-    // UNION 前后应各有一个完整的 SELECT 语句
+    // 操作数括号包装：每个括号内各有一条完整 SELECT
+    assert!(sql.starts_with("(SELECT"));
+    assert!(sql.contains(") UNION (SELECT"));
+    assert!(sql.ends_with(')'));
     let select_count = sql.matches("SELECT").count();
     assert_eq!(select_count, 2);
 }
@@ -82,6 +85,15 @@ fn test_union_with_order_and_range() {
     assert!(sql.contains("ORDER BY age DESC"));
     assert!(sql.contains("LIMIT 10"));
     assert!(sql.contains("LIMIT 5"));
+    // 集合操作数必须括号包装：`(SELECT ...) UNION (SELECT ...)`，
+    // 否则操作数自带的 ORDER BY/LIMIT 会生成语法错误的 SQL。
+    assert!(sql.starts_with("(SELECT"));
+    assert!(sql.contains(") UNION (SELECT"));
+    // 左操作数的 ORDER BY/LIMIT 必须保留在左括号内、右操作数在右括号内
+    let left = &sql[..sql.find(") UNION (SELECT").unwrap()];
+    assert!(left.contains("ORDER BY name ASC"));
+    assert!(left.contains("LIMIT 10"));
+    assert!(!left.contains("ORDER BY age DESC"));
 }
 
 #[test]
@@ -93,6 +105,8 @@ fn test_union_without_filters() {
     println!("SQL: {}", sql);
     assert!(sql.contains("UNION"));
     assert!(!sql.contains("WHERE"));
+    assert!(sql.starts_with("(SELECT"));
+    assert!(sql.contains(") UNION (SELECT"));
     let select_count = sql.matches("SELECT").count();
     assert_eq!(select_count, 2);
 }

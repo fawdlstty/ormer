@@ -32,6 +32,7 @@ use std::sync::Arc;
 ))]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 #[cfg(any(
     feature = "sqlite",
     feature = "mssql",
@@ -39,7 +40,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     feature = "clickhouse",
     feature = "influxdb"
 ))]
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 #[cfg(feature = "postgresql")]
 use bb8_postgres::PostgresConnectionManager;
@@ -307,19 +308,27 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for PooledInsert
             #[cfg(feature = "influxdb")]
             ConnectionWrapper::InfluxDB(db) => {
                 let mut models = self.models;
-                let refs = models.as_refs();
-                if refs.is_empty() {
+                if models.as_refs().is_empty() {
                     return Ok(<I::Model as crate::model::Model>::AutoIncrementKeyType::default());
                 }
                 super::super::influxdb_backend::validate_influx_model::<I::Model>(
                     DbType::InfluxDB,
                 )?;
-                let lines = super::super::influxdb_backend::render_line_protocol::<I::Model>(
-                    &refs,
-                )?;
                 let ctx = crate::HookContext::new(crate::HookOperation::Insert);
+                // 钩子可修改模型字段，Line Protocol 必须在 before_insert 之后渲染
                 models.run_before_insert(ctx).await?;
-                db.write_lines(&lines).await?;
+                {
+                    let refs = models.as_refs();
+                    let lines = super::super::influxdb_backend::render_line_protocol::<I::Model>(
+                        &refs,
+                    )?;
+                    db.write_lines_with_policy(
+                        &lines,
+                        super::super::influxdb_backend::model_retention_policy_name::<I::Model>()
+                            .as_deref(),
+                    )
+                    .await?;
+                }
                 models.run_after_insert(ctx).await?;
                 Ok(<I::Model as crate::model::Model>::AutoIncrementKeyType::default())
             }
@@ -414,26 +423,20 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(_) => {
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+                // 与 mysql_backend::InsertOrUpdateExecutor 同款语义：
+                // 冲突更新排除主键列，自增主键未设置的行纯插入，全主键模型退化为 INSERT IGNORE
+                let statements =
+                    super::super::mysql_backend::build_mysql_upsert_statements::<I::Model>(&refs)?;
+
+                Ok(SqlStatement::batch(
                     DbType::MySQL,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::MySQL),
-                    I::Model::COLUMNS,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::All,
-                );
-
-                sql.push_str(" ON DUPLICATE KEY UPDATE ");
-                let mut first = true;
-                for col_name in I::Model::COLUMNS.iter() {
-                    if !first {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&format!("{col_name} = VALUES({col_name})"));
-                    first = false;
-                }
-
-                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(_) => {
@@ -768,7 +771,7 @@ impl ConnectionWrapper {
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => db.is_valid().await,
             #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => db.is_valid(),
+            ConnectionWrapper::MSSQL(db) => db.is_valid().await,
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => db.is_valid().await,
             #[cfg(feature = "clickhouse")]
@@ -791,16 +794,64 @@ impl ConnectionWrapper {
     feature = "influxdb"
 ))]
 pub struct ManualPool {
-    /// 空闲连接队列
-    idle_connections: Mutex<VecDeque<ConnectionWrapper>>,
+    /// 空闲连接队列（附带建连/入队时间，供 idle_timeout / max_lifetime 判定）
+    idle_connections: Mutex<VecDeque<IdleConnection>>,
     /// 当前连接总数(包括使用中和空闲的)
     total_connections: AtomicU32,
+    /// 容量信号量：可用名额 = 空闲连接数 + 剩余可建连接数，
+    /// 用于等待/唤醒（替换旧的 10ms 轮询）并控制并发建连不超过 max_size
+    permits: Semaphore,
     /// 连接池配置
     config: PoolConfig,
     /// 数据库类型
     db_type: DbType,
     /// 连接字符串
     connection_string: String,
+}
+
+/// 空闲队列条目：连接 + 生命周期时间戳。
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
+struct IdleConnection {
+    conn: ConnectionWrapper,
+    /// 建连时间，用于 max_lifetime 判定
+    created_at: Instant,
+    /// 最近一次入队时间，用于 idle_timeout 判定
+    idle_since: Instant,
+}
+
+#[cfg(any(
+    feature = "sqlite",
+    feature = "mssql",
+    feature = "duckdb",
+    feature = "clickhouse",
+    feature = "influxdb"
+))]
+impl IdleConnection {
+    fn fresh(conn: ConnectionWrapper) -> Self {
+        let now = Instant::now();
+        Self {
+            conn,
+            created_at: now,
+            idle_since: now,
+        }
+    }
+
+    /// 是否已超过 idle_timeout / max_lifetime；任一超限即应退役重建。
+    fn is_expired(&self, config: &PoolConfig) -> bool {
+        let now = Instant::now();
+        config
+            .idle_timeout
+            .is_some_and(|timeout| now.duration_since(self.idle_since) >= timeout)
+            || config
+                .max_lifetime
+                .is_some_and(|lifetime| now.duration_since(self.created_at) >= lifetime)
+    }
 }
 
 #[cfg(any(
@@ -813,9 +864,11 @@ pub struct ManualPool {
 impl ManualPool {
     /// 创建新的连接池
     fn new(db_type: DbType, connection_string: String, config: PoolConfig) -> Arc<Self> {
+        let permits = Semaphore::new(config.max_size as usize);
         Arc::new(Self {
             idle_connections: Mutex::new(VecDeque::new()),
             total_connections: AtomicU32::new(0),
+            permits,
             config,
             db_type,
             connection_string,
@@ -878,74 +931,176 @@ impl ManualPool {
     }
 
     /// 获取连接(异步)
-    async fn get(&self) -> crate::Result<ConnectionWrapper> {
-        // 尝试从空闲队列获取
-        {
-            let mut idle = self.idle_connections.lock().await;
-            if let Some(conn) = idle.pop_front() {
-                // 检查连接是否有效
-                if conn.is_valid().await {
-                    return Ok(conn);
-                }
-                // 连接失效,减少计数
-                self.total_connections.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
+    ///
+    /// 通过信号量等待空闲连接或可用容量（不轮询），超过 `acquire_timeout` 返回明确错误；
+    /// 等待者获得资格后若空闲队列无连接且 total < max_size，会主动新建连接（重建路径），
+    /// 数据库重启导致连接全部失效退役后不会再永久死等。
+    /// 返回连接与其建连时间（供租借方归还时回传，维持 max_lifetime 累计）。
+    async fn get(&self) -> crate::Result<(ConnectionWrapper, Instant)> {
+        // 顺带补齐 min_size（低成本路径，容量紧张时跳过）
+        self.maintain_min_connections(false).await;
 
-        // 空闲队列没有可用连接,尝试创建新连接
-        let current_total = self.total_connections.load(Ordering::SeqCst);
-        if current_total < self.config.max_size {
-            // 可以增加连接数
-            let conn = crate::utils::FutureTraceExt::trace(self.create_connection()).await?;
-            self.total_connections.fetch_add(1, Ordering::SeqCst);
-            return Ok(conn);
-        }
-
-        // 已达到最大连接数,等待信号量(会有其他连接归还)
-        // 注意:这里需要先释放 semaphore permit,然后等待
-        // 实际上我们应该等待空闲队列中有连接
+        // ticket 用于在取出失效连接后保留已获得的等待资格，避免重复排队
+        let mut ticket: Option<SemaphorePermit<'_>> = None;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let mut idle = self.idle_connections.lock().await;
-            if let Some(conn) = idle.pop_front() {
-                if conn.is_valid().await {
-                    return Ok(conn);
+            let permit = match ticket.take() {
+                Some(permit) => permit,
+                None => self.acquire_permit().await?,
+            };
+
+            // 锁内只做队列摘取与超期判定，健康检查（可能是一次网络请求）移到锁外执行
+            let candidate = self.idle_connections.lock().await.pop_front();
+            let Some(entry) = candidate else {
+                // 无空闲连接：原子预占名额后新建连接，避免并发下超过 max_size
+                if self.reserve_slot() {
+                    match self.create_connection().await {
+                        Ok(conn) => {
+                            // 新连接占用了本次资格对应的容量
+                            permit.forget();
+                            return Ok((conn, Instant::now()));
+                        }
+                        Err(err) => {
+                            // 建连失败，回退已预占的名额（permit 随作用域结束自动归还）
+                            self.release_slot();
+                            return Err(err);
+                        }
+                    }
                 }
+                // 瞬态无容量可用（如 min_size 补建进行中），释放资格重新等待
+                drop(permit);
+                continue;
+            };
+
+            // 空闲超时 / 达到最大寿命的连接直接退役并携带资格重试（重建路径）
+            if entry.is_expired(&self.config) {
                 self.total_connections.fetch_sub(1, Ordering::SeqCst);
+                ticket = Some(permit);
+                continue;
             }
-        }
-    }
 
-    /// 归还连接到池
-    async fn return_connection(&self, conn: ConnectionWrapper) {
-        // 检查连接是否有效
-        if conn.is_valid().await {
-            let mut idle = self.idle_connections.lock().await;
-            idle.push_back(conn);
-        } else {
-            // 连接失效，减少计数
+            let conn = entry.conn;
+            let created_at = entry.created_at;
+            if conn.is_valid().await {
+                // 该空闲连接被取走，对应的信号量名额随之消耗
+                permit.forget();
+                return Ok((conn, created_at));
+            }
+            // 连接失效，退役并携带资格重试：后续轮次可取其他空闲连接或重建
             self.total_connections.fetch_sub(1, Ordering::SeqCst);
-            // 连接失效时不放入空闲队列，会自动被丢弃
+            ticket = Some(permit);
         }
     }
 
-    /// 将租约对应连接退役，释放池容量但不进入空闲队列。
-    async fn retire_connection(&self) {
+    /// 获取一个等待资格；超过 `acquire_timeout` 时返回明确的超时错误
+    async fn acquire_permit(&self) -> crate::Result<SemaphorePermit<'_>> {
+        let Some(timeout) = self.config.acquire_timeout else {
+            return self
+                .permits
+                .acquire()
+                .await
+                .map_err(|_| self.semaphore_closed_error());
+        };
+        match tokio::time::timeout(timeout, self.permits.acquire()).await {
+            Ok(result) => result.map_err(|_| self.semaphore_closed_error()),
+            Err(_) => Err(crate::OrmerError::Pool {
+                backend: self.db_type,
+                message: format!(
+                    "timed out after {} ms waiting for an available connection (pool max_size = {}, \
+                     adjust via PoolBuilder::acquire_timeout)",
+                    timeout.as_millis(),
+                    self.config.max_size,
+                ),
+            }),
+        }
+    }
+
+    fn semaphore_closed_error(&self) -> crate::OrmerError {
+        crate::OrmerError::Pool {
+            backend: self.db_type,
+            message: "connection pool semaphore closed".to_string(),
+        }
+    }
+
+    /// 原子预占一个连接名额，已达 max_size 时返回 false
+    fn reserve_slot(&self) -> bool {
+        self.total_connections
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |total| {
+                (total < self.config.max_size).then_some(total + 1)
+            })
+            .is_ok()
+    }
+
+    /// 回退一个已预占的连接名额
+    fn release_slot(&self) {
         self.total_connections.fetch_sub(1, Ordering::SeqCst);
     }
 
-    /// 维护最小连接数
-    async fn maintain_min_connections(&self) {
-        let current_total = self.total_connections.load(Ordering::SeqCst);
-        let target = self.config.min_size;
+    /// 归还连接到池。
+    ///
+    /// `created_at` 由租借方（`PooledConnection`）在取用连接时随行带回，
+    /// 保证 max_lifetime 跨借用周期累计；`None`（未知）以当前时刻近似。
+    async fn return_connection(&self, conn: ConnectionWrapper, created_at: Option<Instant>) {
+        // 检查连接是否有效（锁外执行，避免持锁期间发起网络请求）
+        if !conn.is_valid().await {
+            // 连接失效，退役并释放容量（唤醒等待者重建）
+            self.total_connections.fetch_sub(1, Ordering::SeqCst);
+            self.permits.add_permits(1);
+            return;
+        }
 
-        if current_total < target {
-            let to_create = target - current_total;
-            for _ in 0..to_create {
-                if let Ok(conn) = self.create_connection().await {
-                    self.total_connections.fetch_add(1, Ordering::SeqCst);
-                    let mut idle = self.idle_connections.lock().await;
-                    idle.push_back(conn);
+        let now = Instant::now();
+        let entry = IdleConnection {
+            conn,
+            created_at: created_at.unwrap_or(now),
+            idle_since: now,
+        };
+        {
+            let mut idle = self.idle_connections.lock().await;
+            idle.push_back(entry);
+        }
+        // 唤醒一个等待者取用该空闲连接
+        self.permits.add_permits(1);
+    }
+
+    /// 将租约对应连接退役，释放池容量并唤醒等待者重建，但不进入空闲队列。
+    async fn retire_connection(&self) {
+        self.total_connections.fetch_sub(1, Ordering::SeqCst);
+        self.permits.add_permits(1);
+    }
+
+    /// 补齐 min_size 空闲连接。
+    ///
+    /// `wait_for_capacity` 为 true 时（建池阶段）等待容量可用；
+    /// 为 false 时（get() 顺带补建）容量紧张则直接跳过，不阻塞调用方。
+    async fn maintain_min_connections(&self, wait_for_capacity: bool) {
+        while self.total_connections.load(Ordering::SeqCst) < self.config.min_size {
+            let permit = if wait_for_capacity {
+                match self.permits.acquire().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                }
+            } else {
+                match self.permits.try_acquire() {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                }
+            };
+            if !self.reserve_slot() {
+                // 已达 max_size，无法继续补建（permit 随作用域结束自动归还）
+                return;
+            }
+            match self.create_connection().await {
+                Ok(conn) => {
+                    {
+                        let mut idle = self.idle_connections.lock().await;
+                        idle.push_back(IdleConnection::fresh(conn));
+                    }
+                    // 新空闲连接已入队，归还等待资格供等待者取用
+                    drop(permit);
+                }
+                Err(_) => {
+                    self.release_slot();
+                    return;
                 }
             }
         }
@@ -957,6 +1112,12 @@ impl ManualPool {
 pub struct PoolConfig {
     min_size: u32,
     max_size: u32,
+    /// 获取连接的最长等待时间；`None` 表示无限等待
+    acquire_timeout: Option<Duration>,
+    /// 空闲连接在池内滞留超过该时长后退役；`None` 表示不回收空闲连接
+    idle_timeout: Option<Duration>,
+    /// 连接自建立起的最长寿命，到期退役重建；`None` 表示不限寿命
+    max_lifetime: Option<Duration>,
 }
 
 impl Default for PoolConfig {
@@ -964,6 +1125,9 @@ impl Default for PoolConfig {
         Self {
             min_size: 0,
             max_size: 10,
+            acquire_timeout: Some(Duration::from_secs(30)),
+            idle_timeout: None,
+            max_lifetime: None,
         }
     }
 }
@@ -979,6 +1143,21 @@ fn validate_pool_config(config: &PoolConfig) -> crate::Result<()> {
             "connection pool min_size ({}) must not exceed max_size ({})",
             config.min_size, config.max_size
         )));
+    }
+    if config.acquire_timeout == Some(Duration::ZERO) {
+        return Err(crate::OrmerError::invalid_operation(
+            "connection pool acquire_timeout must be greater than zero when set",
+        ));
+    }
+    if config.idle_timeout == Some(Duration::ZERO) {
+        return Err(crate::OrmerError::invalid_operation(
+            "connection pool idle_timeout must be greater than zero when set",
+        ));
+    }
+    if config.max_lifetime == Some(Duration::ZERO) {
+        return Err(crate::OrmerError::invalid_operation(
+            "connection pool max_lifetime must be greater than zero when set",
+        ));
     }
     Ok(())
 }
@@ -1006,6 +1185,37 @@ impl PoolBuilder {
         self
     }
 
+    /// 设置获取连接的最长等待时间，超时返回 `OrmerError::Pool` 错误；
+    /// 传入 `None` 表示无限等待。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn acquire_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.config.acquire_timeout = timeout.into();
+        self
+    }
+
+    /// 设置空闲连接回收时间：连接在池内空闲超过该时长后，下次被取用时
+    /// 会被退役（由后续请求按需重建），而不是继续复用；传入 `None` 表示
+    /// 不回收空闲连接（默认）。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn idle_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.config.idle_timeout = timeout.into();
+        self
+    }
+
+    /// 设置连接最大寿命：连接自建立起超过该时长后在取用时退役重建，
+    /// 避免长期运行的单条连接累积状态；传入 `None` 表示不限寿命（默认）。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn max_lifetime(mut self, lifetime: impl Into<Option<Duration>>) -> Self {
+        self.config.max_lifetime = lifetime.into();
+        self
+    }
+
     /// 构建连接池
     pub async fn build(self) -> crate::Result<ConnectionPool> {
         validate_pool_config(&self.config)?;
@@ -1019,7 +1229,7 @@ impl PoolBuilder {
                 let pool =
                     ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
-                    pool.maintain_min_connections().await;
+                    pool.maintain_min_connections(true).await;
                 }
                 Ok(ConnectionPool::Sqlite(pool))
             }
@@ -1033,7 +1243,21 @@ impl PoolBuilder {
                     mysql_async::Opts::from_url(&self.connection_string),
                     "mysql_async::Opts::from_url",
                 )?;
-                let pool = mysql_async::Pool::new(opts);
+                // 应用池容量约束，连接数受 max_size/min_size 限制
+                let constraints = mysql_async::PoolConstraints::new(
+                    self.config.min_size as usize,
+                    self.config.max_size as usize,
+                )
+                .ok_or_else(|| {
+                    crate::OrmerError::invalid_operation(
+                        "connection pool constraints are invalid (min > max or max == 0)",
+                    )
+                })?;
+                let builder =
+                    mysql_async::OptsBuilder::from_opts(opts).pool_opts(
+                        mysql_async::PoolOpts::default().with_constraints(constraints),
+                    );
+                let pool = mysql_async::Pool::new(builder);
                 Ok(ConnectionPool::MySQL(pool))
             }
             #[cfg(feature = "mssql")]
@@ -1041,7 +1265,7 @@ impl PoolBuilder {
                 let pool =
                     ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
-                    pool.maintain_min_connections().await;
+                    pool.maintain_min_connections(true).await;
                 }
                 Ok(ConnectionPool::MSSQL(pool))
             }
@@ -1050,7 +1274,7 @@ impl PoolBuilder {
                 let pool =
                     ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
-                    pool.maintain_min_connections().await;
+                    pool.maintain_min_connections(true).await;
                 }
                 Ok(ConnectionPool::DuckDB(pool))
             }
@@ -1059,7 +1283,7 @@ impl PoolBuilder {
                 let pool =
                     ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
-                    pool.maintain_min_connections().await;
+                    pool.maintain_min_connections(true).await;
                 }
                 Ok(ConnectionPool::ClickHouse(pool))
             }
@@ -1068,7 +1292,7 @@ impl PoolBuilder {
                 let pool =
                     ManualPool::new(self.db_type, self.connection_string, self.config.clone());
                 if self.config.min_size > 0 {
-                    pool.maintain_min_connections().await;
+                    pool.maintain_min_connections(true).await;
                 }
                 Ok(ConnectionPool::InfluxDB(pool))
             }
@@ -1133,6 +1357,37 @@ impl ReplicatedPoolBuilder {
 
     pub fn max_size(mut self, max_size: u32) -> Self {
         self.config.max_size = max_size;
+        self
+    }
+
+    /// 设置获取连接的最长等待时间，超时返回 `OrmerError::Pool` 错误；
+    /// 传入 `None` 表示无限等待。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn acquire_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.config.acquire_timeout = timeout.into();
+        self
+    }
+
+    /// 设置空闲连接回收时间：连接在池内空闲超过该时长后，下次被取用时
+    /// 会被退役（由后续请求按需重建），而不是继续复用；传入 `None` 表示
+    /// 不回收空闲连接（默认）。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn idle_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
+        self.config.idle_timeout = timeout.into();
+        self
+    }
+
+    /// 设置连接最大寿命：连接自建立起超过该时长后在取用时退役重建，
+    /// 避免长期运行的单条连接累积状态；传入 `None` 表示不限寿命（默认）。
+    ///
+    /// 仅对使用内置手工连接池的后端生效
+    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    pub fn max_lifetime(mut self, lifetime: impl Into<Option<Duration>>) -> Self {
+        self.config.max_lifetime = lifetime.into();
         self
     }
 
@@ -1243,65 +1498,75 @@ impl ConnectionPool {
         match self {
             #[cfg(feature = "sqlite")]
             ConnectionPool::Sqlite(pool) => {
-                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                let (conn, created_at) = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::Sqlite(pool.clone()),
                     connection: Some(conn),
+                    created_at: Some(created_at),
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "postgresql")]
             ConnectionPool::PostgreSQL(pool, db_type) => {
-                let pooled = crate::utils::FutureTraceExt::trace(pool.get()).await?;
-                let db = postgresql_backend::Database::from_pooled_connection(*db_type, pooled);
+                let db = postgresql_backend::Database::from_pool(*db_type, pool.clone()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::PostgreSQL,
                     connection: Some(ConnectionWrapper::PostgreSQL(db)),
+                    created_at: None,
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "mysql")]
             ConnectionPool::MySQL(pool) => {
-                let db = mysql_backend::Database::from_pool(pool.clone());
+                // 真正从池中取出一条独占连接绑定到 Database（pinned connection）：
+                // 非事务多语句固定走同一条连接，max_size 对池化用法生效；
+                // 超时受 mysql_async 池自身 acquire 语义约束。
+                let conn = crate::utils::FutureTraceExt::trace(pool.get_conn()).await?;
+                let db = mysql_backend::Database::from_conn(pool.clone(), conn);
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MySQL,
                     connection: Some(ConnectionWrapper::MySQL(db)),
+                    created_at: None,
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "mssql")]
             ConnectionPool::MSSQL(pool) => {
-                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                let (conn, created_at) = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::MSSQL(pool.clone()),
                     connection: Some(conn),
+                    created_at: Some(created_at),
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "duckdb")]
             ConnectionPool::DuckDB(pool) => {
-                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                let (conn, created_at) = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::DuckDB(pool.clone()),
                     connection: Some(conn),
+                    created_at: Some(created_at),
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "clickhouse")]
             ConnectionPool::ClickHouse(pool) => {
-                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                let (conn, created_at) = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::ClickHouse(pool.clone()),
                     connection: Some(conn),
+                    created_at: Some(created_at),
                     _marker: PhantomData,
                 })
             }
             #[cfg(feature = "influxdb")]
             ConnectionPool::InfluxDB(pool) => {
-                let conn = crate::utils::FutureTraceExt::trace(pool.get()).await?;
+                let (conn, created_at) = crate::utils::FutureTraceExt::trace(pool.get()).await?;
                 Ok(PooledConnection {
                     inner: PooledConnectionInner::InfluxDB(pool.clone()),
                     connection: Some(conn),
+                    created_at: Some(created_at),
                     _marker: PhantomData,
                 })
             }
@@ -1330,28 +1595,51 @@ enum PooledConnectionInner {
 }
 
 impl PooledConnectionInner {
-    async fn return_connection(&self, conn: ConnectionWrapper) {
+    /// 归还连接是否需要异步执行。
+    ///
+    /// PostgreSQL（bb8 `PooledConnection`）与 MySQL（pinned `mysql_async::Conn`）
+    /// 的归还完全由 `ConnectionWrapper` 自身的同步 Drop 完成，连接自动回池，
+    /// 不经过 spawn，运行时关闭时也不会丢失归还。
+    fn return_needs_async(&self) -> bool {
+        #[cfg(feature = "postgresql")]
+        if matches!(self, PooledConnectionInner::PostgreSQL) {
+            return false;
+        }
+        #[cfg(feature = "mysql")]
+        if matches!(self, PooledConnectionInner::MySQL) {
+            return false;
+        }
+        true
+    }
+
+    /// 仅 bb8/MySQL 池自管理的后端编译组合中 `created_at` 无消费分支
+    #[allow(unused_variables)]
+    async fn return_connection(&self, conn: ConnectionWrapper, created_at: Option<Instant>) {
         match self {
             #[cfg(feature = "sqlite")]
-            PooledConnectionInner::Sqlite(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::Sqlite(pool) => pool.return_connection(conn, created_at).await,
             #[cfg(feature = "postgresql")]
             PooledConnectionInner::PostgreSQL => {
-                // bb8 自动管理连接生命周期，无需手动归还
+                // 连接由 ConnectionWrapper::PostgreSQL 内的 bb8 PooledConnection 直接持有，
+                // 在此 drop 即自动归还池并唤醒等待者
                 let _ = conn;
             }
             #[cfg(feature = "mysql")]
             PooledConnectionInner::MySQL => {
-                // mysql_async::Pool 自动管理连接生命周期，无需手动归还
+                // pinned Conn 随 ConnectionWrapper drop 送回 mysql_async 池回收器：
+                // 处于事务中的连接会被先回滚清理再归池，之后才对后续租借可见
                 let _ = conn;
             }
             #[cfg(feature = "mssql")]
-            PooledConnectionInner::MSSQL(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::MSSQL(pool) => pool.return_connection(conn, created_at).await,
             #[cfg(feature = "duckdb")]
-            PooledConnectionInner::DuckDB(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::DuckDB(pool) => pool.return_connection(conn, created_at).await,
             #[cfg(feature = "clickhouse")]
-            PooledConnectionInner::ClickHouse(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::ClickHouse(pool) => {
+                pool.return_connection(conn, created_at).await
+            }
             #[cfg(feature = "influxdb")]
-            PooledConnectionInner::InfluxDB(pool) => pool.return_connection(conn).await,
+            PooledConnectionInner::InfluxDB(pool) => pool.return_connection(conn, created_at).await,
         }
     }
 
@@ -1360,7 +1648,10 @@ impl PooledConnectionInner {
             #[cfg(feature = "sqlite")]
             PooledConnectionInner::Sqlite(pool) => pool.retire_connection().await,
             #[cfg(feature = "postgresql")]
-            PooledConnectionInner::PostgreSQL => {}
+            PooledConnectionInner::PostgreSQL => {
+                // 连接已在 close() 中随 ConnectionWrapper drop 归还 bb8 池，
+                // bb8 不支持池外销毁连接，与 MySQL 池行为一致
+            }
             #[cfg(feature = "mysql")]
             PooledConnectionInner::MySQL => {}
             #[cfg(feature = "mssql")]
@@ -1441,6 +1732,9 @@ impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
 pub struct PooledConnection<'a> {
     inner: PooledConnectionInner,
     connection: Option<ConnectionWrapper>,
+    /// 建连时间：取用连接时从 ManualPool 带出，归还时带回池，
+    /// 使 max_lifetime 跨借用周期累计；PG/MySQL 池自管理，无此信息
+    created_at: Option<Instant>,
     _marker: PhantomData<&'a ()>,
 }
 
@@ -1452,19 +1746,43 @@ pub struct PooledDatabaseScope<'a, 'pool> {
 
 impl<'a> Drop for PooledConnection<'a> {
     fn drop(&mut self) {
-        if let Some(conn) = self.connection.take() {
-            let inner = self.inner.clone();
-            // 尝试获取 tokio 运行时句柄
-            // 如果成功，使用 spawn 异步归还连接
-            // 如果失败（不在 tokio 运行时中），则阻塞执行
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    // 在 tokio 运行时中，异步归还连接
-                    handle.spawn(async move {
-                        inner.return_connection(conn).await;
-                    });
-                }
-                Err(_) => futures::executor::block_on(inner.return_connection(conn)),
+        let Some(conn) = self.connection.take() else {
+            return;
+        };
+        let inner = self.inner.clone();
+
+        // PG（bb8）与 MySQL（pinned Conn）的归还由 ConnectionWrapper 的同步 Drop
+        // 完成，直接 drop 即归池：不经过 spawn，运行时关闭时也不会丢失归还或 panic
+        if !inner.return_needs_async() {
+            return; // conn 在此 drop，自动归还各自连接池
+        }
+
+        // ManualPool 后端的归还包含异步健康检查，需要异步执行
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let watcher_inner = inner.clone();
+                let created_at = self.created_at.take();
+                // 在 tokio 运行时中，异步归还连接
+                let join = handle.spawn(async move {
+                    inner.return_connection(conn, created_at).await;
+                });
+                // 归还任务被取消（运行时关闭等）时连接不会进入空闲队列，
+                // 退役该连接以保证池容量守恒
+                let _ = handle.spawn(async move {
+                    if join.await.is_err() {
+                        watcher_inner.close_connection().await;
+                    }
+                });
+            }
+            Err(_) => {
+                // 不在 tokio 运行时上下文：无法执行归还前的异步健康检查，
+                // 直接退役并丢弃连接（retire 仅做原子计数与信号量释放，同步安全），
+                // 保证池容量守恒；绝不在 Drop 中 panic 或阻塞等待网络
+                eprintln!(
+                    "[ormer] pooled connection dropped outside a tokio runtime; \
+                     the connection is discarded instead of being returned to the pool"
+                );
+                futures::executor::block_on(inner.close_connection());
             }
         }
     }
@@ -1476,7 +1794,9 @@ impl<'a> PooledConnection<'a> {
         let Some(conn) = self.connection.take() else {
             return Err(crate::ormer_error!("connection already returned"));
         };
-        self.inner.return_connection(conn).await;
+        self.inner
+            .return_connection(conn, self.created_at.take())
+            .await;
         Ok(())
     }
 
@@ -1787,6 +2107,11 @@ impl<'a> PooledConnection<'a> {
 
     /// 开始事务
     pub async fn begin(&self) -> crate::Result<super::unified::Transaction<'_>> {
+        self.begin_opts(Default::default()).await
+    }
+
+    /// 按各后端默认方式开启事务（不应用任何选项）
+    async fn begin_raw(&self) -> crate::Result<super::unified::Transaction<'_>> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
@@ -1816,7 +2141,7 @@ impl<'a> PooledConnection<'a> {
             #[cfg(feature = "clickhouse")]
             ConnectionWrapper::ClickHouse(_) => Err(crate::OrmerError::UnsupportedFeature {
                 backend: DbType::ClickHouse,
-                feature: "transactions on ClickHouse",
+                feature: "transactions",
             }),
             #[cfg(feature = "influxdb")]
             ConnectionWrapper::InfluxDB(_) => Err(crate::OrmerError::UnsupportedFeature {
@@ -1824,6 +2149,45 @@ impl<'a> PooledConnection<'a> {
                 feature: "transactions",
             }),
         }
+    }
+
+    /// 开始事务并按后端语义应用事务选项（MySQL 的选项在 BEGIN 前下发）。
+    async fn begin_opts(
+        &self,
+        options: super::unified::TransactionOptions,
+    ) -> crate::Result<super::unified::Transaction<'_>> {
+        // 两个互补 cfg 的通配臂在单后端编译组合下会触发 unreachable 警告
+        #[allow(unreachable_patterns)]
+        match self.get_connection() {
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => {
+                let txn = crate::utils::FutureTraceExt::trace(db.begin_with_opts(options)).await?;
+                Ok(super::unified::Transaction::MySQL(txn))
+            }
+            #[cfg(not(feature = "mysql"))]
+            _ => self.begin_then_apply(options).await,
+            #[cfg(feature = "mysql")]
+            _ => self.begin_then_apply(options).await,
+        }
+    }
+
+    #[allow(unused_variables)]
+    async fn begin_then_apply(
+        &self,
+        options: super::unified::TransactionOptions,
+    ) -> crate::Result<super::unified::Transaction<'_>> {
+        let mut txn = self.begin_raw().await?;
+        if let Err(err) = super::unified::apply_transaction_options(&mut txn, options).await {
+            // 回滚失败不覆盖主错误，但不能静默吞掉
+            if let Err(rollback_err) = txn.rollback().await {
+                eprintln!(
+                    "[ormer] failed to roll back transaction after applying options failed \
+                     (original error: {err}): {rollback_err}"
+                );
+            }
+            return Err(err);
+        }
+        Ok(txn)
     }
 
     pub async fn transaction<R, F>(&self, f: F) -> crate::Result<R>
@@ -1846,11 +2210,8 @@ impl<'a> PooledConnection<'a> {
             &'tx mut super::unified::Transaction<'_>,
         ) -> super::unified::TransactionFuture<'tx, R>,
     {
-        let mut txn = self.begin().await?;
-        if let Err(err) = super::unified::apply_transaction_options(&mut txn, options).await {
-            let _ = txn.rollback().await;
-            return Err(err);
-        }
+        // 选项已在 begin_opts 阶段按后端语义下发（MySQL 必须在 BEGIN 前）
+        let mut txn = self.begin_opts(options).await?;
 
         match f(&mut txn).await {
             Ok(value) => {
@@ -1858,7 +2219,13 @@ impl<'a> PooledConnection<'a> {
                 Ok(value)
             }
             Err(err) => {
-                let _ = txn.rollback().await;
+                // 回滚失败不覆盖主错误，但不能静默吞掉
+                if let Err(rollback_err) = txn.rollback().await {
+                    eprintln!(
+                        "[ormer] failed to roll back transaction after closure error \
+                         (original error: {err}): {rollback_err}"
+                    );
+                }
                 Err(err)
             }
         }

@@ -419,8 +419,9 @@ impl Database {
         self.pool.clone()
     }
 
-    pub fn is_valid(&self) -> bool {
-        true
+    /// 检查连接是否有效：执行真实探活查询，失效连接（数据库重启等）能被检出并退役。
+    pub async fn is_valid(&self) -> bool {
+        self.exec_sql("SELECT 1").await.is_ok()
     }
 
     pub async fn exec_sql(&self, sql: &str) -> crate::Result<u64> {
@@ -497,6 +498,11 @@ impl Database {
         }
     }
 
+    /// 插入模型并返回自增主键值。
+    ///
+    /// 返回值约定：仅单行插入时返回的 id 语义可靠；批量插入多行时返回末块
+    /// OUTPUT 首行 id，仅供诊断，调用方不应依赖（各后端选取不一致）。
+    /// 语句按参数上限（2100）分块，自增与普通路径统一处理。
     pub async fn insert_impl<T: Model>(
         &self,
         models: &[&T],
@@ -506,48 +512,56 @@ impl Database {
         }
 
         let has_auto_increment = T::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
-        let columns = T::insert_columns();
-        let (sql, _) = super::common::common_helpers::build_batch_insert_sql_with_columns(
-            DbType::MSSQL,
-            T::TABLE_NAME,
-            &columns,
-            models.len(),
-        );
-        let all_values =
-            super::common::common_helpers::collect_batch_insert_values_with_auto_increment::<T>(
-                models,
-            );
-
-        let mut client = self.pool.lock().await;
-
-        if has_auto_increment {
-            // 获取自增主键列名
+        // 使用 OUTPUT 子句获取插入的ID（自增模型）
+        let output_clause = has_auto_increment.then(|| {
             let pk_col = T::COLUMN_SCHEMA
                 .iter()
                 .find(|c| c.is_auto_increment)
                 .map(|c| c.name)
                 .unwrap_or("id");
-            // 使用 OUTPUT 子句获取插入的ID
-            let sql_with_output = format!(
-                "{} OUTPUT {}",
-                sql,
+            format!(
+                " OUTPUT {}",
                 common_helpers::quote_column_with_prefix(DbType::MSSQL, "inserted", pk_col)
-            );
-            let mut query = Query::new(&sql_with_output);
-            for param in &all_values {
-                bind_value(&mut query, param)?;
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let row = stream.into_row().trace().await?;
-            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            let result = common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(id)?;
-            Ok(result)
+            )
+        });
+        let columns = T::insert_columns();
+        let statements = common_helpers::build_chunked_insert_statements::<T>(
+            DbType::MSSQL,
+            models,
+            |chunk| {
+                let (sql, _) = common_helpers::build_batch_insert_sql_with_columns(
+                    DbType::MSSQL,
+                    T::TABLE_NAME,
+                    &columns,
+                    chunk.len(),
+                );
+                let params =
+                    common_helpers::collect_batch_insert_values_with_auto_increment::<T>(chunk);
+                Ok(common_helpers::InsertSqlStatement {
+                    sql: format!("{sql}{}", output_clause.as_deref().unwrap_or("")),
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        let statements = statements
+            .into_iter()
+            .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+            .collect::<Vec<_>>();
+
+        let mut client = self.pool.lock().await;
+
+        if has_auto_increment {
+            let last_id = mssql_execute_output_inserts(&mut client, &statements).await?;
+            common_helpers::convert_auto_increment_key::<T::AutoIncrementKeyType>(last_id)
         } else {
-            let mut query = Query::new(&sql);
-            for param in &all_values {
-                bind_value(&mut query, param)?;
+            for statement in &statements {
+                let mut query = Query::new(&statement.sql);
+                for param in &statement.params {
+                    bind_value(&mut query, param)?;
+                }
+                query.execute(&mut *client).trace().await?;
             }
-            query.execute(&mut *client).trace().await?;
             Ok(T::AutoIncrementKeyType::default())
         }
     }
@@ -595,7 +609,7 @@ impl Database {
 
     pub fn select_related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<'_, T, R> {
         RelatedSelectExecutor {
-            select: Select::<T>::new().from::<T, R>(),
+            select: Select::<T>::new().from::<R>(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -605,7 +619,7 @@ impl Database {
         &self,
     ) -> MultiTableSelectExecutor<'_, T, R1, R2> {
         MultiTableSelectExecutor {
-            select: Select::<T>::new().from3::<T, R1, R2>(),
+            select: Select::<T>::new().from3::<R1, R2>(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -615,7 +629,7 @@ impl Database {
         &self,
     ) -> FourTableSelectExecutor<'_, T, R1, R2, R3> {
         FourTableSelectExecutor {
-            select: Select::<T>::new().from4::<T, R1, R2, R3>(),
+            select: Select::<T>::new().from4::<R1, R2, R3>(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -859,7 +873,7 @@ impl Database {
     /// 创建 Related 查询执行器（关联查询）
     pub fn related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<'_, T, R> {
         RelatedSelectExecutor {
-            select: Select::<T>::new().from::<T, R>(),
+            select: Select::<T>::new().from::<R>(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1087,6 +1101,84 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
     }
 }
 
+fn mssql_insert_batch(statements: Vec<common_helpers::InsertSqlStatement>) -> SqlStatement {
+    SqlStatement::batch(
+        DbType::MSSQL,
+        statements
+            .into_iter()
+            .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+            .collect(),
+    )
+}
+
+/// MSSQL 批量插入语句构建：conflict（MERGE）与自增主键（OUTPUT）路径同样按
+/// 参数上限（2100）分块，避免单条语句绑定参数超限；未超限时仍为单条语句。
+fn mssql_model_insert_sql_statement<M: Model>(
+    refs: &[&M],
+    conflict: Option<&InsertConflict>,
+) -> crate::Result<SqlStatement> {
+    if refs.is_empty() {
+        return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
+    }
+
+    if let Some(conflict) = conflict.filter(|conflict| conflict.is_configured()) {
+        let statements = common_helpers::build_chunked_insert_statements::<M>(
+            DbType::MSSQL,
+            refs,
+            |chunk| common_helpers::build_mssql_insert_conflict_statement::<M>(chunk, conflict),
+        )?;
+        return Ok(mssql_insert_batch(statements));
+    }
+
+    if common_helpers::auto_increment_column::<M>().is_some() {
+        let statements = common_helpers::build_chunked_insert_statements::<M>(
+            DbType::MSSQL,
+            refs,
+            |chunk| {
+                let (sql, params) =
+                    common_helpers::build_insert_statement_with_auto_increment_returning::<M>(
+                        DbType::MSSQL,
+                        chunk,
+                    )?;
+                Ok(common_helpers::InsertSqlStatement {
+                    sql,
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        return Ok(mssql_insert_batch(statements));
+    }
+
+    let statements = common_helpers::build_insert_statements_with_conflict::<M>(
+        DbType::MSSQL,
+        refs,
+        conflict,
+    )?;
+    Ok(mssql_insert_batch(statements))
+}
+
+/// 逐条执行带 OUTPUT 自增子句的插入语句块，返回最后一块首行的自增 id。
+///
+/// 仅单行插入时该 id 语义可靠；批量（含分块）插入的返回值仅供诊断，
+/// 调用方不应依赖（见各执行器 `execute` 的文档约定）。
+async fn mssql_execute_output_inserts(
+    client: &mut MssqlClient,
+    statements: &[SingleSqlStatement],
+) -> crate::Result<i64> {
+    let mut last_id = 0i64;
+    for statement in statements {
+        let mut query = Query::new(&statement.sql);
+        for param in &statement.params {
+            bind_value(&mut query, param)?;
+        }
+        let stream = query.query(&mut *client).trace().await?;
+        let row = stream.into_row().trace().await?;
+        last_id = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(last_id);
+    }
+    Ok(last_id)
+}
+
 /// 插入执行器
 pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     pool: Pool,
@@ -1100,49 +1192,15 @@ impl_insert_conflict_methods!(InsertExecutor, with_conflict);
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
-        }
-
-        if let Some(conflict) = self
-            .conflict
-            .as_ref()
-            .filter(|conflict| conflict.is_configured())
-        {
-            let statement =
-                common_helpers::build_mssql_insert_conflict_statement::<I::Model>(&refs, conflict)?;
-            return Ok(SqlStatement::single(
-                DbType::MSSQL,
-                statement.sql,
-                statement.params,
-            ));
-        }
-
-        if common_helpers::auto_increment_column::<I::Model>().is_some() {
-            let (sql, all_values) =
-                common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
-                    DbType::MSSQL,
-                    &refs,
-                )?;
-
-            return Ok(SqlStatement::single(DbType::MSSQL, sql, all_values));
-        }
-
-        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::MSSQL,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-
-        Ok(SqlStatement::batch(
-            DbType::MSSQL,
-            statements
-                .into_iter()
-                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
-                .collect(),
-        ))
+        mssql_model_insert_sql_statement::<I::Model>(&refs, self.conflict.as_ref())
     }
 
+    /// 执行插入并返回自增主键值。
+    ///
+    /// 返回值约定：仅单行插入时返回的 id 语义可靠（该行的自增 id）；批量插入
+    /// 多行时返回 OUTPUT 首个返回行的 id（分块时为末块首行），仅供诊断，调用方
+    /// 不应依赖——各后端批量插入返回的 id 选取不一致（PostgreSQL 取 RETURNING
+    /// 首行、MySQL 取 `last_insert_id`、SQLite 取 `last_insert_rowid`）。
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
@@ -1188,16 +1246,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let mut client = self.pool.lock().await;
 
+        // AutoIncrementKeyType 回填约定：批量（含分块）插入时仅取末块首行 id，
+        // 语义不可靠；单行插入不受影响。
         let result = if has_auto_increment {
-            let statement = &sql.statements[0];
-            let mut query = Query::new(&statement.sql);
-            for param in &statement.params {
-                bind_value(&mut query, param)?;
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let row = stream.into_row().trace().await?;
-            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
-            common_helpers::convert_auto_increment_key::<Self::Output>(id)
+            let last_id = mssql_execute_output_inserts(&mut client, &sql.statements).await?;
+            common_helpers::convert_auto_increment_key::<Self::Output>(last_id)
         } else {
             for statement in &sql.statements {
                 let mut query = Query::new(&statement.sql);
@@ -1384,16 +1437,14 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         if models.is_empty() {
             return Ok(0);
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
-        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
-
-        let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
-            bind_value(&mut query, param)?;
+        // 委托 Database 层实现，避免在 executor 内重复维护一份 MERGE 逻辑；
+        // connection_string 仅用于重连路径，此调用不会触达。
+        Database {
+            pool: self.pool.clone(),
+            connection_string: String::new(),
         }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        .insert_or_ignore_impl(models)
+        .await
     }
 }
 
@@ -1667,49 +1718,13 @@ impl_insert_conflict_methods!(TransactionInsertExecutor);
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
-        }
-
-        if let Some(conflict) = self
-            .conflict
-            .as_ref()
-            .filter(|conflict| conflict.is_configured())
-        {
-            let statement =
-                common_helpers::build_mssql_insert_conflict_statement::<I::Model>(&refs, conflict)?;
-            return Ok(SqlStatement::single(
-                DbType::MSSQL,
-                statement.sql,
-                statement.params,
-            ));
-        }
-
-        if common_helpers::auto_increment_column::<I::Model>().is_some() {
-            let (sql, all_values) =
-                common_helpers::build_insert_statement_with_auto_increment_returning::<I::Model>(
-                    DbType::MSSQL,
-                    &refs,
-                )?;
-
-            return Ok(SqlStatement::single(DbType::MSSQL, sql, all_values));
-        }
-
-        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::MSSQL,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-
-        Ok(SqlStatement::batch(
-            DbType::MSSQL,
-            statements
-                .into_iter()
-                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
-                .collect(),
-        ))
+        mssql_model_insert_sql_statement::<I::Model>(&refs, self.conflict.as_ref())
     }
 
+    /// 执行插入并返回自增主键值。
+    ///
+    /// 返回值约定：仅单行插入时返回的 id 语义可靠；批量插入多行时返回末块
+    /// OUTPUT 首行 id，仅供诊断，调用方不应依赖（各后端选取不一致）。
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
@@ -1731,21 +1746,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
 
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-
-        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
         let mut client = self.pool.lock().await;
 
+        let has_auto_increment = I::Model::COLUMN_SCHEMA.iter().any(|c| c.is_auto_increment);
+
+        // AutoIncrementKeyType 回填约定：批量（含分块）插入时仅取末块首行 id，
+        // 语义不可靠；单行插入不受影响。
         let result = if has_auto_increment {
-            let statement = &sql.statements[0];
-            let mut query = Query::new(&statement.sql);
-            for param in &statement.params {
-                bind_value(&mut query, param)?;
-            }
-            let stream = query.query(&mut *client).trace().await?;
-            let row = stream.into_row().trace().await?;
-            let id: i64 = row.and_then(|r| r.get::<i64, _>(0)).unwrap_or(0);
+            let last_id = mssql_execute_output_inserts(&mut client, &sql.statements).await?;
             common_helpers::convert_auto_increment_key::<<I::Model as Model>::AutoIncrementKeyType>(
-                id,
+                last_id,
             )
         } else {
             for statement in &sql.statements {
@@ -1907,6 +1917,41 @@ pub struct RelatedCollectFuture<'a, T: Model, R: Model> {
     executor: RelatedSelectExecutor<'a, T, R>,
     _marker: PhantomData<&'a ()>,
 }
+/// 关联/多表查询的同谓词行数统计：`SELECT COUNT(*) FROM (<原子查询>)`。
+macro_rules! impl_related_count_mssql {
+    ($executor:ident, [$($g:tt)*], [$($ty:tt)*]) => {
+        impl<$($g)*> $executor<$($ty)*> {
+            /// 统计同谓词总行数（列表分页 total_count 用）。
+            pub async fn count(self) -> crate::Result<i64> {
+                let (sql, params) = self.select.to_count_sql_with_params(DbType::MSSQL);
+                let mut client = self.pool.lock().await;
+                let rows = traced_mssql_query(&mut client, &sql, &params).await?;
+                if rows.is_empty() {
+                    return Ok(0);
+                }
+                match extract_value_from_row(&rows[0], 0)? {
+                    crate::model::Value::Integer(i) => Ok(i),
+                    crate::model::Value::Real(r) => Ok(r as i64),
+                    other => <i64 as crate::model::FromValue>::from_value(&other).map_err(|_| {
+                        crate::ormer_error!("COUNT returned a non-numeric value")
+                    }),
+                }
+            }
+        }
+    };
+}
+impl_related_count_mssql!(RelatedSelectExecutor, ['a, T: Model, R: Model], ['a, T, R]);
+impl_related_count_mssql!(
+    MultiTableSelectExecutor,
+    ['a, T: Model, R1: Model, R2: Model],
+    ['a, T, R1, R2]
+);
+impl_related_count_mssql!(
+    FourTableSelectExecutor,
+    ['a, T: Model, R1: Model, R2: Model, R3: Model],
+    ['a, T, R1, R2, R3]
+);
+
 
 /// 映射收集 Future
 pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
@@ -2053,36 +2098,30 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
-    where
-        T2: Model + 'static,
+    pub fn from<R: Model>(self) -> RelatedSelectExecutor<'a, T, R>
     {
         RelatedSelectExecutor {
-            select: self.select.from::<T2, R>(),
+            select: self.select.from::<R>(),
             pool: self.pool,
             _marker: PhantomData,
         }
     }
 
-    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
-    where
-        T2: Model + 'static,
+    pub fn from3<R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<'a, T, R1, R2>
     {
         MultiTableSelectExecutor {
-            select: self.select.from3::<T2, R1, R2>(),
+            select: self.select.from3::<R1, R2>(),
             pool: self.pool,
             _marker: PhantomData,
         }
     }
 
-    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<R1: Model, R2: Model, R3: Model>(
         self,
     ) -> FourTableSelectExecutor<'a, T, R1, R2, R3>
-    where
-        T2: Model + 'static,
     {
         FourTableSelectExecutor {
-            select: self.select.from4::<T2, R1, R2, R3>(),
+            select: self.select.from4::<R1, R2, R3>(),
             pool: self.pool,
             _marker: PhantomData,
         }
@@ -2285,9 +2324,10 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
             let returning_sql = common_helpers::mssql_delete_returning_sql::<T>(&statement.sql);
             let rows = traced_mssql_query(&mut client, &returning_sql, &statement.params).await?;
             let statement_results = decode_mssql_model_rows::<T>(rows)?;
-            if statement.versioned && statement_results.is_empty() {
-                return Err(common_helpers::optimistic_lock_conflict::<T>());
-            }
+            common_helpers::ensure_optimistic_lock_returned::<T>(
+                statement.versioned,
+                &statement_results,
+            )?;
             results.extend(statement_results);
         }
         Ok(results)
@@ -2390,9 +2430,10 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             let returning_sql = common_helpers::mssql_update_returning_sql::<T>(&statement.sql);
             let rows = traced_mssql_query(&mut client, &returning_sql, &statement.params).await?;
             let statement_results = decode_mssql_model_rows::<T>(rows)?;
-            if statement.versioned && statement_results.is_empty() {
-                return Err(common_helpers::optimistic_lock_conflict::<T>());
-            }
+            common_helpers::ensure_optimistic_lock_returned::<T>(
+                statement.versioned,
+                &statement_results,
+            )?;
             results.extend(statement_results);
         }
         Ok(results)
@@ -2967,24 +3008,32 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Valu
     Ok(Value::Null)
 }
 
-fn decimal_text_to_mssql_numeric(value: &str) -> Numeric {
+fn decimal_text_to_mssql_numeric(value: &str) -> crate::Result<Numeric> {
     let normalized = value.trim();
     let negative = normalized.starts_with('-');
     let unsigned = normalized.strip_prefix(['-', '+']).unwrap_or(normalized);
     let scale = unsigned
         .split_once('.')
         .map(|(_, fraction)| fraction.len())
-        .unwrap_or(0)
-        .min(37);
+        .unwrap_or(0);
+    if scale > 37 {
+        return Err(crate::OrmerError::decode(format!(
+            "failed to bind decimal text {value:?} as MSSQL NUMERIC: fractional digits ({scale}) exceed the supported maximum scale of 37"
+        )));
+    }
     let mut digits = unsigned.replace('.', "");
-    if scale == 0 && digits.is_empty() {
+    if digits.is_empty() {
         digits.push('0');
     }
-    let mut integer = i128::from_str(&digits).unwrap_or(0);
+    let mut integer = i128::from_str(&digits).map_err(|err| {
+        crate::OrmerError::decode(format!(
+            "failed to bind decimal text {value:?} as MSSQL NUMERIC: {err}"
+        ))
+    })?;
     if negative {
         integer = -integer;
     }
-    Numeric::new_with_scale(integer, scale as u8)
+    Ok(Numeric::new_with_scale(integer, scale as u8))
 }
 
 // 辅助函数：将 Value 绑定到 Query
@@ -3006,7 +3055,7 @@ fn bind_value<'a>(query: &mut Query<'a>, value: &'a Value) -> crate::Result<()> 
             query.bind(*v);
         }
         Value::Decimal(v) | Value::BigDecimal(v) => {
-            query.bind(decimal_text_to_mssql_numeric(v));
+            query.bind(decimal_text_to_mssql_numeric(v)?);
         }
         Value::Duration(v) => {
             let micros = v.as_micros().min(i64::MAX as u128) as i64;

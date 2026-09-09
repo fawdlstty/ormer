@@ -27,7 +27,7 @@ pub enum SqlExpr {
         collation: String,
     },
     Aggregate {
-        name: &'static str,
+        name: String,
         expr: Box<SqlExpr>,
         filter: Option<Box<crate::query::filter::FilterExpr>>,
         order_by: Vec<crate::query::filter::OrderBy>,
@@ -764,6 +764,49 @@ fn quote_collation(db_type: DbType, collation: &str) -> String {
     quote_identifier(db_type, collation)
 }
 
+/// InfluxQL 无法渲染的 SQL 表达式族。
+///
+/// 这些变体在 `to_sql` 中对 InfluxDB 是 `unreachable!`；`validate_for_db`
+/// 在渲染前把它们转成 `UnsupportedFeature` 错误，保证 InfluxDB 路径不会
+/// 触达 panic（其余后端维持原有门控不变）。
+#[cfg(feature = "influxdb")]
+fn influxdb_rejected_expr(expr: &SqlExpr) -> bool {
+    matches!(
+        expr,
+        SqlExpr::JsonText { .. }
+            | SqlExpr::JsonPathText { .. }
+            | SqlExpr::JsonPathValue { .. }
+            | SqlExpr::JsonPathExists { .. }
+            | SqlExpr::JsonContains { .. }
+            | SqlExpr::JsonSet { .. }
+            | SqlExpr::JsonRemove { .. }
+            | SqlExpr::ArrayContains { .. }
+            | SqlExpr::ArrayOverlaps { .. }
+            | SqlExpr::ArrayLen { .. }
+            | SqlExpr::DateTrunc { .. }
+            | SqlExpr::DatePart { .. }
+            | SqlExpr::AtTimeZone { .. }
+            | SqlExpr::DateAdd { .. }
+            | SqlExpr::DateDiff { .. }
+            | SqlExpr::Now
+    )
+}
+
+/// 仅 PostgreSQL 提供的数组函数清单（经 `SqlExpr::Function` 渲染，例如
+/// `UpdateField::array_append`/`array_remove`）；其余后端在校验阶段直接
+/// 返回 `UnsupportedFeature`，而不是把未定义函数发给数据库。
+fn is_postgresql_only_function(name: &str) -> bool {
+    matches!(
+        name,
+        "array_append"
+            | "array_remove"
+            | "array_length"
+            | "array_cat"
+            | "array_prepend"
+            | "cardinality"
+    )
+}
+
 impl SqlExpr {
     pub fn column(name: impl Into<String>) -> Self {
         SqlExpr::Column(name.into())
@@ -1295,15 +1338,21 @@ impl SqlExpr {
                     DbType::PostgreSQL => format!("{} @> {}", left_sql, right_sql),
                     #[cfg(feature = "mysql")]
                     DbType::MySQL => format!("JSON_CONTAINS({}, {})", left_sql, right_sql),
+                    // 真包含语义（对齐 PG `@>`）：右数组的每个元素都存在于左数组；
+                    // 注意与 ArrayOverlaps 的“任意交集”语义区分
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => format!(
-                        "EXISTS (SELECT 1 FROM json_each({}) AS l INNER JOIN json_each({}) AS r ON l.value = r.value)",
-                        left_sql, right_sql
+                        "NOT EXISTS (SELECT 1 FROM json_each({}) AS r \
+                         WHERE NOT EXISTS (SELECT 1 FROM json_each({}) AS l \
+                         WHERE l.value = r.value))",
+                        right_sql, left_sql
                     ),
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => format!(
-                        "EXISTS (SELECT 1 FROM OPENJSON({}) l INNER JOIN OPENJSON({}) r ON l.value = r.value)",
-                        left_sql, right_sql
+                        "NOT EXISTS (SELECT 1 FROM OPENJSON({}) AS r \
+                         WHERE NOT EXISTS (SELECT 1 FROM OPENJSON({}) AS l \
+                         WHERE l.value = r.value))",
+                        right_sql, left_sql
                     ),
                     #[cfg(feature = "clickhouse")]
                     DbType::ClickHouse => format!("hasAll({}, {})", left_sql, right_sql),
@@ -1590,9 +1639,12 @@ impl SqlExpr {
                     ),
                     #[cfg(feature = "sqlite")]
                     DbType::Sqlite => {
-                        let divisor = part.epoch_divisor() * 86400.0;
+                        // julianday 差值单位是"天"，换算到目标时间单元：
+                        // 天数 * 86400 秒 / epoch_divisor（与 PostgreSQL 的
+                        // date_part('epoch', l - r) / divisor 保持同一语义）
+                        let divisor = part.epoch_divisor();
                         format!(
-                            "CAST((julianday({left_sql}) - julianday({right_sql})) * {divisor} AS INTEGER)"
+                            "CAST((julianday({left_sql}) - julianday({right_sql})) * 86400 / {divisor} AS INTEGER)"
                         )
                     }
                     #[cfg(feature = "mssql")]
@@ -1655,6 +1707,13 @@ impl SqlExpr {
     }
 
     pub(crate) fn validate_for_db(&self, db_type: DbType) -> crate::Result<()> {
+        #[cfg(feature = "influxdb")]
+        if matches!(db_type, DbType::InfluxDB) && influxdb_rejected_expr(self) {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "SQL expressions outside the InfluxQL column/value subset",
+            });
+        }
         match self {
             #[cfg(feature = "questdb")]
             SqlExpr::JsonText { expr, .. } | SqlExpr::JsonPathText { expr, .. }
@@ -1754,7 +1813,23 @@ impl SqlExpr {
                     }),
                 }
             }
-            SqlExpr::Function { args, .. } | SqlExpr::Row(args) => {
+            SqlExpr::Function { name, args } => {
+                for arg in args {
+                    arg.validate_for_db(db_type)?;
+                }
+                #[cfg(feature = "postgresql")]
+                let is_postgresql = matches!(db_type, DbType::PostgreSQL);
+                #[cfg(not(feature = "postgresql"))]
+                let is_postgresql = false;
+                if is_postgresql_only_function(name) && !is_postgresql {
+                    return Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "PostgreSQL-only array functions",
+                    });
+                }
+                Ok(())
+            }
+            SqlExpr::Row(args) => {
                 for arg in args {
                     arg.validate_for_db(db_type)?;
                 }

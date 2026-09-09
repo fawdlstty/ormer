@@ -210,5 +210,66 @@ async fn test_stream_early_termination_mysql() {
 #[tokio::test]
 async fn test_stream_in_transaction_release_mysql() {
     let config = _test_common::mysql_config();
-    test_stream_in_transaction_release_impl(&config).await;
+    test_stream_unsupported_in_transaction_mysql(&config).await;
+}
+
+/// MySQL 的流式查询拥有连接所有权，无法借用事务连接；
+/// 事务内流式查询按契约快速失败（不再静默逃逸到连接池）。
+#[cfg(feature = "mysql")]
+async fn test_stream_unsupported_in_transaction_mysql(config: &_test_common::DbConfig) {
+    use ormer::OrmerError;
+
+    let db = _test_common::create_db_connection(config).await.unwrap();
+
+    let _ = db.execute_sql("DROP TABLE IF EXISTS stream_txn_test").await;
+    db.create_table::<StreamTxnUser>().execute().await.unwrap();
+
+    for i in 0..10 {
+        let user = StreamTxnUser {
+            id: i + 1,
+            name: format!("txn_user{}", i),
+            age: 25 + i,
+        };
+        db.insert(&user).execute().await.unwrap();
+    }
+
+    let txn = db.begin().await.unwrap();
+    {
+        let result = txn
+            .select::<StreamTxnUser>()
+            .filter(|u| u.age.ge(27))
+            .stream()
+            .into_iter()
+            .await;
+        match result {
+            Err(OrmerError::UnsupportedFeature {
+                backend: ormer::DbType::MySQL,
+                feature,
+                ..
+            }) => {
+                assert_eq!(feature, "stream queries inside a transaction");
+            }
+            Err(err) => panic!("unexpected error: {err}"),
+            Ok(_) => panic!("transaction-scoped streaming should fail fast on MySQL"),
+        }
+    }
+    txn.commit().await.unwrap();
+
+    // 事务外的流式查询不受影响
+    let mut stream = db
+        .select::<StreamTxnUser>()
+        .stream()
+        .into_iter()
+        .await
+        .unwrap();
+    let mut count = 0;
+    while let Some(user_result) = stream.next().await {
+        user_result.unwrap();
+        count += 1;
+    }
+    assert_eq!(count, 10);
+
+    let _ = db.execute_sql("DROP TABLE IF EXISTS stream_txn_test").await;
+
+    println!("✓ test_stream_unsupported_in_transaction_mysql passed");
 }

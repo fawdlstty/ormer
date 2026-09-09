@@ -17,6 +17,10 @@ pub use stream_connection::StreamConnection;
 /// 统一使用 unified 模块提供接口，当启用任一数据库 feature 时可用
 mod unified;
 pub use crate::hooks::WithoutHooksExecutor;
+#[cfg(feature = "mysql")]
+pub(crate) use unified::isolation_level_sql;
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+pub(crate) use unified::compute_pending_migrations;
 pub use unified::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
     BlockDeleteExecutor, BlockDeleteResult, CollectFuture, CreateTableExecutor, Database,

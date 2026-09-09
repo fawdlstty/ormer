@@ -129,7 +129,7 @@ async fn sqlite_insert_conflict_composite_target() -> Result<(), Box<dyn std::er
     })
     .on_conflict(|m| (m.org_id, m.user_id))
     .do_update()
-    .set(|m| m.role = m.role.excluded())
+    .set(|m| m.role = m.role.incoming())
     .execute()
     .await?;
 

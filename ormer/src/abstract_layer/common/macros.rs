@@ -1079,7 +1079,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.filter(f)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.filter(f)),
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
                 }
             }
@@ -1100,8 +1099,25 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => $executor_name::MSSQL(exec.model(model)),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => $executor_name::DuckDB(exec.model(model)),
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     unsupported @ $executor_name::Unsupported { .. } => unsupported,
+                }
+            }
+
+            /// 运行时后端类型：PostgreSQL 变体经后端 `db_type()` 判定
+            /// （QuestDB 复用 PG 连接，不能按变体推断）。
+            fn backend_db_type(&self) -> $crate::DbType {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(..) => $crate::DbType::Sqlite,
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.db_type(),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(..) => $crate::DbType::MySQL,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(..) => $crate::DbType::MSSQL,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(..) => $crate::DbType::DuckDB,
+                    $executor_name::Unsupported { backend, .. } => *backend,
                 }
             }
 
@@ -1117,7 +1133,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.to_sql(),
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.to_sql(),
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature {
@@ -1127,6 +1142,13 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
+            /// 执行删除并返回受影响行数（`IntoFuture` 的默认路径）。
+            ///
+            /// 删除执行器不持有模型主体，因此默认路径不触发 Before/After
+            /// 钩子；钩子通过 [`Self::execute_with_hooks`] /
+            /// [`Self::execute_models_with_hooks`] 显式提供模型主体，
+            /// 并统一受 `hooks_enabled()` 开关与 `without_hooks()` 控制
+            /// （嵌套的 insert 钩子同样会被关闭范围抑制）。
             pub async fn execute(self) -> crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -1139,7 +1161,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.execute().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.execute().await,
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1155,17 +1176,19 @@ macro_rules! impl_unified_delete_executor {
             /// `AfterDelete` runs only when the statement affects at least one
             /// row. The supplied model is the hook subject; filters remain
             /// fully controlled by the executor.
+            ///
+            /// 钩子经隐藏 trait 派发，统一受 `hooks_enabled()` 开关控制：
+            /// `without_hooks()`（或上游写入链的关闭范围）会让本方法跳过
+            /// 全部 Before/After 钩子。
             pub async fn execute_with_hooks(self, model: &T) -> crate::Result<u64>
             where
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
                 let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete);
-                if ctx.hooks_enabled() {
-                    $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
-                }
+                $crate::hooks::HookBeforeDelete::call_before_delete(model, &mut ctx).await?;
                 let affected = self.model(model).execute().await?;
-                if affected > 0 && ctx.hooks_enabled() {
-                    $crate::AfterDelete::after_delete(model, &mut ctx).await?;
+                if affected > 0 {
+                    $crate::hooks::HookAfterDelete::call_after_delete(model, &mut ctx).await?;
                 }
                 Ok(affected)
             }
@@ -1178,9 +1201,7 @@ macro_rules! impl_unified_delete_executor {
                 for (index, model) in models.iter().enumerate() {
                     let mut ctx =
                         $crate::HookContext::new($crate::HookOperation::Delete).for_batch(index);
-                    if ctx.hooks_enabled() {
-                        $crate::BeforeDelete::before_delete(model, &mut ctx).await?;
-                    }
+                    $crate::hooks::HookBeforeDelete::call_before_delete(model, &mut ctx).await?;
                 }
 
                 let affected = self.execute().await?;
@@ -1188,15 +1209,21 @@ macro_rules! impl_unified_delete_executor {
                     for (index, model) in models.iter().enumerate() {
                         let mut ctx = $crate::HookContext::new($crate::HookOperation::Delete)
                             .for_batch(index);
-                        if ctx.hooks_enabled() {
-                            $crate::AfterDelete::after_delete(model, &mut ctx).await?;
-                        }
+                        $crate::hooks::HookAfterDelete::call_after_delete(model, &mut ctx)
+                            .await?;
                     }
                 }
                 Ok(affected)
             }
 
             pub async fn returning(self) -> crate::Result<Vec<T>> {
+                // 能力矩阵优先：dml_returning=false 的后端（MySQL/QuestDB/
+                // ClickHouse/InfluxDB）统一以 "DML RETURNING" 拒绝。
+                $crate::Capabilities::ensure(
+                    self.backend_db_type(),
+                    |caps| caps.dml_returning,
+                    "DML RETURNING",
+                )?;
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.returning().await,
@@ -1208,7 +1235,6 @@ macro_rules! impl_unified_delete_executor {
                     $executor_name::MSSQL(exec) => exec.returning().await,
                     #[cfg(feature = "duckdb")]
                     $executor_name::DuckDB(exec) => exec.returning().await,
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $executor_name::Unsupported {
                         backend, feature, ..
                     } => Err($crate::OrmerError::UnsupportedFeature { backend, feature }),
@@ -1508,6 +1534,13 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
+            /// 执行更新并返回受影响行数（`IntoFuture` 的默认路径）。
+            ///
+            /// 更新执行器不持有模型主体（`set_model` 立即物化为 SQL 赋值
+            /// 计划），因此默认路径不触发 Before/After 钩子；钩子通过
+            /// [`Self::execute_with_hooks`] / [`Self::execute_models_with_hooks`]
+            /// 显式提供模型主体，并统一受 `hooks_enabled()` 开关与
+            /// `without_hooks()` 控制。
             pub async fn execute(self) -> crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
@@ -1536,17 +1569,19 @@ macro_rules! impl_unified_update_executor {
             /// The model supplied here is also the model observed by hooks;
             /// use `set_model(model)` when the update should be derived from
             /// that model's values.
+            ///
+            /// 钩子经隐藏 trait 派发，统一受 `hooks_enabled()` 开关控制：
+            /// `without_hooks()`（或上游写入链的关闭范围）会让本方法跳过
+            /// 全部 Before/After 钩子。
             pub async fn execute_with_hooks(self, model: &mut T) -> crate::Result<u64>
             where
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
                 let mut ctx = $crate::HookContext::new($crate::HookOperation::Update);
-                if ctx.hooks_enabled() {
-                    $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
-                }
+                $crate::hooks::HookBeforeUpdate::call_before_update(model, &mut ctx).await?;
                 let affected = self.execute().await?;
-                if affected > 0 && ctx.hooks_enabled() {
-                    $crate::AfterUpdate::after_update(model, &mut ctx).await?;
+                if affected > 0 {
+                    $crate::hooks::HookAfterUpdate::call_after_update(&*model, &mut ctx).await?;
                 }
                 Ok(affected)
             }
@@ -1559,9 +1594,7 @@ macro_rules! impl_unified_update_executor {
                 for (index, model) in models.iter_mut().enumerate() {
                     let mut ctx =
                         $crate::HookContext::new($crate::HookOperation::Update).for_batch(index);
-                    if ctx.hooks_enabled() {
-                        $crate::BeforeUpdate::before_update(model, &mut ctx).await?;
-                    }
+                    $crate::hooks::HookBeforeUpdate::call_before_update(model, &mut ctx).await?;
                 }
 
                 let affected = self.execute().await?;
@@ -1569,15 +1602,39 @@ macro_rules! impl_unified_update_executor {
                     for (index, model) in models.iter().enumerate() {
                         let mut ctx = $crate::HookContext::new($crate::HookOperation::Update)
                             .for_batch(index);
-                        if ctx.hooks_enabled() {
-                            $crate::AfterUpdate::after_update(model, &mut ctx).await?;
-                        }
+                        $crate::hooks::HookAfterUpdate::call_after_update(model, &mut ctx).await?;
                     }
                 }
                 Ok(affected)
             }
 
+            /// 运行时后端类型：PostgreSQL 变体经后端 `db_type()` 判定
+            /// （QuestDB 复用 PG 连接，不能按变体推断）。
+            fn backend_db_type(&self) -> $crate::DbType {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $executor_name::Sqlite(..) => $crate::DbType::Sqlite,
+                    #[cfg(feature = "postgresql")]
+                    $executor_name::PostgreSQL(exec) => exec.db_type(),
+                    #[cfg(feature = "mysql")]
+                    $executor_name::MySQL(..) => $crate::DbType::MySQL,
+                    #[cfg(feature = "mssql")]
+                    $executor_name::MSSQL(..) => $crate::DbType::MSSQL,
+                    #[cfg(feature = "duckdb")]
+                    $executor_name::DuckDB(..) => $crate::DbType::DuckDB,
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $executor_name::Unsupported { backend, .. } => *backend,
+                }
+            }
+
             pub async fn returning(self) -> crate::Result<Vec<T>> {
+                // 能力矩阵优先：dml_returning=false 的后端（MySQL/QuestDB/
+                // ClickHouse/InfluxDB）统一以 "DML RETURNING" 拒绝。
+                $crate::Capabilities::ensure(
+                    self.backend_db_type(),
+                    |caps| caps.dml_returning,
+                    "DML RETURNING",
+                )?;
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.returning().await,
@@ -1680,6 +1737,13 @@ macro_rules! impl_unified_aggregate_future {
                     $future_name::MSSQL(future) => Box::pin(async move { future.await }),
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(future) => Box::pin(async move { future.await }),
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $future_name::ClickHouse(db, aggregate, _) => Box::pin(async move {
+                        $crate::abstract_layer::common::unified::clickhouse_aggregate_on_backend(
+                            db, aggregate,
+                        )
+                        .await
+                    }),
                     #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {
                         backend, feature, ..
@@ -1911,8 +1975,53 @@ macro_rules! impl_unified_related_collect_future {
     };
 }
 
+/// 统一层关联/多表行数统计 Future 的 IntoFuture：委托到各后端执行器的
+/// `count()`（page.md 缺失一：列表分页 total_count 场景）。
+///
+/// `$decl` 携带泛型与约束（用于 `impl<...>`），`$use` 为纯类型实参
+/// （用于 `Future<...>` 类型位置），两者由调用点成对给出。
+#[macro_export]
+macro_rules! impl_unified_related_count_future {
+    ($future_name:ident, $call:ident, [$($decl:tt)*], [$($use:tt)*]) => {
+        impl<$($decl)*> std::future::IntoFuture for $future_name<$($use)*>
+        where
+            Self: 'a,
+        {
+            type Output = crate::Result<i64>;
+            type IntoFuture =
+                std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
+
+            fn into_future(self) -> Self::IntoFuture {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $future_name::Sqlite(exec, _) => Box::pin(async move { exec.$call().await }),
+                    #[cfg(feature = "postgresql")]
+                    $future_name::PostgreSQL(exec) => Box::pin(async move { exec.$call().await }),
+                    #[cfg(feature = "mysql")]
+                    $future_name::MySQL(exec) => Box::pin(async move { exec.$call().await }),
+                    #[cfg(feature = "mssql")]
+                    $future_name::MSSQL(exec) => Box::pin(async move { exec.$call().await }),
+                    #[cfg(feature = "duckdb")]
+                    $future_name::DuckDB(exec, _) => {
+                        Box::pin(async move { exec.$call().await })
+                    }
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $future_name::Unsupported {
+                        backend, feature, ..
+                    } => Box::pin(async move {
+                        Err($crate::OrmerError::UnsupportedFeature { backend, feature })
+                    }),
+                }
+            }
+        }
+    };
+}
+
 /// 为数据库后端的 Executor 生成通用的 filter/order_by/range 方法
 /// 这个宏用于消除三个后端中重复的 Executor 方法实现
+///
+/// 实际实现收敛在 [`__ormer_impl_backend_select_methods_for!`]：无生命周期
+/// 与带生命周期的版本只差 executor 泛型形状，公开宏名保留为兼容别名。
 #[macro_export]
 macro_rules! impl_backend_executor_methods {
     (
@@ -1921,27 +2030,9 @@ macro_rules! impl_backend_executor_methods {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model> $executor_type<'a, T> {
-            $crate::__ormer_backend_select_methods!($conn_field, distinct);
-
-            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
-            where
-                T: 'static + std::marker::Send + std::marker::Sync,
-            {
-                let (select, cursor_columns) = self.select.prepare_cursor_page()?;
-                let executor = Self {
-                    select: select.clone(),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                };
-                let items: Vec<T> = executor.collect().await?;
-                let next_cursor = match items.last() {
-                    Some(item) => Some(select.cursor_values_from_model(item, &cursor_columns)?),
-                    None => None,
-                };
-                Ok($crate::query::builder::CursorPage::new(items, next_cursor))
-            }
-        }
+        $crate::__ormer_impl_backend_select_methods_for!(
+            $conn_field, distinct; $executor_type<'a, T>; 'a, T: $crate::Model
+        );
     };
 }
 
@@ -1954,9 +2045,9 @@ macro_rules! impl_backend_join_executor_methods {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<T: $crate::Model, J: $crate::Model> $executor_type<T, J> {
-            $crate::__ormer_backend_join_methods!($conn_field);
-        }
+        $crate::__ormer_impl_backend_join_methods_for!(
+            $conn_field; $executor_type<T, J>; T: $crate::Model, J: $crate::Model
+        );
     };
 }
 
@@ -1969,9 +2060,9 @@ macro_rules! impl_backend_related_executor_methods {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<T: $crate::Model, R: $crate::Model> $executor_type<T, R> {
-            $crate::__ormer_backend_related_methods!($conn_field);
-        }
+        $crate::__ormer_impl_backend_related_methods_for!(
+            $conn_field; $executor_type<T, R>; T: $crate::Model, R: $crate::Model
+        );
     };
 }
 
@@ -1984,27 +2075,9 @@ macro_rules! impl_backend_executor_methods_with_lifetime {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model> $executor_type<'a, T> {
-            $crate::__ormer_backend_select_methods!($conn_field);
-
-            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
-            where
-                T: 'static + std::marker::Send + std::marker::Sync,
-            {
-                let (select, cursor_columns) = self.select.prepare_cursor_page()?;
-                let executor = Self {
-                    select: select.clone(),
-                    $conn_field: self.$conn_field,
-                    _marker: std::marker::PhantomData,
-                };
-                let items: Vec<T> = executor.collect().await?;
-                let next_cursor = match items.last() {
-                    Some(item) => Some(select.cursor_values_from_model(item, &cursor_columns)?),
-                    None => None,
-                };
-                Ok($crate::query::builder::CursorPage::new(items, next_cursor))
-            }
-        }
+        $crate::__ormer_impl_backend_select_methods_for!(
+            $conn_field; $executor_type<'a, T>; 'a, T: $crate::Model
+        );
     };
 }
 
@@ -2017,9 +2090,9 @@ macro_rules! impl_backend_join_executor_methods_with_lifetime {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model, J: $crate::Model> $executor_type<'a, T, J> {
-            $crate::__ormer_backend_join_methods!($conn_field);
-        }
+        $crate::__ormer_impl_backend_join_methods_for!(
+            $conn_field; $executor_type<'a, T, J>; 'a, T: $crate::Model, J: $crate::Model
+        );
     };
 }
 
@@ -2032,9 +2105,9 @@ macro_rules! impl_backend_related_executor_methods_with_lifetime {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model, R: $crate::Model> $executor_type<'a, T, R> {
-            $crate::__ormer_backend_related_methods!($conn_field);
-        }
+        $crate::__ormer_impl_backend_related_methods_for!(
+            $conn_field; $executor_type<'a, T, R>; 'a, T: $crate::Model, R: $crate::Model
+        );
     };
 }
 
@@ -2047,11 +2120,11 @@ macro_rules! impl_backend_multi_table_executor_methods_with_lifetime {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model>
-            $executor_type<'a, T, R1, R2>
-        {
-            $crate::__ormer_backend_multi_table_methods!($conn_field);
-        }
+        $crate::__ormer_impl_backend_multi_table_methods_for!(
+            $conn_field;
+            $executor_type<'a, T, R1, R2>;
+            'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model
+        );
     };
 }
 
@@ -2064,9 +2137,80 @@ macro_rules! impl_backend_four_table_executor_methods_with_lifetime {
         $conn_type:ty,
         $select_type:ident
     ) => {
-        impl<'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model, R3: $crate::Model>
-            $executor_type<'a, T, R1, R2, R3>
-        {
+        $crate::__ormer_impl_backend_four_table_methods_for!(
+            $conn_field;
+            $executor_type<'a, T, R1, R2, R3>;
+            'a, T: $crate::Model, R1: $crate::Model, R2: $crate::Model, R3: $crate::Model
+        );
+    };
+}
+
+/// 后端 Executor 通用方法的实现核心：`impl<...> Executor<...>` 的泛型形状
+/// 由调用方以 `executor 类型; 泛型参数列表` 传入，可选的 `distinct` 标记
+/// 决定是否生成 `distinct()`（无生命周期/带生命周期两套公开宏共用此核心）。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_impl_backend_select_methods_for {
+    ($conn_field:ident $(, $distinct:ident)? ; $executor_type:ty ; $($generics:tt)*) => {
+        impl<$($generics)*> $executor_type {
+            $crate::__ormer_backend_select_methods!($conn_field $(, $distinct)?);
+
+            pub async fn fetch_page(self) -> $crate::Result<$crate::query::builder::CursorPage<T>>
+            where
+                T: 'static + std::marker::Send + std::marker::Sync,
+            {
+                let (select, cursor_columns) = self.select.prepare_cursor_page()?;
+                let executor = Self {
+                    select: select.clone(),
+                    $conn_field: self.$conn_field,
+                    _marker: std::marker::PhantomData,
+                };
+                let items: Vec<T> = executor.collect().await?;
+                select.finish_cursor_page(items, &cursor_columns)
+            }
+        }
+    };
+}
+
+/// 后端 JOIN Executor 通用方法的实现核心（泛型形状由调用方传入）。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_impl_backend_join_methods_for {
+    ($conn_field:ident; $executor_type:ty; $($generics:tt)*) => {
+        impl<$($generics)*> $executor_type {
+            $crate::__ormer_backend_join_methods!($conn_field);
+        }
+    };
+}
+
+/// 后端 RelatedSelectExecutor 通用方法的实现核心（泛型形状由调用方传入）。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_impl_backend_related_methods_for {
+    ($conn_field:ident; $executor_type:ty; $($generics:tt)*) => {
+        impl<$($generics)*> $executor_type {
+            $crate::__ormer_backend_related_methods!($conn_field);
+        }
+    };
+}
+
+/// 后端 MultiTableSelectExecutor 通用方法的实现核心（泛型形状由调用方传入）。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_impl_backend_multi_table_methods_for {
+    ($conn_field:ident; $executor_type:ty; $($generics:tt)*) => {
+        impl<$($generics)*> $executor_type {
+            $crate::__ormer_backend_multi_table_methods!($conn_field);
+        }
+    };
+}
+
+/// 后端 FourTableSelectExecutor 通用方法的实现核心（泛型形状由调用方传入）。
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __ormer_impl_backend_four_table_methods_for {
+    ($conn_field:ident; $executor_type:ty; $($generics:tt)*) => {
+        impl<$($generics)*> $executor_type {
             $crate::__ormer_backend_four_table_methods!($conn_field);
         }
     };

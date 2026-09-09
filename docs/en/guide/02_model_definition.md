@@ -100,8 +100,9 @@ let include_deleted: Vec<Order> = scoped
 ```
 
 Filters enabled on `scope()` are inherited by queries, relationship loading,
-updates, and deletes. `unset_filter_*()` disables only an inherited named
-filter; it does not remove filters added directly with `filter(...)`.
+updates, and deletes. `unset_filter_*()` disables the named filter with the
+same name, whether inherited from a scope or applied on the current query via
+`filter_*()`; it does not remove filters added directly with `filter(...)`.
 
 ## Dynamic Table Routing
 

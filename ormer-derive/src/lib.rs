@@ -23,6 +23,7 @@ use proc_macro::TokenStream;
         postgresql,
         mssql,
         clickhouse,
+        influxdb,
         has_many,
         belongs_to,
         has_one,

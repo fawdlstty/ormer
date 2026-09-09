@@ -173,6 +173,22 @@ let deleted: Option<User> = txn.delete_model_returning(&user).await?;
 This is not single-statement atomic `RETURNING`. Use the surrounding transaction
 to keep the write and primary-key lookup consistent.
 
+### Scope inside a Transaction
+
+Transactions expose the same scoped entry as `Database::scope()`, attaching
+context filters (e.g. tenant conditions) automatically; writes are protected too:
+
+```rust
+let mut txn = db.begin().await?;
+let users = txn
+    .scope()
+    .with_context_filter::<User>("tenant", u_tenant_expr)
+    .select::<User>()
+    .collect::<Vec<_>>()
+    .await?;
+txn.commit().await?;
+```
+
 ## Error Handling
 
 ```rust

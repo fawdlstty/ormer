@@ -107,13 +107,13 @@ mod composite_primary_key_tests {
     }
 
     #[test]
-    fn test_primary_field_names_and_promary_fields() {
+    fn test_primary_field_names_and_primary_fields() {
         let user = PrimaryMetadataUser {
             id: 42,
             name: "Alice".to_string(),
         };
         assert_eq!(PrimaryMetadataUser::primary_field_names(), vec!["id"]);
-        assert_eq!(user.promary_fields(), (42,));
+        assert_eq!(user.primary_fields(), (42,));
 
         let renamed = RenamedPrimaryMetadata {
             tenant: "acme".to_string(),
@@ -128,7 +128,7 @@ mod composite_primary_key_tests {
             RenamedPrimaryMetadata::primary_field_names(),
             vec!["tenant", "user_id"]
         );
-        assert_eq!(renamed.promary_fields(), ("acme".to_string(), 7));
+        assert_eq!(renamed.primary_fields(), ("acme".to_string(), 7));
 
         let item = OrderItem {
             id: 10,
@@ -136,7 +136,7 @@ mod composite_primary_key_tests {
             quantity: 2,
         };
         assert_eq!(OrderItem::primary_field_names(), vec!["id", "product_id"]);
-        assert_eq!(item.promary_fields(), (10, 20));
+        assert_eq!(item.primary_fields(), (10, 20));
     }
 
     #[test]

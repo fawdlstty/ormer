@@ -41,19 +41,26 @@ let user: Vec<User> = db
 .filter(|u| u.name.contains("li").and(u.age.gt(29)))
 ```
 
-### PostgreSQL 字符串数组包含
+### 数组包含（SQL 级下推）
 
-对于 PostgreSQL 的 `Vec<String>` 字段，可使用 `contains` 判断数组是否包含元素：
+对于 `Vec<String>` 字段，`contains` / `contains_all` / `overlaps` 会下推为 SQL 谓词
+参与分页与计数，不会退化为内存过滤：
 
 ```rust
 let users: Vec<User> = db
     .select::<User>()
-    .filter(|u| u.tags.contains("admin"))
+    .filter(|u| u.tags.contains("admin"))          // 包含该元素
+    .filter(|u| u.tags.contains_all(vec!["admin".to_string(), "ops".to_string()])) // 全部包含
+    .filter(|u| u.tags.overlaps(vec!["ops".to_string(), "dev".to_string()]))       // 任一交集
     .collect()
     .await?;
 ```
 
-该条件生成 PostgreSQL 数组包含运算；其他后端不提供此数组专用条件。
+各后端生成等价语义的方言 SQL：PostgreSQL `@>` / `&&`，MySQL `JSON_CONTAINS` /
+`JSON_OVERLAPS`，SQLite `json_each`，MSSQL `OPENJSON`，ClickHouse `has`/`hasAll`，
+DuckDB `list_contains`/`list_has_any`。
+
+QuestDB 与 InfluxDB 不支持数组谓词，构造查询时返回 `UnsupportedFeature` 错误。
 
 ### NULL 判断
 

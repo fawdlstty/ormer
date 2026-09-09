@@ -13,6 +13,8 @@ pub struct FilterFormatter {
     table_prefix: Option<String>,
     /// 右列表别名前缀，用于 ColumnComparison（列-列比较）
     right_table_prefix: Option<String>,
+    /// 关联表列清单（别名 → SQL 列名），用于值过滤列的表归属解析
+    related_tables: Vec<(&'static str, Vec<&'static str>)>,
     /// PostgreSQL HAVING子句中的参数需要添加::bigint类型转换
     postgresql_having_cast: bool,
 }
@@ -23,6 +25,7 @@ impl FilterFormatter {
             db_type,
             table_prefix: None,
             right_table_prefix: None,
+            related_tables: Vec::new(),
             postgresql_having_cast: false,
         }
     }
@@ -36,6 +39,21 @@ impl FilterFormatter {
     /// 设置右列表别名前缀（用于列-列比较）
     pub fn with_right_table_prefix(mut self, prefix: &str) -> Self {
         self.right_table_prefix = Some(prefix.to_string());
+        self
+    }
+
+    /// 注册关联表（别名 → SQL 列名清单）。
+    ///
+    /// 多表查询中，通过 Where 代理生成的值过滤列（Comparison / IN / BETWEEN /
+    /// IS NULL 等）无法在表达式层面区分来自哪张表；渲染时按注册顺序解析：
+    /// 未限定的过滤列命中某个关联表的列清单时，限定到该表别名（t1/t2/t3），
+    /// 否则回落到主表前缀 t0。列-列比较（ColumnComparison）仍按
+    /// `table_prefix` / `right_table_prefix` 的位置约定渲染，不受影响。
+    pub fn with_related_tables(
+        mut self,
+        tables: Vec<(&'static str, Vec<&'static str>)>,
+    ) -> Self {
+        self.related_tables = tables;
         self
     }
 
@@ -210,12 +228,35 @@ impl FilterFormatter {
                 operator,
                 value,
             } => {
-                let full_col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
+                let full_col_name = self.qualified_column(column);
                 use std::fmt::Write;
+                // 三值逻辑下 "= NULL" 恒假、"/!= NULL" 恒真，
+                // 改写为 IS NULL / IS NOT NULL，且不产生绑定参数
+                if matches!(value, Value::Null) && matches!(operator.as_str(), "=" | "!=" | "<>") {
+                    let null_check = if operator == "=" {
+                        "IS NULL"
+                    } else {
+                        "IS NOT NULL"
+                    };
+                    write!(
+                        sql,
+                        "{} {}",
+                        quote_column_reference(self.db_type, &full_col_name),
+                        null_check
+                    )
+                    .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
+                    return;
+                }
+                // NULL + 非等值操作符（> >= < <= LIKE 等）在三值逻辑下恒为
+                // UNKNOWN，行级过滤中等价于恒假。校验阶段
+                // （FilterExpr::validate_null_usage）已对主查询路径报错；
+                // 这里是未走校验的渲染路径的兜底，渲染显式恒假表达式并
+                // 不产生绑定参数，避免静默生成 "col" > NULL 这类无警告假谓词
+                if matches!(value, Value::Null) {
+                    write!(sql, "1 = 0")
+                        .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
+                    return;
+                }
                 write!(
                     sql,
                     "{}",
@@ -348,11 +389,7 @@ impl FilterFormatter {
                     .unwrap_or_else(|e| panic!("Failed to write IS NOT NULL clause: {}", e));
             }
             FilterExpr::Between { column, min, max } => {
-                let col_name = if let Some(ref prefix) = self.table_prefix {
-                    format!("{}.{}", prefix, column)
-                } else {
-                    column.clone()
-                };
+                let col_name = self.qualified_column(column);
                 use std::fmt::Write;
                 let min_placeholder = placeholder(self.db_type, *param_idx as usize);
                 *param_idx += 1;
@@ -578,16 +615,16 @@ impl FilterFormatter {
                     crate::DbType::Sqlite => format!("{} MATCH {}", expr_sql, query_sql),
                     #[cfg(feature = "mssql")]
                     crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
+                    #[cfg(feature = "questdb")]
+                    crate::DbType::QuestDB => {
+                        unreachable!("QuestDB text search is gated by validate_filter_for_db")
+                    }
                     #[cfg(any(
                         feature = "duckdb",
                         feature = "clickhouse",
                         feature = "influxdb"
                     ))]
                     _ => format!("{} LIKE {}", expr_sql, query_sql),
-                    #[cfg(feature = "questdb")]
-                    crate::DbType::QuestDB => {
-                        unreachable!("QuestDB text search is gated by validate_filter_for_db")
-                    }
                 };
                 write!(sql, "{sql_fragment}")
                     .unwrap_or_else(|e| panic!("Failed to write text search clause: {}", e));
@@ -627,6 +664,13 @@ impl FilterFormatter {
             self.table_prefix.as_deref(),
         );
         use std::fmt::Write;
+        // 空集合短路语义：IN 恒假、NOT IN 恒真，避免生成非法的 "expr IN ()"
+        if values.is_empty() {
+            let truth = if negated { "1 = 1" } else { "1 = 0" };
+            write!(sql, "{}", truth)
+                .unwrap_or_else(|e| panic!("Failed to write expression IN clause: {}", e));
+            return;
+        }
         write!(
             sql,
             "{} {} (",
@@ -649,12 +693,29 @@ impl FilterFormatter {
     }
 
     fn quoted_column(&self, column: &str) -> String {
-        let col_name = if let Some(ref prefix) = self.table_prefix {
-            format!("{}.{}", prefix, column)
-        } else {
-            column.to_owned()
-        };
-        quote_column_reference(self.db_type, &col_name)
+        quote_column_reference(self.db_type, &self.qualified_column(column))
+    }
+
+    /// 解析值过滤列最终使用的（可能带别名前缀的）列引用。
+    ///
+    /// - 已含 `.` 的列视为已限定，保持原样，避免重复加前缀；
+    /// - 未限定列按注册顺序匹配关联表列清单，命中则限定到该关联表别名
+    ///   （多表查询中关联表过滤列必须限定到 t1/t2/t3，而不是主表 t0）；
+    /// - 未命中关联表时回落到主表前缀（未设置前缀则保持原样，
+    ///   单表查询行为不变）。
+    fn qualified_column(&self, column: &str) -> String {
+        if column.contains('.') {
+            return column.to_owned();
+        }
+        for (alias, columns) in &self.related_tables {
+            if columns.iter().any(|candidate| *candidate == column) {
+                return format!("{}.{}", alias, column);
+            }
+        }
+        match self.table_prefix.as_deref() {
+            Some(prefix) => format!("{}.{}", prefix, column),
+            None => column.to_owned(),
+        }
     }
 
     fn format_column_values_clause(
@@ -667,6 +728,13 @@ impl FilterFormatter {
         params: &mut Vec<Value>,
     ) {
         use std::fmt::Write;
+        // 空集合短路语义：IN 恒假、NOT IN 恒真，避免生成非法的 "col IN ()"
+        if values.is_empty() {
+            let truth = if keyword == "IN" { "1 = 0" } else { "1 = 1" };
+            write!(sql, "{}", truth)
+                .unwrap_or_else(|e| panic!("Failed to write {} clause: {}", keyword, e));
+            return;
+        }
         write!(sql, "{} {} (", self.quoted_column(column), keyword)
             .unwrap_or_else(|e| panic!("Failed to write {} clause: {}", keyword, e));
         for (i, value) in values.iter().enumerate() {
@@ -829,6 +897,36 @@ impl FilterFormatter {
         #[cfg(feature = "postgresql")]
         if matches!(self.db_type, DbType::PostgreSQL) && operator == "@>" {
             return format!("{} @> ARRAY[{}]", full_col_name, param_placeholder);
+        }
+
+        // 数组成员过滤（`Vec<T>` 列的 contains）跨后端语义下推：
+        // 与 SqlExpr::ArrayContains 的方言分支保持一致，避免 `@>`
+        // 被原样透传给不支持该操作符的后端。
+        #[cfg(feature = "mysql")]
+        if matches!(self.db_type, DbType::MySQL) && operator == "@>" {
+            return format!("JSON_CONTAINS({full_col_name}, JSON_ARRAY({param_placeholder}))");
+        }
+        #[cfg(feature = "sqlite")]
+        if matches!(self.db_type, DbType::Sqlite) && operator == "@>" {
+            return format!(
+                "EXISTS (SELECT 1 FROM json_each({full_col_name}) AS __ormer_arr \
+                 WHERE __ormer_arr.value = {param_placeholder})"
+            );
+        }
+        #[cfg(feature = "mssql")]
+        if matches!(self.db_type, DbType::MSSQL) && operator == "@>" {
+            return format!(
+                "EXISTS (SELECT 1 FROM OPENJSON({full_col_name}) AS __ormer_arr \
+                 WHERE __ormer_arr.value = {param_placeholder})"
+            );
+        }
+        #[cfg(feature = "duckdb")]
+        if matches!(self.db_type, DbType::DuckDB) && operator == "@>" {
+            return format!("list_contains({full_col_name}, {param_placeholder})");
+        }
+        #[cfg(feature = "clickhouse")]
+        if matches!(self.db_type, DbType::ClickHouse) && operator == "@>" {
+            return format!("has({full_col_name}, {param_placeholder})");
         }
 
         #[cfg(feature = "sqlite")]

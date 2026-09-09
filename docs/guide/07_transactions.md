@@ -167,6 +167,22 @@ let deleted: Option<User> = txn.delete_model_returning(&user).await?;
 
 这不是单条 SQL 的原子 `RETURNING`；写入和回查的一致性依赖外层事务。
 
+### 事务内的 scope
+
+事务内也能使用与 `Database::scope()` 一致的作用域入口，自动附加租户等
+context filter，写路径同样受保护：
+
+```rust
+let mut txn = db.begin().await?;
+let users = txn
+    .scope()
+    .with_context_filter::<User>("tenant", u_tenant_expr)
+    .select::<User>()
+    .collect::<Vec<_>>()
+    .await?;
+txn.commit().await?;
+```
+
 ## 错误处理
 
 ```rust

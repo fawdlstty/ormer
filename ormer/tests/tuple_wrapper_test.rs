@@ -74,7 +74,7 @@ mod tuple_wrapper_tests {
         });
 
         assert_eq!(TestUser::primary_field_names(), vec!["id"]);
-        assert_eq!(user.promary_fields(), (5,));
+        assert_eq!(user.primary_fields(), (5,));
     }
 
     async fn test_tuple_wrapper_crud_impl(

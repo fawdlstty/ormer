@@ -161,10 +161,6 @@ impl<T> UpdateField<T> {
         }
     }
 
-    pub fn excluded(&self) -> Self {
-        self.incoming()
-    }
-
     pub fn assignment(&self) -> Option<UpdateAssignment> {
         self.assigned.then(|| UpdateAssignment {
             column: self.column_name.to_string(),

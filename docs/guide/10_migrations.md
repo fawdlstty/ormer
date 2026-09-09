@@ -109,6 +109,14 @@ InfluxDB 使用同一迁移入口：没有建表 DDL（measurement 由首条写�
 
 `migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
 
+`ensure_table` 遇到需要删列或删表重建的破坏性变更时默认报错（返回
+`UnmigratableSchema`），不再静默删数据；显式允许时改用
+`ensure_table_permissive`。`migrate_table::<T>()` 支持链式 `rename_column("old", "new")`
+标注列重命名（生成 `ALTER TABLE ... RENAME COLUMN`），避免"删列 + 加空列"。
+索引按"期望集合 vs 实际集合"自动对比：给已有列新增 `#[index]` 会生成建索引步骤，
+删除 `#[index]` 会生成 `DropIndex`。把可空列收紧为 `NOT NULL` 前，若存量行含 NULL
+会先报错，需先回填。
+
 模型中的 `#[compress(...)]` 也会参与表结构校验和迁移。PostgreSQL 会生成列级 `SET COMPRESSION`，MySQL 会生成表级 `COMPRESSION` 选项；MySQL 同一张表的压缩列必须使用同一种算法。
 
 ## QuestDB 迁移

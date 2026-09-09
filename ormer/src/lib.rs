@@ -52,25 +52,29 @@ pub use migration::{
 ))]
 pub use abstract_layer::{
     BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, BlockDeleteExecutor,
-    BlockDeleteResult, ConnectionPool, CreateTableExecutor, Database, DbExecutor, DeleteExecutor,
-    DerivedTableCollectFuture, DerivedTableSelectExecutor, DoubleIncludedCollectFuture,
-    DoubleIncludedSelectExecutor, DropTableExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor,
-    InsertPartialExecutor, IsolationLevel, MappedCollectFuture, MappedSelectExecutor,
-    ModelCollectWithFuture, NestedInclude, PooledConnection, PooledDatabaseScope,
-    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelationNestedLoader,
+    BlockDeleteResult, CollectFuture, ConnectionPool, CreateTableExecutor, Database, DbExecutor,
+    DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
+    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
+    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
+    InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
+    InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
+    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
+    PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor, RawCollectFuture,
+    RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader,
     ReplicatedConnectionPool, ReplicatedDatabase, ReplicatedDatabaseBuilder,
     ReplicatedPoolBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
-    SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement,
-    Transaction, TransactionFuture, TransactionInsertOrIgnoreExecutor, TransactionOptions,
+    SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
+    SqlStatement, Transaction, TransactionFuture, TransactionInsertExecutor,
+    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
     TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
-    TruncateTableExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
+    TruncateTableExecutor, UpdateExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
 pub use model::{
     ActiveValue, AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
     CompressionAlgorithm, DbValue, Embed, EmbedWhere, FieldType, FieldTypeProvider, FromRowValues,
-    FromSingleValue, FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum,
+    FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum,
     ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
     RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
     TableOptions, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel,
@@ -83,7 +87,7 @@ pub use model::{
 };
 pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum, ViewModel, raw};
 pub use query::builder::{
-    AgeColumn, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
+    CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
     FilterQuery, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoArrayValue,
     IntoGroupingSets, IntoJsonPath, IntoJsonScalar, IsInValue, IsInValues, LeftJoinedSelect,
     MapToResult, MappedSelect, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor,

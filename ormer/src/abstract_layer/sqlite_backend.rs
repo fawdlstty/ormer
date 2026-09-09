@@ -98,25 +98,61 @@ fn sqlite_sql_with_returning_count(sql: &str) -> Option<String> {
     Some(format!("{sql} RETURNING 1"))
 }
 
-/// 判断错误是否为约束冲突错误（如主键/唯一键重复）
-/// turso 不支持 INSERT OR IGNORE / ON CONFLICT 语法，因此需要在执行阶段通过捕获此类错误来实现忽略行为。
-fn is_unique_constraint_error(e: &crate::OrmerError) -> bool {
-    let msg = e.to_string();
-    msg.contains("UNIQUE constraint failed")
-}
 
-fn sqlite_simulated_sql(sql: String, label: &str) -> String {
-    format!("/* ormer-sqlite-simulated:{label} */ {sql}")
-}
 
 fn table_name_for<T: Model>() -> &'static str {
     T::table_name_for_db(DbType::Sqlite)
 }
 
-fn is_uuid_rust_type(rust_type: &str) -> bool {
-    matches!(rust_type, "Uuid" | "uuid::Uuid")
+/// 公共 strict helper（parse_column_value_strict）覆盖的 rust_type 集合。
+fn is_sqlite_strict_rust_type(rust_type: &str) -> bool {
+    matches!(
+        rust_type,
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "String"
+            | "f32"
+            | "f64"
+            | "Decimal"
+            | "rust_decimal::Decimal"
+            | "BigDecimal"
+            | "bigdecimal::BigDecimal"
+            | "bool"
+            | "Uuid"
+            | "uuid::Uuid"
+            | "Vec<u8>"
+            | "&[u8]"
+            | "DateTime"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>"
+            | "NaiveDateTime"
+            | "chrono::NaiveDateTime"
+            | "NaiveDate"
+            | "chrono::NaiveDate"
+            | "NaiveTime"
+            | "chrono::NaiveTime"
+    )
 }
 
+/// SQLite 时间列以文本存储：优先 RFC3339（写入侧格式），兼容
+/// "YYYY-MM-DD HH:MM:SS[.fff]" 的历史数据。
+fn parse_sqlite_datetime_text(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|naive| chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc))
+}
+
+/// 模型路径（带 rust_type）的列值解码：按目标列类型走公共 strict helper，
+/// 不对所有文本做时间嗅探——普通文本列存 "2024-01-01T00:00:00Z" 样式的
+/// 字符串必须仍解码为文本。时间解析只发生在列类型确为时间类型的上下文中。
 fn convert_turso_model_value<T: Model>(
     column_index: usize,
     value: &turso::Value,
@@ -126,18 +162,101 @@ fn convert_turso_model_value<T: Model>(
         .get(column_index)
         .ok_or_else(|| crate::ormer_error!("Column index out of bounds: {}", column_index))?;
 
-    if is_uuid_rust_type(column.rust_type) {
+    // NULL 直接短路，避免各分支重复判空
+    if matches!(value, turso::Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let rust_type = column.data_type.unwrap_or(column.rust_type);
+
+    // ENUM 列以文本存储，直接按文本解码
+    if column.enum_variants.is_some() {
         return match value {
-            turso::Value::Null => Ok(Value::Null),
-            turso::Value::Text(raw) => crate::model::uuid_from_text(raw).map(Value::Uuid),
+            turso::Value::Text(raw) => Ok(Value::Text(raw.clone())),
             _ => Err(crate::ormer_error!(
-                "Failed to decode SQLite UUID column '{}' from non-text value",
+                "Failed to decode SQLite enum column '{}' from non-text value",
                 column.name
             )),
         };
     }
 
-    convert_turso_value(value)
+    match rust_type {
+        // SQLite 以 INTEGER 微秒存储 Duration（写入侧 value_to_turso_value）
+        "Duration" | "std::time::Duration" => {
+            return match value {
+                turso::Value::Integer(micros) => Ok(Value::Duration(std::time::Duration::from_micros(
+                    (*micros).max(0) as u64,
+                ))),
+                _ => Err(crate::ormer_error!(
+                    "Failed to parse column '{}' (expected Duration microseconds)",
+                    column.name
+                )),
+            };
+        }
+        // JSON 列以 JSON 文本存储，解析为 Json 值
+        "JsonValue" | "serde_json::Value" => {
+            return match value {
+                turso::Value::Text(raw) => serde_json::from_str::<serde_json::Value>(raw)
+                    .map(Value::Json)
+                    .map_err(|err| {
+                        crate::ormer_error!(
+                            "Failed to parse column '{}' (expected JSON text): {}",
+                            column.name,
+                            err
+                        )
+                    }),
+                _ => Err(crate::ormer_error!(
+                    "Failed to parse column '{}' (expected JSON text)",
+                    column.name
+                )),
+            };
+        }
+        // strict helper 未覆盖的整数宽度类型按整数解码
+        "isize" | "usize" => {
+            return match value {
+                turso::Value::Integer(v) => Ok(Value::Integer(*v)),
+                _ => Err(crate::ormer_error!(
+                    "Failed to parse column '{}' (expected integer type)",
+                    column.name
+                )),
+            };
+        }
+        // 未知自定义类型：保持历史无类型解码
+        _ if !is_sqlite_strict_rust_type(rust_type) => {
+            return convert_turso_value(value);
+        }
+        _ => {}
+    }
+
+    common_helpers::parse_column_value_strict(
+        rust_type,
+        column.is_nullable,
+        column.name,
+        || match value {
+            turso::Value::Integer(v) => Some(*v),
+            _ => None,
+        },
+        || match value {
+            turso::Value::Text(raw) => Some(raw.clone()),
+            _ => None,
+        },
+        || match value {
+            turso::Value::Real(v) => Some(*v),
+            _ => None,
+        },
+        || match value {
+            turso::Value::Integer(v) => Some(*v as i8),
+            _ => None,
+        },
+        || match value {
+            turso::Value::Blob(v) => Some(v.clone()),
+            _ => None,
+        },
+        || match value {
+            turso::Value::Text(raw) => parse_sqlite_datetime_text(raw),
+            _ => None,
+        },
+    )
 }
 
 // 导入宏
@@ -162,19 +281,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             return common_helpers::sql_type_with_nullability("TEXT", is_nullable || is_primary);
         }
 
-        // 首先处理主键类型
-        if is_primary {
-            if is_uuid_rust_type(rust_type) {
-                return "TEXT PRIMARY KEY".to_string();
-            }
-            if is_auto_increment {
-                return "INTEGER PRIMARY KEY AUTOINCREMENT".to_string();
-            } else {
-                return "INTEGER PRIMARY KEY".to_string();
-            }
-        }
-
-        // 基础类型映射（SQLite 类型系统更简单）
+        // 基础类型映射（SQLite 类型系统更简单），主键列复用同一映射
         let base_type = match rust_type {
             // 整数类型
             "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => "INTEGER",
@@ -204,6 +311,16 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
             // 默认使用 TEXT
             _ => "TEXT",
         };
+
+        // 主键分支只负责拼接 PRIMARY KEY 约束：自增语义按 SQLite 惯例
+        // 仅对整数主键输出 AUTOINCREMENT；非整数类型（String/DateTime 等）
+        // 主键按上方基础类型映射建列，避免被错误建成整数列
+        if is_primary {
+            if is_auto_increment && base_type == "INTEGER" {
+                return "INTEGER PRIMARY KEY AUTOINCREMENT".to_string();
+            }
+            return format!("{base_type} PRIMARY KEY");
+        }
 
         common_helpers::sql_type_with_nullability(base_type, is_nullable)
     }
@@ -340,6 +457,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         ))
     }
 
+    /// 执行插入并返回自增主键值。
+    ///
+    /// 返回值约定：仅单行插入时返回的 id 语义可靠（该行的自增 id）；批量插入
+    /// 多行（含按 999 参数上限分块）时返回 `last_insert_rowid()`（最后写入行），
+    /// 仅供诊断，调用方不应依赖——各后端批量插入返回的 id 选取不一致
+    /// （PostgreSQL 取 RETURNING 首行、MySQL 取 `last_insert_id`）。
     pub async fn execute(self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         <Self as SqlExecutor>::execute(self).await
     }
@@ -405,7 +528,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
         }
         self.models.run_after_insert(hook_ctx).await?;
 
-        // 获取自增ID（如果有自增主键）
+        // AutoIncrementKeyType 回填约定：批量（含分块）插入时取 last_insert_rowid()
+        // （最后写入行），语义不可靠；单行插入不受影响。
         let has_auto_increment = I::Model::column_schema()
             .iter()
             .any(|c| c.is_auto_increment);
@@ -524,73 +648,34 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        // turso 不支持 INSERT OR REPLACE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
-        // 在执行阶段通过 DELETE + INSERT 实现 upsert 语义。
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &I::Model::columns(),
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
+        // 原生 ON CONFLICT upsert（与事务版语义一致）：
+        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        let statements =
+            common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
+                DbType::Sqlite,
+                "INSERT INTO",
+                <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+                &refs,
+                |sql, columns| {
+                    common_helpers::append_standard_upsert_clause::<I::Model>(
+                        DbType::Sqlite,
+                        sql,
+                        columns,
+                    )
+                },
+            )?;
 
-        Ok(SqlStatement::single(
+        Ok(SqlStatement::batch(
             DbType::Sqlite,
-            sqlite_simulated_sql(sql, "delete+insert upsert"),
-            all_values,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
         ))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
-            return Ok(());
-        }
-
-        let hook_ctx = HookContext::new(HookOperation::Insert);
-        self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
-        let pk_columns = I::Model::primary_key_columns();
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::Sqlite,
-                    c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in refs.iter() {
-            // 先删除已有记录
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.db.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            // 然后插入新记录
-            let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.db.conn, &insert_sql, insert_params, &all_values).await?;
-        }
-
-        self.models.run_after_insert(hook_ctx).await?;
-        Ok(())
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 }
 
@@ -601,13 +686,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         InsertOrUpdateExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-        traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
+        }
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -627,54 +716,21 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         }
 
         let columns = I::Model::insert_columns();
-        // turso 不支持 INSERT OR IGNORE / ON CONFLICT，因此生成普通 INSERT INTO SQL，
-        // 在执行阶段捕获约束冲突错误并忽略。
+        // 原生 INSERT OR IGNORE：重复主键/唯一键直接忽略
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::Sqlite,
-            "INSERT INTO",
+            "INSERT OR IGNORE INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             &refs,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
         );
 
-        Ok(SqlStatement::single(
-            DbType::Sqlite,
-            sqlite_simulated_sql(sql, "error-capture ignore"),
-            all_values,
-        ))
+        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
     }
 
-    pub async fn execute(mut self) -> crate::Result<()> {
-        if self.models.as_refs().is_empty() {
-            return Ok(());
-        }
-
-        let hook_ctx = HookContext::new(HookOperation::Insert);
-        self.models.run_before_insert(hook_ctx).await?;
-
-        let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders_str = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let sql = format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders_str})");
-
-        for model in refs.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.db.conn, &sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_unique_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
-        self.models.run_after_insert(hook_ctx).await?;
-        Ok(())
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
     }
 }
 
@@ -685,20 +741,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         InsertOrIgnoreExecutor::to_sql(self)
     }
 
-    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+    async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         if sql.statements.is_empty() {
             return Ok(());
         }
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-        match traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await
-        {
-            Ok(_) => {}
-            Err(e) if is_unique_constraint_error(&e) => {
-                // 忽略约束冲突（重复主键/唯一键）
-            }
-            Err(e) => return Err(e),
+        let hook_ctx = HookContext::new(HookOperation::Insert);
+        self.models.run_before_insert(hook_ctx).await?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_sqlite_execute(&self.db.conn, &statement.sql, params, &statement.params).await?;
         }
+        self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
 }
@@ -1003,25 +1056,9 @@ impl Database {
                 expected_col.enum_variants,
             );
 
-            // 对于类型比较，我们需要提取基础类型（不包含约束）
-            let type_to_compare = if expected_col.is_primary {
-                // 主键的基础类型，不包含任何约束
-                match effective_rust_type {
-                    "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" => {
-                        "INTEGER".to_string()
-                    }
-                    "f32" | "f64" => "REAL".to_string(),
-                    "Decimal"
-                    | "rust_decimal::Decimal"
-                    | "BigDecimal"
-                    | "bigdecimal::BigDecimal" => "TEXT".to_string(),
-                    "String" => "TEXT".to_string(),
-                    "bool" => "INTEGER".to_string(),
-                    "Vec<u8>" | "&[u8]" => "BLOB".to_string(),
-                    _ => "TEXT".to_string(),
-                }
-            } else {
-                // 非主键列，提取基础类型（去掉 NOT NULL）
+            // 对于类型比较，提取基础类型（去掉 NOT NULL 约束）；
+            // 主键列与建表使用同一张基础类型映射表，避免自检漏报/误报
+            let type_to_compare = {
                 let full_type = crate::abstract_layer::DbType::Sqlite.sql_type(
                     effective_rust_type,
                     false,
@@ -1302,79 +1339,45 @@ impl Database {
     }
 
     /// 批量插入或更新记录（遇到重复键时更新）
-    /// turso 不支持 ON CONFLICT，因此通过 DELETE + INSERT 实现 upsert 语义。
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let col_count = columns.len();
-        let pk_columns = T::primary_key_columns();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::Sqlite,
-                    c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in models.iter() {
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            let all_values = model.insert_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.conn, &insert_sql, insert_params, &all_values).await?;
+        let statements = common_helpers::build_auto_increment_aware_upsert_statements::<T>(
+            DbType::Sqlite,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::Sqlite),
+            models,
+            |sql, columns| {
+                common_helpers::append_standard_upsert_clause::<T>(DbType::Sqlite, sql, columns)
+            },
+        )?;
+        for statement in statements {
+            let params = values_to_params(&statement.params)?;
+            traced_sqlite_execute(&self.conn, &statement.sql, params, &statement.params).await?;
         }
-
         Ok(())
     }
 
     /// 批量插入或忽略记录（遇到重复键时忽略）
-    /// turso 不支持 ON CONFLICT，因此通过捕获约束错误实现忽略语义。
     pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
         let columns = T::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<T>(DbType::Sqlite);
+        let (sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::Sqlite,
+            "INSERT OR IGNORE INTO",
+            T::table_name_for_db(DbType::Sqlite),
+            &columns,
+            models,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+        );
 
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
-
-        for model in models.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.conn, &insert_sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_unique_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
-        }
-
+        let params = values_to_params(&all_values)?;
+        traced_sqlite_execute(&self.conn, &sql, params, &all_values).await?;
         Ok(())
     }
 
@@ -1420,13 +1423,16 @@ impl Database {
     /// 创建 Related 查询执行器
     pub fn related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<T, R> {
         RelatedSelectExecutor {
-            select: Select::<T>::new().from::<T, R>(),
+            select: Select::<T>::new().from::<R>(),
             conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
 
     /// 开始事务
+    ///
+    /// 注意：事务运行在共享单连接上，事务期间禁止并发使用同一 `Database`
+    /// 实例执行其他操作（并发语句会混入事务）。
     pub async fn begin(&self) -> crate::Result<Transaction> {
         traced_sqlite_execute(&self.conn, "BEGIN", (), &[]).await?;
         Ok(Transaction {
@@ -1623,6 +1629,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         ))
     }
 
+    /// 执行插入并返回自增主键值。
+    ///
+    /// 返回值约定：仅单行插入时返回的 id 语义可靠（该行的自增 id）；批量插入
+    /// 多行（含按 999 参数上限分块）时返回 `last_insert_rowid()`（最后写入行），
+    /// 仅供诊断，调用方不应依赖——各后端批量插入返回的 id 选取不一致
+    /// （PostgreSQL 取 RETURNING 首行、MySQL 取 `last_insert_id`）。
     pub async fn execute(mut self) -> crate::Result<<I::Model as Model>::AutoIncrementKeyType> {
         let sql = self.to_sql()?;
         if sql.statements.is_empty() {
@@ -1644,7 +1656,8 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         }
         self.models.run_after_insert(hook_ctx).await?;
 
-        // 获取自增ID（如果有自增主键）
+        // AutoIncrementKeyType 回填约定：批量（含分块）插入时取
+        // last_insert_rowid()（最后写入行），语义不可靠；单行插入不受影响。
         let has_auto_increment = I::Model::column_schema()
             .iter()
             .any(|c| c.is_auto_increment);
@@ -1677,16 +1690,28 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
             return Ok(SqlStatement::batch(DbType::Sqlite, Vec::new()));
         }
 
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::Sqlite,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-            &I::Model::columns(),
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
+        let statements =
+            common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
+                DbType::Sqlite,
+                "INSERT INTO",
+                <I::Model as Model>::table_name_for_db(DbType::Sqlite),
+                &refs,
+                |sql, columns| {
+                    common_helpers::append_standard_upsert_clause::<I::Model>(
+                        DbType::Sqlite,
+                        sql,
+                        columns,
+                    )
+                },
+            )?;
 
-        Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+        Ok(SqlStatement::batch(
+            DbType::Sqlite,
+            statements
+                .into_iter()
+                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+                .collect(),
+        ))
     }
 
     pub async fn execute(mut self) -> crate::Result<()> {
@@ -1697,41 +1722,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
 
-        let refs = self.models.as_refs();
-        let columns = I::Model::columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
-        let pk_columns = I::Model::primary_key_columns();
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let insert_placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({insert_placeholders})");
-
-        let where_clauses: Vec<String> = pk_columns
-            .iter()
-            .enumerate()
-            .map(|(idx, c)| {
-                common_helpers::quote_assignment(
-                    DbType::Sqlite,
-                    c,
-                    &common_helpers::placeholder(DbType::Sqlite, idx + 1),
-                )
-            })
-            .collect();
-        let delete_sql = format!(
-            "DELETE FROM {table_name} WHERE {}",
-            where_clauses.join(" AND ")
-        );
-
-        for model in refs.iter() {
-            let pk_values = model.primary_key_values();
-            let delete_params = values_to_params(&pk_values)?;
-            traced_sqlite_execute(&self.txn.conn, &delete_sql, delete_params, &pk_values).await?;
-
-            let all_values = model.field_values();
-            let insert_params = values_to_params(&all_values)?;
-            traced_sqlite_execute(&self.txn.conn, &insert_sql, insert_params, &all_values).await?;
+        let sql = self.to_sql()?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_sqlite_execute(&self.txn.conn, &statement.sql, params, &statement.params).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1756,7 +1750,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         let columns = I::Model::insert_columns();
         let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
             DbType::Sqlite,
-            "INSERT INTO",
+            "INSERT OR IGNORE INTO",
             <I::Model as Model>::table_name_for_db(DbType::Sqlite),
             &columns,
             &refs,
@@ -1774,26 +1768,10 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
 
-        let refs = self.models.as_refs();
-        let columns = I::Model::insert_columns();
-        let col_count = columns.len();
-        let table_name = common_helpers::quote_table_name::<I::Model>(DbType::Sqlite);
-
-        let columns_str = common_helpers::quote_column_list(DbType::Sqlite, &columns);
-        let placeholders = common_helpers::placeholder_list(DbType::Sqlite, 1, col_count);
-        let insert_sql =
-            format!("INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})");
-
-        for model in refs.iter() {
-            let values = model.insert_values();
-            let params = values_to_params(&values)?;
-            match traced_sqlite_execute(&self.txn.conn, &insert_sql, params, &values).await {
-                Ok(_) => {}
-                Err(e) if is_unique_constraint_error(&e) => {
-                    // 忽略约束冲突（重复主键/唯一键）
-                }
-                Err(e) => return Err(e),
-            }
+        let sql = self.to_sql()?;
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_sqlite_execute(&self.txn.conn, &statement.sql, params, &statement.params).await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -2272,14 +2250,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    /// 添加关联表查询（支持2个泛型参数，第一个必须与T相同）
+    /// 添加关联表查询
     /// select::<User>().from::<User, Role>()
-    pub fn from<T2, R: Model>(self) -> RelatedSelectExecutor<T, R>
-    where
-        T2: Model + 'static,
+    pub fn from<R: Model>(self) -> RelatedSelectExecutor<T, R>
     {
         RelatedSelectExecutor {
-            select: self.select.from::<T2, R>(),
+            select: self.select.from::<R>(),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2287,12 +2263,10 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询（支持3个表）
     /// select::<User>().from3::<User, Role, Permission>()
-    pub fn from3<T2, R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2>
-    where
-        T2: Model + 'static,
+    pub fn from3<R1: Model, R2: Model>(self) -> MultiTableSelectExecutor<T, R1, R2>
     {
         MultiTableSelectExecutor {
-            select: self.select.from3::<T2, R1, R2>(),
+            select: self.select.from3::<R1, R2>(),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2300,14 +2274,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
     /// 添加关联表查询(支持4个表)
     /// select::<User>().from4::<User, Role, Permission, Department>()
-    pub fn from4<T2, R1: Model, R2: Model, R3: Model>(
+    pub fn from4<R1: Model, R2: Model, R3: Model>(
         self,
     ) -> FourTableSelectExecutor<T, R1, R2, R3>
-    where
-        T2: Model + 'static,
     {
         FourTableSelectExecutor {
-            select: self.select.from4::<T2, R1, R2, R3>(),
+            select: self.select.from4::<R1, R2, R3>(),
             conn: self.conn,
             _marker: PhantomData,
         }
@@ -2755,6 +2727,44 @@ pub struct RelatedCollectFuture<T: Model, R: Model> {
 
 // SAFETY: Contains executor which references Database (Send + Sync)
 unsafe impl<T: Model + Send, R: Model + Send> Send for RelatedCollectFuture<T, R> {}
+/// 关联/多表查询的同谓词行数统计：`SELECT COUNT(*) FROM (<原子查询>)`，
+/// 排序与分页已由 to_count_sql_with_params 剥离，count 不受其影响。
+macro_rules! impl_related_count {
+    ($executor:ident, [$($g:tt)*], [$($ty:tt)*]) => {
+        impl<$($g)*> $executor<$($ty)*> {
+            /// 统计同谓词总行数（列表分页 total_count 用）。
+            pub async fn count(self) -> crate::Result<i64> {
+                let (sql, params) = self.select.to_count_sql_with_params(DbType::Sqlite);
+                let turso_params = values_to_params(&params)?;
+                let mut rows = if turso_params.is_empty() {
+                    traced_sqlite_query(&self.conn, &sql, (), &params).await?
+                } else {
+                    traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
+                };
+                if let Some(row) = rows.next().trace().await? {
+                    match row.get_value(0).trace_for("turso::Row::get_value")? {
+                        turso::Value::Integer(i) => Ok(i),
+                        turso::Value::Real(r) => Ok(r as i64),
+                        turso::Value::Text(t) => t.parse::<i64>().map_err(|e| {
+                            crate::ormer_error!("Invalid COUNT value: {t} ({e})")
+                        }),
+                        _ => Err(crate::ormer_error!("COUNT returned a non-numeric value")),
+                    }
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+    };
+}
+impl_related_count!(RelatedSelectExecutor, [T: Model, R: Model], [T, R]);
+impl_related_count!(MultiTableSelectExecutor, [T: Model, R1: Model, R2: Model], [T, R1, R2]);
+impl_related_count!(
+    FourTableSelectExecutor,
+    [T: Model, R1: Model, R2: Model, R3: Model],
+    [T, R1, R2, R3]
+);
+
 
 impl<T: Model + 'static + std::marker::Send, R: Model + 'static + std::marker::Send>
     std::future::IntoFuture for RelatedCollectFuture<T, R>
@@ -2840,28 +2850,42 @@ impl<T: Model> DeleteExecutor<T> {
     }
 
     /// 执行删除并返回被删除的行数据（SQLite RETURNING 支持）
+    ///
+    /// 版本化模型（乐观锁）未命中任何行时返回 `optimistic_lock_conflict` 错误，
+    /// 与 `execute()` 及 MSSQL/PostgreSQL 后端的 returning 语义保持一致。
     pub async fn returning(self) -> crate::Result<Vec<T>> {
         let sql = self.to_sql()?;
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
-
-        let sql_with_returning = format!("{} RETURNING *", statement.sql);
-        let mut rows =
-            traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params).await?;
-
         let mut results = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
-            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                let value = row.get_value(i)?;
-                convert_turso_model_value::<T>(i, &value)
-            })?;
-            results.push(model);
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+
+            let sql_with_returning = format!("{} RETURNING *", statement.sql);
+            let mut rows =
+                traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
+                    .await?;
+
+            let mut statement_results = Vec::new();
+            while let Some(row) = rows.next().trace().await? {
+                let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    let value = row.get_value(i)?;
+                    convert_turso_model_value::<T>(i, &value)
+                })?;
+                statement_results.push(model);
+            }
+
+            common_helpers::ensure_optimistic_lock_returned::<T>(
+                statement.versioned,
+                &statement_results,
+            )?;
+            results.extend(statement_results);
         }
 
         Ok(results)
     }
 
     /// 执行删除操作并返回影响的行数（execute 的别名）
+    /// 同义词，等价于 [`Self::execute`]。
+    #[deprecated(since = "0.2.11", note = "use `execute()` instead")]
     pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
@@ -2977,6 +3001,9 @@ impl<T: Model> UpdateExecutor<T> {
     }
 
     /// 执行更新并返回被更新的行数据（SQLite RETURNING 支持）
+    ///
+    /// 版本化模型（乐观锁）未命中任何行时返回 `optimistic_lock_conflict` 错误，
+    /// 与 `execute()` 及 MSSQL/PostgreSQL 后端的 returning 语义保持一致。
     pub async fn returning(self) -> crate::Result<Vec<T>> {
         let statements = self.to_sql()?;
         let mut results = Vec::new();
@@ -2986,18 +3013,26 @@ impl<T: Model> UpdateExecutor<T> {
             let mut rows =
                 traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
                     .await?;
+            let mut statement_results = Vec::new();
             while let Some(row) = rows.next().trace().await? {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
                     convert_turso_model_value::<T>(i, &value)
                 })?;
-                results.push(model);
+                statement_results.push(model);
             }
+            common_helpers::ensure_optimistic_lock_returned::<T>(
+                statement.versioned,
+                &statement_results,
+            )?;
+            results.extend(statement_results);
         }
         Ok(results)
     }
 
     /// 执行更新操作（execute 的别名）
+    /// 同义词，等价于 [`Self::execute`]。
+    #[deprecated(since = "0.2.11", note = "use `execute()` instead")]
     pub async fn exec(self) -> crate::Result<u64> {
         self.execute().await
     }
@@ -3090,7 +3125,12 @@ fn value_to_turso_value(value: Value) -> crate::Result<turso::Value> {
         Value::Time(time) => Ok(turso::Value::Text(time.to_string())),
         Value::Json(v) => Ok(turso::Value::Text(v.to_string())),
         Value::Uuid(v) => Ok(turso::Value::Text(v.to_string())),
-        Value::BigInt(v) => Ok(turso::Value::Integer(v as i64)),
+        Value::BigInt(v) => match i64::try_from(v) {
+            Ok(v) => Ok(turso::Value::Integer(v)),
+            Err(_) => Err(crate::OrmerError::decode(format!(
+                "BigInt value {v} out of range for SQLite INTEGER"
+            ))),
+        },
         Value::IntegerArray(_) | Value::BigIntArray(_) | Value::NullableBigIntArray(_) => Err(
             common_helpers::unsupported_postgresql_array_value(DbType::Sqlite),
         ),

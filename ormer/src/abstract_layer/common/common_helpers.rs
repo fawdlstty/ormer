@@ -136,7 +136,7 @@ pub(crate) fn primary_key_filter_exprs(
         .map(|(col, val)| FilterExpr::Comparison {
             column: col.to_string(),
             operator: "=".to_string(),
-            value: value_to_filter_value(&val),
+            value: val.clone(),
         })
         .collect()
 }
@@ -181,7 +181,7 @@ pub fn model_update_plan<T: Model>(
         filters.push(FilterExpr::Comparison {
             column: info.column.to_string(),
             operator: "=".to_string(),
-            value: value_to_filter_value(&Value::from(old_version)),
+            value: Value::from(old_version),
         });
         crate::model::version_snapshot_update(model, old_version)
     } else {
@@ -202,7 +202,7 @@ pub fn model_delete_filters<T: Model>(model: &T) -> Vec<FilterExpr> {
         filters.push(FilterExpr::Comparison {
             column: info.column.to_string(),
             operator: "=".to_string(),
-            value: value_to_filter_value(&Value::from(version)),
+            value: Value::from(version),
         });
     }
     filters
@@ -377,31 +377,39 @@ impl PartitionUnit {
     }
 
     /// 当前块边界的下一个边界（用于 `between` 起点的向上对齐）。
-    fn next_block_boundary(self, t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    /// 溢出转为错误，不 panic（与模块其余路径的空区间 no-op / 参数报错约定一致）。
+    fn next_block_boundary(
+        self,
+        t: chrono::DateTime<chrono::Utc>,
+    ) -> crate::Result<chrono::DateTime<chrono::Utc>> {
         use chrono::{Months, TimeZone};
         let naive = t.naive_utc();
         let naive = match self {
             Self::Hour => naive + chrono::Duration::hours(1),
             Self::Day => naive + chrono::Duration::days(1),
             Self::Week => naive + chrono::Duration::weeks(1),
-            Self::Month => naive
-                .checked_add_months(Months::new(1))
-                .expect("next block boundary out of range"),
-            Self::Year => naive
-                .checked_add_months(Months::new(12))
-                .expect("next block boundary out of range"),
+            Self::Month => naive.checked_add_months(Months::new(1)).ok_or_else(|| {
+                crate::OrmerError::invalid_operation(
+                    "next block boundary out of range (month overflow)",
+                )
+            })?,
+            Self::Year => naive.checked_add_months(Months::new(12)).ok_or_else(|| {
+                crate::OrmerError::invalid_operation(
+                    "next block boundary out of range (year overflow)",
+                )
+            })?,
         };
-        chrono::Utc.from_utc_datetime(&naive)
+        Ok(chrono::Utc.from_utc_datetime(&naive))
     }
 
     /// 向上对齐（ceil）：不在块边界上时进到下一个边界。
     fn align_to_block_ceil(
         self,
         t: chrono::DateTime<chrono::Utc>,
-    ) -> chrono::DateTime<chrono::Utc> {
+    ) -> crate::Result<chrono::DateTime<chrono::Utc>> {
         let floor = self.align_to_block(t);
         if floor == t {
-            floor
+            Ok(floor)
         } else {
             self.next_block_boundary(floor)
         }
@@ -457,7 +465,7 @@ impl AlignedBlockRange {
                         "block delete between requires start < end",
                     ));
                 }
-                let start = unit.align_to_block_ceil(start);
+                let start = unit.align_to_block_ceil(start)?;
                 let end = unit.align_to_block(end);
                 if start >= end {
                     return Ok(None);
@@ -578,13 +586,13 @@ pub fn block_delete_fallback_filters(
         filters.push(FilterExpr::Comparison {
             column: time_column.to_string(),
             operator: ">=".to_string(),
-            value: value_to_filter_value(&Value::DateTime(start)),
+            value: Value::DateTime(start),
         });
     }
     filters.push(FilterExpr::Comparison {
         column: time_column.to_string(),
         operator: "<".to_string(),
-        value: value_to_filter_value(&Value::DateTime(range.end)),
+        value: Value::DateTime(range.end),
     });
     filters
 }
@@ -1353,6 +1361,19 @@ pub fn optimistic_lock_conflict<T: Model>() -> crate::OrmerError {
     }
 }
 
+/// `update/delete().returning()` 路径的乐观锁冲突检查：版本化语句未返回任何行
+/// 视为并发冲突。各后端 returning 实现必须与 `execute()`（affected == 0 报错）
+/// 语义一致，同一 API 不得因后端不同而静默返回空结果。
+pub fn ensure_optimistic_lock_returned<T: Model>(
+    versioned: bool,
+    results: &[T],
+) -> crate::Result<()> {
+    if versioned && results.is_empty() {
+        return Err(optimistic_lock_conflict::<T>());
+    }
+    Ok(())
+}
+
 pub fn unsupported_postgresql_array_value(db_type: DbType) -> crate::OrmerError {
     crate::OrmerError::UnsupportedFeature {
         backend: db_type,
@@ -1456,14 +1477,6 @@ pub fn format_upsert_update_assignment(
     quote_assignment(db_type, &assignment.column, &value_sql)
 }
 
-pub fn quote_postgres_excluded_assignment(db_type: DbType, column: &str) -> String {
-    quote_assignment(
-        db_type,
-        column,
-        &quote_column_with_prefix(db_type, "EXCLUDED", column),
-    )
-}
-
 pub fn quote_mysql_values_assignment(db_type: DbType, column: &str) -> String {
     quote_assignment(
         db_type,
@@ -1512,20 +1525,105 @@ pub fn append_standard_upsert_clause<T: Model>(
     Ok(())
 }
 
-pub fn sql_type_with_nullability(base_type: &str, is_nullable: bool) -> String {
-    format!("{base_type}{}", if is_nullable { "" } else { " NOT NULL" })
+/// 判断自增主键的值是否"已设置"（非类型默认值）。
+fn auto_increment_key_is_set<T: Model>(model: &T, column: &str) -> bool {
+    !matches!(
+        model.column_value(column),
+        Some(Value::Integer(0)) | Some(Value::BigInt(0)) | Some(Value::Null) | None
+    )
 }
 
-/// 通用过滤器格式化函数（不包含参数值，用于 DELETE）
-pub fn format_filter(
-    filter: &FilterExpr,
-    sql: &mut String,
-    param_idx: &mut i32,
+/// 自增感知 upsert 语句：SQL、参数与实际写入的列清单。
+pub struct UpsertSqlStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+    pub row_count: usize,
+    /// 实际写入的列（含或不含自增主键），供参数类型推导。
+    pub columns: Vec<&'static str>,
+}
+
+/// 生成自增感知的批量 upsert 语句组。
+///
+/// 模型带单列自增主键时按"主键是否已设置"分行处理：
+/// - 已设置：携带主键列插入并追加 `upsert_clause`，冲突更新按该主键生效
+///   （graph 同步、显式 id 的 insert_or_update 场景）；
+/// - 未设置：排除自增列由序列生成。若也追加冲突子句，多条新记录会因
+///   显式写入的默认主键值互相冲突塌缩成一行。
+///
+/// 无自增主键的模型退化为单条全列 upsert（与历史行为一致）。
+pub fn build_auto_increment_aware_upsert_statements<T: Model>(
     db_type: DbType,
-) -> crate::Result<()> {
-    let mut params = Vec::new();
-    sql.push_str(&FilterFormatter::new(db_type).format(filter, param_idx, &mut params));
-    Ok(())
+    insert_prefix: &str,
+    table_name: &str,
+    models: &[&T],
+    upsert_clause: impl Fn(&mut String, &[&str]) -> crate::Result<()>,
+) -> crate::Result<Vec<UpsertSqlStatement>> {
+    let Some(auto_column) = auto_increment_column::<T>().filter(|_| !models.is_empty()) else {
+        let columns = T::columns();
+        let (mut sql, values) = build_batch_insert_statement::<T>(
+            db_type,
+            insert_prefix,
+            table_name,
+            &columns,
+            models,
+            BatchInsertValuesMode::All,
+        );
+        upsert_clause(&mut sql, &columns)?;
+        let row_count = models.len();
+        return Ok(vec![UpsertSqlStatement {
+            sql,
+            params: values,
+            row_count,
+            columns,
+        }]);
+    };
+
+    let (set, unset): (Vec<&T>, Vec<&T>) = models
+        .iter()
+        .copied()
+        .partition(|model| auto_increment_key_is_set(*model, auto_column));
+
+    let mut statements = Vec::with_capacity(2);
+    if !set.is_empty() {
+        let columns = T::columns();
+        let (mut sql, values) = build_batch_insert_statement::<T>(
+            db_type,
+            insert_prefix,
+            table_name,
+            &columns,
+            &set,
+            BatchInsertValuesMode::All,
+        );
+        upsert_clause(&mut sql, &columns)?;
+        statements.push(UpsertSqlStatement {
+            sql,
+            params: values,
+            row_count: set.len(),
+            columns,
+        });
+    }
+    if !unset.is_empty() {
+        let columns = T::insert_columns();
+        let (sql, values) = build_batch_insert_statement::<T>(
+            db_type,
+            insert_prefix,
+            table_name,
+            &columns,
+            &unset,
+            BatchInsertValuesMode::WithoutAutoIncrement,
+        );
+        statements.push(UpsertSqlStatement {
+            sql,
+            params: values,
+            row_count: unset.len(),
+            columns,
+        });
+    }
+    Ok(statements)
+}
+
+pub fn sql_type_with_nullability(base_type: &str, is_nullable: bool) -> String {
+    format!("{base_type}{}", if is_nullable { "" } else { " NOT NULL" })
 }
 
 /// 通用过滤器格式化函数并收集参数（用于 UPDATE/SELECT）
@@ -1548,6 +1646,27 @@ pub fn extract_model_from_row<T: Model>(row_data: &HashMap<String, Value>) -> cr
     T::from_row(&row)
 }
 
+/// P2-6：把行→Value 解码阶段的无定位失败升级为带列名 + rust 类型的
+/// [`OrmerError::Decode`]。已带定位的 Decode 错误与非解码类错误原样透传。
+fn with_decode_location<T: Model>(column: &str, error: crate::OrmerError) -> crate::OrmerError {
+    let rust_type = T::COLUMN_SCHEMA
+        .iter()
+        .find(|schema| schema.name == column)
+        .map(|schema| schema.rust_type);
+    match error {
+        crate::OrmerError::Decode {
+            column: None,
+            rust_type: None,
+            message,
+        } => crate::OrmerError::Decode {
+            column: Some(column.to_string()),
+            rust_type,
+            message,
+        },
+        other => other,
+    }
+}
+
 pub fn decode_model_from_indexed_values<T, F>(offset: usize, mut value_at: F) -> crate::Result<T>
 where
     T: Model,
@@ -1555,7 +1674,9 @@ where
 {
     let mut data = HashMap::new();
     for (i, col_name) in T::columns().iter().enumerate() {
-        data.insert(col_name.to_string(), value_at(offset + i)?);
+        let value = value_at(offset + i)
+            .map_err(|error| with_decode_location::<T>(col_name, error))?;
+        data.insert(col_name.to_string(), value);
     }
 
     T::from_row(&Row::new(data))
@@ -1572,7 +1693,8 @@ where
     let mut data = HashMap::new();
     let mut is_null = true;
     for (i, col_name) in T::columns().iter().enumerate() {
-        let value = value_at(offset + i)?;
+        let value =
+            value_at(offset + i).map_err(|error| with_decode_location::<T>(col_name, error))?;
         if !matches!(value, Value::Null) {
             is_null = false;
         }
@@ -1892,11 +2014,6 @@ pub fn convert_column_value(
         get_datetime(),
         ColumnValueMode::Default,
     )
-}
-
-/// 将 model::Value 转换为 filter::Value
-pub fn value_to_filter_value(val: &Value) -> crate::query::filter::Value {
-    val.clone()
 }
 
 fn downcast_auto_increment_key<K: 'static, T: 'static>(value: T) -> K {
@@ -2271,8 +2388,6 @@ pub fn build_partial_insert_statement_for_table<T: Model>(
         match db_type {
             #[cfg(feature = "mysql")]
             DbType::MySQL => format!("INSERT INTO {table_name} () VALUES ()"),
-            #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mssql"))]
-            _ => format!("INSERT INTO {table_name} DEFAULT VALUES"),
             #[cfg(feature = "influxdb")]
             DbType::InfluxDB => {
                 return Err(crate::OrmerError::UnsupportedFeature {
@@ -2280,6 +2395,8 @@ pub fn build_partial_insert_statement_for_table<T: Model>(
                     feature: "partial insert without columns",
                 });
             }
+            #[cfg(any(feature = "sqlite", feature = "postgresql", feature = "mssql"))]
+            _ => format!("INSERT INTO {table_name} DEFAULT VALUES"),
         }
     } else {
         let columns_str = quote_column_list(db_type, &columns);
@@ -2391,11 +2508,32 @@ pub fn build_insert_statement_with_conflict<T: Model>(
     Ok((sql, values))
 }
 
-fn insert_rows_per_statement<T: Model>(db_type: DbType) -> usize {
+/// 单条 INSERT 允许的最大行数：按后端绑定参数上限（`bind_param_limit`）与
+/// 模型 insert 列数推导，MSSQL 2100 / SQLite 999 参数上限由此生效。
+pub fn insert_rows_per_statement<T: Model>(db_type: DbType) -> usize {
     let column_count = T::insert_columns().len().max(1);
     (bind_param_limit(db_type) / column_count).max(1)
 }
 
+/// 按参数上限把模型行分块，逐块调用 `build` 生成语句并聚合。
+///
+/// 自增主键与带 conflict 的插入同样受后端参数上限约束，必须经由本 helper
+/// 分块，避免单条语句绑定参数超限（MSSQL 2100 / SQLite 999）导致运行时失败；
+/// 行数未超限时仍生成单条语句，语句形态与历史行为一致。
+pub fn build_chunked_insert_statements<T: Model>(
+    db_type: DbType,
+    models: &[&T],
+    mut build: impl FnMut(&[&T]) -> crate::Result<InsertSqlStatement>,
+) -> crate::Result<Vec<InsertSqlStatement>> {
+    let rows_per_statement = insert_rows_per_statement::<T>(db_type);
+    if models.len() <= rows_per_statement {
+        let statement = build(models)?;
+        return Ok(vec![statement]);
+    }
+    models.chunks(rows_per_statement).map(build).collect()
+}
+
+/// 构建批量插入语句组（含自增主键 / 带 conflict 路径），统一按参数上限分块。
 pub fn build_insert_statements_with_conflict<T: Model>(
     db_type: DbType,
     models: &[&T],
@@ -2405,39 +2543,15 @@ pub fn build_insert_statements_with_conflict<T: Model>(
         return Ok(Vec::new());
     }
 
-    if conflict.is_some_and(InsertConflict::is_configured) || auto_increment_column::<T>().is_some()
-    {
-        let (sql, params) = build_insert_statement_with_conflict::<T>(db_type, models, conflict)?;
-        return Ok(vec![InsertSqlStatement {
-            sql,
-            params,
-            row_count: models.len(),
-        }]);
-    }
-
-    let rows_per_statement = insert_rows_per_statement::<T>(db_type);
-    if models.len() <= rows_per_statement {
-        let (sql, params) = build_insert_statement_with_conflict::<T>(db_type, models, conflict)?;
-        return Ok(vec![InsertSqlStatement {
-            sql,
-            params,
-            row_count: models.len(),
-        }]);
-    }
-
     routed_table_name_for_models(db_type, models)?;
-    models
-        .chunks(rows_per_statement)
-        .map(|chunk| {
-            let (sql, params) =
-                build_insert_statement_with_conflict::<T>(db_type, chunk, conflict)?;
-            Ok(InsertSqlStatement {
-                sql,
-                params,
-                row_count: chunk.len(),
-            })
+    build_chunked_insert_statements::<T>(db_type, models, |chunk| {
+        let (sql, params) = build_insert_statement_with_conflict::<T>(db_type, chunk, conflict)?;
+        Ok(InsertSqlStatement {
+            sql,
+            params,
+            row_count: chunk.len(),
         })
-        .collect()
+    })
 }
 
 #[cfg(any(
@@ -2452,21 +2566,19 @@ fn append_insert_conflict_clause<T: Model>(
     params: &mut Vec<Value>,
     conflict: &InsertConflict,
 ) -> crate::Result<()> {
+    // 能力矩阵优先：insert_conflict=false 的后端（QuestDB/InfluxDB/ClickHouse）
+    // 统一拒绝；MSSQL 虽为 true（insert_or_update 走 MERGE），可配置 conflict
+    // 子句的细粒度限制仍在矩阵之后单独拒绝。
+    crate::Capabilities::ensure(
+        db_type,
+        |caps| caps.insert_conflict,
+        "insert conflict handling",
+    )?;
     match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => {
             append_standard_insert_conflict_clause::<T>(DbType::PostgreSQL, sql, params, conflict)
         }
-        #[cfg(feature = "questdb")]
-        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "insert conflict handling",
-        }),
-        #[cfg(feature = "influxdb")]
-        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
-            backend: db_type,
-            feature: "insert conflict handling",
-        }),
         #[cfg(feature = "sqlite")]
         DbType::Sqlite => {
             append_standard_insert_conflict_clause::<T>(DbType::Sqlite, sql, params, conflict)
@@ -2481,8 +2593,9 @@ fn append_insert_conflict_clause<T: Model>(
         DbType::MSSQL => Err(crate::ormer_error!(
             "MSSQL does not support configurable insert conflict handling; use insert_or_update for primary-key MERGE"
         )),
-        #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+        // 矩阵兜底：正常不可达（insert_conflict=false 已在上面拦截）。
+        #[allow(unreachable_patterns)]
+        _ => Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
             feature: "insert conflict handling",
         }),
@@ -2833,8 +2946,12 @@ pub fn build_mssql_insert_conflict_statement<T: Model>(
 
 #[cfg(feature = "mssql")]
 pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>) {
-    let columns = quote_column_list(DbType::MSSQL, T::COLUMNS);
-    let col_count = T::COLUMNS.len();
+    // 与 conflict 路径（build_mssql_insert_conflict_statement）及 MySQL/PG/SQLite 的
+    // upsert 语义保持一致：MERGE 源列使用 insert_columns() 排除自增列，避免向
+    // IDENTITY 列显式插入未赋值的 0/NULL（SQL Server 错误 544）。
+    let columns = T::insert_columns();
+    let columns_sql = quote_column_list(DbType::MSSQL, &columns);
+    let col_count = columns.len();
     let mut sql = format!(
         "MERGE INTO {} AS target USING (VALUES ",
         quote_table_name::<T>(DbType::MSSQL)
@@ -2847,12 +2964,19 @@ pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>)
         }
         let placeholders = placeholder_list(DbType::MSSQL, all_values.len() + 1, col_count);
         sql.push_str(&format!("({placeholders})"));
-        all_values.extend(model.field_values());
+        all_values.extend(model.insert_values());
     }
 
-    sql.push_str(&format!(") AS source ({columns}) ON "));
-    for (i, pk) in T::primary_key_columns().iter().enumerate() {
-        if i > 0 {
+    sql.push_str(&format!(") AS source ({columns_sql}) ON "));
+    // 仅对存在于源列中的主键生成等值条件；自增主键已从源中排除
+    //（未赋值时原本也不可能匹配到已有行），无可用主键时退化为
+    // 永不匹配的 1 = 0，使 MERGE 仅执行插入分支。
+    let mut has_match_condition = false;
+    for pk in T::primary_key_columns() {
+        if !columns.contains(pk) {
+            continue;
+        }
+        if has_match_condition {
             sql.push_str(" AND ");
         }
         sql.push_str(&format!(
@@ -2860,6 +2984,10 @@ pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>)
             quote_column_with_prefix(DbType::MSSQL, "target", pk),
             quote_column_with_prefix(DbType::MSSQL, "source", pk)
         ));
+        has_match_condition = true;
+    }
+    if !has_match_condition {
+        sql.push_str("1 = 0");
     }
 
     (sql, all_values)
@@ -2867,14 +2995,19 @@ pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>)
 
 #[cfg(feature = "mssql")]
 pub fn append_mssql_merge_update_clause<T: Model>(sql: &mut String) {
-    sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+    // 更新列同样限定在 MERGE 源列（insert_columns，排除自增列）之内，
+    // 避免引用源中不存在的自增列；主键列不参与更新。
     let pks = T::primary_key_columns();
-    let mut first = true;
-    for col_name in T::COLUMNS.iter() {
-        if pks.contains(col_name) {
-            continue;
-        }
-        if !first {
+    let updatable: Vec<&'static str> = T::insert_columns()
+        .into_iter()
+        .filter(|col_name| !pks.contains(col_name))
+        .collect();
+    if updatable.is_empty() {
+        return;
+    }
+    sql.push_str(" WHEN MATCHED THEN UPDATE SET ");
+    for (index, col_name) in updatable.iter().enumerate() {
+        if index > 0 {
             sql.push_str(", ");
         }
         sql.push_str(&quote_assignment(
@@ -2882,13 +3015,12 @@ pub fn append_mssql_merge_update_clause<T: Model>(sql: &mut String) {
             col_name,
             &quote_column_with_prefix(DbType::MSSQL, "source", col_name),
         ));
-        first = false;
     }
 }
 
 #[cfg(feature = "mssql")]
 pub fn append_mssql_merge_insert_clause<T: Model>(sql: &mut String) {
-    append_mssql_merge_insert_clause_for_columns(sql, T::COLUMNS);
+    append_mssql_merge_insert_clause_for_columns(sql, &T::insert_columns());
 }
 
 #[cfg(feature = "mssql")]

@@ -155,7 +155,7 @@ async fn test_in_statement_cases_impl(config: &_test_common::DbConfig) {
         ormer::Select::<TestUser>::new()
             .filter(|p| p.age.is_in(empty_vec))
             .to_sql(),
-        |sql: &str| assert!(sql.contains("age IN ()")),
+        |sql: &str| assert!(sql.contains("1 = 0")),
     );
 
     // Vec 类型

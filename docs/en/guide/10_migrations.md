@@ -128,4 +128,13 @@ QuestDB (8.3+ required) executes migrations one by one and keeps history in
 
 `migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
 
+`ensure_table` rejects destructive changes (column drops and table rebuilds) by default
+with an `UnmigratableSchema` error instead of silently deleting data; opt in explicitly
+with `ensure_table_permissive`. `migrate_table::<T>()` supports chained
+`rename_column("old", "new")` annotations (rendered as `ALTER TABLE ... RENAME COLUMN`)
+so renames no longer degrade to drop + add. Indexes are diffed as expected-vs-actual
+sets: adding `#[index]` to an existing column creates the index, removing it emits
+`DropIndex`. Tightening a nullable column to `NOT NULL` fails first when existing rows
+contain NULLs; backfill before migrating.
+
 Model `#[compress(...)]` attributes are included in schema validation and migration. PostgreSQL uses column-level `SET COMPRESSION`; MySQL uses the table-level `COMPRESSION` option, so all compressed columns in one MySQL table must use the same algorithm.

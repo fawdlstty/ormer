@@ -299,7 +299,7 @@ struct EntityField<'a> {
     enum_name: Option<String>,
 }
 
-pub fn generate_entities(db_type: DbType, tables: &[DbFirstTable]) -> String {
+pub fn generate_entities(db_type: DbType, tables: &[DbFirstTable]) -> crate::Result<String> {
     let mut entities = tables
         .iter()
         .map(|table| EntityTable {
@@ -318,9 +318,10 @@ pub fn generate_entities(db_type: DbType, tables: &[DbFirstTable]) -> String {
             .map(|column| {
                 let field_name = unique_field_name(&column.name, &mut used_fields);
                 let enum_name = enum_name_for_column(entity.table, column, tables);
-                let base_type = enum_name
-                    .clone()
-                    .unwrap_or_else(|| rust_type_for_column(db_type, column));
+                let base_type = match enum_name.clone() {
+                    Some(enum_name) => enum_name,
+                    None => rust_type_for_column(db_type, column)?,
+                };
                 let rust_type = if column.primary_key {
                     base_type
                 } else if column.nullable {
@@ -328,14 +329,14 @@ pub fn generate_entities(db_type: DbType, tables: &[DbFirstTable]) -> String {
                 } else {
                     base_type
                 };
-                EntityField {
+                Ok(EntityField {
                     column,
                     field_name,
                     rust_type,
                     enum_name,
-                }
+                })
             })
-            .collect();
+            .collect::<crate::Result<Vec<_>>>()?;
     }
 
     let table_by_key = entities
@@ -392,7 +393,7 @@ pub fn generate_entities(db_type: DbType, tables: &[DbFirstTable]) -> String {
         code.push_str("}\n\n");
     }
 
-    code.trim_end().to_string()
+    Ok(code.trim_end().to_string())
 }
 
 fn table_attribute(db_type: DbType, table: &DbFirstTable) -> String {
@@ -604,26 +605,29 @@ fn has_many_relations(entity: &EntityTable<'_>, entities: &[EntityTable<'_>]) ->
     relations
 }
 
-fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> String {
+fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> crate::Result<String> {
     let raw = column.type_name.trim();
     let lower = raw.to_ascii_lowercase();
     match db_type {
         #[cfg(feature = "sqlite")]
-        DbType::Sqlite => sqlite_rust_type(&lower),
+        DbType::Sqlite => Ok(sqlite_rust_type(&lower)),
         #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => postgresql_rust_type(&lower),
+        DbType::PostgreSQL => Ok(postgresql_rust_type(&lower)),
         #[cfg(feature = "questdb")]
-        DbType::QuestDB => postgresql_rust_type(&lower),
+        DbType::QuestDB => Ok(postgresql_rust_type(&lower)),
         #[cfg(feature = "mysql")]
-        DbType::MySQL => mysql_rust_type(&lower),
+        DbType::MySQL => Ok(mysql_rust_type(&lower)),
         #[cfg(feature = "mssql")]
-        DbType::MSSQL => mssql_rust_type(&lower),
+        DbType::MSSQL => Ok(mssql_rust_type(&lower)),
         #[cfg(feature = "duckdb")]
-        DbType::DuckDB => duckdb_rust_type(raw),
+        DbType::DuckDB => Ok(duckdb_rust_type(raw)),
         #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => clickhouse_rust_type(raw),
+        DbType::ClickHouse => Ok(clickhouse_rust_type(raw)),
         #[cfg(feature = "influxdb")]
-        DbType::InfluxDB => unreachable!("InfluxDB does not support db-first generation"),
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "db-first entity generation",
+        }),
     }
 }
 
@@ -837,15 +841,15 @@ mod clickhouse_tests {
     #[test]
     fn maps_clickhouse_types_for_entity_generation() {
         assert_eq!(
-            rust_type_for_column(DbType::ClickHouse, &column("Nullable(Array(Int64))")),
+            rust_type_for_column(DbType::ClickHouse, &column("Nullable(Array(Int64))")).unwrap(),
             "Vec<i64>"
         );
         assert_eq!(
-            rust_type_for_column(DbType::ClickHouse, &column("DateTime64(3)")),
+            rust_type_for_column(DbType::ClickHouse, &column("DateTime64(3)")).unwrap(),
             "chrono::NaiveDateTime"
         );
         assert_eq!(
-            rust_type_for_column(DbType::ClickHouse, &column("Decimal128(38)")),
+            rust_type_for_column(DbType::ClickHouse, &column("Decimal128(38)")).unwrap(),
             "rust_decimal::Decimal"
         );
     }
@@ -872,19 +876,19 @@ mod duckdb_tests {
     #[test]
     fn maps_duckdb_types_for_entity_generation() {
         assert_eq!(
-            rust_type_for_column(DbType::DuckDB, &column("BIGINT")),
+            rust_type_for_column(DbType::DuckDB, &column("BIGINT")).unwrap(),
             "i64"
         );
         assert_eq!(
-            rust_type_for_column(DbType::DuckDB, &column("VARCHAR[]")),
+            rust_type_for_column(DbType::DuckDB, &column("VARCHAR[]")).unwrap(),
             "Vec<String>"
         );
         assert_eq!(
-            rust_type_for_column(DbType::DuckDB, &column("DECIMAL(18, 2)")),
+            rust_type_for_column(DbType::DuckDB, &column("DECIMAL(18, 2)")).unwrap(),
             "rust_decimal::Decimal"
         );
         assert_eq!(
-            rust_type_for_column(DbType::DuckDB, &column("TIMESTAMP")),
+            rust_type_for_column(DbType::DuckDB, &column("TIMESTAMP")).unwrap(),
             "chrono::NaiveDateTime"
         );
     }

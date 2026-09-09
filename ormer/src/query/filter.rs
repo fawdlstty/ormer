@@ -225,6 +225,12 @@ pub(crate) fn infer_filter_value_rust_type(value: &Value) -> &'static str {
         Value::Time(_) => "NaiveTime",
         Value::Json(_) => "String",
         Value::Uuid(_) => "uuid::Uuid",
+        // NULL 没有可推断的列类型：保持与 `pg_value_to_param` 的无类型
+        // NULL 分支一致（None::<i32>，整型家族）。等值 NULL 在渲染层已被
+        // 改写为 IS NULL / IS NOT NULL（不产生参数），非等值 NULL 由
+        // `FilterExpr::validate_null_usage` 在校验阶段拦截；此处仅剩
+        // 表达式字面量等罕见路径会真正绑定 NULL 参数，维持现状以免
+        // 引入新的绑定失败（其他占位类型只是把失败挪到别的列类型上）。
         Value::Null => "i32",
     }
 }
@@ -323,6 +329,100 @@ impl FilterExpr {
     pub fn or(self, other: FilterExpr) -> Self {
         FilterExpr::Or(Box::new(self), Box::new(other))
     }
+
+    /// NULL 比较语义校验：三值逻辑下非等值比较（> >= < <= LIKE IN
+    /// BETWEEN 等）与 NULL 组合恒为 UNKNOWN，生成恒假 SQL 不会有任何
+    /// 警告。此处在校验阶段直接报错，要求改用 IS NULL / IS NOT NULL /
+    /// 等值判断（等值/不等值会被渲染层改写为 IS NULL / IS NOT NULL）。
+    pub(crate) fn validate_null_usage(&self) -> crate::Result<()> {
+        validate_null_usage(self)
+    }
+}
+
+/// `SqlExpr` 是否为裸 NULL 字面量（区别于嵌套在函数/COALESCE 里的 NULL，
+/// 后者是合法 SQL，不拦截）。
+fn is_null_literal(expr: &SqlExpr) -> bool {
+    matches!(expr, SqlExpr::Value(Value::Null))
+}
+
+fn null_comparison_error(subject: &str, operator: &str) -> crate::OrmerError {
+    crate::OrmerError::invalid_operation(format!(
+        "{} cannot be compared with NULL using '{}': NULL only supports IS NULL / IS NOT NULL / equality checks",
+        subject, operator
+    ))
+}
+
+fn validate_null_usage(expr: &FilterExpr) -> crate::Result<()> {
+    match expr {
+        FilterExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => {
+            if matches!(value, Value::Null) && !matches!(operator.as_str(), "=" | "!=" | "<>") {
+                return Err(null_comparison_error(
+                    &format!("column '{column}'"),
+                    operator,
+                ));
+            }
+            Ok(())
+        }
+        FilterExpr::Between { column, min, max } => {
+            if matches!(min, Value::Null) || matches!(max, Value::Null) {
+                return Err(crate::OrmerError::invalid_operation(format!(
+                    "column '{column}' BETWEEN bounds cannot be NULL: NULL only supports IS NULL / IS NOT NULL / equality checks"
+                )));
+            }
+            Ok(())
+        }
+        FilterExpr::In { column, values } | FilterExpr::NotIn { column, values } => {
+            if values.iter().any(|value| matches!(value, Value::Null)) {
+                return Err(crate::OrmerError::invalid_operation(format!(
+                    "column '{column}' IN/NOT IN list cannot contain NULL: NULL never matches, use is_null()/is_not_null() instead"
+                )));
+            }
+            Ok(())
+        }
+        FilterExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => {
+            let null_operand = is_null_literal(left) || is_null_literal(right);
+            if null_operand && !matches!(operator.as_str(), "=" | "!=" | "<>") {
+                return Err(null_comparison_error("expression", operator));
+            }
+            Ok(())
+        }
+        FilterExpr::ExprBetween { min, max, .. } => {
+            if is_null_literal(min) || is_null_literal(max) {
+                return Err(crate::OrmerError::invalid_operation(
+                    "expression BETWEEN bounds cannot be NULL: NULL only supports IS NULL / IS NOT NULL / equality checks",
+                ));
+            }
+            Ok(())
+        }
+        FilterExpr::ExprIn { values, .. } | FilterExpr::ExprNotIn { values, .. } => {
+            if values.iter().any(is_null_literal) {
+                return Err(crate::OrmerError::invalid_operation(
+                    "expression IN/NOT IN list cannot contain NULL: NULL never matches, use is_null()/is_not_null() instead",
+                ));
+            }
+            Ok(())
+        }
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            validate_null_usage(left)?;
+            validate_null_usage(right)
+        }
+        FilterExpr::RelationExists { filter, .. }
+        | FilterExpr::ThroughRelationExists { filter, .. } => {
+            if let Some(filter) = filter {
+                return validate_null_usage(filter);
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// 排序方向
@@ -361,18 +461,24 @@ impl OrderBy {
     }
 
     pub fn asc_expr(expr: SqlExpr) -> Self {
-        Self {
-            column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
-            direction: OrderDirection::Asc,
-            expr: Some(expr),
-            error: None,
-        }
+        Self::for_expr(expr, OrderDirection::Asc)
     }
 
     pub fn desc_expr(expr: SqlExpr) -> Self {
+        Self::for_expr(expr, OrderDirection::Desc)
+    }
+
+    /// 表达式排序项：`column` 只存规范列名（裸列名，不带方言引用/转换），
+    /// 表达式渲染延迟到 `to_sql` 阶段由 `expr` 字段完成。
+    ///
+    /// `column` 会被 cursor 分页当作列名与主键比较、被 `model.column_value`
+    /// 查找；若把 default 方言渲染的 SQL 片段快照进去，真实后端不同时会
+    /// 携带另一种方言的片段（见 P2-8）。非列表达式没有规范列名，置空并
+    /// 由 `prepare_cursor_page` 强制要求 `cursor_by`。
+    fn for_expr(expr: SqlExpr, direction: OrderDirection) -> Self {
         Self {
-            column: expr.to_sql_no_params(crate::query::builder::default_db_type()),
-            direction: OrderDirection::Desc,
+            column: canonical_expr_column(&expr),
+            direction,
             expr: Some(expr),
             error: None,
         }
@@ -440,5 +546,14 @@ impl OrderBy {
             .map(|expr| expr.to_sql(db_type, param_idx, params, table_prefix))
             .unwrap_or_else(|| crate::model::quote_column_reference(db_type, &self.column));
         format!("{} {}", expr_sql, dir)
+    }
+}
+
+/// 表达式排序项的规范列名：裸列引用直接取列名，其余表达式没有可作列名
+/// 使用的规范形式，返回空串（渲染一律走 `expr` 字段）。
+fn canonical_expr_column(expr: &SqlExpr) -> String {
+    match expr {
+        SqlExpr::Column(column) => column.clone(),
+        _ => String::new(),
     }
 }
