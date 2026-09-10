@@ -63,6 +63,16 @@ let applied = runner.execute().await?;
 println!("applied: {applied}");
 ```
 
+执行前可用 `dry_run()` 预演：返回待执行步骤的 SQL、已完成版本与警告，不会写库。
+
+```rust
+let dry = db.migrations(&migrations).dry_run().await?;
+
+for step in &dry.steps {
+    println!("{} {} -> {}", step.version, step.migration_name, step.sql);
+}
+```
+
 如果不需要持有 runner，也可以直接调用数据库入口：
 
 ```rust

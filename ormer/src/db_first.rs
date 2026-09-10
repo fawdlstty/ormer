@@ -652,7 +652,9 @@ fn duckdb_rust_type(type_name: &str) -> String {
         "tinyint" | "smallint" | "integer" | "int" | "int4" | "usmallint" | "uinteger" => "i32",
         "bigint" | "int8" | "int64" | "ubigint" => "i64",
         "hugeint" => "i128",
-        "uhugeint" => "u128",
+        // 无符号 hugeint 值域（0..2^128-1）超出 i128，model::Value 无原生
+        // 无符号 128 位载体，映射 String 文本保真回读
+        "uhugeint" => "String",
         "float" | "real" | "double" | "double precision" => "f64",
         "decimal" | "numeric" => "rust_decimal::Decimal",
         "boolean" | "bool" => "bool",
@@ -706,7 +708,8 @@ fn clickhouse_rust_type(type_name: &str) -> String {
         "uint16" => "u16",
         "uint32" => "u32",
         "uint64" => "u64",
-        "uint128" | "uint256" => "u128",
+        // 无符号 128/256 位整数超出 i128 载体值域，映射 String 文本保真
+        "uint128" | "uint256" => "String",
         "float32" => "f32",
         "float64" => "f64",
         "decimal32" | "decimal64" | "decimal128" | "decimal256" => "rust_decimal::Decimal",

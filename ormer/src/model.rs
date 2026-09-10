@@ -239,8 +239,53 @@ fn version_snapshot_key<T: Model>(model: &T) -> VersionSnapshotKey {
             .iter()
             .filter(|column| Some(**column) != version_column)
             .filter_map(|column| model.column_value(column))
-            .map(|value| value.to_table_route_value())
+            .map(|value| version_snapshot_value_key(&value))
             .collect(),
+    }
+}
+
+/// 乐观锁内容键的单值编码：带 variant 标签，保证单射。
+///
+/// 直接复用 `TableRouteValue::to_table_route_value` 会让 `Null` 与
+/// `Text("null")`、`Real(1.0)` 与 `Integer(1)`/`Boolean(true)` 编码成同一
+/// 字符串，两行不同内容共享版本快照，产生错误的乐观锁冲突。这里每个
+/// `Value` variant 使用独立标签前缀，编码互不重叠。
+fn version_snapshot_value_key(value: &Value) -> String {
+    match value {
+        Value::Integer(value) => format!("i:{value}"),
+        Value::BigInt(value) => format!("j:{value}"),
+        Value::Duration(value) => format!("u:{}", value.as_nanos()),
+        Value::Text(value) => format!("t:{value}"),
+        Value::TextArray(value) => format!("a:{}", value.join("\u{1}")),
+        Value::Real(value) => format!("r:{value}"),
+        Value::Decimal(value) => format!("d:{value}"),
+        Value::BigDecimal(value) => format!("b:{value}"),
+        Value::Boolean(value) => format!("o:{}", i32::from(*value)),
+        Value::Bytes(value) => {
+            format!("x:{}", value.iter().map(|byte| format!("{byte:02x}")).collect::<String>())
+        }
+        Value::IntegerArray(value) => {
+            format!("i:{}a", value.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+        }
+        Value::BigIntArray(value) => {
+            format!("j:{}a", value.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+        }
+        Value::NullableBigIntArray(value) => format!(
+            "n:{}a",
+            value
+                .iter()
+                .map(|value| value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "~".to_string()))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Value::DateTime(value) => format!("w:{}", value.timestamp_nanos_opt().unwrap_or(0)),
+        Value::Date(value) => format!("y:{}", value.format("%Y%m%d")),
+        Value::Time(value) => format!("m:{}", value.format("%H%M%S%.f")),
+        Value::Json(value) => format!("s:{value}"),
+        Value::Uuid(value) => format!("U:{value}"),
+        Value::Null => "z".to_string(),
     }
 }
 
@@ -339,35 +384,42 @@ pub fn version_snapshot_update<T: Model>(
 
 /// 为 Duration 扩展 PostgreSQL INTERVAL 格式化能力
 pub trait DurationToInterval {
-    /// 将 Duration 转换为 PostgreSQL INTERVAL 字符串
-    /// 支持小数形式，自动选择最适配的单位（milliseconds/seconds/minutes/hours/days）
+    /// 将 Duration 转换为 PostgreSQL INTERVAL 可解析的文本。
+    ///
+    /// 按天 + `HH:MM:SS.ffffff` 整数分量无损拼接（消费方为 PG interval
+    /// 文本输入，如 PG COPY 与 TimescaleDB `chunk_time_interval`）。
+    /// 不再用浮点近似换算大单位——旧实现 25h 会写成 "1.042 days"，
+    /// 静默多出约 28.8s。
     fn to_interval_string(&self) -> String;
 }
 
 impl DurationToInterval for std::time::Duration {
     fn to_interval_string(&self) -> String {
-        let total_secs = self.as_secs_f64();
-        let millis = self.subsec_millis();
+        // PG interval 内部为微秒精度：亚微秒纳秒尾数无法表示，按微秒截断
+        // （与 postgresql_backend::to_postgres_interval 的天+微秒分解一致）。
+        let micros = self.subsec_micros();
+        let total_secs = self.as_secs();
+        let days = total_secs / 86_400;
+        let hours = (total_secs % 86_400) / 3_600;
+        let minutes = (total_secs % 3_600) / 60;
+        let seconds = total_secs % 60;
+        let has_time_part = days == 0 || hours > 0 || minutes > 0 || seconds > 0 || micros > 0;
 
-        if total_secs < 1.0 && millis > 0 {
-            format!("{} milliseconds", millis)
-        } else if total_secs < 60.0 {
-            format_interval_unit(total_secs, "seconds")
-        } else if total_secs < 3600.0 {
-            format_interval_unit(total_secs / 60.0, "minutes")
-        } else if total_secs < 86400.0 {
-            format_interval_unit(total_secs / 3600.0, "hours")
-        } else {
-            format_interval_unit(total_secs / 86400.0, "days")
+        let mut out = String::new();
+        if days > 0 {
+            out.push_str(&days.to_string());
+            out.push_str(if days == 1 { " day" } else { " days" });
+            if has_time_part {
+                out.push(' ');
+            }
         }
-    }
-}
-
-fn format_interval_unit(value: f64, unit: &str) -> String {
-    if value.fract() == 0.0 {
-        format!("{} {}", value as u64, unit)
-    } else {
-        format!("{:.3} {}", value, unit)
+        if has_time_part {
+            out.push_str(&format!("{hours:02}:{minutes:02}:{seconds:02}"));
+            if micros > 0 {
+                out.push_str(&format!(".{micros:06}"));
+            }
+        }
+        out
     }
 }
 
@@ -767,6 +819,14 @@ pub enum ColumnDefault {
 }
 
 impl ColumnDefault {
+    /// 渲染为 SQL 字面量。
+    ///
+    /// 签名保持返回 `String`：除建表路径外，`migration.rs` 与
+    /// `db_first.rs` 的 schema 比对也直接消费该值。InfluxDB 为
+    /// schemaless、无 SQL 列默认值语义——建表入口
+    /// （`generate_create_table_sql*`）已对 InfluxDB 提前返回
+    /// `UnsupportedFeature`，其余调用方只对 SQL 后端调用，正常不会
+    /// 触达该分支。
     pub fn to_sql(self, db_type: crate::abstract_layer::DbType) -> String {
         match self {
             Self::String(value) => quote_sql_literal(value),
@@ -796,9 +856,11 @@ impl ColumnDefault {
                 crate::abstract_layer::DbType::ClickHouse => {
                     if value { "TRUE" } else { "FALSE" }.to_string()
                 }
+                // 入口拦截说明见上：generate_create_table_sql* 对 InfluxDB
+                // 返回 UnsupportedFeature，SQL 列默认值渲染不应到达这里
                 #[cfg(feature = "influxdb")]
                 crate::abstract_layer::DbType::InfluxDB => unreachable!(
-                    "InfluxDB does not support SQL column defaults"
+                    "InfluxDB does not support SQL column defaults (rejected at create-table entry)"
                 ),
             },
             Self::Expression(expr) => expr.to_string(),
@@ -870,6 +932,7 @@ impl_table_route_value_to_string!(
     i16,
     i32,
     i64,
+    i128,
     isize,
     u8,
     u16,
@@ -1566,6 +1629,11 @@ macro_rules! impl_primary_key_tuple {
 
 impl_primary_key_tuple!(A: 0, B: 1);
 impl_primary_key_tuple!(A: 0, B: 1, C: 2);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2, D: 3);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2, D: 3, E: 4);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+impl_primary_key_tuple!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
 
 /// 主键 Rust 字段元数据。
 pub trait PrimaryFields {
@@ -1579,6 +1647,31 @@ pub trait PrimaryFields {
     fn promary_fields(&self) -> Self::Fields {
         self.primary_fields()
     }
+}
+
+/// 从列 schema 中提取 hypertable 时间列信息，`ViewModel` 与 `Model` 默认实现共用。
+fn hypertable_info_of_schema(
+    schema: &[ColumnSchema],
+) -> Option<(&'static str, std::time::Duration)> {
+    schema
+        .iter()
+        .find_map(|col| col.hypertable.map(|duration| (col.name, duration)))
+}
+
+/// 从列 schema 中提取 TimescaleDB 空间分区信息，`ViewModel` 与 `Model` 默认实现共用。
+fn hypertable_space_info_of_schema(schema: &[ColumnSchema]) -> Option<(&'static str, u16)> {
+    schema
+        .iter()
+        .find_map(|col| col.hypertable_space.map(|partitions| (col.name, partitions)))
+}
+
+/// 从列 schema 中提取主键 Rust 字段名列表，`ViewModel` 与 `Model` 默认实现共用。
+fn primary_field_names_of_schema(schema: &[ColumnSchema]) -> Vec<&'static str> {
+    schema
+        .iter()
+        .filter(|column| column.is_primary)
+        .map(|column| column.rust_name)
+        .collect()
 }
 
 /// 只读模型 trait，用于 view、DTO、raw SQL 结果和查询投影。
@@ -1595,12 +1688,7 @@ pub trait ViewModel: Sized {
 
     /// 获取 hypertable 时间字段名和分片时长（如果有）
     fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
-        for col in Self::column_schema() {
-            if let Some(duration) = col.hypertable {
-                return Some((col.name, duration));
-            }
-        }
-        None
+        hypertable_info_of_schema(&Self::column_schema())
     }
 
     /// 时序时间列。时序库分块/分区能力（按块删除、未来 InfluxDB 后端）的统一声明入口，
@@ -1616,10 +1704,7 @@ pub trait ViewModel: Sized {
 
     /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
     fn hypertable_space_info() -> Option<(&'static str, u16)> {
-        Self::column_schema().into_iter().find_map(|col| {
-            col.hypertable_space
-                .map(|partitions| (col.name, partitions))
-        })
+        hypertable_space_info_of_schema(&Self::column_schema())
     }
 
     type QueryBuilder;
@@ -1635,11 +1720,7 @@ pub trait ViewModel: Sized {
 
     /// 获取主键 Rust 字段名列表。
     fn primary_field_names() -> Vec<&'static str> {
-        Self::COLUMN_SCHEMA
-            .iter()
-            .filter(|column| column.is_primary)
-            .map(|column| column.rust_name)
-            .collect()
+        primary_field_names_of_schema(Self::COLUMN_SCHEMA)
     }
 
     fn query() -> Self::QueryBuilder;
@@ -1688,12 +1769,7 @@ pub trait Model: Sized {
 
     /// 获取 hypertable 时间字段名和分片时长（如果有）
     fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
-        for col in Self::column_schema() {
-            if let Some(duration) = col.hypertable {
-                return Some((col.name, duration));
-            }
-        }
-        None
+        hypertable_info_of_schema(&Self::column_schema())
     }
 
     /// 时序时间列。时序库分块/分区能力（按块删除、未来 InfluxDB 后端）的统一声明入口，
@@ -1709,10 +1785,7 @@ pub trait Model: Sized {
 
     /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
     fn hypertable_space_info() -> Option<(&'static str, u16)> {
-        Self::column_schema().into_iter().find_map(|col| {
-            col.hypertable_space
-                .map(|partitions| (col.name, partitions))
-        })
+        hypertable_space_info_of_schema(&Self::column_schema())
     }
 
     /// 获取 TimescaleDB 字符串拆表路由键（如果有）。
@@ -1739,11 +1812,7 @@ pub trait Model: Sized {
 
     /// 获取主键 Rust 字段名列表。
     fn primary_field_names() -> Vec<&'static str> {
-        Self::COLUMN_SCHEMA
-            .iter()
-            .filter(|column| column.is_primary)
-            .map(|column| column.rust_name)
-            .collect()
+        primary_field_names_of_schema(Self::COLUMN_SCHEMA)
     }
 
     fn version_info() -> Option<VersionInfo> {
@@ -1892,6 +1961,73 @@ pub trait Model: Sized {
                     })
             })
             .collect()
+    }
+}
+
+/// 所有 `Model` 同时也是只读 `ViewModel`，由 blanket impl 统一委托 `Model` 的实现；
+/// 派生宏只生成一份 `impl Model`，不再为每个模型重复输出 `impl ViewModel`。
+impl<T: Model> ViewModel for T {
+    const TABLE_NAME: &'static str = <T as Model>::TABLE_NAME;
+    const COLUMNS: &'static [&'static str] = <T as Model>::COLUMNS;
+    const COLUMN_SCHEMA: &'static [ColumnSchema] = <T as Model>::COLUMN_SCHEMA;
+    const TABLE_OPTIONS: Option<TableOptions> = <T as Model>::TABLE_OPTIONS;
+
+    type QueryBuilder = <T as Model>::QueryBuilder;
+    type Where = <T as Model>::Where;
+
+    /// 获取指定数据库后端实际使用的表名。
+    fn table_name_for_db(db_type: crate::abstract_layer::DbType) -> &'static str {
+        <T as Model>::table_name_for_db(db_type)
+    }
+
+    /// 获取 hypertable 时间字段名和分片时长（如果有）
+    fn hypertable_info() -> Option<(&'static str, std::time::Duration)> {
+        <T as Model>::hypertable_info()
+    }
+
+    /// 时序时间列。时序库分块/分区能力（按块删除、未来 InfluxDB 后端）的统一声明入口，
+    /// 默认取 `#[hypertable]` 声明，不直接依赖 `hypertable_info()`。
+    fn ts_time_key() -> Option<&'static str> {
+        <T as Model>::ts_time_key()
+    }
+
+    /// 时序分块时长。默认取 `#[hypertable]` 声明。
+    fn ts_block_interval() -> Option<std::time::Duration> {
+        <T as Model>::ts_block_interval()
+    }
+
+    /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
+    fn hypertable_space_info() -> Option<(&'static str, u16)> {
+        <T as Model>::hypertable_space_info()
+    }
+
+    fn columns() -> Vec<&'static str> {
+        <T as Model>::columns()
+    }
+
+    fn column_schema() -> Vec<ColumnSchema> {
+        <T as Model>::column_schema()
+    }
+
+    /// 获取主键 Rust 字段名列表。
+    fn primary_field_names() -> Vec<&'static str> {
+        <T as Model>::primary_field_names()
+    }
+
+    fn query() -> Self::QueryBuilder {
+        <T as Model>::query()
+    }
+
+    fn select() -> Self::QueryBuilder {
+        <T as Model>::select()
+    }
+
+    fn from_row(row: &Row) -> crate::Result<Self> {
+        <T as Model>::from_row(row)
+    }
+
+    fn from_row_values(values: &[Value]) -> crate::Result<Self> {
+        <T as Model>::from_row_values(values)
     }
 }
 
@@ -2851,6 +2987,7 @@ impl_field_type_provider_for_plain_type!(
     i16,
     i32,
     i64,
+    i128,
     u8,
     u16,
     u32,
@@ -3021,50 +3158,65 @@ impl<T: crate::model::WritableModel> Insertable for Vec<T> {
 }
 
 /// A mutable batch opts into automatic per-row insert hooks.
-#[async_trait::async_trait]
-impl<T> Insertable for &mut Vec<T>
-where
-    T: crate::model::WritableModel
-        + crate::hooks::BeforeInsert
-        + crate::hooks::AfterInsert
-        + Send
-        + Sync,
-{
-    type Model = T;
+///
+/// `&mut Vec<T>`、`&mut [T]`、`&mut [T; N]` 三个可变集合接收者的钩子循环
+/// 逐行同构，统一由此宏生成（单模型 `&mut T` 的非循环实现保持独立）。
+/// 泛型参数以方括号组传入：普通集合为 `[]`，定长数组为 `[const N: usize]`。
+macro_rules! impl_insertable_mut_batch {
+    ([$($generics:tt)*] $ty:ty) => {
+        #[async_trait::async_trait]
+        impl<T, $($generics)*> Insertable for $ty
+        where
+            T: crate::model::WritableModel
+                + crate::hooks::BeforeInsert
+                + crate::hooks::AfterInsert
+                + Send
+                + Sync,
+        {
+            type Model = T;
 
-    fn as_refs(&self) -> Vec<&T> {
-        self.iter().collect()
-    }
+            fn as_refs(&self) -> Vec<&T> {
+                self.iter().collect()
+            }
 
-    fn as_refs_mut(&mut self) -> Vec<&mut T> {
-        self.iter_mut().collect()
-    }
+            fn as_refs_mut(&mut self) -> Vec<&mut T> {
+                self.iter_mut().collect()
+            }
 
-    async fn run_before_insert(
-        &mut self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
-        }
-        for (index, model) in self.iter_mut().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.before_insert(&mut row_ctx).await?;
-        }
-        Ok(())
-    }
+            async fn run_before_insert(
+                &mut self,
+                ctx: crate::hooks::HookContext<'static>,
+            ) -> crate::Result<()> {
+                if !ctx.hooks_enabled() {
+                    return Ok(());
+                }
+                for (index, model) in self.iter_mut().enumerate() {
+                    let mut row_ctx = ctx.for_batch(index);
+                    model.before_insert(&mut row_ctx).await?;
+                }
+                Ok(())
+            }
 
-    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
+            async fn run_after_insert(
+                &self,
+                ctx: crate::hooks::HookContext<'static>,
+            ) -> crate::Result<()> {
+                if !ctx.hooks_enabled() {
+                    return Ok(());
+                }
+                for (index, model) in self.iter().enumerate() {
+                    let mut row_ctx = ctx.for_batch(index);
+                    model.after_insert(&mut row_ctx).await?;
+                }
+                Ok(())
+            }
         }
-        for (index, model) in self.iter().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.after_insert(&mut row_ctx).await?;
-        }
-        Ok(())
-    }
+    };
 }
+
+impl_insertable_mut_batch!([] &mut Vec<T>);
+impl_insertable_mut_batch!([] &mut [T]);
+impl_insertable_mut_batch!([const N: usize] &mut [T; N]);
 
 impl<T: crate::model::WritableModel> Insertable for &Vec<T> {
     type Model = T;
@@ -3074,51 +3226,6 @@ impl<T: crate::model::WritableModel> Insertable for &Vec<T> {
     fn as_refs_mut(&mut self) -> Vec<&mut T> {
         // &Vec<T> 无法提供 &mut T，返回空向量
         vec![]
-    }
-}
-
-#[async_trait::async_trait]
-impl<T> Insertable for &mut [T]
-where
-    T: crate::model::WritableModel
-        + crate::hooks::BeforeInsert
-        + crate::hooks::AfterInsert
-        + Send
-        + Sync,
-{
-    type Model = T;
-
-    fn as_refs(&self) -> Vec<&T> {
-        self.iter().collect()
-    }
-
-    fn as_refs_mut(&mut self) -> Vec<&mut T> {
-        self.iter_mut().collect()
-    }
-
-    async fn run_before_insert(
-        &mut self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
-        }
-        for (index, model) in self.iter_mut().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.before_insert(&mut row_ctx).await?;
-        }
-        Ok(())
-    }
-
-    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
-        }
-        for (index, model) in self.iter().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.after_insert(&mut row_ctx).await?;
-        }
-        Ok(())
     }
 }
 
@@ -3141,51 +3248,6 @@ impl<T: crate::model::WritableModel, const N: usize> Insertable for &[T; N] {
     fn as_refs_mut(&mut self) -> Vec<&mut T> {
         // &[T; N] 无法提供 &mut T，返回空向量
         vec![]
-    }
-}
-
-#[async_trait::async_trait]
-impl<T, const N: usize> Insertable for &mut [T; N]
-where
-    T: crate::model::WritableModel
-        + crate::hooks::BeforeInsert
-        + crate::hooks::AfterInsert
-        + Send
-        + Sync,
-{
-    type Model = T;
-
-    fn as_refs(&self) -> Vec<&T> {
-        self.iter().collect()
-    }
-
-    fn as_refs_mut(&mut self) -> Vec<&mut T> {
-        self.iter_mut().collect()
-    }
-
-    async fn run_before_insert(
-        &mut self,
-        ctx: crate::hooks::HookContext<'static>,
-    ) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
-        }
-        for (index, model) in self.iter_mut().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.before_insert(&mut row_ctx).await?;
-        }
-        Ok(())
-    }
-
-    async fn run_after_insert(&self, ctx: crate::hooks::HookContext<'static>) -> crate::Result<()> {
-        if !ctx.hooks_enabled() {
-            return Ok(());
-        }
-        for (index, model) in self.iter().enumerate() {
-            let mut row_ctx = ctx.for_batch(index);
-            model.after_insert(&mut row_ctx).await?;
-        }
-        Ok(())
     }
 }
 
@@ -3240,6 +3302,68 @@ pub fn quote_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// 解析自定义 DbValue 列在建表时的 SQL 类型。
+///
+/// `#[derive(DbValue)]` 把未配置映射的后端解析为空串（而非 panic）；空串
+/// 不是合法 SQL 类型，建表入口据此返回 `UnsupportedFeature`，让调用方可以
+/// 用 `Result` 捕获后端未配置的错误。
+pub(crate) fn resolve_db_value_column_type(
+    db_type: crate::abstract_layer::DbType,
+    db_value_type: fn(crate::abstract_layer::DbType) -> &'static str,
+) -> crate::Result<String> {
+    let resolved = db_value_type(db_type);
+    if resolved.is_empty() {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "custom DbValue column type (no #[db_type] mapping configured for this backend)",
+        });
+    }
+    Ok(resolved.to_string())
+}
+
+/// 派生宏生成代码专用的字符串驻留表：把 `prefix + suffix` 拼接结果按
+/// 唯一键缓存为 `&'static str`。
+///
+/// `Model::columns()`/`column_schema()` 等 hot path（每次 insert、每行解码、
+/// 每次 `Where::default()` 都会执行）此前对每个 embed/payload 列执行一次
+/// `Box::leak(format!(...))`，长驻进程内存无界增长；驻留后每个唯一拼接
+/// 至多泄漏一次。
+#[doc(hidden)]
+pub fn intern_concat(a: &'static str, b: &'static str) -> &'static str {
+    static CACHE: OnceLock<Mutex<HashMap<(&'static str, &'static str), &'static str>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    intern_with(cache, (a, b), || Box::leak(format!("{a}{b}").into_boxed_str()))
+}
+
+/// 同 [`intern_concat`]，但左侧前缀来自运行时字符串（如 `EmbedWhere::
+/// new_with_prefix(prefix)` 的 prefix 参数），缓存键持有前缀副本。
+#[doc(hidden)]
+pub fn intern_prefixed(prefix: &str, suffix: &'static str) -> &'static str {
+    static CACHE: OnceLock<Mutex<HashMap<(Box<str>, &'static str), &'static str>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    intern_with(cache, (prefix.into(), suffix), || {
+        Box::leak(format!("{prefix}{suffix}").into_boxed_str())
+    })
+}
+
+fn intern_with<K, F>(cache: &Mutex<HashMap<K, &'static str>>, key: K, leak: F) -> &'static str
+where
+    K: Eq + std::hash::Hash + Clone,
+    F: FnOnce() -> &'static str,
+{
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(existing) = guard.get(&key) {
+        return existing;
+    }
+    let leaked = leak();
+    guard.insert(key, leaked);
+    leaked
+}
+
 pub(crate) fn duckdb_auto_increment_sequence_name(table_name: &str, column_name: &str) -> String {
     format!(
         "__ormer_seq_{}_{}",
@@ -3264,36 +3388,161 @@ fn needs_identifier_quote(identifier: &str) -> bool {
         return true;
     }
 
+    // SQL 标准与各支持后端（SQLite/PostgreSQL/MySQL/MSSQL/QuestDB/DuckDB/
+    // ClickHouse/InfluxDB）保留字的并集，按并集保守引号化：宁可多引号
+    // （各后端引号标识符总是合法），不可漏引号拼出非法 SQL。
     matches!(
         identifier,
-        "all"
+        "add"
+            | "all"
+            | "alter"
+            | "analyze"
             | "and"
+            | "any"
+            | "array"
             | "as"
+            | "asc"
+            | "asymmetric"
+            | "at"
+            | "authorization"
+            | "begin"
+            | "between"
+            | "both"
             | "by"
+            | "cascade"
+            | "case"
+            | "cast"
             | "check"
+            | "collate"
             | "column"
+            | "columns"
+            | "commit"
             | "constraint"
             | "create"
+            | "cross"
+            | "current_date"
+            | "current_time"
+            | "current_timestamp"
+            | "current_user"
+            | "database"
+            | "databases"
+            | "day"
+            | "declare"
             | "default"
             | "delete"
             | "desc"
+            | "describe"
+            | "distinct"
+            | "drop"
+            | "else"
+            | "end"
+            | "escape"
+            | "except"
+            | "exclude"
+            | "exists"
+            | "explain"
+            | "false"
+            | "fetch"
+            | "filter"
+            | "first"
+            | "foreign"
             | "from"
+            | "full"
+            | "grant"
             | "group"
+            | "having"
+            | "if"
+            | "ignore"
+            | "ilike"
+            | "in"
             | "index"
+            | "inner"
             | "insert"
+            | "intersect"
+            | "interval"
             | "into"
+            | "is"
+            | "join"
             | "key"
+            | "last"
+            | "leading"
+            | "left"
+            | "like"
+            | "limit"
+            | "localtime"
+            | "localtimestamp"
+            | "match"
+            | "materialized"
+            | "natural"
+            | "next"
             | "not"
             | "null"
+            | "object"
+            | "of"
+            | "offset"
+            | "on"
+            | "only"
+            | "operator"
+            | "or"
             | "order"
+            | "outer"
+            | "over"
+            | "overlay"
+            | "partition"
+            | "placing"
+            | "preceding"
             | "primary"
+            | "procedure"
+            | "qualify"
+            | "range"
             | "references"
+            | "regexp"
+            | "release"
+            | "rename"
+            | "replace"
+            | "restrict"
+            | "returning"
+            | "revoke"
+            | "right"
+            | "rlike"
+            | "rollback"
+            | "rollup"
+            | "row"
+            | "rows"
+            | "schema"
+            | "schemas"
             | "select"
+            | "session_user"
+            | "set"
+            | "similar"
+            | "some"
+            | "symmetric"
+            | "system"
             | "table"
+            | "tables"
+            | "then"
+            | "ties"
+            | "to"
+            | "top"
+            | "trailing"
+            | "transaction"
+            | "trigger"
+            | "true"
+            | "truncate"
+            | "union"
             | "unique"
+            | "unknown"
             | "update"
             | "user"
+            | "using"
+            | "values"
+            | "when"
             | "where"
+            | "while"
+            | "window"
+            | "with"
+            | "within"
+            | "xor"
     )
 }
 
@@ -3388,6 +3637,17 @@ pub fn generate_create_table_sql_with_name<T: Model>(
     db_type: crate::abstract_layer::DbType,
     table_name: Option<&str>,
 ) -> crate::Result<String> {
+    // InfluxDB 为 schemaless 写入（line protocol），不存在 SQL DDL；拼空
+    // sql_type 只会产生垃圾 SQL，这里统一返回 UnsupportedFeature。
+    // ClickHouse 专用入口（generate_clickhouse_create_table_sql*）只路由
+    // ClickHouse，不会携带 InfluxDB 到达通用路径。
+    #[cfg(feature = "influxdb")]
+    if matches!(db_type, crate::abstract_layer::DbType::InfluxDB) {
+        return Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "CREATE TABLE SQL generation (InfluxDB is schemaless and writes via line protocol)",
+        });
+    }
     #[cfg(feature = "questdb")]
     if matches!(db_type, crate::abstract_layer::DbType::QuestDB) {
         return generate_questdb_create_table_sql_with_name::<T>(table_name);
@@ -3426,7 +3686,7 @@ fn generate_questdb_create_table_sql_with_name<T: Model>(
             });
         }
         let mut sql_type = if let Some(db_value_type) = column.db_value_type {
-            db_value_type(db_type).to_string()
+            resolve_db_value_column_type(db_type, db_value_type)?
         } else {
             let sql_type = db_type.sql_type(
                 column.data_type.unwrap_or(column.rust_type),
@@ -3439,11 +3699,21 @@ fn generate_questdb_create_table_sql_with_name<T: Model>(
         };
         // QuestDB 只允许对 SYMBOL 列建索引：`#[index]` 的 String 列（默认或
         // 类型覆盖映射为 STRING）改为 SYMBOL 类型，并在列定义处内联 INDEX，
-        // 过滤查询才能走索引；同时迁移路径无需再对该列生成 QuestDB 不支持的
-        // CREATE INDEX 语句。非 String 列的 `#[index]` 已在派生宏层拒绝。
-        // INDEX 不带容量参数，使用 QuestDB 服务端默认容量（最保守形式）。
-        let inline_symbol_index = column.is_indexed && sql_type.eq_ignore_ascii_case("STRING");
-        if inline_symbol_index {
+        // 过滤查询才能走索引；同时迁移路径无需再对该列生成 QuestDB 不支持
+        // 的 CREATE INDEX 语句。非 String/SYMBOL 列的 `#[index]` 无法落地
+        // （QuestDB 无独立 CREATE INDEX），这里返回明确的 UnsupportedFeature，
+        // 不再静默丢弃。INDEX 不带容量参数，使用 QuestDB 服务端默认容量
+        // （最保守形式）。
+        let inline_symbol_index = column.is_indexed
+            && (sql_type.eq_ignore_ascii_case("STRING")
+                || sql_type.eq_ignore_ascii_case("SYMBOL"));
+        if column.is_indexed && !inline_symbol_index {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "indexes on non-STRING columns (QuestDB SYMBOL indexes require String columns; map the column to STRING or SYMBOL)",
+            });
+        }
+        if inline_symbol_index && sql_type.eq_ignore_ascii_case("STRING") {
             sql_type = "SYMBOL".to_string();
         }
         sql.push_str(&quote_identifier(db_type, column.name));
@@ -3593,8 +3863,9 @@ fn generate_create_table_sql_with_engine<T: Model>(
 
         // 对于复合主键，不在列定义中添加 PRIMARY KEY，而是在最后添加表级约束
         let sql_type = if let Some(db_value_type) = column.db_value_type {
+            let resolved = resolve_db_value_column_type(db_type, db_value_type)?;
             crate::abstract_layer::common::common_helpers::sql_type_with_nullability(
-                db_value_type(db_type),
+                resolved.as_str(),
                 column.is_nullable,
             )
         } else {
@@ -3856,8 +4127,6 @@ fn generate_indexes_with_name<T: Model>(
 ) -> crate::Result<String> {
     let mut sqls = Vec::new();
 
-    // 检查是否为 MySQL 数据库（通过调试字符串）
-    let is_mysql = format!("{:?}", db_type).contains("MySQL");
     let column_schema = T::column_schema();
     #[cfg(feature = "sqlite")]
     if matches!(db_type, crate::abstract_layer::DbType::Sqlite)
@@ -3904,7 +4173,6 @@ fn generate_indexes_with_name<T: Model>(
             .unwrap_or_else(|| format!("idx_{}_{}", table_name.replace('.', "_"), column.name));
         sqls.push(render_index_sql(
             db_type,
-            is_mysql,
             table_name,
             &index_name,
             &[column],
@@ -3923,7 +4191,6 @@ fn generate_indexes_with_name<T: Model>(
             .unwrap_or_else(|| format!("idx_{}_{}", table_name.replace('.', "_"), group_id));
         sqls.push(render_index_sql(
             db_type,
-            is_mysql,
             table_name,
             &index_name,
             &columns,
@@ -3933,9 +4200,48 @@ fn generate_indexes_with_name<T: Model>(
     Ok(sqls.join(";"))
 }
 
+/// 判断后端 CREATE INDEX 是否支持 IF NOT EXISTS（MySQL/MSSQL 不支持）。
+pub(crate) fn index_supports_if_not_exists(db_type: crate::abstract_layer::DbType) -> bool {
+    #[cfg(feature = "mysql")]
+    if matches!(db_type, crate::abstract_layer::DbType::MySQL) {
+        return false;
+    }
+    #[cfg(feature = "mssql")]
+    if matches!(db_type, crate::abstract_layer::DbType::MSSQL) {
+        return false;
+    }
+    #[cfg(not(any(feature = "mysql", feature = "mssql")))]
+    let _ = db_type;
+    true
+}
+
+/// 渲染 CREATE INDEX 语句的公共入口，建表路径与迁移路径（migration.rs 的
+/// `MigrationStep::CreateIndex` 与 `index_migration_step`）共用同一份
+/// IF NOT EXISTS 后端分派与标识符引用逻辑。
+///
+/// `columns_sql` 为调用方已渲染好的列清单（可含排序后缀等方言细节）。
+pub(crate) fn render_create_index(
+    db_type: crate::abstract_layer::DbType,
+    index_name: &str,
+    table_name: &str,
+    columns_sql: &str,
+    unique: bool,
+) -> String {
+    let unique_sql = if unique { "UNIQUE " } else { "" };
+    let if_not_exists = if index_supports_if_not_exists(db_type) {
+        " IF NOT EXISTS"
+    } else {
+        ""
+    };
+    format!(
+        "CREATE {unique_sql}INDEX{if_not_exists} {} ON {} ({columns_sql})",
+        quote_identifier(db_type, index_name),
+        quote_qualified_identifier(db_type, table_name)
+    )
+}
+
 fn render_index_sql(
     db_type: crate::abstract_layer::DbType,
-    is_mysql: bool,
     table_name: &str,
     index_name: &str,
     columns: &[&ColumnSchema],
@@ -3944,6 +4250,16 @@ fn render_index_sql(
     let is_postgresql = matches!(db_type, crate::abstract_layer::DbType::PostgreSQL);
     #[cfg(not(feature = "postgresql"))]
     let is_postgresql = false;
+    let is_mysql = {
+        #[cfg(feature = "mysql")]
+        {
+            matches!(db_type, crate::abstract_layer::DbType::MySQL)
+        }
+        #[cfg(not(feature = "mysql"))]
+        {
+            false
+        }
+    };
     let method = columns.iter().find_map(|column| column.index_method);
     let expression = columns.iter().find_map(|column| column.index_expression);
     let explicit_columns = columns.iter().find_map(|column| column.index_columns);
@@ -4021,25 +4337,25 @@ fn render_index_sql(
         }
     }
     let sql = if is_mysql {
-        let fulltext = method == Some("fulltext");
+        if method == Some("fulltext") {
+            // MySQL 全文索引使用独立 FULLTEXT 前缀语法
+            format!(
+                "CREATE FULLTEXT INDEX {} ON {} ({columns_sql})",
+                quote_identifier(db_type, index_name),
+                quote_qualified_identifier(db_type, table_name),
+            )
+        } else {
+            render_create_index(db_type, index_name, table_name, &columns_sql, false)
+        }
+    } else if let Some(method) = method {
+        // PostgreSQL USING 索引方法子句位于表名与列清单之间
         format!(
-            "CREATE {}INDEX {} ON {} ({})",
-            if fulltext { "FULLTEXT " } else { "" },
+            "CREATE INDEX IF NOT EXISTS {} ON {} USING {method} ({columns_sql})",
             quote_identifier(db_type, index_name),
             quote_qualified_identifier(db_type, table_name),
-            columns_sql
         )
     } else {
-        format!(
-            "CREATE INDEX IF NOT EXISTS {} ON {}{}",
-            quote_identifier(db_type, index_name),
-            quote_qualified_identifier(db_type, table_name),
-            if let Some(method) = method {
-                format!(" USING {method} ({columns_sql})")
-            } else {
-                format!(" ({columns_sql})")
-            }
-        )
+        render_create_index(db_type, index_name, table_name, &columns_sql, false)
     };
 
     Ok(if let Some(where_clause) = where_clause {
@@ -4198,7 +4514,13 @@ impl Row {
     pub fn get<T: FromValue>(&self, column: &str) -> crate::Result<T> {
         self.data
             .get(column)
-            .ok_or_else(|| crate::ormer_error!("Column not found: {}", column))
+            .ok_or_else(|| {
+                crate::OrmerError::decode_at(
+                    column,
+                    std::any::type_name::<T>(),
+                    "column not found",
+                )
+            })
             .and_then(|v| T::from_value(v))
     }
 }
@@ -4263,7 +4585,7 @@ fn parse_naive_time_text(raw: &str) -> crate::Result<chrono::NaiveTime> {
 }
 
 /// 值类型
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Integer(i64),
     BigInt(i128),
@@ -4507,6 +4829,7 @@ impl_from_value_for!(
     i16,
     i32,
     i64,
+    i128,
     u8,
     u16,
     u32,
@@ -4533,6 +4856,7 @@ impl_from_row_values_single!(
     i16 => "i16",
     i32 => "i32",
     i64 => "i64",
+    i128 => "i128",
     u8 => "u8",
     u16 => "u16",
     u32 => "u32",
@@ -4762,8 +5086,9 @@ macro_rules! impl_from_for_value {
 }
 
 // 为整数类型生成 From 实现
+// i128 走 BigInt(i128) 载体：放得下 i64 用 Integer，超出则直接 BigInt。
 impl_from_for_value!(
-    i8, i16, i32, i64, isize, u8, u16, u32, u64, usize,
+    i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, usize,
 );
 
 // f64 特殊处理
@@ -4937,7 +5262,9 @@ impl FromValue for chrono::NaiveDate {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Date(v) => Ok(*v),
-            Value::DateTime(v) => Ok(v.date_naive()),
+            // 与 NaiveDateTime 分支一致：先转本地墙钟再取日期分量，
+            // 不能直接取 UTC 日期（时区东缘的本地次日在 UTC 里还是当日）
+            Value::DateTime(v) => Ok(utc_to_naive_local(*v).date()),
             Value::Text(v) => parse_naive_date_text(v),
             _ => Err(crate::ormer_error!("Type mismatch: expected NaiveDate")),
         }
@@ -4954,7 +5281,9 @@ impl FromValue for chrono::NaiveTime {
     fn from_value(value: &Value) -> crate::Result<Self> {
         match value {
             Value::Time(v) => Ok(*v),
-            Value::DateTime(v) => Ok(v.time()),
+            // 与 NaiveDateTime 分支一致：先转本地墙钟再取时间分量，
+            // 不能直接取 UTC 时间（与本地墙钟可能相差数小时）
+            Value::DateTime(v) => Ok(utc_to_naive_local(*v).time()),
             Value::Text(v) => parse_naive_time_text(v),
             _ => Err(crate::ormer_error!("Type mismatch: expected NaiveTime")),
         }

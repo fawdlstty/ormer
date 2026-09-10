@@ -2,6 +2,7 @@ mod db_value;
 mod model;
 mod model_enum;
 mod raw;
+mod shared;
 
 use proc_macro::TokenStream;
 

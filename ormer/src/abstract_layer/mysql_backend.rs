@@ -1,4 +1,5 @@
 use super::common::common_helpers;
+use super::common::ddl_introspection;
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{SingleSqlStatement, SqlExecutor, SqlStatement};
 use crate::db_first::{
@@ -6,9 +7,9 @@ use crate::db_first::{
 };
 use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column_with_compression};
-use crate::model::{DbBackendTypeMapper, Model, Row, Value, WritableModel};
+use crate::model::{DbBackendTypeMapper, Model, Value, WritableModel};
 use crate::query::builder::{
-    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
+    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, ProjectionSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
@@ -27,7 +28,7 @@ use crate::{
 use chrono::{Datelike, Timelike};
 use mysql_async::Pool;
 use mysql_async::prelude::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
@@ -94,6 +95,16 @@ fn mysql_returning_unsupported() -> crate::OrmerError {
     }
 }
 
+/// MySQL 厂商错误码结构化提取（L10）：`Error::Server(ServerError)` 携带
+/// 精确的 code（1062 唯一冲突、1213 死锁等），在 trace 包装层拍平成
+/// 字符串前提取，文本启发式仅兜底。
+fn mysql_server_error_code(error: &mysql_async::Error) -> Option<String> {
+    match error {
+        mysql_async::Error::Server(server) => Some(server.code.to_string()),
+        _ => None,
+    }
+}
+
 async fn traced_mysql_query(
     conn: &mut mysql_async::Conn,
     sql: &str,
@@ -104,7 +115,11 @@ async fn traced_mysql_query(
             trace.finish_ok();
             Ok(rows)
         }
-        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::query", error)),
+        Err(error) => {
+            let code = mysql_server_error_code(&error);
+            let error = trace.finish_external_error("mysql_async::Conn::query", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -115,7 +130,11 @@ async fn traced_mysql_query_drop(conn: &mut mysql_async::Conn, sql: &str) -> cra
             trace.finish_ok();
             Ok(())
         }
-        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::query_drop", error)),
+        Err(error) => {
+            let code = mysql_server_error_code(&error);
+            let error = trace.finish_external_error("mysql_async::Conn::query_drop", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -134,7 +153,11 @@ async fn traced_mysql_exec(
             trace.finish_ok();
             Ok(rows)
         }
-        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::exec", error)),
+        Err(error) => {
+            let code = mysql_server_error_code(&error);
+            let error = trace.finish_external_error("mysql_async::Conn::exec", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -153,7 +176,11 @@ async fn traced_mysql_exec_drop(
             trace.finish_ok();
             Ok(())
         }
-        Err(error) => Err(trace.finish_external_error("mysql_async::Conn::exec_drop", error)),
+        Err(error) => {
+            let code = mysql_server_error_code(&error);
+            let error = trace.finish_external_error("mysql_async::Conn::exec_drop", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -530,6 +557,130 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
     }
 }
 
+/// 清空表执行器：生成 `TRUNCATE TABLE t`。
+pub struct TruncateTableExecutor<'a, T: crate::model::WritableModel> {
+    pool: ExecutorConn<'a>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            DbType::MySQL,
+            format!(
+                "TRUNCATE TABLE {}",
+                common_helpers::quote_table_name::<T>(DbType::MySQL)
+            ),
+            Vec::new(),
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: crate::model::WritableModel> SqlExecutor for TruncateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        TruncateTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        let mut lease = self.pool.lease().await?;
+        for statement in sql.statements {
+            traced_mysql_query_drop(lease.conn()?, &statement.sql).await?;
+        }
+        Ok(())
+    }
+}
+
+/// MySQL 插入语句渲染（执行器与连接池共用入口，R7/L12）：按绑定参数上限
+/// 分块的 VALUES 语句组，conflict 子句由公共 helper 追加。
+pub(crate) fn mysql_insert_to_sql<M: Model>(
+    refs: &[&M],
+    conflict: Option<&InsertConflict>,
+) -> crate::Result<SqlStatement> {
+    if refs.is_empty() {
+        return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+    }
+
+    let statements = common_helpers::build_insert_statements_with_conflict::<M>(
+        DbType::MySQL,
+        refs,
+        conflict,
+    )?;
+
+    Ok(SqlStatement::batch(
+        DbType::MySQL,
+        statements
+            .into_iter()
+            .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+            .collect(),
+    ))
+}
+
+/// MySQL upsert（`ON DUPLICATE KEY UPDATE`）语句渲染（执行器与连接池共用）：
+/// 自增感知 + 按绑定参数上限分块，全主键模型退化为 INSERT IGNORE。
+pub(crate) fn mysql_insert_or_update_to_sql<M: Model>(
+    refs: &[&M],
+) -> crate::Result<SqlStatement> {
+    if refs.is_empty() {
+        return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+    }
+
+    let statements = build_mysql_upsert_statements::<M>(refs)?;
+
+    Ok(SqlStatement::batch(
+        DbType::MySQL,
+        statements
+            .into_iter()
+            .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+            .collect(),
+    ))
+}
+
+/// MySQL `INSERT IGNORE` 语句渲染（执行器与连接池共用）：写入全部列
+/// （含主键），按全列数分块。
+pub(crate) fn mysql_insert_or_ignore_to_sql<M: Model>(
+    refs: &[&M],
+) -> crate::Result<SqlStatement> {
+    if refs.is_empty() {
+        return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
+    }
+
+    let columns = M::columns();
+    let statements = common_helpers::build_chunked_insert_statements_for_columns::<M>(
+        DbType::MySQL,
+        columns.len(),
+        refs,
+        |chunk| {
+            let (sql, params) = common_helpers::build_batch_insert_statement::<M>(
+                DbType::MySQL,
+                "INSERT IGNORE INTO",
+                M::table_name_for_db(DbType::MySQL),
+                &columns,
+                chunk,
+                common_helpers::BatchInsertValuesMode::All,
+            );
+            Ok(common_helpers::InsertSqlStatement {
+                sql,
+                params,
+                row_count: chunk.len(),
+            })
+        },
+    )?;
+
+    Ok(SqlStatement::batch(
+        DbType::MySQL,
+        statements
+            .into_iter()
+            .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
+            .collect(),
+    ))
+}
+
 /// 插入执行器
 pub struct InsertExecutor<'a, I: crate::model::Insertable> {
     pool: ExecutorConn<'a>,
@@ -542,24 +693,7 @@ impl_insert_conflict_methods!(InsertExecutor, with_conflict);
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
-        }
-
-        let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
-            DbType::MySQL,
-            &refs,
-            self.conflict.as_ref(),
-        )?;
-
-        Ok(SqlStatement::batch(
-            DbType::MySQL,
-            statements
-                .into_iter()
-                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
-                .collect(),
-        ))
+        mysql_insert_to_sql::<I::Model>(&self.models.as_refs(), self.conflict.as_ref())
     }
 
     /// 执行插入并返回自增主键值。
@@ -708,22 +842,9 @@ pub struct InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
-        }
-
         // 原生 ON DUPLICATE KEY upsert（与事务版语义一致）：
         // 冲突更新排除主键列，全主键模型退化为 INSERT IGNORE
-        let statements = build_mysql_upsert_statements::<I::Model>(&refs)?;
-
-        Ok(SqlStatement::batch(
-            DbType::MySQL,
-            statements
-                .into_iter()
-                .map(|statement| SingleSqlStatement::new(statement.sql, statement.params))
-                .collect(),
-        ))
+        mysql_insert_or_update_to_sql::<I::Model>(&self.models.as_refs())
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -764,21 +885,8 @@ pub struct InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
-        }
-
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::MySQL,
-            "INSERT IGNORE INTO",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL),
-            I::Model::COLUMNS,
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+        // MySQL 的 INSERT IGNORE 写入全部列（含主键），按全列数分块
+        mysql_insert_or_ignore_to_sql::<I::Model>(&self.models.as_refs())
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -799,10 +907,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         }
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
         let mut lease = self.pool.lease().await?;
-        traced_mysql_exec_drop(lease.conn()?, &statement.sql, params, &statement.params).await?;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_mysql_exec_drop(lease.conn()?, &statement.sql, params, &statement.params)
+                .await?;
+        }
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -1385,7 +1496,7 @@ impl Database {
         Ok(())
     }
 
-    /// 批量插入或忽略记录（遇到重复键时忽略）
+    /// 批量插入或忽略记录（遇到重复键时忽略；按全列数分块）
     pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
@@ -1394,18 +1505,33 @@ impl Database {
         let mut lease = self.executor_conn().lease().await?;
 
         // 构建批量插入或忽略的 SQL: INSERT IGNORE INTO table (cols) VALUES (...), (...)
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+        // MySQL 的 INSERT IGNORE 写入全部列（含主键），按全列数分块
+        let columns = T::columns();
+        let statements = common_helpers::build_chunked_insert_statements_for_columns::<T>(
             DbType::MySQL,
-            "INSERT IGNORE INTO",
-            T::table_name_for_db(DbType::MySQL),
-            T::COLUMNS,
+            columns.len(),
             models,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        let params = values_to_params(&all_values)?;
-
-        traced_mysql_exec_drop(lease.conn()?, &sql, params, &all_values).await?;
+            |chunk| {
+                let (sql, params) = common_helpers::build_batch_insert_statement::<T>(
+                    DbType::MySQL,
+                    "INSERT IGNORE INTO",
+                    T::table_name_for_db(DbType::MySQL),
+                    &columns,
+                    chunk,
+                    common_helpers::BatchInsertValuesMode::All,
+                );
+                Ok(common_helpers::InsertSqlStatement {
+                    sql,
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        for statement in statements {
+            let params = values_to_params(&statement.params)?;
+            traced_mysql_exec_drop(lease.conn()?, &statement.sql, params, &statement.params)
+                .await?;
+        }
 
         Ok(())
     }
@@ -1420,9 +1546,9 @@ impl Database {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             pool: self.executor_conn(),
             _marker: PhantomData,
         }
@@ -1499,6 +1625,14 @@ impl Database {
     /// 删除表 - 返回执行器
     pub fn drop_table<T: WritableModel>(&self) -> DropTableExecutor<'_, T> {
         DropTableExecutor {
+            pool: self.executor_conn(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// 清空表数据 - 返回执行器（`TRUNCATE TABLE`）
+    pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
+        TruncateTableExecutor {
             pool: self.executor_conn(),
             _marker: std::marker::PhantomData,
         }
@@ -1980,8 +2114,11 @@ impl<'a> Transaction<'a> {
         Ok(conn.affected_rows())
     }
 
+    /// 接收器为 `&self`（R3：raw select 三路径合一，统一层 ConnRef 持共享
+    /// 引用）：事务由单一所有者持有，`lock().await` 无争用，与原
+    /// `&mut self + get_mut()` 路径行为等价。
     pub(crate) async fn select_raw<V, C>(
-        &mut self,
+        &self,
         sql: &str,
         params: Vec<Value>,
     ) -> crate::Result<C>
@@ -1989,9 +2126,8 @@ impl<'a> Transaction<'a> {
         V: crate::model::FromRowValues,
         C: FromIterator<V>,
     {
-        let conn = self
-            .conn
-            .get_mut()
+        let mut conn_guard = self.conn.lock().await;
+        let conn = conn_guard
             .as_mut()
             .ok_or_else(|| crate::ormer_error!("Transaction connection is unavailable"))?;
         let mysql_params = values_to_params(&params)?;
@@ -2000,6 +2136,7 @@ impl<'a> Transaction<'a> {
         } else {
             traced_mysql_exec(conn, sql, mysql_params, &params).await?
         };
+        drop(conn_guard);
 
         let mut results = Vec::new();
         for row in rows {
@@ -2054,9 +2191,9 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建分组聚合查询执行器（查询在事务连接上执行）
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             pool: ExecutorConn::Transaction(&self.conn),
             _marker: PhantomData,
         }
@@ -2155,20 +2292,9 @@ pub struct TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
 
 impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let refs = self.models.as_refs();
-        if refs.is_empty() {
-            return Ok(SqlStatement::batch(DbType::MySQL, Vec::new()));
-        }
-        let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::MySQL,
-            "INSERT IGNORE INTO",
-            <I::Model as Model>::table_name_for_db(DbType::MySQL),
-            I::Model::COLUMNS,
-            &refs,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+        // MySQL 的 INSERT IGNORE 写入全部列（含主键），按全列数分块
+        // （与非事务执行器共用同一渲染入口）
+        mysql_insert_or_ignore_to_sql::<I::Model>(&self.models.as_refs())
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -2191,8 +2317,6 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
-        let params = values_to_params(&statement.params)?;
 
         let conn = self
             .conn
@@ -2200,7 +2324,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
             .ok_or_else(|| {
                 crate::ormer_error!("Transaction already committed or rolled back")
             })?;
-        traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let params = values_to_params(&statement.params)?;
+            traced_mysql_exec_drop(conn, &statement.sql, params, &statement.params).await?;
+        }
 
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
@@ -2235,35 +2363,39 @@ pub struct SelectExecutor<'a, T: Model> {
     _marker: PhantomData<T>,
 }
 
-/// 映射查询结果执行器
-pub struct MappedSelectExecutor<'a, T: Model, V> {
-    select: crate::query::builder::MappedSelect<T, V>,
+/// Projection 查询执行器（字段投影与分组聚合合一）
+pub struct ProjectionSelectExecutor<'a, T: Model, V> {
+    select: ProjectionSelect<T, V>,
     pool: ExecutorConn<'a>,
     _marker: PhantomData<(T, V)>,
 }
 
-/// 分组聚合查询执行器
-pub struct GroupedSelectExecutor<'a, T: Model, V> {
-    select: GroupedSelect<T, V>,
-    pool: ExecutorConn<'a>,
-    _marker: PhantomData<(T, V)>,
-}
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type MappedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 
-impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
+
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
     pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
         self.select.try_to_sql_with_params(DbType::MySQL)
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> ProjectionCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
     {
-        MappedCollectFuture {
-            select: self.select.clone(),
-            pool: self.pool,
+        ProjectionCollectFuture {
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }
@@ -2276,6 +2408,45 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         self.select.as_model::<R>()
     }
 
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        Self {
+            select: self.select.group_by(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F, W>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
+    {
+        Self {
+            select: self.select.having(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F, W>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
+    {
+        Self {
+            select: self.select.filter(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
     /// 克隆executor（保持相同的pool引用）
     pub fn clone_with_pool(&self) -> Self {
         Self {
@@ -2286,19 +2457,30 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
-/// 映射查询收集Future
-pub struct MappedCollectFuture<'a, T: Model, V, C> {
-    select: crate::query::builder::MappedSelect<T, V>,
-    pool: ExecutorConn<'a>,
+/// Projection 收集 Future（字段投影与分组聚合合一）
+pub struct ProjectionCollectFuture<'a, T: Model, V, C> {
+    executor: ProjectionSelectExecutor<'a, T, V>,
     _marker: PhantomData<(T, V, C)>,
 }
+
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type MappedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
+
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type GroupedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
 
 impl<
     'a,
     T: Model + 'static + Send,
     V: crate::model::FromRowValues + 'static + Send,
     C: FromIterator<V> + 'static,
-> std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+> std::future::IntoFuture for ProjectionCollectFuture<'a, T, V, C>
 {
     type Output = crate::Result<C>;
     type IntoFuture =
@@ -2306,9 +2488,14 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
-
-            let mut lease = self.pool.lease().await?;
+            // 分组聚合路径与原 GroupedCollectFuture 一致不做前置校验；
+            // 无分组路径与原 MappedCollectFuture 一致走 try_ 校验。
+            let (sql, params) = if self.executor.select.is_grouped() {
+                self.executor.select.to_sql_with_params(DbType::MySQL)
+            } else {
+                self.executor.select.try_to_sql_with_params(DbType::MySQL)?
+            };
+            let mut lease = self.executor.pool.lease().await?;
 
             // 将ormer::Value转换为mysql_async::Params
             let mysql_params = values_to_params(&params)?;
@@ -2460,13 +2647,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 映射查询结果到自定义类型
-    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    pub fn map_to<F, M>(self, f: F) -> ProjectionSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(T::Where) -> M,
         M: crate::query::builder::MapToResult,
     {
         let mapped_select = self.select.map_to(f);
-        MappedSelectExecutor {
+        ProjectionSelectExecutor {
             select: mapped_select,
             pool: self.pool,
             _marker: PhantomData,
@@ -2487,13 +2674,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 选择列（支持聚合函数）- 转换为分组查询
-    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    pub fn select_column<F, V>(self, f: F) -> ProjectionSelectExecutor<'a, T, V>
     where
         F: FnOnce(T::Where) -> V,
         V: crate::query::builder::SelectColumnResult,
     {
         let grouped_select = self.select.select_column(f);
-        GroupedSelectExecutor {
+        ProjectionSelectExecutor {
             select: grouped_select,
             pool: self.pool,
             _marker: PhantomData,
@@ -2645,7 +2832,7 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (sql, params) = self.aggregate_select.to_sql_with_params(DbType::MySQL);
+            let (sql, params) = self.aggregate_select.try_to_sql_with_params(DbType::MySQL)?;
 
             // 将ormer::Value转换为mysql_async Value
             let mut lease = self.pool.lease().await?;
@@ -3139,7 +3326,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
     }
 
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
 
         let mysql_params = values_to_params(&params)?;
 
@@ -3190,8 +3377,14 @@ impl_backend_multi_table_executor_methods_with_lifetime!(
 );
 
 impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2> {
+    /// 多表查询的主表行收集入口（L18）：统一层 collect() 经此取回行数据，
+    /// 实现复用既有 collect_inner。
+    pub(crate) async fn collect_rows(self) -> crate::Result<Vec<T>> {
+        self.collect_inner().await
+    }
+
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
 
         let mysql_params = values_to_params(&params)?;
 
@@ -3274,8 +3467,14 @@ impl_backend_four_table_executor_methods_with_lifetime!(
 );
 
 impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, T, R1, R2, R3> {
+    /// 多表查询的主表行收集入口（L18）：统一层 collect() 经此取回行数据，
+    /// 实现复用既有 collect_inner。
+    pub(crate) async fn collect_rows(self) -> crate::Result<Vec<T>> {
+        self.collect_inner().await
+    }
+
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
-        let (sql, params) = self.select.to_sql_with_params(DbType::MySQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::MySQL)?;
         let mut lease = self.pool.lease().await?;
 
         let mysql_params = values_to_params(&params)?;
@@ -3284,122 +3483,10 @@ impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, 
             traced_mysql_exec(lease.conn()?, &sql, mysql_params, &params).await?;
 
         let mut results = Vec::new();
-        let column_schema = T::column_schema();
         for row in rows {
-            let mut data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let column_info = &column_schema[i];
-                let rust_type = column_info.rust_type;
-                let is_nullable = column_info.is_nullable;
-
-                let ormer_value = if is_uuid_rust_type(rust_type) {
-                    convert_mysql_uuid_value(&row, i)?
-                } else if is_nullable {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-                            let v: Option<i64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => crate::model::Value::Null,
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i).unwrap_or(None);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => crate::model::Value::Null,
-                                _ => crate::model::Value::Null,
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported nullable column type: {rust_type}"
-                            )));
-                        }
-                    }
-                } else {
-                    match rust_type {
-                        "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize" => {
-                            let v: Option<i64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Integer(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected integer type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "String" => {
-                            let v: Option<String> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Text(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected String type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "f32" | "f64" => {
-                            let v: Option<f64> = row.get(i);
-                            match v {
-                                Some(val) => crate::model::Value::Real(val),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected float type)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        "bool" => {
-                            let v: Option<i8> = row.get(i);
-                            match v {
-                                Some(1) => crate::model::Value::Integer(1),
-                                Some(0) => crate::model::Value::Integer(0),
-                                None => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (expected bool type)",
-                                        col_name
-                                    )));
-                                }
-                                _ => {
-                                    return Err(crate::ormer_error!(format!(
-                                        "Failed to parse non-nullable column '{}' (invalid bool value)",
-                                        col_name
-                                    )));
-                                }
-                            }
-                        }
-                        _ => {
-                            return Err(crate::ormer_error!(format!(
-                                "Unsupported column type: {rust_type}"
-                            )));
-                        }
-                    }
-                };
-                data.insert(col_name.to_string(), ormer_value);
-            }
-            let ormer_row = Row::new(data);
-            let model = T::from_row(&ormer_row)?;
+            let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                convert_mysql_model_value::<T>(&row, i)
+            })?;
             results.push(model);
         }
         Ok(results)
@@ -3498,102 +3585,20 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
-        let t_column_schema = T::column_schema();
-        let j_column_schema = J::column_schema();
 
         for row in rows {
-            let mut t_data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = t_column_schema[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" | "usize" | "isize" => {
-                        let v: i64 = row.get(i).unwrap_or(0);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(i).unwrap_or(String::new());
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(i).unwrap_or(0.0);
-                        crate::model::Value::Real(v)
-                    }
-                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, i)?,
-                    _ => {
-                        return Err(crate::ormer_error!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                t_data.insert(col_name.to_string(), ormer_value);
-            }
-            let t_model = T::from_row(&Row::new(t_data))?;
+            let t_model =
+                common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    convert_mysql_model_value::<T>(&row, i)
+                })?;
 
             // 尝试读取 J 的列
-            let mut j_data = HashMap::new();
-            let mut j_is_null = true;
-            for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                let idx = t_col_count + i;
-                let rust_type = j_column_schema[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" | "usize" | "isize" => {
-                        // 先检查是否为 NULL
-                        match row.get_opt::<i64, usize>(idx) {
-                            None | Some(Err(_)) => crate::model::Value::Integer(0),
-                            Some(Ok(v)) => {
-                                if v != 0 {
-                                    j_is_null = false;
-                                }
-                                crate::model::Value::Integer(v)
-                            }
-                        }
-                    }
-                    "String" => {
-                        // 先检查是否为 NULL
-                        match row.get_opt::<String, usize>(idx) {
-                            None | Some(Err(_)) => crate::model::Value::Text(String::new()),
-                            Some(Ok(v)) => {
-                                if !v.is_empty() {
-                                    j_is_null = false;
-                                }
-                                crate::model::Value::Text(v)
-                            }
-                        }
-                    }
-                    "f32" | "f64" => {
-                        // 先检查是否为 NULL
-                        match row.get_opt::<f64, usize>(idx) {
-                            None | Some(Err(_)) => crate::model::Value::Real(0.0),
-                            Some(Ok(v)) => {
-                                if v != 0.0 {
-                                    j_is_null = false;
-                                }
-                                crate::model::Value::Real(v)
-                            }
-                        }
-                    }
-                    "Uuid" | "uuid::Uuid" => {
-                        let value = convert_mysql_uuid_value(&row, idx)?;
-                        if !matches!(value, crate::model::Value::Null) {
-                            j_is_null = false;
-                        }
-                        value
-                    }
-                    _ => {
-                        return Err(crate::ormer_error!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                j_data.insert(col_name.to_string(), ormer_value);
-            }
+            let j_model = common_helpers::decode_optional_model_from_indexed_values::<J, _>(
+                t_col_count,
+                |i| convert_mysql_model_value_at::<J>(&row, i, i - t_col_count),
+            )?;
 
-            if j_is_null {
-                results.push((t_model, None));
-            } else {
-                let j_model = J::from_row(&Row::new(j_data))?;
-                results.push((t_model, Some(j_model)));
-            }
+            results.push((t_model, j_model));
         }
 
         Ok(results.into_iter().collect())
@@ -3650,65 +3655,16 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
 
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
-        let t_column_schema = T::column_schema();
-        let j_column_schema = J::column_schema();
 
         for row in rows {
-            let mut t_data = HashMap::new();
-            for (i, col_name) in T::COLUMNS.iter().enumerate() {
-                let rust_type = t_column_schema[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" | "usize" | "isize" => {
-                        let v: i64 = row.get(i).unwrap_or(0);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(i).unwrap_or(String::new());
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(i).unwrap_or(0.0);
-                        crate::model::Value::Real(v)
-                    }
-                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, i)?,
-                    _ => {
-                        return Err(crate::ormer_error!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                t_data.insert(col_name.to_string(), ormer_value);
-            }
-            let t_model = T::from_row(&Row::new(t_data))?;
-
-            let mut j_data = HashMap::new();
-            for (i, col_name) in J::COLUMNS.iter().enumerate() {
-                let idx = t_col_count + i;
-                let rust_type = j_column_schema[i].rust_type;
-                let ormer_value = match rust_type {
-                    "i32" | "i64" | "u32" | "u64" | "usize" | "isize" => {
-                        let v: i64 = row.get(idx).unwrap_or(0);
-                        crate::model::Value::Integer(v)
-                    }
-                    "String" => {
-                        let v: String = row.get(idx).unwrap_or(String::new());
-                        crate::model::Value::Text(v)
-                    }
-                    "f32" | "f64" => {
-                        let v: f64 = row.get(idx).unwrap_or(0.0);
-                        crate::model::Value::Real(v)
-                    }
-                    "Uuid" | "uuid::Uuid" => convert_mysql_uuid_value(&row, idx)?,
-                    _ => {
-                        return Err(crate::ormer_error!(format!(
-                            "Unsupported column type: {rust_type}"
-                        )));
-                    }
-                };
-                j_data.insert(col_name.to_string(), ormer_value);
-            }
-
-            let j_model = J::from_row(&Row::new(j_data))?;
+            let t_model =
+                common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
+                    convert_mysql_model_value::<T>(&row, i)
+                })?;
+            let j_model =
+                common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
+                    convert_mysql_model_value_at::<J>(&row, i, i - t_col_count)
+                })?;
             results.push((t_model, j_model));
         }
 
@@ -3741,12 +3697,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
 pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
     executor: RightJoinedSelectExecutor<'a, T, J>,
     _marker: PhantomData<(T, J)>,
-}
-
-/// Grouped Collect future（分组聚合查询）
-pub struct GroupedCollectFuture<'a, T: Model, V, C> {
-    executor: GroupedSelectExecutor<'a, T, V>,
-    _marker: PhantomData<(T, V, C)>,
 }
 
 impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
@@ -3791,41 +3741,6 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 }
 
-fn is_uuid_rust_type(rust_type: &str) -> bool {
-    matches!(rust_type, "Uuid" | "uuid::Uuid")
-}
-
-fn convert_mysql_uuid_value(
-    row: &mysql_async::Row,
-    index: usize,
-) -> crate::Result<crate::model::Value> {
-    let value = row
-        .get::<Option<mysql_async::Value>, _>(index)
-        .unwrap_or(None);
-
-    match value {
-        Some(mysql_async::Value::NULL) | None => Ok(crate::model::Value::Null),
-        Some(mysql_async::Value::Bytes(bytes)) => {
-            let raw = String::from_utf8(bytes).map_err(|err| {
-                crate::ormer_error!(
-                    "Failed to decode MySQL UUID column {} as UTF-8: {}",
-                    index,
-                    err
-                )
-            })?;
-            uuid::Uuid::parse_str(raw.trim())
-                .map(crate::model::Value::Uuid)
-                .map_err(|err| {
-                    crate::ormer_error!("Failed to parse MySQL UUID column {}: {}", index, err)
-                })
-        }
-        Some(_) => Err(crate::ormer_error!(
-            "Failed to decode MySQL UUID column {} from non-text value",
-            index
-        )),
-    }
-}
-
 /// 模型路径的列值解码入口（带 rust_type）。
 fn convert_mysql_model_value<T: Model>(
     row: &mysql_async::Row,
@@ -3841,6 +3756,40 @@ fn mysql_value_int(value: &mysql_async::Value) -> Option<i64> {
         mysql_async::Value::UInt(u) => Some(*u as i64),
         _ => None,
     }
+}
+
+/// DECIMAL 列元数据判定：SUM/AVG 等聚合在 MySQL 返回 DECIMAL 列，
+/// 二进制协议下以文本 Bytes 返回。
+fn mysql_is_decimal_column(row: &mysql_async::Row, index: usize) -> bool {
+    use mysql_async::consts::ColumnType;
+    row.columns().get(index).is_some_and(|col| {
+        matches!(
+            col.column_type(),
+            ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL
+        )
+    })
+}
+
+/// DECIMAL 列文本（如 SUM 聚合的 "110"）无损落到整数模型字段；
+/// 带非零小数位（如 AVG 的 "36.667"）返回 None，由 strict helper 报错。
+fn mysql_decimal_int_text(value: &mysql_async::Value) -> Option<i64> {
+    let mysql_async::Value::Bytes(bytes) = value else {
+        return None;
+    };
+    let text = std::str::from_utf8(bytes).ok()?;
+    if let Ok(int) = text.parse::<i64>() {
+        return Some(int);
+    }
+    let real = text.parse::<f64>().ok()?;
+    (real.fract() == 0.0).then_some(real as i64)
+}
+
+/// DECIMAL 列文本落到浮点模型字段（如 AVG 聚合的 "36.667"）。
+fn mysql_decimal_real_text(value: &mysql_async::Value) -> Option<f64> {
+    let mysql_async::Value::Bytes(bytes) = value else {
+        return None;
+    };
+    std::str::from_utf8(bytes).ok()?.parse::<f64>().ok()
 }
 
 fn mysql_value_real(value: &mysql_async::Value) -> Option<f64> {
@@ -3894,38 +3843,12 @@ fn mysql_value_string(value: &mysql_async::Value, rust_type: &str) -> Option<Str
     }
 }
 
-/// 公共 strict helper（parse_column_value_strict）覆盖的 rust_type 集合。
-fn is_mysql_strict_rust_type(rust_type: &str) -> bool {
+/// 字符串数组列（写入侧 stringify_string_vec 存文本）：显式按文本解码，
+/// 不落数值嗅探——单元素 "123" 必须仍解码为文本。
+fn is_mysql_vec_string_type(rust_type: &str) -> bool {
     matches!(
         rust_type,
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "String"
-            | "f32"
-            | "f64"
-            | "Decimal"
-            | "rust_decimal::Decimal"
-            | "BigDecimal"
-            | "bigdecimal::BigDecimal"
-            | "bool"
-            | "Uuid"
-            | "uuid::Uuid"
-            | "Vec<u8>"
-            | "&[u8]"
-            | "DateTime"
-            | "chrono::DateTime"
-            | "chrono::DateTime<chrono::Utc>"
-            | "NaiveDateTime"
-            | "chrono::NaiveDateTime"
-            | "NaiveDate"
-            | "chrono::NaiveDate"
-            | "NaiveTime"
-            | "chrono::NaiveTime"
+        "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>"
     )
 }
 
@@ -4007,20 +3930,48 @@ fn convert_mysql_model_value_at<T: Model>(
                     )
                 });
         }
+        // 字符串数组列以 stringify_string_vec 文本存储，按文本解码
+        // （FromValue for Vec<String> 接受 Text），不落数值嗅探
+        _ if is_mysql_vec_string_type(rust_type) => {
+            return mysql_value_bytes(&value)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .map(crate::model::Value::Text)
+                .ok_or_else(|| {
+                    crate::ormer_error!(
+                        "Failed to parse column '{}' (expected string array text)",
+                        column.name
+                    )
+                });
+        }
         // 未知自定义类型：保持历史无类型解码
-        _ if !is_mysql_strict_rust_type(rust_type) => {
+        _ if !ddl_introspection::is_strict_rust_type(rust_type) => {
             return convert_mysql_value(row, row_index);
         }
         _ => {}
     }
 
+    // DECIMAL 聚合列（SUM/AVG）按列元数据放行到整数/浮点模型字段；
+    // VARCHAR 等文本列仍不做数值嗅探。
+    let is_decimal_col = mysql_is_decimal_column(row, row_index);
     common_helpers::parse_column_value_strict(
         rust_type,
         column.is_nullable,
         column.name,
-        || mysql_value_int(&value),
+        || {
+            mysql_value_int(&value).or_else(|| {
+                is_decimal_col
+                    .then(|| mysql_decimal_int_text(&value))
+                    .flatten()
+            })
+        },
         || mysql_value_string(&value, rust_type),
-        || mysql_value_real(&value),
+        || {
+            mysql_value_real(&value).or_else(|| {
+                is_decimal_col
+                    .then(|| mysql_decimal_real_text(&value))
+                    .flatten()
+            })
+        },
         || mysql_value_bool(&value),
         || mysql_value_bytes(&value),
         || mysql_value_datetime(&value),
@@ -4047,12 +3998,7 @@ fn convert_mysql_value(row: &mysql_async::Row, index: usize) -> crate::Result<cr
                 | ColumnType::MYSQL_TYPE_VAR_STRING
         ) && col.character_set() == 63 // 63 = binary charset
     });
-    let is_decimal_col = row.columns().get(index).is_some_and(|col| {
-        matches!(
-            col.column_type(),
-            ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL
-        )
-    });
+    let is_decimal_col = mysql_is_decimal_column(row, index);
 
     match value {
         Some(Value::NULL) | None => Ok(crate::model::Value::Null),
@@ -4131,109 +4077,3 @@ fn convert_mysql_value(row: &mysql_async::Row, index: usize) -> crate::Result<cr
     }
 }
 
-impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
-    /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
-    where
-        T: 'static,
-        V: crate::model::FromRowValues + 'static,
-    {
-        GroupedCollectFuture {
-            executor: GroupedSelectExecutor {
-                select: self.select.clone(),
-                pool: self.pool,
-                _marker: PhantomData,
-            },
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
-    where
-        T: Send + Sync + 'static,
-        V: Send + Sync + 'static,
-    {
-        self.select.as_model::<R>()
-    }
-
-    /// 添加 GROUP BY 字段
-    pub fn group_by<F, G>(self, f: F) -> Self
-    where
-        F: FnOnce(<T as Model>::Where) -> G,
-        G: crate::query::builder::GroupByColumns,
-    {
-        Self {
-            select: self.select.group_by(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加 HAVING 条件
-    pub fn having<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(<T as Model>::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        Self {
-            select: self.select.having(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        Self {
-            select: self.select.filter(f),
-            pool: self.pool,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<
-    'a,
-    T: Model + 'static + Send,
-    V: crate::model::FromRowValues + 'static + Send,
-    C: FromIterator<V> + 'static,
-> std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
-{
-    type Output = crate::Result<C>;
-    type IntoFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let (sql, params) = self.executor.select.to_sql_with_params(DbType::MySQL);
-            let mut lease = self.executor.pool.lease().await?;
-
-            // 将ormer::Value转换为mysql_async::Params
-            let mysql_params: Vec<mysql_async::Value> = params
-                .iter()
-                .map(mysql_value_from_ormer_value)
-                .collect::<crate::Result<_>>()?;
-
-            let rows: Vec<mysql_async::Row> = if mysql_params.is_empty() {
-                traced_mysql_query(lease.conn()?, &sql).await?
-            } else {
-                traced_mysql_exec(lease.conn()?, &sql, mysql_params, &params).await?
-            };
-
-            let mut results = Vec::new();
-            let column_count = self.executor.select.column_count();
-            for row in rows {
-                let v = common_helpers::decode_row_values_from_indexed_values(column_count, |i| {
-                    convert_mysql_value(&row, i)
-                })?;
-                results.push(v);
-            }
-
-            Ok(results.into_iter().collect())
-        })
-    }
-}

@@ -1,5 +1,17 @@
 /// 数据库抽象层模块
 /// 根据运行时指定的数据库类型选择对应的数据库后端
+// 该 trait 为下方 sql_type 各 cfg 分支的完全限定调用提供作用域；
+// 仅启用不实现 TypeMapper 的后端（如 influxdb-only）时未被使用。
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "clickhouse"
+    )),
+    allow(unused_imports)
+)]
 use crate::model::DbBackendTypeMapper;
 
 #[cfg(feature = "sqlite")]
@@ -166,21 +178,31 @@ impl DbType {
 pub use common::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
     BlockDeleteExecutor, BlockDeleteResult, CollectFuture, CreateTableExecutor, Database,
-    DbExecutor, DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
-    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
-    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
-    InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
-    InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    PooledRawSelectExecutor, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    DatabaseScope, DbExecutor, DeleteExecutor, DerivedTableCollectFuture,
+    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
+    DropTableExecutor, FirstFuture, FourTableCountFuture, IncludedCollectFuture,
+    IncludedSelectExecutor, InnerJoinedSelectExecutor, InsertExecutor, InsertGraphExecutor,
+    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel,
+    LeftJoinCollectFuture, LeftJoinedSelectExecutor, ModelCollectWithFuture,
+    MultiTableCountFuture, NestedInclude, ProjectionCollectFuture, ProjectionSelectExecutor,
+    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedCountFuture,
     RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder,
-    SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
-    SelectStreamIterator, SingleSqlStatement, SqlExecutor, SqlStatement, Transaction,
-    TransactionFuture, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
-    TransactionInsertOrUpdateExecutor, TransactionOptions, TransactionRawCollectFuture,
-    TransactionRawSelectExecutor, TransactionSaveExecutor, TruncateTableExecutor, UpdateExecutor,
-    UpdateGraphExecutor,
-    WithoutHooksExecutor,
+    RightJoinedSelectExecutor, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
+    SqlStatement, Transaction, TransactionFuture, TransactionOptions, TruncateTableExecutor,
+    UnionSelectExecutor, UpdateExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
+};
+
+// 旧类型名过渡别名（已合并，保留 re-export 以兼容现有导入路径）：
+// - Mapped/Grouped* → Projection*（R2）
+// - Transaction*Insert* / TransactionRaw* / TransactionSave* → 合并入对应普通执行器（R3）
+// - PooledRawSelectExecutor → RawSelectExecutor（R3）
+#[allow(deprecated)]
+pub use common::{
+    GroupedCollectFuture, GroupedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
+    PooledRawSelectExecutor, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    TransactionSaveExecutor,
 };
 
 pub use common::{

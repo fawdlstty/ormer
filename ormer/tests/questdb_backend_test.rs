@@ -91,7 +91,8 @@ fn questdb_create_table_partition_unit_follows_duration_mapping() {
     }
 
     let sql = generate_create_table_sql_with_name::<QuestDbMonthly>(DbType::QuestDB, None).unwrap();
-    assert!(sql.ends_with("timestamp(at) PARTITION BY MONTH"), "SQL: {sql}");
+    // `at` 是保留字列名，designated timestamp 子句与列定义一致地引号化
+    assert!(sql.ends_with("timestamp(\"at\") PARTITION BY MONTH"), "SQL: {sql}");
 
     // 半小时时长映射为小时分区
     #[derive(Debug, ormer::Model)]
@@ -104,7 +105,7 @@ fn questdb_create_table_partition_unit_follows_duration_mapping() {
     }
 
     let sql = generate_create_table_sql_with_name::<QuestDbHourly>(DbType::QuestDB, None).unwrap();
-    assert!(sql.ends_with("timestamp(at) PARTITION BY HOUR"), "SQL: {sql}");
+    assert!(sql.ends_with("timestamp(\"at\") PARTITION BY HOUR"), "SQL: {sql}");
 }
 
 #[test]

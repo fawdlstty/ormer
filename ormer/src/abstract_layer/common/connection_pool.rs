@@ -1,11 +1,22 @@
 use super::super::DbType;
+// 池化 insert 系执行器的语句构建仅在有本地写后端的组合中使用
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_imports)
+)]
 use super::common_helpers;
 use super::{DbExecutor, SqlExecutor, SqlStatement};
 use crate::impl_insert_conflict_methods;
-use crate::model::{FromRowValues, Model, RelationSelection, WritableModel};
+use crate::model::{Model, RelationSelection, WritableModel};
 use crate::query::builder::{ContextFilter, NamedFilterQuery, WhereExpr};
 use crate::query::insert::InsertConflict;
-use crate::raw_sql::{IntoRawSql, RawSql};
+use crate::raw_sql::IntoRawSql;
 #[cfg(any(
     feature = "sqlite",
     feature = "mssql",
@@ -58,9 +69,12 @@ use tokio_postgres::NoTls;
     feature = "influxdb"
 ))]
 use super::unified::{
-    CreateTableExecutor, DropTableExecutor, RelationNestedLoader, ScopedDeleteExecutor,
-    ScopedUpdateExecutor, primary_key_filter, relation_owner_key,
+    ConnRefMut, CreateTableExecutor, DropTableExecutor, InsertPartialExecutor,
+    RelationNestedLoader, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    TruncateTableExecutor, apply_transaction_options_or_rollback, exec_raw_sql_on,
+    find_by_id_with_executor, find_related_with_executor, preload_with_executor, run_txn_closure,
 };
+use crate::model::Tracked;
 
 /// 连接池插入执行器
 pub struct PooledInsertExecutor<'a, I: crate::model::Insertable> {
@@ -359,82 +373,59 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
         }
 
         match self.pooled_conn.get_connection() {
+            // 各后端 to_sql 与池层共用同一渲染入口（自增主键拆分、按绑定参数
+            // 上限分块、标识符引用均由 common_helpers 统一生成），保证池层
+            // to_sql 输出与后端 execute 路径逐字一致。
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(_) => {
-                let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::Sqlite,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-                );
-
-                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-                let mut first = true;
-                for col_name in columns.iter() {
-                    if primary_key_columns.contains(col_name) {
-                        continue;
-                    }
-                    if !first {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&format!("{col_name} = excluded.{col_name}"));
-                    first = false;
-                }
-
-                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+                super::super::sqlite_backend::sqlite_insert_or_update_to_sql::<I::Model>(&refs)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(_) => {
-                let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::PostgreSQL,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-                );
-                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-                let mut first = true;
-                for col_name in columns.iter() {
-                    if primary_key_columns.contains(col_name) {
-                        continue;
-                    }
-                    if !first {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&format!("{col_name} = EXCLUDED.{col_name}"));
-                    first = false;
-                }
-                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-                    .iter()
-                    .filter(|col| !col.is_auto_increment)
-                    .map(|col| col.data_type.unwrap_or(col.rust_type))
-                    .collect();
+                // 与 postgresql_backend::InsertOrUpdateExecutor::to_sql 调用同一组
+                // common_helpers（后端未暴露共享入口，池层按相同算法组装）。
+                let statements =
+                    common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
+                        DbType::PostgreSQL,
+                        "INSERT INTO",
+                        <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+                        &refs,
+                        |sql, columns| {
+                            common_helpers::append_standard_upsert_clause::<I::Model>(
+                                DbType::PostgreSQL,
+                                sql,
+                                columns,
+                            )
+                        },
+                    )?;
                 Ok(SqlStatement::batch(
                     DbType::PostgreSQL,
-                    vec![
-                        super::SingleSqlStatement::new(sql, all_values)
-                            .with_param_rust_types(rust_types),
-                    ],
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            let rust_types = pg_upsert_param_rust_types_for::<I::Model>(
+                                statement.row_count,
+                                &statement.columns,
+                            );
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                                .with_param_rust_types(rust_types)
+                        })
+                        .collect(),
                 ))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(_) => {
                 // 与 mysql_backend::InsertOrUpdateExecutor 同款语义：
                 // 冲突更新排除主键列，自增主键未设置的行纯插入，全主键模型退化为 INSERT IGNORE
+                super::super::mysql_backend::mysql_insert_or_update_to_sql::<I::Model>(&refs)
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(_) => {
+                // 与 mssql 后端 to_sql 同源：按参数上限（2100）分块的 MERGE 语句组
                 let statements =
-                    super::super::mysql_backend::build_mysql_upsert_statements::<I::Model>(&refs)?;
-
+                    common_helpers::build_mssql_merge_statements::<I::Model>(&refs, true)?;
                 Ok(SqlStatement::batch(
-                    DbType::MySQL,
+                    DbType::MSSQL,
                     statements
                         .into_iter()
                         .map(|statement| {
@@ -443,40 +434,9 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrUpdateExecutor<'a, I> {
                         .collect(),
                 ))
             }
-            #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(_) => {
-                let (mut sql, all_values) =
-                    common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-                common_helpers::append_mssql_merge_update_clause::<I::Model>(&mut sql);
-                common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
-            }
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(_) => {
-                let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::DuckDB,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::DuckDB),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-                );
-                sql.push_str(&format!(" ON CONFLICT ({}) DO UPDATE SET ", primary_key));
-                let mut first = true;
-                for col_name in columns.iter() {
-                    if primary_key_columns.contains(col_name) {
-                        continue;
-                    }
-                    if !first {
-                        sql.push_str(", ");
-                    }
-                    sql.push_str(&format!("{col_name} = excluded.{col_name}"));
-                    first = false;
-                }
-                Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+                super::super::duckdb_backend::duckdb_insert_or_update_to_sql::<I::Model>(&refs)
             }
             // 矩阵兜底：正常不可达（insert_conflict=false 已在上面拦截）。
             #[allow(unreachable_patterns)]
@@ -503,6 +463,16 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrUpdateExecut
         PooledInsertOrUpdateExecutor::to_sql(self)
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
         let db_type = db_type_for_connection(self.pooled_conn.get_connection());
         crate::Capabilities::ensure(
@@ -551,85 +521,83 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
         }
 
         match self.pooled_conn.get_connection() {
+            // 各后端 to_sql 与池层共用同一渲染入口（按绑定参数上限分块、标识符
+            // 引用均由 common_helpers 统一生成），保证池层 to_sql 输出与后端
+            // execute 路径逐字一致。
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(_) => {
-                let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::Sqlite,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::Sqlite),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-                );
-
-                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-                Ok(SqlStatement::single(DbType::Sqlite, sql, all_values))
+                super::super::sqlite_backend::sqlite_insert_or_ignore_to_sql::<I::Model>(&refs)
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(_) => {
+                // 与 postgresql_backend::build_pg_insert_or_ignore_statements 调用同一组
+                // common_helpers（后端该函数为私有，池层按相同算法组装）。
                 let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
+                let primary_key = common_helpers::quote_column_list(
                     DbType::PostgreSQL,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+                    &I::Model::primary_key_columns(),
                 );
-                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-                let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-                    .iter()
-                    .filter(|col| !col.is_auto_increment)
-                    .map(|col| col.data_type.unwrap_or(col.rust_type))
-                    .collect();
+                let statements = common_helpers::build_chunked_insert_statements::<I::Model>(
+                    DbType::PostgreSQL,
+                    &refs,
+                    |chunk| {
+                        let (mut sql, params) =
+                            common_helpers::build_batch_insert_statement::<I::Model>(
+                                DbType::PostgreSQL,
+                                "INSERT INTO",
+                                <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+                                &columns,
+                                chunk,
+                                common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+                            );
+                        sql.push_str(" ON CONFLICT (");
+                        sql.push_str(&primary_key);
+                        sql.push_str(") DO NOTHING");
+                        Ok(common_helpers::InsertSqlStatement {
+                            sql,
+                            params,
+                            row_count: chunk.len(),
+                        })
+                    },
+                )?;
                 Ok(SqlStatement::batch(
                     DbType::PostgreSQL,
-                    vec![
-                        super::SingleSqlStatement::new(sql, all_values)
-                            .with_param_rust_types(rust_types),
-                    ],
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            let rust_types = pg_upsert_param_rust_types_for::<I::Model>(
+                                statement.row_count,
+                                &columns,
+                            );
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                                .with_param_rust_types(rust_types)
+                        })
+                        .collect(),
                 ))
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(_) => {
-                let (sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::MySQL,
-                    "INSERT IGNORE INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::MySQL),
-                    I::Model::COLUMNS,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::All,
-                );
-
-                Ok(SqlStatement::single(DbType::MySQL, sql, all_values))
+                // MySQL 的 INSERT IGNORE 写入全部列（含主键），按全列数分块
+                super::super::mysql_backend::mysql_insert_or_ignore_to_sql::<I::Model>(&refs)
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(_) => {
-                let (mut sql, all_values) =
-                    common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-                common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-                Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+                // 与 mssql 后端 to_sql 同源：按参数上限（2100）分块的 MERGE 语句组
+                let statements =
+                    common_helpers::build_mssql_merge_statements::<I::Model>(&refs, false)?;
+                Ok(SqlStatement::batch(
+                    DbType::MSSQL,
+                    statements
+                        .into_iter()
+                        .map(|statement| {
+                            super::SingleSqlStatement::new(statement.sql, statement.params)
+                        })
+                        .collect(),
+                ))
             }
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(_) => {
-                let columns = I::Model::insert_columns();
-                let primary_key_columns = I::Model::primary_key_columns();
-                let primary_key = primary_key_columns.join(", ");
-                let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-                    DbType::DuckDB,
-                    "INSERT INTO",
-                    <I::Model as Model>::table_name_for_db(DbType::DuckDB),
-                    &columns,
-                    &refs,
-                    common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-                );
-                sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-                Ok(SqlStatement::single(DbType::DuckDB, sql, all_values))
+                super::super::duckdb_backend::duckdb_insert_or_ignore_to_sql::<I::Model>(&refs)
             }
             // 矩阵兜底：正常不可达（insert_ignore=false 已在上面拦截）。
             #[allow(unreachable_patterns)]
@@ -668,6 +636,32 @@ fn db_type_for_connection(connection: &ConnectionWrapper) -> DbType {
     }
 }
 
+/// 按实际写入列推导 PostgreSQL upsert/ignore 语句的参数类型（行数 × 每行列类型）。
+///
+/// 与 `postgresql_backend::pg_upsert_param_rust_types` 保持同算法逐字对齐
+/// （该函数为后端私有，池层无法直接调用），保证池层 to_sql 产出的参数类型
+/// 与后端执行路径一致。
+#[cfg(feature = "postgresql")]
+fn pg_upsert_param_rust_types_for<T: Model>(
+    row_count: usize,
+    columns: &[&str],
+) -> Vec<&'static str> {
+    let per_row: Vec<&'static str> = columns
+        .iter()
+        .filter_map(|column| {
+            T::COLUMN_SCHEMA
+                .iter()
+                .find(|schema| schema.name == *column)
+                .map(|schema| schema.data_type.unwrap_or(schema.rust_type))
+        })
+        .collect();
+    let mut rust_types = Vec::with_capacity(row_count * per_row.len());
+    for _ in 0..row_count {
+        rust_types.extend(per_row.iter().copied());
+    }
+    rust_types
+}
+
 impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecutor<'a, I> {
     type Output = ();
 
@@ -675,6 +669,16 @@ impl<'a, I: crate::model::Insertable> SqlExecutor for PooledInsertOrIgnoreExecut
         PooledInsertOrIgnoreExecutor::to_sql(self)
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     async fn execute_with_sql(self, _sql: SqlStatement) -> crate::Result<Self::Output> {
         let db_type = db_type_for_connection(self.pooled_conn.get_connection());
         crate::Capabilities::ensure(db_type, |caps| caps.insert_ignore, "insert ignore")?;
@@ -726,8 +730,10 @@ use super::super::clickhouse_backend;
 use super::super::influxdb_backend;
 
 /// 连接包装器 - 包装各后端的 Database 实例
+/// （R3：raw select 三路径合一，池连接经 [`super::unified::ConnRef::Pooled`]
+/// 参与统一分派，故提升为 crate 可见）
 #[allow(clippy::upper_case_acronyms)]
-enum ConnectionWrapper {
+pub(crate) enum ConnectionWrapper {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::Database),
     #[cfg(feature = "postgresql")]
@@ -1165,6 +1171,9 @@ pub struct PoolBuilder {
     db_type: DbType,
     connection_string: String,
     config: PoolConfig,
+    /// 用户是否显式设置过 acquire_timeout（L29：显式设置时映射到
+    /// bb8 的 connection_timeout；默认值不映射，保持零行为变化）。
+    acquire_timeout_set: bool,
 }
 
 impl PoolBuilder {
@@ -1173,6 +1182,7 @@ impl PoolBuilder {
             db_type,
             connection_string: connection_string.to_string(),
             config: PoolConfig::default(),
+            acquire_timeout_set: false,
         }
     }
 
@@ -1186,10 +1196,16 @@ impl PoolBuilder {
     /// 设置获取连接的最长等待时间，超时返回 `OrmerError::Pool` 错误；
     /// 传入 `None` 表示无限等待。
     ///
-    /// 仅对使用内置手工连接池的后端生效
-    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    /// - 内置手工连接池的后端（sqlite/mssql/duckdb/clickhouse/influxdb）
+    ///   原生生效；
+    /// - PostgreSQL/TimescaleDB/QuestDB（bb8）：显式设置时映射到 bb8 的
+    ///   connection_timeout（默认 30s 不映射，保持 bb8 自身默认行为）；
+    /// - MySQL（mysql_async）：当前版本（0.37）的 `PoolOpts` 无获取超时项，
+    ///   显式设置非默认值时在 build 阶段返回明确的不支持错误，
+    ///   不再静默丢弃。
     pub fn acquire_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.config.acquire_timeout = timeout.into();
+        self.acquire_timeout_set = true;
         self
     }
 
@@ -1237,6 +1253,23 @@ impl PoolBuilder {
             DbType::QuestDB => self.build_postgres_like_pool().await,
             #[cfg(feature = "mysql")]
             DbType::MySQL => {
+                // mysql_async 0.37 的 PoolOpts 没有获取超时项（L29）：
+                // 显式设置的非默认 acquire_timeout 不再静默丢弃，
+                // 在 build 阶段返回明确错误（默认值不映射，零行为变化）。
+                if self.acquire_timeout_set
+                    && self.config.acquire_timeout
+                        != Some(Duration::from_secs(30))
+                {
+                    return Err(crate::OrmerError::Pool {
+                        backend: DbType::MySQL,
+                        message: format!(
+                            "mysql_async pool does not support acquire_timeout \
+                             (got {:?}); remove PoolBuilder::acquire_timeout or use \
+                             the manual-pool backends (sqlite/mssql/duckdb)",
+                            self.config.acquire_timeout
+                        ),
+                    });
+                }
                 let opts = crate::utils::ResultTraceExt::trace_for(
                     mysql_async::Opts::from_url(&self.connection_string),
                     "mysql_async::Opts::from_url",
@@ -1308,6 +1341,13 @@ impl PoolBuilder {
         if self.config.min_size > 0 {
             builder = builder.min_idle(Some(self.config.min_size));
         }
+        // L29：显式设置的 acquire_timeout 映射到 bb8 的 connection_timeout
+        // （获取/检出的最长等待）；默认 30s 不映射，保持 bb8 自身默认。
+        if self.acquire_timeout_set {
+            if let Some(timeout) = self.config.acquire_timeout {
+                builder = builder.connection_timeout(timeout);
+            }
+        }
         let pool = crate::utils::FutureTraceExt::trace(builder.build(manager)).await?;
         Ok(ConnectionPool::PostgreSQL(pool, self.db_type))
     }
@@ -1318,6 +1358,8 @@ pub struct ReplicatedPoolBuilder {
     write_connection: Option<String>,
     read_connections: Vec<String>,
     config: PoolConfig,
+    /// 用户是否显式设置过 acquire_timeout（与 PoolBuilder 同语义，L29）。
+    acquire_timeout_set: bool,
 }
 
 pub struct ReplicatedConnectionPool {
@@ -1334,6 +1376,7 @@ impl ReplicatedPoolBuilder {
             write_connection: None,
             read_connections: Vec::new(),
             config: PoolConfig::default(),
+            acquire_timeout_set: false,
         }
     }
 
@@ -1361,10 +1404,12 @@ impl ReplicatedPoolBuilder {
     /// 设置获取连接的最长等待时间，超时返回 `OrmerError::Pool` 错误；
     /// 传入 `None` 表示无限等待。
     ///
-    /// 仅对使用内置手工连接池的后端生效
-    /// （sqlite/mssql/duckdb/clickhouse/influxdb）。
+    /// 生效范围与 [`PoolBuilder::acquire_timeout`] 一致：手工池后端原生
+    /// 生效；PostgreSQL（bb8）显式设置时映射 connection_timeout；
+    /// MySQL（mysql_async 0.37）无对应项，显式非默认值 build 时报错。
     pub fn acquire_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.config.acquire_timeout = timeout.into();
+        self.acquire_timeout_set = true;
         self
     }
 
@@ -1402,6 +1447,7 @@ impl ReplicatedPoolBuilder {
             db_type: self.db_type,
             connection_string: write_connection,
             config: self.config.clone(),
+            acquire_timeout_set: self.acquire_timeout_set,
         }
         .build()
         .await?;
@@ -1413,6 +1459,7 @@ impl ReplicatedPoolBuilder {
                     db_type: self.db_type,
                     connection_string,
                     config: self.config.clone(),
+                    acquire_timeout_set: self.acquire_timeout_set,
                 }
                 .build()
                 .await?,
@@ -1664,66 +1711,8 @@ impl PooledConnectionInner {
     }
 }
 
-pub struct PooledRawSelectExecutor<'conn, 'pool, T> {
-    pooled_conn: &'conn PooledConnection<'pool>,
-    sql: RawSql,
-    _marker: PhantomData<T>,
-}
-
-impl<'conn, 'pool, T> PooledRawSelectExecutor<'conn, 'pool, T> {
-    pub async fn collect<C>(self) -> crate::Result<C>
-    where
-        T: FromRowValues,
-        C: FromIterator<T>,
-    {
-        let raw_sql = self.sql;
-        match self.pooled_conn.get_connection() {
-            #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => {
-                let (sql, params) = raw_sql.render(DbType::Sqlite)?;
-                db.select_raw::<T, C>(&sql, params).await
-            }
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::PostgreSQL)?;
-                db.select_raw::<T, C>(&sql, params).await
-            }
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::MySQL)?;
-                db.select_raw::<T, C>(&sql, params).await
-            }
-            #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::MSSQL)?;
-                db.select_raw::<T, C>(&sql, params).await
-            }
-            #[cfg(feature = "duckdb")]
-            ConnectionWrapper::DuckDB(db) => {
-                let (sql, params) = raw_sql.render(DbType::DuckDB)?;
-                db.select_raw::<T, C>(&sql, params).await
-            }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(db) => {
-                let rows = db
-                    .select_values(raw_sql, <T as FromRowValues>::row_columns())
-                    .await?;
-                rows.into_iter()
-                    .map(|values| <T as FromRowValues>::from_row_values(&values))
-                    .collect()
-            }
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(db) => {
-                let rows = db
-                    .select_values(raw_sql, <T as FromRowValues>::row_columns())
-                    .await?;
-                rows.into_iter()
-                    .map(|values| <T as FromRowValues>::from_row_values(&values))
-                    .collect()
-            }
-        }
-    }
-}
+// PooledRawSelectExecutor 已合并为 unified::RawSelectExecutor（R3：raw select
+// 三路径合一），旧名在 unified.rs 保留为 deprecated 类型别名。
 
 /// 统一的 PooledConnection
 /// 包装连接,实现 Database 的所有方法,Drop 时自动归还到池
@@ -1811,6 +1800,12 @@ impl<'a> PooledConnection<'a> {
     /// 获取底层连接的引用(内部使用)
     fn get_connection(&self) -> &ConnectionWrapper {
         self.connection.as_ref().expect("Connection already taken")
+    }
+
+    /// 连接的实际数据库类型（含 QuestDB 复用 PostgreSQL 连接的运行时判定，
+    /// 与统一层 `Database::db_type` 口径一致；供 save 等池连接入口使用）。
+    pub(crate) fn db_type(&self) -> DbType {
+        db_type_for_connection(self.get_connection())
     }
 
     /// 创建表 - 返回执行器
@@ -1907,6 +1902,93 @@ impl<'a> PooledConnection<'a> {
             pooled_conn: self,
             models,
             _marker: PhantomData,
+        }
+    }
+
+    /// 部分字段插入 - 返回执行器（L24：与 [`crate::Database::insert_partial`]
+    /// 对齐的池连接入口）。
+    pub fn insert_partial<T: WritableModel + Send + Sync>(&self) -> InsertPartialExecutor<'_, T> {
+        match self.get_connection() {
+            #[cfg(feature = "sqlite")]
+            ConnectionWrapper::Sqlite(db) => {
+                InsertPartialExecutor::Sqlite(db.insert_partial::<T>(), PhantomData)
+            }
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => {
+                InsertPartialExecutor::PostgreSQL(db.insert_partial::<T>())
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => InsertPartialExecutor::MySQL(db.insert_partial::<T>()),
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => InsertPartialExecutor::MSSQL(db.insert_partial::<T>()),
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                InsertPartialExecutor::DuckDB(db.insert_partial::<T>())
+            }
+            #[cfg(feature = "clickhouse")]
+            ConnectionWrapper::ClickHouse(_) => InsertPartialExecutor::Unsupported {
+                backend: DbType::ClickHouse,
+                feature: "partial Model insert on ClickHouse",
+                _marker: PhantomData,
+            },
+            #[cfg(feature = "influxdb")]
+            ConnectionWrapper::InfluxDB(_) => InsertPartialExecutor::Unsupported {
+                backend: DbType::InfluxDB,
+                feature: "insert_partial",
+                _marker: PhantomData,
+            },
+        }
+    }
+
+    /// 保存 tracked 模型的 dirty 变更 + 图关系同步（L24：与
+    /// [`crate::Database::save`] 对齐的池连接入口；写核心在池连接自开的
+    /// 事务上执行，结束时提交/回滚）。
+    pub fn save<'s, T: WritableModel + crate::model::GraphWritable>(
+        &'s self,
+        model: &'s mut Tracked<T>,
+    ) -> SaveExecutor<'s, T> {
+        SaveExecutor::from_pooled(self, model)
+    }
+
+    /// 清空表数据 - 返回执行器（`TRUNCATE TABLE`；L24：QuestDB 不支持
+    /// 行级 DELETE，这是池连接清空表数据的唯一受支持手段）。
+    ///
+    /// 以 [`crate::Capabilities::truncate`] 为准，QuestDB 复用 PostgreSQL
+    /// 连接、按运行时 db_type 判定（与 [`crate::Database::truncate_table`]
+    /// 一致），仍走 PostgreSQL 执行器分支。
+    pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
+        let db_type = db_type_for_connection(self.get_connection());
+        if !crate::Capabilities::of(db_type).truncate {
+            return TruncateTableExecutor::Unsupported {
+                backend: db_type,
+                feature: "truncate_table",
+                _marker: PhantomData,
+            };
+        }
+        match self.get_connection() {
+            #[cfg(feature = "postgresql")]
+            ConnectionWrapper::PostgreSQL(db) => {
+                TruncateTableExecutor::PostgreSQL(db.truncate_table::<T>())
+            }
+            #[cfg(feature = "mysql")]
+            ConnectionWrapper::MySQL(db) => {
+                TruncateTableExecutor::MySQL(db.truncate_table::<T>())
+            }
+            #[cfg(feature = "mssql")]
+            ConnectionWrapper::MSSQL(db) => {
+                TruncateTableExecutor::MSSQL(db.truncate_table::<T>())
+            }
+            #[cfg(feature = "duckdb")]
+            ConnectionWrapper::DuckDB(db) => {
+                TruncateTableExecutor::DuckDB(db.truncate_table::<T>())
+            }
+            // 矩阵兜底：正常不可达（truncate=false 已在上面拦截）。
+            #[allow(unreachable_patterns)]
+            _ => TruncateTableExecutor::Unsupported {
+                backend: db_type,
+                feature: "truncate_table",
+                _marker: PhantomData,
+            },
         }
     }
 
@@ -2068,6 +2150,13 @@ impl<'a> PooledConnection<'a> {
     }
 
     /// 创建 Related 查询执行器
+    ///
+    /// 与 `select::<T>().from::<R>()` 是同一功能的重复入口（L30）：
+    /// 请改用 `conn.select::<T>().from::<R>()`。
+    #[deprecated(
+        since = "0.2.12",
+        note = "use `select::<T>().from::<R>()` instead"
+    )]
     pub fn related<T: Model + 'static, R: Model>(
         &self,
     ) -> super::unified::RelatedSelectExecutor<'_, T, R> {
@@ -2164,38 +2253,15 @@ impl<'a> PooledConnection<'a> {
         &self,
         options: super::unified::TransactionOptions,
     ) -> crate::Result<super::unified::Transaction<'_>> {
-        // 两个互补 cfg 的通配臂在单后端编译组合下会触发 unreachable 警告
-        #[allow(unreachable_patterns)]
-        match self.get_connection() {
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => {
-                let txn = crate::utils::FutureTraceExt::trace(db.begin_with_opts(options)).await?;
-                Ok(super::unified::Transaction::MySQL(txn))
-            }
-            #[cfg(not(feature = "mysql"))]
-            _ => self.begin_then_apply(options).await,
-            #[cfg(feature = "mysql")]
-            _ => self.begin_then_apply(options).await,
+        // MySQL 的选项必须在 BEGIN 前下发（begin_with_opts），其余后端
+        // 走"先 BEGIN 再应用选项、失败回滚"的公共路径（L20：与
+        // Database::begin_opts 共用 apply_transaction_options_or_rollback）。
+        #[cfg(feature = "mysql")]
+        if let ConnectionWrapper::MySQL(db) = self.get_connection() {
+            let txn = crate::utils::FutureTraceExt::trace(db.begin_with_opts(options)).await?;
+            return Ok(super::unified::Transaction::MySQL(txn));
         }
-    }
-
-    #[allow(unused_variables)]
-    async fn begin_then_apply(
-        &self,
-        options: super::unified::TransactionOptions,
-    ) -> crate::Result<super::unified::Transaction<'_>> {
-        let mut txn = self.begin_raw().await?;
-        if let Err(err) = super::unified::apply_transaction_options(&mut txn, options).await {
-            // 回滚失败不覆盖主错误，但不能静默吞掉
-            if let Err(rollback_err) = txn.rollback().await {
-                eprintln!(
-                    "[ormer] failed to roll back transaction after applying options failed \
-                     (original error: {err}): {rollback_err}"
-                );
-            }
-            return Err(err);
-        }
-        Ok(txn)
+        apply_transaction_options_or_rollback(self.begin_raw().await?, options).await
     }
 
     pub async fn transaction<R, F>(&self, f: F) -> crate::Result<R>
@@ -2218,25 +2284,11 @@ impl<'a> PooledConnection<'a> {
             &'tx mut super::unified::Transaction<'_>,
         ) -> super::unified::TransactionFuture<'tx, R>,
     {
-        // 选项已在 begin_opts 阶段按后端语义下发（MySQL 必须在 BEGIN 前）
-        let mut txn = self.begin_opts(options).await?;
-
-        match f(&mut txn).await {
-            Ok(value) => {
-                txn.commit().await?;
-                Ok(value)
-            }
-            Err(err) => {
-                // 回滚失败不覆盖主错误，但不能静默吞掉
-                if let Err(rollback_err) = txn.rollback().await {
-                    eprintln!(
-                        "[ormer] failed to roll back transaction after closure error \
-                         (original error: {err}): {rollback_err}"
-                    );
-                }
-                Err(err)
-            }
-        }
+        // 选项已在 begin_opts 阶段按后端语义下发（MySQL 必须在 BEGIN 前）；
+        // 收尾（提交/回滚，回滚失败走统一日志）与 Database 路径共用
+        // run_txn_closure（L20）。
+        let txn = self.begin_opts(options).await?;
+        run_txn_closure(txn, f).await
     }
 
     /// 删除表 - 返回执行器
@@ -2261,54 +2313,25 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
-    pub fn select_sql<T>(&self, sql: impl IntoRawSql) -> PooledRawSelectExecutor<'_, 'a, T> {
-        PooledRawSelectExecutor {
-            pooled_conn: self,
-            sql: sql.into_raw_sql(),
-            _marker: PhantomData,
-        }
+    /// 池连接上的原生 SQL select（R3：与 Database / Transaction 路径共用
+    /// [`super::unified::RawSelectExecutor`]，经 [`super::unified::ConnRef::Pooled`]
+    /// 分派；返回类型的旧名 `PooledRawSelectExecutor` 保留为过渡别名）。
+    pub fn select_sql<T>(&self, sql: impl IntoRawSql) -> super::unified::RawSelectExecutor<'_, T> {
+        super::unified::RawSelectExecutor::from_conn(
+            super::unified::ConnRef::Pooled(self.get_connection()),
+            sql.into_raw_sql(),
+        )
     }
 
-    /// 执行原生非查询 SQL
+    /// 执行原生非查询 SQL 并返回影响的行数
+    ///
+    /// 注意：ClickHouse 与 InfluxDB 的执行通道（HTTP）不报告 affected rows，
+    /// 这两个后端恒返回 `Ok(0)`——即使语句实际修改了大量数据。调用方不能
+    /// 以返回值 0 区分"未影响任何行"与"后端不统计行数"；需要精确行数时
+    /// 应改用 `SELECT count()`（前后各查一次）或选择支持行数统计的后端。
     pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
-        let raw_sql = sql.into_raw_sql();
-        match self.get_connection() {
-            #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => {
-                let (sql, params) = raw_sql.render(DbType::Sqlite)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::PostgreSQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::MySQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => {
-                let (sql, params) = raw_sql.render(DbType::MSSQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "duckdb")]
-            ConnectionWrapper::DuckDB(db) => {
-                let (sql, params) = raw_sql.render(DbType::DuckDB)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(db) => {
-                db.execute_sql(raw_sql).await?;
-                Ok(0)
-            }
-            #[cfg(feature = "influxdb")]
-            ConnectionWrapper::InfluxDB(db) => {
-                db.execute_sql(raw_sql).await?;
-                Ok(0)
-            }
-        }
+        // L21：Database / 事务 / 池连接三路径共用一份后端分派。
+        exec_raw_sql_on(ConnRefMut::Pooled(self.get_connection()), sql.into_raw_sql()).await
     }
 }
 
@@ -2323,14 +2346,7 @@ impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
         &self,
         key: impl crate::model::PrimaryKey,
     ) -> crate::Result<Option<T>> {
-        let where_expr = primary_key_filter::<T>(key)?;
-        let results = self
-            .select::<T>()
-            .filter(|_| where_expr)
-            .range(..1)
-            .collect::<Vec<T>>()
-            .await?;
-        Ok(results.into_iter().next())
+        find_by_id_with_executor(self.select::<T>(), key).await
     }
 
     pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
@@ -2343,11 +2359,7 @@ impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
         S::Target: Send + Sync,
         S::Via: Send + Sync,
     {
-        let path = relation.path_info()?;
-        let key = owner.relation_key_value(relation_owner_key(path))?;
-        self.select::<T>()
-            .select_related_with_selection(vec![key], &relation)
-            .await
+        find_related_with_executor(&self.select::<T>(), owner, &relation).await
     }
 
     pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
@@ -2360,9 +2372,7 @@ impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
         S::Target: Send + Sync,
         S::Via: Send + Sync,
     {
-        self.select::<T>()
-            .preload_models_with_selection(owners, relation)
-            .await
+        preload_with_executor(&self.select::<T>(), owners, relation).await
     }
 
     pub fn delete<T: WritableModel>(&self) -> ScopedDeleteExecutor<'_, T> {
@@ -2397,41 +2407,51 @@ impl<'a> DbExecutor for PooledConnection<'a> {
 
     fn select_column<T: crate::model::Model, V>(
         &self,
-    ) -> super::unified::GroupedSelectExecutor<'_, T, V> {
+    ) -> super::unified::ProjectionSelectExecutor<'_, T, V> {
         match self.get_connection() {
             #[cfg(feature = "sqlite")]
             ConnectionWrapper::Sqlite(db) => {
-                super::unified::GroupedSelectExecutor::Sqlite(db.select_column::<T, V>())
+                super::unified::ProjectionSelectExecutor::Sqlite(db.select_column::<T, V>())
             }
             #[cfg(feature = "postgresql")]
             ConnectionWrapper::PostgreSQL(db) => {
-                super::unified::GroupedSelectExecutor::PostgreSQL(db.select_column::<T, V>())
+                super::unified::ProjectionSelectExecutor::PostgreSQL(db.select_column::<T, V>())
             }
             #[cfg(feature = "mysql")]
             ConnectionWrapper::MySQL(db) => {
-                super::unified::GroupedSelectExecutor::MySQL(db.select_column::<T, V>())
+                super::unified::ProjectionSelectExecutor::MySQL(db.select_column::<T, V>())
             }
             #[cfg(feature = "mssql")]
             ConnectionWrapper::MSSQL(db) => {
-                super::unified::GroupedSelectExecutor::MSSQL(db.select_column::<T, V>())
+                super::unified::ProjectionSelectExecutor::MSSQL(db.select_column::<T, V>())
             }
             #[cfg(feature = "duckdb")]
             ConnectionWrapper::DuckDB(db) => {
-                super::unified::GroupedSelectExecutor::DuckDB(db.select_column::<T, V>())
+                super::unified::ProjectionSelectExecutor::DuckDB(db.select_column::<T, V>())
             }
             #[cfg(feature = "clickhouse")]
-            ConnectionWrapper::ClickHouse(_) => {
-                super::unified::GroupedSelectExecutor::Unsupported {
+            ConnectionWrapper::ClickHouse(db) => match super::unified::clickhouse_projection_gate(
+                DbType::ClickHouse,
+            ) {
+                // L19：与 Database::select_column 共用同一判定与文案——
+                // ClickHouse 支持聚合投影（advanced_grouping = true），放行
+                // 构造分组聚合执行分支，不再在池层提前拒绝。
+                None => super::unified::ProjectionSelectExecutor::ClickHouse(
+                    db,
+                    crate::query::builder::ProjectionSelect::new(),
+                ),
+                Some(feature) => super::unified::ProjectionSelectExecutor::Unsupported {
                     backend: DbType::ClickHouse,
-                    feature: "Model select_column on ClickHouse; use select_sql",
+                    feature,
                     _marker: PhantomData,
-                }
-            }
+                },
+            },
             #[cfg(feature = "influxdb")]
             ConnectionWrapper::InfluxDB(_) => {
-                super::unified::GroupedSelectExecutor::Unsupported {
+                super::unified::ProjectionSelectExecutor::Unsupported {
                     backend: DbType::InfluxDB,
-                    feature: "select_column",
+                    feature: super::unified::clickhouse_projection_gate(DbType::InfluxDB)
+                        .unwrap_or("GROUP BY aggregation"),
                     _marker: PhantomData,
                 }
             }

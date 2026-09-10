@@ -37,6 +37,8 @@ let sql = Select::<User>::new()
     .to_sql();
 ```
 
+> The builder's no-argument `to_sql()` is a preview only: it uses the default dialect and performs no capability validation, so its output changes with the enabled features. For exact SQL matching real execution, use the executor's `to_sql()` (actual dialect with validation), e.g. `db.select::<User>().to_sql()?`.
+
 ### Multiple Columns + Grouping
 
 ```rust
@@ -159,6 +161,19 @@ let rows: Vec<User> = db
 ```
 
 `DISTINCT ON` uses native syntax on PostgreSQL / DuckDB and a window-function rewrite elsewhere; `ORDER BY` must start with the partition keys.
+
+Multi-field full-text search uses a DSL: `fields` selects the searched columns, `query` provides the search text, `mode` picks the match mode (`FullTextMode::Natural` by default / `Boolean` / `WebSearch`), and optionally `language` sets the language while `rank(FullTextRank::Relevance)` orders by relevance:
+
+```rust
+let rows: Vec<Article> = db
+    .select::<Article>()
+    .fields(|a| (a.title, a.body))
+    .query("rust ormer")
+    .mode(ormer::FullTextMode::Boolean)
+    .rank(ormer::FullTextRank::Relevance)
+    .collect()
+    .await?;
+```
 
 A `serde_json::Value` field can declare static JSON paths and array paths:
 
@@ -294,7 +309,7 @@ let page: Vec<(User, Option<Role>)> = db
 
 ### Derived Table JOIN
 
-`Select`, `MappedSelect`, and `GroupedSelect` can be promoted to a derived table with `as_model::<R>()`. Use `ViewModel` for projection result types without a primary key.
+`Select` and `ProjectionSelect` (the return type of `select_column` / `map_to`) can be promoted to a derived table with `as_model::<R>()`. Use `ViewModel` for projection result types without a primary key.
 
 ```rust
 #[derive(Debug, ormer::ViewModel)]

@@ -79,41 +79,9 @@ where
     }
 }
 
-#[async_trait::async_trait(?Send)]
-impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertExecutor<'a, I>
-where
-    I: Insertable + Send + Sync,
-{
-    type Output = <I::Model as Model>::AutoIncrementKeyType;
-
-    async fn execute(self) -> crate::Result<Self::Output> {
-        crate::abstract_layer::TransactionInsertExecutor::execute(self).await
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertOrUpdateExecutor<'a, I>
-where
-    I: Insertable + Send + Sync,
-{
-    type Output = ();
-
-    async fn execute(self) -> crate::Result<Self::Output> {
-        crate::abstract_layer::TransactionInsertOrUpdateExecutor::execute(self).await
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<'a, I> HookExecutable for crate::abstract_layer::TransactionInsertOrIgnoreExecutor<'a, I>
-where
-    I: Insertable + Send + Sync,
-{
-    type Output = ();
-
-    async fn execute(self) -> crate::Result<Self::Output> {
-        crate::abstract_layer::TransactionInsertOrIgnoreExecutor::execute(self).await
-    }
-}
+// TransactionInsertExecutor / TransactionInsertOrUpdateExecutor /
+// TransactionInsertOrIgnoreExecutor 已合并为对应的普通执行器（R3），
+// HookExecutable 实现随合并唯一化，不再重复。
 
 #[async_trait::async_trait(?Send)]
 impl<'a, T: Model> HookExecutable for crate::abstract_layer::DeleteExecutor<'a, T> {

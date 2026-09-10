@@ -877,6 +877,10 @@ impl SqlExpr {
                 order_by,
                 over,
             } => {
+                // 入口快照：FILTER 非原生改写会丢弃已渲染的聚合参数文本，
+                // 参数与序号必须一并回滚（见下方非 native 分支）。
+                let entry_params_len = params.len();
+                let entry_param_idx = *param_idx;
                 let mut sql = format!(
                     "{}({}",
                     name,
@@ -904,6 +908,12 @@ impl SqlExpr {
                         sql.push_str(&filter_sql);
                         sql.push(')');
                     } else {
+                        // CASE WHEN 改写：首轮渲染已 push 的聚合表达式参数
+                        // （含内部 ORDER BY 参数）不在最终 SQL 中出现，先回滚
+                        // 参数与序号再重渲染，保证 argument 是唯一一次 push，
+                        // 避免 MySQL/MSSQL 占位符错位、PG 编号跳缺。
+                        params.truncate(entry_params_len);
+                        *param_idx = entry_param_idx;
                         sql.clear();
                         sql.push_str(name);
                         sql.push('(');
@@ -1888,7 +1898,10 @@ impl SqlExpr {
                     }),
                 }
             }
-            SqlExpr::DateAdd { amount, .. } => amount.validate_for_db(db_type),
+            SqlExpr::DateAdd { expr, amount, .. } => {
+                expr.validate_for_db(db_type)?;
+                amount.validate_for_db(db_type)
+            }
             SqlExpr::DateDiff { left, right, .. } => {
                 left.validate_for_db(db_type)?;
                 right.validate_for_db(db_type)
@@ -2040,9 +2053,24 @@ pub(crate) fn validate_filter_for_db(
             Ok(())
         }
         FilterExpr::FullTextSearch(search) => {
-            if search.exprs.is_empty() {
+            // query()/mode() 等单独调用时以 SqlExpr::Value(NULL) 占位，
+            // 必须搭配 fields() 提供真实检索列；表达式全是 Value 变体
+            // 视为未指定字段（PG 会生成恒假查询、SQLite 生成非法 MATCH）。
+            let only_placeholders = search.exprs.iter().all(|expr| {
+                matches!(expr, SqlExpr::Value(_))
+            });
+            if search.exprs.is_empty() || only_placeholders {
                 return Err(crate::ormer_error!(
                     "Full-text search requires at least one field"
+                ));
+            }
+            // fields() 单独调用（未调 query()）会以空串创建检索对象；
+            // 空查询在 PG 上生成恒假的 plainto_tsquery('', ...)、在其他
+            // 后端同样无意义，校验阶段直接报错而不是静默过滤整表。
+            if search.query.trim().is_empty() {
+                return Err(crate::ormer_error!(
+                    "Full-text search requires a non-empty query; call .query(\"...\") \
+                     (fields() alone does not start a search)"
                 ));
             }
             for expr in &search.exprs {

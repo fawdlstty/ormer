@@ -73,6 +73,60 @@ pub fn quote_table_name<T: Model>(db_type: DbType) -> String {
     quote_qualified_identifier(db_type, T::table_name_for_db(db_type))
 }
 
+/// 带默认 schema 省略规则的表名引用（运行时表名字符串入口，如
+/// `Database::table_row_count`）。
+///
+/// 与模型版 [`quote_table_name`] 的差异：模型版对名字中的每个点分段
+/// 逐一引用（`"schema"."table"`），本函数按后端语义省略默认 schema——
+/// PostgreSQL 省略 `public`、MSSQL 省略 `dbo`、QuestDB 只取末段，
+/// 其余后端直接引用归一化后的整名。
+pub(crate) fn quote_table_name_with_schema(db_type: DbType, table_name: &str) -> String {
+    let normalized = crate::model::normalize_table_name_for_db(db_type, table_name);
+    match db_type {
+        #[cfg(feature = "postgresql")]
+        DbType::PostgreSQL => {
+            let (schema, table) = crate::model::split_schema_table_name(normalized, "public");
+            if schema == "public" {
+                crate::model::quote_identifier(db_type, table)
+            } else {
+                format!(
+                    "{}.{}",
+                    crate::model::quote_identifier(db_type, schema),
+                    crate::model::quote_identifier(db_type, table)
+                )
+            }
+        }
+        #[cfg(feature = "mssql")]
+        DbType::MSSQL => {
+            let (schema, table) = crate::model::split_schema_table_name(normalized, "dbo");
+            if schema == "dbo" {
+                crate::model::quote_identifier(db_type, table)
+            } else {
+                format!(
+                    "{}.{}",
+                    crate::model::quote_identifier(db_type, schema),
+                    crate::model::quote_identifier(db_type, table)
+                )
+            }
+        }
+        #[cfg(feature = "questdb")]
+        DbType::QuestDB => {
+            let (_, table) = crate::model::split_schema_table_name(normalized, "public");
+            crate::model::quote_identifier(db_type, table)
+        }
+        #[cfg(feature = "sqlite")]
+        DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
+        #[cfg(feature = "mysql")]
+        DbType::MySQL => crate::model::quote_identifier(db_type, normalized),
+        #[cfg(any(
+            feature = "duckdb",
+            feature = "clickhouse",
+            feature = "influxdb"
+        ))]
+        _ => crate::model::quote_identifier(db_type, normalized),
+    }
+}
+
 pub fn quote_routed_table_name<T: Model>(
     db_type: DbType,
     route: &TableRoute,
@@ -1273,6 +1327,17 @@ fn build_mysql_bulk_model_update_sql<T: Model>(
     })
 }
 
+// plans 仅由各后端 cfg 分支消费；仅启用无本地写后端的组合时未使用
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_variables)
+)]
 fn build_bulk_model_update_sql<T: Model>(
     db_type: DbType,
     plans: &[ModelUpdatePlan],
@@ -1542,7 +1607,7 @@ pub struct UpsertSqlStatement {
     pub columns: Vec<&'static str>,
 }
 
-/// 生成自增感知的批量 upsert 语句组。
+/// 生成自增感知的批量 upsert 语句组（按参数上限分块）。
 ///
 /// 模型带单列自增主键时按"主键是否已设置"分行处理：
 /// - 已设置：携带主键列插入并追加 `upsert_clause`，冲突更新按该主键生效
@@ -1550,7 +1615,12 @@ pub struct UpsertSqlStatement {
 /// - 未设置：排除自增列由序列生成。若也追加冲突子句，多条新记录会因
 ///   显式写入的默认主键值互相冲突塌缩成一行。
 ///
-/// 无自增主键的模型退化为单条全列 upsert（与历史行为一致）。
+/// 无自增主键的模型退化为单条全列 upsert（行数未超限时，与历史行为一致）。
+///
+/// 各分组分别按其实际写入列数（全列组含自增列）经由
+/// [`build_chunked_insert_statements_for_columns`] 分块，避免单条语句
+/// 绑定参数超限（MSSQL 2100 / SQLite 999）；`upsert_clause` 在每块的
+/// build 闭包内追加。
 pub fn build_auto_increment_aware_upsert_statements<T: Model>(
     db_type: DbType,
     insert_prefix: &str,
@@ -1560,22 +1630,36 @@ pub fn build_auto_increment_aware_upsert_statements<T: Model>(
 ) -> crate::Result<Vec<UpsertSqlStatement>> {
     let Some(auto_column) = auto_increment_column::<T>().filter(|_| !models.is_empty()) else {
         let columns = T::columns();
-        let (mut sql, values) = build_batch_insert_statement::<T>(
+        let statements = build_chunked_insert_statements_for_columns::<T>(
             db_type,
-            insert_prefix,
-            table_name,
-            &columns,
+            columns.len(),
             models,
-            BatchInsertValuesMode::All,
-        );
-        upsert_clause(&mut sql, &columns)?;
-        let row_count = models.len();
-        return Ok(vec![UpsertSqlStatement {
-            sql,
-            params: values,
-            row_count,
-            columns,
-        }]);
+            |chunk| {
+                let (mut sql, params) = build_batch_insert_statement::<T>(
+                    db_type,
+                    insert_prefix,
+                    table_name,
+                    &columns,
+                    chunk,
+                    BatchInsertValuesMode::All,
+                );
+                upsert_clause(&mut sql, &columns)?;
+                Ok(InsertSqlStatement {
+                    sql,
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        return Ok(statements
+            .into_iter()
+            .map(|statement| UpsertSqlStatement {
+                sql: statement.sql,
+                params: statement.params,
+                row_count: statement.row_count,
+                columns: columns.clone(),
+            })
+            .collect());
     };
 
     let (set, unset): (Vec<&T>, Vec<&T>) = models
@@ -1583,41 +1667,65 @@ pub fn build_auto_increment_aware_upsert_statements<T: Model>(
         .copied()
         .partition(|model| auto_increment_key_is_set(*model, auto_column));
 
-    let mut statements = Vec::with_capacity(2);
+    let mut statements = Vec::new();
     if !set.is_empty() {
         let columns = T::columns();
-        let (mut sql, values) = build_batch_insert_statement::<T>(
+        let chunked = build_chunked_insert_statements_for_columns::<T>(
             db_type,
-            insert_prefix,
-            table_name,
-            &columns,
+            columns.len(),
             &set,
-            BatchInsertValuesMode::All,
-        );
-        upsert_clause(&mut sql, &columns)?;
-        statements.push(UpsertSqlStatement {
-            sql,
-            params: values,
-            row_count: set.len(),
-            columns,
-        });
+            |chunk| {
+                let (mut sql, params) = build_batch_insert_statement::<T>(
+                    db_type,
+                    insert_prefix,
+                    table_name,
+                    &columns,
+                    chunk,
+                    BatchInsertValuesMode::All,
+                );
+                upsert_clause(&mut sql, &columns)?;
+                Ok(InsertSqlStatement {
+                    sql,
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        statements.extend(chunked.into_iter().map(|statement| UpsertSqlStatement {
+            sql: statement.sql,
+            params: statement.params,
+            row_count: statement.row_count,
+            columns: columns.clone(),
+        }));
     }
     if !unset.is_empty() {
         let columns = T::insert_columns();
-        let (sql, values) = build_batch_insert_statement::<T>(
+        let chunked = build_chunked_insert_statements_for_columns::<T>(
             db_type,
-            insert_prefix,
-            table_name,
-            &columns,
+            columns.len(),
             &unset,
-            BatchInsertValuesMode::WithoutAutoIncrement,
-        );
-        statements.push(UpsertSqlStatement {
-            sql,
-            params: values,
-            row_count: unset.len(),
-            columns,
-        });
+            |chunk| {
+                let (sql, params) = build_batch_insert_statement::<T>(
+                    db_type,
+                    insert_prefix,
+                    table_name,
+                    &columns,
+                    chunk,
+                    BatchInsertValuesMode::WithoutAutoIncrement,
+                );
+                Ok(InsertSqlStatement {
+                    sql,
+                    params,
+                    row_count: chunk.len(),
+                })
+            },
+        )?;
+        statements.extend(chunked.into_iter().map(|statement| UpsertSqlStatement {
+            sql: statement.sql,
+            params: statement.params,
+            row_count: statement.row_count,
+            columns: columns.clone(),
+        }));
     }
     Ok(statements)
 }
@@ -2509,10 +2617,31 @@ pub fn build_insert_statement_with_conflict<T: Model>(
 }
 
 /// 单条 INSERT 允许的最大行数：按后端绑定参数上限（`bind_param_limit`）与
-/// 模型 insert 列数推导，MSSQL 2100 / SQLite 999 参数上限由此生效。
+/// 实际写入列数推导，MSSQL 2100 / SQLite 999 参数上限由此生效。
+///
+/// 写入列集与 `T::insert_columns()` 不同时（如 upsert 携带自增列的全列
+/// 路径、含全部列的 `INSERT IGNORE`）必须经由本入口传入真实列数，
+/// 避免按 `insert_columns` 分块导致单条语句参数超限。
+pub fn insert_rows_per_statement_for(db_type: DbType, column_count: usize) -> usize {
+    (bind_param_limit(db_type) / column_count.max(1)).max(1)
+}
+
+/// 单条 INSERT 允许的最大行数（按 `T::insert_columns()` 推导）。
 pub fn insert_rows_per_statement<T: Model>(db_type: DbType) -> usize {
-    let column_count = T::insert_columns().len().max(1);
-    (bind_param_limit(db_type) / column_count).max(1)
+    insert_rows_per_statement_for(db_type, T::insert_columns().len())
+}
+
+/// 按显式每语句行数把模型行分块，逐块调用 `build` 生成语句并聚合。
+fn chunk_model_statements<T, S>(
+    models: &[&T],
+    rows_per_statement: usize,
+    mut build: impl FnMut(&[&T]) -> crate::Result<S>,
+) -> crate::Result<Vec<S>> {
+    if models.len() <= rows_per_statement {
+        let statement = build(models)?;
+        return Ok(vec![statement]);
+    }
+    models.chunks(rows_per_statement).map(build).collect()
 }
 
 /// 按参数上限把模型行分块，逐块调用 `build` 生成语句并聚合。
@@ -2523,14 +2652,24 @@ pub fn insert_rows_per_statement<T: Model>(db_type: DbType) -> usize {
 pub fn build_chunked_insert_statements<T: Model>(
     db_type: DbType,
     models: &[&T],
-    mut build: impl FnMut(&[&T]) -> crate::Result<InsertSqlStatement>,
+    build: impl FnMut(&[&T]) -> crate::Result<InsertSqlStatement>,
 ) -> crate::Result<Vec<InsertSqlStatement>> {
-    let rows_per_statement = insert_rows_per_statement::<T>(db_type);
-    if models.len() <= rows_per_statement {
-        let statement = build(models)?;
-        return Ok(vec![statement]);
-    }
-    models.chunks(rows_per_statement).map(build).collect()
+    chunk_model_statements(models, insert_rows_per_statement::<T>(db_type), build)
+}
+
+/// 按参数上限把模型行分块（显式列数版本）：写入列集与 `T::insert_columns()`
+/// 不同时由调用方给出真实列数（见 [`insert_rows_per_statement_for`]）。
+pub fn build_chunked_insert_statements_for_columns<T: Model>(
+    db_type: DbType,
+    column_count: usize,
+    models: &[&T],
+    build: impl FnMut(&[&T]) -> crate::Result<InsertSqlStatement>,
+) -> crate::Result<Vec<InsertSqlStatement>> {
+    chunk_model_statements(
+        models,
+        insert_rows_per_statement_for(db_type, column_count),
+        build,
+    )
 }
 
 /// 构建批量插入语句组（含自增主键 / 带 conflict 路径），统一按参数上限分块。
@@ -2991,6 +3130,31 @@ pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>)
     }
 
     (sql, all_values)
+}
+
+/// 生成批量 MERGE 语句组（insert_or_update / insert_or_ignore，按参数上限
+/// 2100 分块）：MERGE 源列使用 insert_columns()，分块尺寸与其一致，
+/// `with_update` 控制 WHEN MATCHED UPDATE 分支（insert_or_update）。
+///
+/// mssql 后端与连接池的 insert_or_update / insert_or_ignore 路径统一经此
+/// 入口，to_sql 与 execute 共用同一份语句构建。
+#[cfg(feature = "mssql")]
+pub fn build_mssql_merge_statements<T: Model>(
+    models: &[&T],
+    with_update: bool,
+) -> crate::Result<Vec<InsertSqlStatement>> {
+    build_chunked_insert_statements::<T>(DbType::MSSQL, models, |chunk| {
+        let (mut sql, params) = build_mssql_merge_source::<T>(chunk);
+        if with_update {
+            append_mssql_merge_update_clause::<T>(&mut sql);
+        }
+        append_mssql_merge_insert_clause::<T>(&mut sql);
+        Ok(InsertSqlStatement {
+            sql,
+            params,
+            row_count: chunk.len(),
+        })
+    })
 }
 
 #[cfg(feature = "mssql")]

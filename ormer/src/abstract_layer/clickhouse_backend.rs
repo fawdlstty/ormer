@@ -629,6 +629,10 @@ fn clickhouse_json_value(value: &serde_json::Value) -> crate::Result<crate::mode
             if let Some(value) = value.as_i64() {
                 Ok(Value::Integer(value))
             } else if let Some(value) = value.as_u64() {
+                // u64 → i128 无损（u64::MAX 远小于 i128::MAX）：UInt64/UInt128
+                // 落入 u64 范围的值以 BigInt 为载体。超出 u64 的整数值在
+                // serde_json 解析阶段已成 f64，解为 Real，后续 FromValue 的
+                // i128 try_from / 类型检查会显式报错，不会静默回绕。
                 Ok(Value::BigInt(value as i128))
             } else if let Some(value) = value.as_f64() {
                 Ok(Value::Real(value))
@@ -1107,12 +1111,12 @@ impl DbBackendTypeMapper for ClickHouseTypeMapper {
             "i8" => "Int8",
             "i16" => "Int16",
             "i32" => "Int32",
-            "i64" => "Int64",
+            "i64" | "isize" => "Int64",
             "i128" => "Int128",
             "u8" => "UInt8",
             "u16" => "UInt16",
             "u32" => "UInt32",
-            "u64" => "UInt64",
+            "u64" | "usize" => "UInt64",
             "u128" => "UInt128",
             "f32" => "Float32",
             "f64" => "Float64",

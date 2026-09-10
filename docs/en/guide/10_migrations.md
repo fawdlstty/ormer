@@ -63,6 +63,16 @@ let applied = runner.execute().await?;
 println!("applied: {applied}");
 ```
 
+Preview pending work with `dry_run()`: it renders every pending statement and reports completed versions and warnings without touching the database.
+
+```rust
+let dry = db.migrations(&migrations).dry_run().await?;
+
+for step in &dry.steps {
+    println!("{} {} -> {}", step.version, step.migration_name, step.sql);
+}
+```
+
 When a runner is not needed, call the database methods directly:
 
 ```rust
@@ -112,6 +122,19 @@ InfluxDB uses the same migration entry point: there is no table-creation DDL
 a time without rollback, and history is recorded in the `__ormer_migrations`
 measurement.
 
+`migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
+
+`ensure_table` rejects destructive changes (column drops and table rebuilds) by default
+with an `UnmigratableSchema` error instead of silently deleting data; opt in explicitly
+with `ensure_table_permissive`. `migrate_table::<T>()` supports chained
+`rename_column("old", "new")` annotations (rendered as `ALTER TABLE ... RENAME COLUMN`)
+so renames no longer degrade to drop + add. Indexes are diffed as expected-vs-actual
+sets: adding `#[index]` to an existing column creates the index, removing it emits
+`DropIndex`. Tightening a nullable column to `NOT NULL` fails first when existing rows
+contain NULLs; backfill before migrating.
+
+Model `#[compress(...)]` attributes are included in schema validation and migration. PostgreSQL uses column-level `SET COMPRESSION`; MySQL uses the table-level `COMPRESSION` option, so all compressed columns in one MySQL table must use the same algorithm.
+
 ## QuestDB migrations
 
 QuestDB (8.3+ required) executes migrations one by one and keeps history in
@@ -125,16 +148,3 @@ QuestDB (8.3+ required) executes migrations one by one and keeps history in
   no primary-key or NOT NULL constraints, so those are not compared; the
   designated timestamp clause is generated at create-table time and existing
   tables are never rebuilt destructively by auto migration.
-
-`migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
-
-`ensure_table` rejects destructive changes (column drops and table rebuilds) by default
-with an `UnmigratableSchema` error instead of silently deleting data; opt in explicitly
-with `ensure_table_permissive`. `migrate_table::<T>()` supports chained
-`rename_column("old", "new")` annotations (rendered as `ALTER TABLE ... RENAME COLUMN`)
-so renames no longer degrade to drop + add. Indexes are diffed as expected-vs-actual
-sets: adding `#[index]` to an existing column creates the index, removing it emits
-`DropIndex`. Tightening a nullable column to `NOT NULL` fails first when existing rows
-contain NULLs; backfill before migrating.
-
-Model `#[compress(...)]` attributes are included in schema validation and migration. PostgreSQL uses column-level `SET COMPRESSION`; MySQL uses the table-level `COMPRESSION` option, so all compressed columns in one MySQL table must use the same algorithm.

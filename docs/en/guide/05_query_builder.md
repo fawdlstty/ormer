@@ -100,11 +100,9 @@ QuestDB and InfluxDB do not support array predicates; building such a query retu
 
 ### Model Filters
 
-`#[filter]` generates same-named chain methods for the model. Import the generated extension trait before use:
+`#[filter]` generates same-named chain methods for the model (the extension trait is generated into the local scope by the derive, so no import is needed within the same module):
 
 ```rust
-use OrderFilterExt;
-
 let orders: Vec<Order> = db
     .select::<Order>()
     .filter_tenant(tenant_id)
@@ -144,6 +142,27 @@ let users: Vec<User> = db
 .range(10..20)
 .range(..5)
 .range(10..)
+```
+
+For deep pagination use cursor pagination: `cursor_by` declares the cursor columns (matching the ordering), `fetch_page` returns a `CursorPage` with `next_cursor()`, and the cursor is passed to `after()` for the next page:
+
+```rust
+let page = db
+    .select::<User>()
+    .order_by_desc(|u| u.id)
+    .cursor_by(|u| u.id)
+    .limit(10)
+    .fetch_page()
+    .await?;
+
+let next = db
+    .select::<User>()
+    .order_by_desc(|u| u.id)
+    .cursor_by(|u| u.id)
+    .after(page.next_cursor().expect("more pages"))
+    .limit(10)
+    .fetch_page()
+    .await?;
 ```
 
 ## Distinct Queries

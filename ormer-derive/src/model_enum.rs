@@ -1,20 +1,40 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Ident, Lit, Meta};
+use syn::{Data, DeriveInput, Fields, Ident, Meta};
+
+// 列名解析与类型工具与 Model 派生共用同一份实现（crate::shared），
+// 保证 #[column(name = ...)] 等属性行为一致
+use crate::shared::{
+    extract_column_name, is_string_type, normalize_type_string, option_inner_type, to_snake_case,
+};
 
 pub fn derive_model_enum(input: DeriveInput) -> TokenStream {
     derive_field_type(input)
 }
 
 pub fn derive_field_type(input: DeriveInput) -> TokenStream {
-    match &input.data {
-        Data::Enum(data_enum) => derive_enum_field_type(&input, data_enum),
-        Data::Struct(data_struct) => derive_tuple_struct_field_type(&input, data_struct),
-        _ => panic!("FieldType can only be derived for enums or single-field tuple structs"),
+    match derive_field_type_inner(input) {
+        Ok(tokens) => tokens,
+        // 属性解析/校验失败统一走 compile_error，而不是让派生宏 panic
+        Err(error) => error.to_compile_error(),
     }
 }
 
-fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> TokenStream {
+fn derive_field_type_inner(input: DeriveInput) -> syn::Result<TokenStream> {
+    match &input.data {
+        Data::Enum(data_enum) => derive_enum_field_type(&input, data_enum),
+        Data::Struct(data_struct) => derive_tuple_struct_field_type(&input, data_struct),
+        _ => Err(syn::Error::new_spanned(
+            input.ident,
+            "FieldType can only be derived for enums or single-field tuple structs",
+        )),
+    }
+}
+
+fn derive_enum_field_type(
+    input: &DeriveInput,
+    data_enum: &syn::DataEnum,
+) -> syn::Result<TokenStream> {
     if data_enum
         .variants
         .iter()
@@ -31,20 +51,61 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
     let repr_integer_type = repr_integer_type(input);
     let is_numeric_enum = repr_integer_type.is_some();
 
+    // 数值枚举的宽度校验与转换表达式：
+    // - u64/usize 判别值可能超出 i64，`as i64` 会静默回绕写错库值，
+    //   在派生期直接拒绝；
+    // - 其余 repr 的判别值总是放得下 i64，统一用 `i64::from(v)` 无损转换
+    //   （isize 无 From 实现，但指针宽度不超过 64 位，`as i64` 无损）；
+    // - `From<Enum> for i32` 只对判别值总能放进 i32 的窄 repr
+    //   （i8/i16/i32/u8/u16）生成：宽 repr 上的 `as i32` 会截断回绕，
+    //   且注入的 impl 会与用户手写实现冲突。宽 repr 配合 `#[data_type(i32)]`
+    //   需要的转换由用户显式提供。
+    let (numeric_to_i64, numeric_repr) = match &repr_integer_type {
+        Some(repr_type) => {
+            let repr_str = quote! { #repr_type }.to_string().replace(' ', "");
+            if matches!(repr_str.as_str(), "u64" | "usize") {
+                return Err(syn::Error::new_spanned(
+                    input.ident.clone(),
+                    format!(
+                        "#[repr({repr_str})] numeric enums are not supported: discriminants can \
+                         exceed i64 and would silently wrap when stored; use #[repr(i64)] or a \
+                         narrower repr"
+                    ),
+                ));
+            }
+            let to_i64 = if repr_str == "isize" {
+                quote! { v as i64 }
+            } else {
+                // 先取判别值（as 转 repr 无损），再经 From 提升到 i64
+                quote! { <i64 as ::core::convert::From<#repr_type>>::from(v as #repr_type) }
+            };
+            (to_i64, repr_str)
+        }
+        None => (quote! {}, String::new()),
+    };
+
     let from_value_impl = if is_numeric_enum {
-        quote! {
+        let mut impls = quote! {
             impl From<#name> for ::ormer::model::Value {
                 fn from(v: #name) -> Self {
-                    ::ormer::model::Value::Integer(v as i64)
+                    ::ormer::model::Value::Integer(#numeric_to_i64)
                 }
             }
-
-            impl ::core::convert::From<#name> for i32 {
-                fn from(v: #name) -> Self {
-                    v as i32
+        };
+        if matches!(
+            numeric_repr.as_str(),
+            "i8" | "i16" | "i32" | "u8" | "u16"
+        ) {
+            let repr_type = repr_integer_type.as_ref().expect("numeric repr is present");
+            impls.extend(quote! {
+                impl ::core::convert::From<#name> for i32 {
+                    fn from(v: #name) -> Self {
+                        <i32 as ::core::convert::From<#repr_type>>::from(v as #repr_type)
+                    }
                 }
-            }
+            });
         }
+        impls
     } else {
         let match_arms = variant_names.iter().map(|v| {
             quote! {
@@ -166,14 +227,9 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
     };
 
     let name_method = {
-        let match_arms_1 = variant_names.iter().map(|v| {
-            let v_str = v.to_string();
-            quote! {
-                #name::#v => #v_str,
-            }
-        });
-
-        let match_arms_2 = variant_names.iter().map(|v| {
+        // name 的 match 臂只生成一份（FieldType trait 实现）；
+        // inherent pub fn name / VARIANTS 委托 trait 实现，不再复制臂与常量
+        let name_arms = variant_names.iter().map(|v| {
             let v_str = v.to_string();
             quote! {
                 #name::#v => #v_str,
@@ -201,9 +257,16 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
         };
 
         let numeric_enum_methods = if is_numeric_enum {
+            let repr_type = repr_integer_type.as_ref().expect("numeric repr is present");
+            let self_to_i64 = if numeric_repr == "isize" {
+                quote! { *self as i64 }
+            } else {
+                // *self 是枚举，先转判别值再提升到 i64
+                quote! { <i64 as ::core::convert::From<#repr_type>>::from(*self as #repr_type) }
+            };
             quote! {
                 fn as_i64(&self) -> i64 {
-                    *self as i64
+                    #self_to_i64
                 }
 
                 fn from_i64(value: i64) -> ::ormer::Result<Self> {
@@ -226,12 +289,11 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
         quote! {
             impl #name {
                 pub fn name(&self) -> &'static str {
-                    match self {
-                        #(#match_arms_1)*
-                    }
+                    <Self as ::ormer::model::FieldType>::name(self)
                 }
 
-                pub const VARIANTS: &'static [&'static str] = &[#(#variant_names_str),*];
+                pub const VARIANTS: &'static [&'static str] =
+                    <#name as ::ormer::model::FieldType>::VARIANTS;
             }
 
             impl ::ormer::model::FieldType for #name {
@@ -239,7 +301,7 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
 
                 fn name(&self) -> &'static str {
                     match self {
-                        #(#match_arms_2)*
+                        #(#name_arms)*
                     }
                 }
 
@@ -262,13 +324,13 @@ fn derive_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> Tok
         }
     };
 
-    quote! {
+    Ok(quote! {
         #try_from_i32_impl
         #from_impl
         #from_value_impl
         #from_row_values_impl
         #name_method
-    }
+    })
 }
 
 enum DbTypeAttr {
@@ -285,9 +347,12 @@ struct VariantFieldInfo<'a> {
     rust_type: String,
 }
 
-fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -> TokenStream {
+fn derive_data_enum_field_type(
+    input: &DeriveInput,
+    data_enum: &syn::DataEnum,
+) -> syn::Result<TokenStream> {
     let name = &input.ident;
-    let db_type = extract_db_type_attr(input);
+    let db_type = extract_db_type_attr(input)?;
     let variants = &data_enum.variants;
     let variant_names: Vec<&Ident> = variants.iter().map(|v| &v.ident).collect();
     let variant_db_names: Vec<String> = variant_names
@@ -299,15 +364,21 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
     let mut seen_columns = std::collections::BTreeSet::new();
     for variant in variants {
         let Fields::Named(fields) = &variant.fields else {
-            panic!("polymorphic ModelEnum variants must use named fields");
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "polymorphic ModelEnum variants must use named fields",
+            ));
         };
         for field in &fields.named {
             let ident = field.ident.as_ref().expect("variant field must be named");
-            let column_name = extract_column_name(field);
+            let column_name = extract_column_name(field)?;
             if !seen_columns.insert(column_name.clone()) {
-                panic!(
-                    "polymorphic ModelEnum payload column `{column_name}` is declared more than once"
-                );
+                return Err(syn::Error::new_spanned(
+                    field,
+                    format!(
+                        "polymorphic ModelEnum payload column `{column_name}` is declared more than once"
+                    ),
+                ));
             }
             all_fields.push(VariantFieldInfo {
                 variant: &variant.ident,
@@ -381,7 +452,10 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
             let rust_type = &field.rust_type;
             quote! {
                 columns.push(::ormer::model::ColumnSchema {
-                    rust_name: Box::leak(format!("{}.{}", column_rust_name, #field_name).into_boxed_str()),
+                    rust_name: ::ormer::model::intern_concat(
+                        column_rust_name,
+                        concat!(".", #field_name),
+                    ),
                     name: #column_name,
                     rust_type: match <#field_type as ::ormer::model::FieldTypeProvider>::RUST_TYPE {
                         Some(rust_type) => rust_type,
@@ -451,26 +525,30 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
             .iter()
             .zip(variant_db_names.iter())
             .enumerate()
-            .map(|(idx, (variant, db_name))| {
+            .map(|(idx, (variant, db_name))| -> syn::Result<TokenStream> {
                 let variant_ident = &variant.ident;
                 let fields = match &variant.fields {
                     Fields::Named(fields) => &fields.named,
                     _ => unreachable!(),
                 };
-                let field_values = fields.iter().map(|field| {
-                    let ident = field.ident.as_ref().unwrap();
-                    let column_name = extract_column_name(field);
-                    quote! {
-                        #ident: row.get(#column_name)?
-                    }
-                });
+                let field_values = fields
+                    .iter()
+                    .map(|field| {
+                        let ident = field.ident.as_ref().unwrap();
+                        let column_name = extract_column_name(field)?;
+                        Ok(quote! {
+                            #ident: row.get(#column_name)?
+                        })
+                    })
+                    .collect::<syn::Result<Vec<_>>>()?;
                 let condition = discriminator_match_condition(&db_type, idx, db_name);
-                quote! {
+                Ok(quote! {
                     value if #condition => Ok(#name::#variant_ident {
                         #(#field_values),*
                     }),
-                }
-            });
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
         quote! {
             fn model_from_row(
                 _rust_field: &'static str,
@@ -496,35 +574,40 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
             .iter()
             .zip(variant_db_names.iter())
             .enumerate()
-            .map(|(idx, (variant, db_name))| {
+            .map(|(idx, (variant, db_name))| -> syn::Result<TokenStream> {
                 let variant_ident = &variant.ident;
                 let fields = match &variant.fields {
                     Fields::Named(fields) => &fields.named,
                     _ => unreachable!(),
                 };
-                let field_values = fields.iter().map(|field| {
-                    let ident = field.ident.as_ref().unwrap();
-                    let column_name = extract_column_name(field);
-                    let field_type = &field.ty;
-                    let value_index = all_fields
-                        .iter()
-                        .position(|candidate| candidate.column_name == column_name)
-                        .expect("payload field must be indexed")
-                        + 1;
-                    let value_index = syn::Index::from(value_index);
-                    quote! {
-                        #ident: <#field_type as ::ormer::FromRowValues>::from_row_values(
-                            &values[#value_index..#value_index + 1]
-                        )?
-                    }
-                });
+                let field_values = fields
+                    .iter()
+                    .map(|field| {
+                        let ident = field.ident.as_ref().unwrap();
+                        let column_name = extract_column_name(field)?;
+                        let field_type = &field.ty;
+                        // all_fields 收集自同样的 payload 字段，查找必然命中
+                        let value_index = all_fields
+                            .iter()
+                            .position(|candidate| candidate.column_name == column_name)
+                            .expect("payload field must be indexed")
+                            + 1;
+                        let value_index = syn::Index::from(value_index);
+                        Ok(quote! {
+                            #ident: <#field_type as ::ormer::FromRowValues>::from_row_values(
+                                &values[#value_index..#value_index + 1]
+                            )?
+                        })
+                    })
+                    .collect::<syn::Result<Vec<_>>>()?;
                 let condition = discriminator_match_condition(&db_type, idx, db_name);
-                quote! {
+                Ok(quote! {
                     value if #condition => Ok(#name::#variant_ident {
                         #(#field_values),*
                     }),
-                }
-            });
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?;
         quote! {
             fn model_from_row_values(
                 _rust_field: &'static str,
@@ -640,19 +723,76 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
         }
     };
 
-    let model_assign_column_value = quote! {
-        fn model_assign_column_value(
-            &mut self,
-            _discriminator_column: &'static str,
-            _rust_field: &'static str,
-            _column: &str,
-            _value: ::ormer::Value,
-        ) -> ::ormer::Result<bool> {
-            Ok(false)
+    let model_assign_column_value = {
+        // discriminator 列：值与当前变体一致时确认赋值（图写入回填关系键的
+        // 场景），不一致时报错——仅凭 discriminator 无法切换变体（payload 未知）。
+        let discriminator_arms = variant_names
+            .iter()
+            .zip(variant_db_names.iter())
+            .enumerate()
+            .map(|(idx, (variant, db_name))| {
+                let condition = discriminator_match_condition(&db_type, idx, db_name);
+                quote! {
+                    #name::#variant { .. } => #condition,
+                }
+            });
+        // payload 列：当前变体与声明该列的变体一致时整体写入对应字段；
+        // 不一致时报错（切换变体需要完整 payload，无法从单列值构造）。
+        let payload_arms = all_fields.iter().map(|field| {
+            let column_name = field.column_name.as_str();
+            let field_name_str = field.ident.to_string();
+            let field_ident = field.ident;
+            let field_variant = field.variant;
+            let field_type = &field.field.ty;
+            quote! {
+                #column_name | #field_name_str => {
+                    match self {
+                        #name::#field_variant { #field_ident, .. } => {
+                            *#field_ident =
+                                <#field_type as ::ormer::model::FromValue>::from_value(&value)?;
+                            Ok(true)
+                        }
+                        _ => Err(::ormer::ormer_error!(
+                            "cannot assign payload column {} of {} while a different variant is active",
+                            column,
+                            stringify!(#name),
+                        )),
+                    }
+                }
+            }
+        });
+        quote! {
+            fn model_assign_column_value(
+                &mut self,
+                discriminator_column: &'static str,
+                rust_field: &'static str,
+                column: &str,
+                value: ::ormer::Value,
+            ) -> ::ormer::Result<bool> {
+                if column == discriminator_column || column == rust_field {
+                    let value = &value;
+                    let matches_current = match self {
+                        #(#discriminator_arms)*
+                    };
+                    return if matches_current {
+                        Ok(true)
+                    } else {
+                        Err(::ormer::ormer_error!(
+                            "cannot switch {} to the variant for discriminator column {}",
+                            stringify!(#name),
+                            column,
+                        ))
+                    };
+                }
+                match column {
+                    #(#payload_arms,)*
+                    _ => Ok(false),
+                }
+            }
         }
     };
 
-    quote! {
+    Ok(quote! {
         impl From<#name> for ::ormer::model::Value {
             fn from(value: #name) -> Self {
                 match value {
@@ -724,7 +864,7 @@ fn derive_data_enum_field_type(input: &DeriveInput, data_enum: &syn::DataEnum) -
             #model_column_value
             #model_assign_column_value
         }
-    }
+    })
 }
 
 fn discriminator_value_expr(
@@ -782,105 +922,37 @@ fn discriminator_match_condition(db_type: &DbTypeAttr, idx: usize, db_name: &str
     }
 }
 
-fn extract_db_type_attr(input: &DeriveInput) -> DbTypeAttr {
+fn extract_db_type_attr(input: &DeriveInput) -> syn::Result<DbTypeAttr> {
     for attr in &input.attrs {
         if !attr.path().is_ident("db_type") {
             continue;
         }
         return match &attr.meta {
-            Meta::Path(_) => DbTypeAttr::Native,
+            Meta::Path(_) => Ok(DbTypeAttr::Native),
             Meta::List(list) => {
-                let ty: syn::Type =
-                    syn::parse2(list.tokens.clone()).expect("#[db_type] type is invalid");
+                let ty: syn::Type = syn::parse2(list.tokens.clone())
+                    .map_err(|_| syn::Error::new_spanned(attr, "#[db_type] type is invalid"))?;
                 if is_string_type(&ty) {
-                    DbTypeAttr::String
+                    Ok(DbTypeAttr::String)
                 } else {
-                    DbTypeAttr::Numeric(ty)
+                    Ok(DbTypeAttr::Numeric(ty))
                 }
             }
-            Meta::NameValue(_) => panic!("#[db_type] must use #[db_type] or #[db_type(Type)]"),
+            Meta::NameValue(_) => Err(syn::Error::new_spanned(
+                attr,
+                "#[db_type] must use #[db_type] or #[db_type(Type)]",
+            )),
         };
     }
-    DbTypeAttr::Native
+    Ok(DbTypeAttr::Native)
 }
 
-fn extract_column_name(field: &syn::Field) -> String {
-    let default_name = field.ident.as_ref().unwrap().to_string();
-
-    for attr in &field.attrs {
-        if attr.path().is_ident("column") {
-            if let Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr) = &meta.value
-                    && let Lit::Str(lit) = &expr.lit
-                {
-                    return lit.value();
-                }
-            }
-
-            if let Meta::List(list) = &attr.meta {
-                if let Ok(lit) = syn::parse2::<syn::LitStr>(list.tokens.clone()) {
-                    return lit.value();
-                }
-            }
-        }
-    }
-
-    default_name
-}
+// extract_column_name / to_snake_case / normalize_type_string /
+// option_inner_type / is_string_type 统一使用 crate::shared 中的实现
 
 fn field_rust_type(ty: &syn::Type) -> String {
     let ty = option_inner_type(ty).unwrap_or(ty);
     normalize_type_string(quote! { #ty }.to_string())
-}
-
-fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
-    match ty {
-        syn::Type::Path(type_path) if type_path.qself.is_none() => {
-            let segment = type_path.path.segments.last()?;
-            if segment.ident != "Option" {
-                return None;
-            }
-
-            match &segment.arguments {
-                syn::PathArguments::AngleBracketed(args) => args.args.first().and_then(|arg| {
-                    if let syn::GenericArgument::Type(inner) = arg {
-                        Some(inner)
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn is_string_type(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident == "String")
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-fn to_snake_case(s: &str) -> String {
-    let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                result.push('_');
-            }
-            result.push(c.to_lowercase().next().unwrap());
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 fn repr_integer_type(input: &DeriveInput) -> Option<syn::Type> {
@@ -907,15 +979,20 @@ fn repr_integer_type(input: &DeriveInput) -> Option<syn::Type> {
 fn derive_tuple_struct_field_type(
     input: &DeriveInput,
     data_struct: &syn::DataStruct,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let inner_type = match &data_struct.fields {
         Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0].ty,
-        _ => panic!("FieldType can only be derived for enums or single-field tuple structs"),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input.ident.clone(),
+                "FieldType can only be derived for enums or single-field tuple structs",
+            ))
+        }
     };
     let inner_type_str = normalize_type_string(quote! { #inner_type }.to_string());
 
-    quote! {
+    Ok(quote! {
         impl From<#name> for ::ormer::model::Value {
             fn from(value: #name) -> Self {
                 ::ormer::model::Value::from(value.0)
@@ -956,13 +1033,88 @@ fn derive_tuple_struct_field_type(
                 ))
             }
         }
-    }
+    })
 }
 
-fn normalize_type_string(type_str: String) -> String {
-    type_str
-        .replace(" :: ", "::")
-        .replace(" < ", "<")
-        .replace(" >", ">")
-        .replace(" , ", ",")
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    // 校验失败统一展开为 compile_error!，断言错误文本出现在产物中
+
+    #[test]
+    fn rejects_u64_repr_numeric_enum() {
+        let input: DeriveInput = parse_quote! {
+            #[repr(u64)]
+            enum WideFlag {
+                Big = 5_000_000_000,
+            }
+        };
+        let tokens = derive_model_enum(input).to_string();
+        assert!(tokens.contains("numeric enums are not supported"), "{tokens}");
+    }
+
+    #[test]
+    fn rejects_usize_repr_numeric_enum() {
+        let input: DeriveInput = parse_quote! {
+            #[repr(usize)]
+            enum WideFlag {
+                Big = 1,
+            }
+        };
+        let tokens = derive_model_enum(input).to_string();
+        assert!(tokens.contains("numeric enums are not supported"), "{tokens}");
+    }
+
+    #[test]
+    fn numeric_enum_uses_lossless_i64_conversion_and_skips_i32_for_wide_repr() {
+        let input: DeriveInput = parse_quote! {
+            #[repr(i64)]
+            enum Status {
+                Disabled = 0,
+                Active = 1,
+            }
+        };
+        let tokens = derive_model_enum(input).to_string();
+        assert!(
+            tokens.contains("< i64 as :: core :: convert :: From < i64 >> :: from (v as i64)"),
+            "expected lossless From conversion, got: {tokens}"
+        );
+        // 宽 repr 不再注入 From<Enum> for i32（会截断/与用户手写 impl 冲突）
+        assert!(
+            !tokens.contains("impl :: core :: convert :: From < Status > for i32"),
+            "wide repr must not inject From<Enum> for i32: {tokens}"
+        );
+    }
+
+    #[test]
+    fn narrow_repr_numeric_enum_keeps_i32_from_impl() {
+        let input: DeriveInput = parse_quote! {
+            #[repr(u16)]
+            enum Status {
+                Disabled = 0,
+                Active = 1,
+            }
+        };
+        let tokens = derive_model_enum(input).to_string();
+        assert!(
+            tokens.contains("impl :: core :: convert :: From < Status > for i32"),
+            "narrow repr keeps the lossless From<Enum> for i32 impl: {tokens}"
+        );
+    }
+
+    #[test]
+    fn polymorphic_enum_generates_assign_column_value_impl() {
+        let input: DeriveInput = parse_quote! {
+            enum Attr {
+                Text { text_value: String },
+                Num { num_value: i64 },
+            }
+        };
+        let tokens = derive_model_enum(input).to_string();
+        assert!(tokens.contains("model_assign_column_value"), "{tokens}");
+        // 不再是恒返回 Ok(false) 的空实现
+        assert!(!tokens.contains("Ok (false) }, "), "{tokens}");
+    }
 }

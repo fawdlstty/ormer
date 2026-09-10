@@ -196,11 +196,16 @@ impl DynamicSubquery {
         (self.render)(db_type)
     }
 
+    /// 渲染并只取参数（PostgreSQL rust 类型收集路径）。
+    ///
+    /// `Vec<Value>` 签名无法携带错误：渲染失败时返回空列表，保持 rust
+    /// 类型清单与实际占位符数量对齐（渲染层对失败子查询生成零占位符的
+    /// 错误占位引用，最终以数据库错误而非 panic 的形式抛出）。
     #[cfg(feature = "postgresql")]
     pub(crate) fn params(&self, db_type: crate::abstract_layer::DbType) -> Vec<Value> {
-        (self.render)(db_type)
-            .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"))
-            .1
+        self.render(db_type)
+            .map(|(_, params)| params)
+            .unwrap_or_default()
     }
 }
 
@@ -253,6 +258,12 @@ macro_rules! impl_decimal_query_traits {
 
             fn supports_comparison() -> bool {
                 true
+            }
+        }
+
+        impl crate::query::builder::IsInValue<$type> for $type {
+            fn to_in_value(self) -> $type {
+                self
             }
         }
 
@@ -501,18 +512,12 @@ impl OrderBy {
         self.error.as_deref()
     }
 
-    /// 将 OrderBy 转换为 SQL 字符串
+    /// 将 OrderBy 转换为 SQL 字符串（默认方言，含列名引用）
+    ///
+    /// 与 `to_sql_for(default_db_type())` 完全一致，避免出现同一排序项
+    /// 两份拼接逻辑、裸拼列名与实际执行语句不一致的问题。
     pub fn to_sql(&self) -> String {
-        let dir = match self.direction {
-            OrderDirection::Asc => "ASC",
-            OrderDirection::Desc => "DESC",
-        };
-        let expr_sql = self
-            .expr
-            .as_ref()
-            .map(|expr| expr.to_sql_no_params(crate::query::builder::default_db_type()))
-            .unwrap_or_else(|| self.column.clone());
-        format!("{} {}", expr_sql, dir)
+        self.to_sql_for(crate::query::builder::default_db_type())
     }
 
     /// 将 OrderBy 转换为指定后端的 SQL 字符串

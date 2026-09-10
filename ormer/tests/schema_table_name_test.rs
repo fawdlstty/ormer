@@ -119,9 +119,11 @@ fn mssql_keeps_schema_prefix_in_table_names() {
 
     let create_sql = ormer::generate_create_table_sql::<SchemaTableUser>(db_type).unwrap();
     assert!(create_sql.contains("CREATE TABLE IF NOT EXISTS auth.schema_table_users_1"));
-    assert!(create_sql.contains(
-        "CREATE INDEX IF NOT EXISTS idx_auth_schema_table_users_1_name ON auth.schema_table_users_1 (name)"
-    ));
+    // MSSQL 方言不支持 CREATE INDEX IF NOT EXISTS，与 MySQL 一样输出裸 CREATE INDEX
+    assert!(
+        create_sql
+            .contains("CREATE INDEX idx_auth_schema_table_users_1_name ON auth.schema_table_users_1 (name)")
+    );
 
     let child_sql = ormer::generate_create_table_sql::<SchemaTableChild>(db_type).unwrap();
     assert!(

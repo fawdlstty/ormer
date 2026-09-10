@@ -21,6 +21,13 @@ pub struct Capabilities {
     /// ClickHouse 建表把自增列按普通列映射、InfluxDB 在 Line Protocol 写入前由
     /// `validate_influx_model` 拒绝，两处语义各异，仍由各后端自行处理。
     pub auto_increment: bool,
+    /// 是否支持事务内 SAVEPOINT（`Transaction::savepoint`）。
+    ///
+    /// 消费点：统一层 `Transaction::savepoint` 入口 `ensure`。DuckDB 不支持
+    /// SAVEPOINT 语法（调用即驱动层 Parser 错误），置 false 使其返回
+    /// `UnsupportedFeature` 而不是透传协议错误；无事务的后端
+    /// （QuestDB/ClickHouse/InfluxDB）同样为 false（`begin()` 已先行拦截）。
+    pub savepoints: bool,
     /// 是否支持 DML `RETURNING`（或等价的 MSSQL `OUTPUT inserted./deleted.`）。
     ///
     /// 消费点：统一层 `InsertExecutor::returning` / `DeleteExecutor::returning` /
@@ -80,11 +87,24 @@ pub struct Capabilities {
     /// 但 GROUPING SETS/CUBE 由 `validate_grouping_clause` 按子句精确拒绝，
     /// 故此处保持 false 不影响普通聚合查询。
     pub advanced_grouping: bool,
-    /// 是否提供 `truncate_table` 执行器（当前为 PostgreSQL/QuestDB）。
+    /// 是否提供 `truncate_table` 执行器（PostgreSQL/QuestDB/MySQL/MSSQL/DuckDB；
+    /// SQLite 无 TRUNCATE 语法、ClickHouse/InfluxDB 未接入执行器，均为 false）。
     ///
     /// 消费点：统一层 `Database::truncate_table`。QuestDB 走 `Database::PostgreSQL`
     /// 分支，`TruncateTableExecutor` 携带运行时 `db_type`。
     pub truncate: bool,
+    /// 是否支持 `JOIN LATERAL (子查询)` 语法（JOIN 右表排序/分页改写路径）。
+    ///
+    /// 消费点：`query::builder::validate_join_parts`（`LeftJoinedSelect` /
+    /// `InnerJoinedSelect` / `RightJoinedSelect` 的 `try_to_sql_with_params`）。
+    /// - PostgreSQL / DuckDB：原生支持 LATERAL 关键字；
+    /// - MySQL：8.0.14+ 支持（与递归 CTE 一致按 MySQL 8 口径放行），内层
+    ///   分页的 `LIMIT n OFFSET m` 方言合法；
+    /// - SQLite：3.39+ 支持隐式 lateral 子查询，但解析器不接受 `LATERAL`
+    ///   关键字（生成 `JOIN LATERAL (...)` 会直接语法错误），置 false；
+    /// - MSSQL：只支持 CROSS/OUTER APPLY 等价改写，置 false；
+    /// - ClickHouse/InfluxDB/QuestDB：不支持该语法，置 false。
+    pub lateral: bool,
 }
 
 impl Capabilities {
@@ -95,6 +115,9 @@ impl Capabilities {
                 copy: false,
                 row_lock: false,
                 advanced_grouping: false,
+                // SQLite 3.39+ 支持隐式 lateral 子查询，但不解析 LATERAL
+                // 关键字，`JOIN LATERAL (...)` 会语法错误。
+                lateral: false,
                 ..Self::full_oltp()
             },
             #[cfg(feature = "postgresql")]
@@ -107,6 +130,7 @@ impl Capabilities {
                 // QuestDB 无事务：统一层 Database::begin() 依此声明直接报错，
                 // 而不是透传 PostgreSQL 协议的伪事务。
                 transactions: false,
+                savepoints: false,
                 auto_increment: false,
                 dml_returning: false,
                 insert_conflict: false,
@@ -121,12 +145,16 @@ impl Capabilities {
                 schema_introspection: true,
                 advanced_grouping: false,
                 truncate: true,
+                // QuestDB 不支持 LATERAL 派生表语法。
+                lateral: false,
             },
             #[cfg(feature = "mysql")]
             DbType::MySQL => Self {
                 dml_returning: false,
                 copy: false,
                 advanced_grouping: false,
+                // MySQL 原生支持 TRUNCATE TABLE
+                truncate: true,
                 ..Self::full_oltp()
             },
             #[cfg(feature = "mssql")]
@@ -136,6 +164,11 @@ impl Capabilities {
                 // 声明为 false 与实现矛盾，以实现为准修正。
                 dml_returning: true,
                 copy: false,
+                // SQL Server 原生支持 TRUNCATE TABLE
+                truncate: true,
+                // T-SQL 无 LATERAL 关键字（等价能力是 CROSS/OUTER APPLY），
+                // JOIN 右表排序/分页的 LATERAL 改写对其返回 UnsupportedFeature。
+                lateral: false,
                 ..Self::full_oltp()
             },
             #[cfg(feature = "duckdb")]
@@ -143,11 +176,17 @@ impl Capabilities {
                 // COPY INTO 批量导入尚未实现，待 duckdb_backend 接入后再放开。
                 copy: false,
                 row_lock: false,
+                // DuckDB 不支持 SAVEPOINT 语法，savepoint() 依此返回
+                // UnsupportedFeature 而非驱动层 Parser 错误。
+                savepoints: false,
+                // DuckDB 原生支持 TRUNCATE TABLE
+                truncate: true,
                 ..Self::full_oltp()
             },
             #[cfg(feature = "clickhouse")]
             DbType::ClickHouse => Self {
                 transactions: false,
+                savepoints: false,
                 auto_increment: false,
                 dml_returning: false,
                 insert_conflict: false,
@@ -160,11 +199,13 @@ impl Capabilities {
                 // ClickHouse 支持 GROUP BY/HAVING/GROUPING SETS/CUBE/ROLLUP，
                 // 统一层的分组聚合执行分支据此放行。
                 advanced_grouping: true,
+                lateral: false,
                 ..Self::full_oltp()
             },
             #[cfg(feature = "influxdb")]
             DbType::InfluxDB => Self {
                 transactions: false,
+                savepoints: false,
                 auto_increment: false,
                 dml_returning: false,
                 insert_conflict: false,
@@ -177,6 +218,7 @@ impl Capabilities {
                 schema_introspection: false,
                 advanced_grouping: false,
                 truncate: false,
+                lateral: false,
             },
         }
     }
@@ -204,6 +246,7 @@ impl Capabilities {
     const fn full_oltp() -> Self {
         Self {
             transactions: true,
+            savepoints: true,
             auto_increment: true,
             dml_returning: true,
             insert_conflict: true,
@@ -216,6 +259,7 @@ impl Capabilities {
             schema_introspection: true,
             advanced_grouping: true,
             truncate: false,
+            lateral: true,
         }
     }
 }

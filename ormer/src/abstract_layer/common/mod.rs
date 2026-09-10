@@ -3,6 +3,9 @@ pub mod connection_pool;
 
 pub mod common_helpers;
 
+/// SQLite/DuckDB 共用的 DDL 内省与约束校验
+pub mod ddl_introspection;
+
 use crate::abstract_layer::DbType;
 use crate::model::{Value, VersionSnapshotUpdate};
 
@@ -24,25 +27,36 @@ pub(crate) use unified::compute_pending_migrations;
 pub use unified::{
     AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
     BlockDeleteExecutor, BlockDeleteResult, CollectFuture, CreateTableExecutor, Database,
-    DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
-    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
-    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
+    DatabaseScope, DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
+    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor, FirstFuture,
+    FourTableCountFuture, IncludedCollectFuture, IncludedSelectExecutor, InnerJoinedSelectExecutor,
     InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
     InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    RawCollectFuture, RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor,
-    RelationNestedLoader, ReplicatedDatabase, ReplicatedDatabaseBuilder, SaveExecutor,
-    ScopedDeleteExecutor, ScopedUpdateExecutor, SelectExecutor, SelectStream,
-    SelectStreamIterator, Transaction, TransactionFuture, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
-    TruncateTableExecutor, UpdateExecutor, UpdateGraphExecutor,
+    ModelCollectWithFuture, MultiTableCountFuture, NestedInclude, ProjectionCollectFuture,
+    ProjectionSelectExecutor, RawCollectFuture, RawSelectExecutor, RelatedCollectFuture,
+    RelatedCountFuture, RelatedSelectExecutor, RelationNestedLoader, ReplicatedDatabase,
+    ReplicatedDatabaseBuilder, RightJoinedSelectExecutor, SaveExecutor, ScopedDeleteExecutor,
+    ScopedUpdateExecutor, SelectExecutor, SelectStream, SelectStreamIterator, Transaction,
+    TransactionFuture, TransactionOptions, TruncateTableExecutor, UnionSelectExecutor,
+    UpdateExecutor, UpdateGraphExecutor,
+};
+
+// 旧类型名过渡别名（已合并，保留 re-export 以兼容现有导入路径）：
+// - Mapped/Grouped* → Projection*（R2）
+// - Transaction*Insert* / TransactionRaw* / TransactionSave* → 合并入对应普通执行器（R3）
+// - PooledRawSelectExecutor → unified::RawSelectExecutor（R3）
+#[allow(deprecated)]
+pub use unified::{
+    GroupedCollectFuture, GroupedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
+    PooledRawSelectExecutor, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    TransactionSaveExecutor,
 };
 
 // 连接池类型 - 根据启用的 feature 导出
 pub use connection_pool::{
-    ConnectionPool, PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor,
-    ReplicatedConnectionPool, ReplicatedPoolBuilder,
+    ConnectionPool, PooledConnection, PooledDatabaseScope, ReplicatedConnectionPool,
+    ReplicatedPoolBuilder,
 };
 
 #[derive(Debug, Clone)]
@@ -128,7 +142,7 @@ pub trait SqlExecutor: Sized {
 pub trait DbExecutor {
     fn select<T: crate::model::Model>(&self) -> SelectExecutor<'_, T>;
 
-    fn select_column<T: crate::model::Model, V>(&self) -> GroupedSelectExecutor<'_, T, V>;
+    fn select_column<T: crate::model::Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V>;
 
     fn batch<'a, B>(&'a self, batch: B) -> BatchFuture<'a, B>
     where

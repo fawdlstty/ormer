@@ -5,18 +5,19 @@ use super::SingleSqlStatement;
 /// 统一的数据库抽象层
 /// 使用枚举包装不同数据库后端,对外提供统一接口
 /// 通过条件编译控制枚举变体
+use super::connection_pool;
 use super::{SqlStatement, common_helpers};
 use super::super::capabilities::Capabilities;
 use crate::db_first;
 use crate::model::{
     Model, NoInclude, Relation, RelationHandle, RelationInfo, RelationPathInfo, RelationQuery,
     RelationSelection, TableRouteValue, ThroughRelation, Tracked, Value, WritableModel,
-    normalize_table_name_for_db, routed_model_table_name_for_db,
+    routed_model_table_name_for_db,
 };
 #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
 use crate::query::builder::Select;
 #[cfg(feature = "clickhouse")]
-use crate::query::builder::GroupedSelect;
+use crate::query::builder::ProjectionSelect;
 use crate::query::builder::{
     ContextFilter, DerivedSelect, DerivedTableSelect, FilterQuery, NamedFilterQuery, WhereExpr,
     WithoutFilterQuery,
@@ -293,6 +294,83 @@ pub(crate) fn relation_owner_key(path: RelationPathInfo) -> &'static RelationInf
     }
 }
 
+/// find_by_id 家族的公共尾部（L26）：主键过滤 → `range(..1)` → collect →
+/// 取首行。Database / DatabaseScope / Transaction / TransactionScope /
+/// 池连接 PooledDatabaseScope 五个入口共用，各入口只负责构造带各自
+/// context filters 的 [`SelectExecutor`]。
+pub(crate) async fn find_by_id_with_executor<T>(
+    exec: SelectExecutor<'_, T>,
+    key: impl crate::model::PrimaryKey,
+) -> crate::Result<Option<T>>
+where
+    T: Model + 'static + Send + Sync,
+{
+    let where_expr = primary_key_filter::<T>(key)?;
+    let results = exec
+        .filter(|_| where_expr)
+        .range(..1)
+        .collect::<Vec<T>>()
+        .await?;
+    Ok(results.into_iter().next())
+}
+
+/// find_related 的公共尾部（L26）：解析 owner key 后走关联查询执行器。
+pub(crate) async fn find_related_with_executor<'a, T, S>(
+    exec: &SelectExecutor<'a, T>,
+    owner: &T,
+    relation: &S,
+) -> crate::Result<Vec<S::Target>>
+where
+    T: Model + 'static + Send + Sync,
+    S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync,
+    S::Target: Send + Sync,
+    S::Via: Send + Sync,
+{
+    let path = relation.path_info()?;
+    let key = owner.relation_key_value(relation_owner_key(path))?;
+    exec.select_related_with_selection(vec![key], relation).await
+}
+
+/// preload 的公共尾部（L26）：批量预加载关联对象，避免 N+1。
+pub(crate) async fn preload_with_executor<'a, T, S>(
+    exec: &SelectExecutor<'a, T>,
+    owners: &mut [T],
+    relation: S,
+) -> crate::Result<()>
+where
+    T: Model + 'static + Send + Sync,
+    S: RelationSelection<T> + RelationNestedLoader<'a, T> + Send + Sync,
+    S::Target: Send + Sync,
+    S::Via: Send + Sync,
+{
+    exec.preload_models_with_selection(owners, relation).await
+}
+
+/// select_column 家族（[`Database::select_column`] / 池连接
+/// `DbExecutor::select_column` / [`SelectExecutor::select_column`]）对
+/// ClickHouse 协议后端的统一能力判定（L19：三个入口共用同一判定与文案）。
+///
+/// 以 `Capabilities::advanced_grouping` 为准：ClickHouse 支持聚合投影
+/// （矩阵为 true，放行走分组聚合执行分支）；InfluxDB 不支持（InfluxQL
+/// 的 GROUP BY 仅支持时间桶与 tag）。返回 `None` 表示放行，`Some(feature)`
+/// 为统一的拒绝文案。
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+pub(crate) fn clickhouse_projection_gate(
+    db_type: super::super::DbType,
+) -> Option<&'static str> {
+    if Capabilities::of(db_type).advanced_grouping {
+        return None;
+    }
+    // DbType::InfluxDB 变体仅在 influxdb feature 下存在，需同步门控。
+    #[cfg(feature = "influxdb")]
+    if db_type == super::super::DbType::InfluxDB {
+        return Some(
+            "GROUP BY aggregation on InfluxDB (InfluxQL GROUP BY only supports time buckets and tags)",
+        );
+    }
+    Some("GROUP BY aggregation")
+}
+
 pub trait NestedInclude<'a, Owner: Model>: Clone {
     fn load_nested_include<'b>(
         self,
@@ -452,53 +530,6 @@ where
     }
 }
 
-fn quote_table_name(db_type: super::super::DbType, table_name: &str) -> String {
-    let normalized = normalize_table_name_for_db(db_type, table_name);
-    match db_type {
-        #[cfg(feature = "postgresql")]
-        super::super::DbType::PostgreSQL => {
-            let (schema, table) = crate::model::split_schema_table_name(normalized, "public");
-            if schema == "public" {
-                crate::model::quote_identifier(db_type, table)
-            } else {
-                format!(
-                    "{}.{}",
-                    crate::model::quote_identifier(db_type, schema),
-                    crate::model::quote_identifier(db_type, table)
-                )
-            }
-        }
-        #[cfg(feature = "mssql")]
-        super::super::DbType::MSSQL => {
-            let (schema, table) = crate::model::split_schema_table_name(normalized, "dbo");
-            if schema == "dbo" {
-                crate::model::quote_identifier(db_type, table)
-            } else {
-                format!(
-                    "{}.{}",
-                    crate::model::quote_identifier(db_type, schema),
-                    crate::model::quote_identifier(db_type, table)
-                )
-            }
-        }
-        #[cfg(feature = "questdb")]
-        super::super::DbType::QuestDB => {
-            let (_, table) = crate::model::split_schema_table_name(normalized, "public");
-            crate::model::quote_identifier(db_type, table)
-        }
-        #[cfg(feature = "sqlite")]
-        super::super::DbType::Sqlite => crate::model::quote_identifier(db_type, normalized),
-        #[cfg(feature = "mysql")]
-        super::super::DbType::MySQL => crate::model::quote_identifier(db_type, normalized),
-        #[cfg(any(
-            feature = "duckdb",
-            feature = "clickhouse",
-            feature = "influxdb"
-        ))]
-        _ => crate::model::quote_identifier(db_type, normalized),
-    }
-}
-
 /// 统一的 Database 枚举
 pub enum Database {
     #[cfg(feature = "sqlite")]
@@ -637,14 +668,7 @@ impl<'a> DatabaseScope<'a> {
         &self,
         key: impl crate::model::PrimaryKey,
     ) -> crate::Result<Option<T>> {
-        let where_expr = primary_key_filter::<T>(key)?;
-        let results = self
-            .select::<T>()
-            .filter(|_| where_expr)
-            .range(..1)
-            .collect::<Vec<T>>()
-            .await?;
-        Ok(results.into_iter().next())
+        find_by_id_with_executor(self.select::<T>(), key).await
     }
 
     pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
@@ -657,11 +681,7 @@ impl<'a> DatabaseScope<'a> {
         S::Target: Send + Sync,
         S::Via: Send + Sync,
     {
-        let path = relation.path_info()?;
-        let key = owner.relation_key_value(relation_owner_key(path))?;
-        self.select::<T>()
-            .select_related_with_selection(vec![key], &relation)
-            .await
+        find_related_with_executor(&self.select::<T>(), owner, &relation).await
     }
 
     pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
@@ -674,9 +694,7 @@ impl<'a> DatabaseScope<'a> {
         S::Target: Send + Sync,
         S::Via: Send + Sync,
     {
-        self.select::<T>()
-            .preload_models_with_selection(owners, relation)
-            .await
+        preload_with_executor(&self.select::<T>(), owners, relation).await
     }
 
     pub fn delete<T: WritableModel>(&self) -> ScopedDeleteExecutor<'a, T> {
@@ -749,8 +767,9 @@ where
     R: crate::model::FromValue,
 {
     let backend = clickhouse_select_backend_db_type(db);
-    let (mut sql, params) = aggregate.to_sql_with_params(backend);
-    // InfluxQL 没有 AVG，对应语义是 MEAN
+    // InfluxQL 没有 AVG，对应语义是 MEAN（仅 influxdb 构建需要改写 sql）
+    #[cfg_attr(not(feature = "influxdb"), allow(unused_mut))]
+    let (mut sql, params) = aggregate.try_to_sql_with_params(backend)?;
     #[cfg(feature = "influxdb")]
     if backend == super::super::DbType::InfluxDB && sql.starts_with("SELECT AVG(") {
         sql = sql.replacen("SELECT AVG(", "SELECT MEAN(", 1);
@@ -856,6 +875,17 @@ pub enum CreateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
+    // table_name 仅由本地后端分支消费（InfluxDB measurement 名称由模型固定）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn with_table_name(self, table_name: &str) -> Self {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1066,10 +1096,17 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
 /// 统一的 TruncateTableExecutor 枚举：`TRUNCATE TABLE t`。
 ///
 /// QuestDB 不支持行级 DELETE，`truncate_table` 是唯一的清空表数据手段；
-/// PostgreSQL 同样支持。其余后端暂未提供该执行器。
+/// PostgreSQL/MySQL/MSSQL/DuckDB 同样原生支持；SQLite 无 TRUNCATE 语法
+/// （能力矩阵为 false），ClickHouse/InfluxDB 未接入执行器。
 pub enum TruncateTableExecutor<'a, T: crate::model::WritableModel> {
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::TruncateTableExecutor<'a, T>),
+    #[cfg(feature = "mysql")]
+    MySQL(mysql_backend::TruncateTableExecutor<'a, T>),
+    #[cfg(feature = "mssql")]
+    MSSQL(mssql_backend::TruncateTableExecutor<'a, T>),
+    #[cfg(feature = "duckdb")]
+    DuckDB(duckdb_backend::TruncateTableExecutor<'a, T>),
     /// 能力矩阵门控产物：`truncate: false` 的后端在
     /// [`Database::truncate_table`] 构造时落入该变体。
     #[doc(hidden)]
@@ -1085,6 +1122,12 @@ impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
         match self {
             #[cfg(feature = "postgresql")]
             TruncateTableExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            TruncateTableExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            TruncateTableExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            TruncateTableExecutor::DuckDB(exec) => exec.to_sql(),
             TruncateTableExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1095,6 +1138,12 @@ impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
         match self {
             #[cfg(feature = "postgresql")]
             TruncateTableExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            TruncateTableExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mssql")]
+            TruncateTableExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            TruncateTableExecutor::DuckDB(exec) => exec.execute().await,
             TruncateTableExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -1108,14 +1157,30 @@ impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
 pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "sqlite")]
+    /// 事务路径变体：持有后端事务插入执行器，与 `Sqlite` 变体共享同一套
+    /// 链式配置方法（原 `TransactionInsertExecutor` 已合并入本枚举）。
+    SqliteTxn(sqlite_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "postgresql")]
+    /// 事务路径变体（原 `TransactionInsertExecutor` 的 PostgreSQL 分支）。
+    PostgreSQLTxn(postgresql_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "mysql")]
+    /// 事务路径变体（原 `TransactionInsertExecutor` 的 MySQL 分支）。
+    MySQLTxn(mysql_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "mssql")]
+    /// 事务路径变体（原 `TransactionInsertExecutor` 的 MSSQL 分支）。
+    MSSQLTxn(mssql_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertExecutor<'a, I>),
+    #[cfg(feature = "duckdb")]
+    /// 事务路径变体（原 `TransactionInsertExecutor` 的 DuckDB 分支）。
+    DuckDBTxn(duckdb_backend::TransactionInsertExecutor<'a, I>),
     #[cfg(feature = "clickhouse")]
     ClickHouse(
         &'a clickhouse_backend::Database,
@@ -1136,9 +1201,19 @@ pub enum InsertExecutor<'a, I: crate::model::Insertable> {
     InfluxDB(
         &'a influxdb_backend::Database,
         I,
+        Option<crate::query::insert::InsertConflict>,
         std::marker::PhantomData<I::Model>,
     ),
 }
+
+/// 旧事务插入执行器名过渡别名（已合并为 [`InsertExecutor`]，保留
+/// re-export 以兼容现有导入路径；事务入口 [`Transaction::insert`]
+/// 返回的就是 [`InsertExecutor`] 的事务变体）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionInsertExecutor 已合并为 InsertExecutor，请改用 InsertExecutor"
+)]
+pub type TransactionInsertExecutor<'a, I> = InsertExecutor<'a, I>;
 
 pub enum InsertPartialExecutor<'a, T: Model> {
     #[cfg(feature = "sqlite")]
@@ -1164,6 +1239,17 @@ pub enum InsertPartialExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
+    // f 仅由本地后端分支消费（ClickHouse/InfluxDB 不支持 partial insert）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn set<F, A>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> A,
@@ -1253,7 +1339,51 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
     }
 }
 
+/// ClickHouse/InfluxDB 变体的 insert conflict 配置落地（L11）：两后端不支持
+/// conflict 处理，配置存储到变体字段，由 to_sql / execute 入口统一返回
+/// `UnsupportedFeature`，与 to_sql 的拒绝行为一致，不再静默丢弃。
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+fn insert_conflict_or_default(
+    conflict: &mut Option<crate::query::insert::InsertConflict>,
+) -> &mut crate::query::insert::InsertConflict {
+    conflict.get_or_insert_with(crate::query::insert::InsertConflict::default)
+}
+
+/// 已配置的 insert conflict（ClickHouse/InfluxDB execute 入口的拒绝判定）。
+#[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+fn insert_conflict_is_configured(
+    conflict: Option<&crate::query::insert::InsertConflict>,
+) -> bool {
+    conflict.is_some_and(|conflict| conflict.is_configured())
+}
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
+    /// ClickHouse/InfluxDB 变体的 conflict 配置分支收敛（L22：14 处同构
+    /// match 分支合一）。原宏在 match 臂位置展开多条臂的写法非法（宏
+    /// 无法生成 match 臂），改为方法：两个后端变体的解构、conflict
+    /// 初始化与执行器重建在此统一，调用方分支体以 `FnOnce` 闭包传入
+    /// （match 分支互斥，捕获的参数可安全移动）。其余变体（含
+    /// Unsupported 哨兵）原样返回。
+    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+    fn with_insert_conflict<F>(self, apply: F) -> Self
+    where
+        F: FnOnce(&mut crate::query::insert::InsertConflict),
+    {
+        match self {
+            #[cfg(feature = "clickhouse")]
+            InsertExecutor::ClickHouse(db, models, mut conflict, marker) => {
+                apply(insert_conflict_or_default(&mut conflict));
+                InsertExecutor::ClickHouse(db, models, conflict, marker)
+            }
+            #[cfg(feature = "influxdb")]
+            InsertExecutor::InfluxDB(db, models, mut conflict, marker) => {
+                apply(insert_conflict_or_default(&mut conflict));
+                InsertExecutor::InfluxDB(db, models, conflict, marker)
+            }
+            other => other,
+        }
+    }
+
     pub fn on_conflict<F, C>(self, f: F) -> Self
     where
         F: FnOnce(<I::Model as Model>::Where) -> C,
@@ -1262,20 +1392,32 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.on_conflict(f)),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.on_conflict(f)),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.on_conflict(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.on_conflict(f))
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_conflict(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => InsertExecutor::MySQLTxn(exec.on_conflict(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_conflict(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => InsertExecutor::MSSQLTxn(exec.on_conflict(f)),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_conflict(f)),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => InsertExecutor::DuckDBTxn(exec.on_conflict(f)),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                conflict.target = Some(crate::query::insert::InsertConflictTarget::Columns(
+                    f(<I::Model as Model>::Where::default()).conflict_columns(),
+                ));
+            }),
         }
     }
 
@@ -1286,22 +1428,40 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.on_constraint(target)),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => {
+                InsertExecutor::SqliteTxn(exec.on_constraint(target))
+            }
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => {
                 InsertExecutor::PostgreSQL(exec.on_constraint(target))
             }
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.on_constraint(target))
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.on_constraint(target)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => {
+                InsertExecutor::MySQLTxn(exec.on_constraint(target))
+            }
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.on_constraint(target)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => {
+                InsertExecutor::MSSQLTxn(exec.on_constraint(target))
+            }
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.on_constraint(target)),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => {
+                InsertExecutor::DuckDBTxn(exec.on_constraint(target))
+            }
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                conflict.target = Some(target.into_insert_conflict_target());
+            }),
         }
     }
 
@@ -1313,20 +1473,38 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.conflict_where(f)),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.conflict_where(f)),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.conflict_where(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.conflict_where(f))
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.conflict_where(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => {
+                InsertExecutor::MySQLTxn(exec.conflict_where(f))
+            }
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.conflict_where(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => {
+                InsertExecutor::MSSQLTxn(exec.conflict_where(f))
+            }
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.conflict_where(f)),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => {
+                InsertExecutor::DuckDBTxn(exec.conflict_where(f))
+            }
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                conflict.target_filter = Some(crate::query::insert::where_expr_to_filter(f(
+                    <I::Model as Model>::Where::default(),
+                )));
+            }),
         }
     }
 
@@ -1334,20 +1512,30 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_nothing()),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.do_nothing()),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_nothing()),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.do_nothing())
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_nothing()),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => InsertExecutor::MySQLTxn(exec.do_nothing()),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_nothing()),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => InsertExecutor::MSSQLTxn(exec.do_nothing()),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_nothing()),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => InsertExecutor::DuckDBTxn(exec.do_nothing()),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                conflict.action = Some(crate::query::insert::InsertConflictAction::DoNothing);
+            }),
         }
     }
 
@@ -1355,20 +1543,30 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_update()),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.do_update()),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_update()),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.do_update())
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update()),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => InsertExecutor::MySQLTxn(exec.do_update()),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update()),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => InsertExecutor::MSSQLTxn(exec.do_update()),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update()),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => InsertExecutor::DuckDBTxn(exec.do_update()),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                conflict.action = Some(crate::query::insert::InsertConflictAction::DoUpdate);
+            }),
         }
     }
 
@@ -1380,20 +1578,34 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.do_update_if(f)),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.do_update_if(f)),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.do_update_if(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.do_update_if(f))
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.do_update_if(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => InsertExecutor::MySQLTxn(exec.do_update_if(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.do_update_if(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => InsertExecutor::MSSQLTxn(exec.do_update_if(f)),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.do_update_if(f)),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => InsertExecutor::DuckDBTxn(exec.do_update_if(f)),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                let update_filter = crate::query::insert::where_expr_to_filter(f(
+                    <I::Model as Model>::Where::default(),
+                ));
+                conflict.action = Some(crate::query::insert::InsertConflictAction::DoUpdate);
+                conflict.update_filter = Some(update_filter);
+            }),
         }
     }
 
@@ -1404,20 +1616,39 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => InsertExecutor::Sqlite(exec.set(f)),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => InsertExecutor::SqliteTxn(exec.set(f)),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => InsertExecutor::PostgreSQL(exec.set(f)),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => {
+                InsertExecutor::PostgreSQLTxn(exec.set(f))
+            }
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => InsertExecutor::MySQL(exec.set(f)),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => InsertExecutor::MySQLTxn(exec.set(f)),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => InsertExecutor::MSSQL(exec.set(f)),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => InsertExecutor::MSSQLTxn(exec.set(f)),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => InsertExecutor::DuckDB(exec.set(f)),
-            #[cfg(feature = "clickhouse")]
-            unsupported @ InsertExecutor::ClickHouse(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::InfluxDB(..) => unsupported,
-            #[cfg(feature = "influxdb")]
-            unsupported @ InsertExecutor::Unsupported { .. } => unsupported,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => InsertExecutor::DuckDBTxn(exec.set(f)),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            exec => exec.with_insert_conflict(|conflict| {
+                let mut update = <I::Model as Model>::Update::default();
+                f(&mut update);
+                conflict
+                    .action
+                    .get_or_insert(crate::query::insert::InsertConflictAction::DoUpdate);
+                conflict.assignments.extend(
+                    <<I::Model as Model>::Update as crate::query::update::UpdateFields>::assignments(
+                        &update,
+                    ),
+                );
+            }),
         }
     }
 
@@ -1425,14 +1656,24 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => exec.to_sql(),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => exec.to_sql(),
             #[cfg(feature = "clickhouse")]
             InsertExecutor::ClickHouse(_, models, conflict, _) => {
                 // to_sql 渲染等价的多行 VALUES 文本（可观测性用途）；
@@ -1471,16 +1712,34 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(exec) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.execute().await,
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.execute().await,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(exec) => exec.execute().await,
             #[cfg(feature = "clickhouse")]
-            InsertExecutor::ClickHouse(db, mut models, _conflict, _) => {
+            InsertExecutor::ClickHouse(db, mut models, conflict, _) => {
+                // ClickHouse 不支持 insert conflict：已配置的 conflict 配置在
+                // 入口直接拒绝（与 to_sql 行为一致），不再静默丢弃
+                if insert_conflict_is_configured(conflict.as_ref()) {
+                    return Err(unsupported_feature(
+                        super::super::DbType::ClickHouse,
+                        "insert conflict handling",
+                    ));
+                }
                 if models.as_refs().is_empty() {
                     return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
                 }
@@ -1507,7 +1766,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 Err(unsupported_feature(backend, feature))
             }
             #[cfg(feature = "influxdb")]
-            InsertExecutor::InfluxDB(db, mut models, _) => {
+            InsertExecutor::InfluxDB(db, mut models, conflict, _) => {
+                // InfluxDB 不支持 insert conflict：已配置的 conflict 配置在
+                // 入口直接拒绝（与 to_sql 行为一致），不再静默丢弃
+                if insert_conflict_is_configured(conflict.as_ref()) {
+                    return Err(unsupported_feature(
+                        super::super::DbType::InfluxDB,
+                        "insert conflict handling",
+                    ));
+                }
                 if models.as_refs().is_empty() {
                     return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
                 }
@@ -1549,14 +1816,26 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         let backend = match &self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(_) => super::super::DbType::Sqlite,
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(_) => super::super::DbType::Sqlite,
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => exec.db_type(),
+            // 事务只存在于 transactions=true 的真实 PostgreSQL 连接上，
+            // 无 QuestDB 运行时分支。
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(_) => super::super::DbType::PostgreSQL,
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(_) => super::super::DbType::MySQL,
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(_) => super::super::DbType::MySQL,
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(_) => super::super::DbType::MSSQL,
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(_) => super::super::DbType::MSSQL,
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(_) => super::super::DbType::DuckDB,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(_) => super::super::DbType::DuckDB,
             #[cfg(feature = "clickhouse")]
             InsertExecutor::ClickHouse(..) => super::super::DbType::ClickHouse,
             #[cfg(feature = "influxdb")]
@@ -1568,14 +1847,39 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertExecutor::Sqlite(exec) => exec.returning().await,
+            #[cfg(feature = "sqlite")]
+            InsertExecutor::SqliteTxn(_) => Err(unsupported_feature(
+                super::super::DbType::Sqlite,
+                "DML RETURNING inside transactions",
+            )),
             #[cfg(feature = "postgresql")]
             InsertExecutor::PostgreSQL(exec) => exec.returning().await,
+            #[cfg(feature = "postgresql")]
+            InsertExecutor::PostgreSQLTxn(_) => Err(unsupported_feature(
+                super::super::DbType::PostgreSQL,
+                "DML RETURNING inside transactions",
+            )),
             #[cfg(feature = "mysql")]
             InsertExecutor::MySQL(exec) => exec.returning().await,
+            #[cfg(feature = "mysql")]
+            InsertExecutor::MySQLTxn(_) => Err(unsupported_feature(
+                super::super::DbType::MySQL,
+                "DML RETURNING inside transactions",
+            )),
             #[cfg(feature = "mssql")]
             InsertExecutor::MSSQL(exec) => exec.returning().await,
+            #[cfg(feature = "mssql")]
+            InsertExecutor::MSSQLTxn(_) => Err(unsupported_feature(
+                super::super::DbType::MSSQL,
+                "DML RETURNING inside transactions",
+            )),
             #[cfg(feature = "duckdb")]
             InsertExecutor::DuckDB(exec) => exec.returning().await,
+            #[cfg(feature = "duckdb")]
+            InsertExecutor::DuckDBTxn(_) => Err(unsupported_feature(
+                super::super::DbType::DuckDB,
+                "DML RETURNING inside transactions",
+            )),
             #[cfg(feature = "clickhouse")]
             InsertExecutor::ClickHouse(..) => Err(unsupported_feature(
                 super::super::DbType::ClickHouse,
@@ -1596,18 +1900,52 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
     }
 }
 
+/// `db.insert(&models).await` 直接执行（委托 [`InsertExecutor::execute`]），
+/// 与后端层执行器和文档示例的写法保持一致。
+/// 注意：Delete/Update 执行器的 `IntoFuture` 由 `impl_unified_delete_executor!`
+/// / `impl_unified_update_executor!` 宏生成，此处不再重复实现。
+impl<'a, I> std::future::IntoFuture for InsertExecutor<'a, I>
+where
+    I: crate::model::Insertable + Send + Sync,
+    <I::Model as crate::model::Model>::AutoIncrementKeyType: Send,
+    <I as crate::model::Insertable>::Model: Send + Sync,
+    Self: 'a,
+{
+    type Output = crate::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.execute())
+    }
+}
+
 /// 统一的 InsertOrUpdateExecutor 枚举
 pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::InsertOrUpdateExecutor<'a, I>),
+    /// 事务路径变体：原 `TransactionInsertOrUpdateExecutor` 已合并入本枚举。
+    #[cfg(feature = "sqlite")]
+    SqliteTxn(sqlite_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::InsertOrUpdateExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrUpdateExecutor` 的 PostgreSQL 分支）。
+    #[cfg(feature = "postgresql")]
+    PostgreSQLTxn(postgresql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::InsertOrUpdateExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrUpdateExecutor` 的 MySQL 分支）。
+    #[cfg(feature = "mysql")]
+    MySQLTxn(mysql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertOrUpdateExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrUpdateExecutor` 的 MSSQL 分支）。
+    #[cfg(feature = "mssql")]
+    MSSQLTxn(mssql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertOrUpdateExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrUpdateExecutor` 的 DuckDB 分支）。
+    #[cfg(feature = "duckdb")]
+    DuckDBTxn(duckdb_backend::TransactionInsertOrUpdateExecutor<'a, I>),
     /// 能力矩阵门控产物：`insert_conflict: false` 的后端在
     /// [`Database::insert_or_update`] 构造时落入该变体。
     #[doc(hidden)]
@@ -1617,6 +1955,14 @@ pub enum InsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
         _marker: std::marker::PhantomData<&'a I>,
     },
 }
+
+/// 旧事务插入或更新执行器名过渡别名（已合并为 [`InsertOrUpdateExecutor`]，
+/// 保留 re-export 以兼容现有导入路径）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionInsertOrUpdateExecutor 已合并为 InsertOrUpdateExecutor，请改用 InsertOrUpdateExecutor"
+)]
+pub type TransactionInsertOrUpdateExecutor<'a, I> = InsertOrUpdateExecutor<'a, I>;
 
 pub struct InsertGraphExecutor<'a, T: crate::model::GraphWritable> {
     db: &'a Database,
@@ -1633,14 +1979,24 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "sqlite")]
+            InsertOrUpdateExecutor::SqliteTxn(exec) => exec.to_sql(),
             #[cfg(feature = "postgresql")]
             InsertOrUpdateExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertOrUpdateExecutor::PostgreSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mysql")]
             InsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertOrUpdateExecutor::MySQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertOrUpdateExecutor::MSSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertOrUpdateExecutor::DuckDBTxn(exec) => exec.to_sql(),
             InsertOrUpdateExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1651,14 +2007,24 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrUpdateExecutor::Sqlite(exec) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            InsertOrUpdateExecutor::SqliteTxn(exec) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             InsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertOrUpdateExecutor::PostgreSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
             InsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertOrUpdateExecutor::MySQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "mssql")]
+            InsertOrUpdateExecutor::MSSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             InsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "duckdb")]
+            InsertOrUpdateExecutor::DuckDBTxn(exec) => exec.execute().await,
             InsertOrUpdateExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -1672,10 +2038,50 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
 
 /// 错误处理兜底路径中的回滚：失败不能完全静默，至少记录日志，
 /// 避免连接带着未关闭的事务回池而无任何痕迹。
-fn log_rollback_failure(result: crate::Result<()>) {
+///
+/// L20：Database / 事务 / 池连接三条路径的回滚失败日志统一走此处
+/// （savepoint 的 ROLLBACK TO / RELEASE 失败同样）。
+/// 泛型化返回值：调用方既有 `Result<()>`（事务回滚）也有 `Result<u64>`
+/// （savepoint 的 execute_sql），仅日志用途，不关心成功值。
+pub(crate) fn log_rollback_failure<T>(result: crate::Result<T>) {
     if let Err(err) = result {
         eprintln!("[ormer] rollback failed during error handling: {err}");
     }
+}
+
+/// 事务闭包的公共收尾（L20）：成功提交、失败回滚（回滚失败走统一日志，
+/// 不覆盖主错误）。[`Database::transaction_opts`] 与池连接的
+/// `PooledConnection::transaction_opts` 共用。
+pub(crate) async fn run_txn_closure<R, F>(txn: Transaction<'_>, f: F) -> crate::Result<R>
+where
+    F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
+{
+    let mut txn = txn;
+    match f(&mut txn).await {
+        Ok(value) => {
+            txn.commit().await?;
+            Ok(value)
+        }
+        Err(err) => {
+            log_rollback_failure(txn.rollback().await);
+            Err(err)
+        }
+    }
+}
+
+/// "先 BEGIN 再应用事务选项"的公共路径（L20）：应用失败时回滚并返回
+/// 原错误（回滚失败走统一日志）。MySQL 以外的后端共用；
+/// [`Database::begin_opts`] 与池连接的 `begin_then_apply` 均委托此处。
+pub(crate) async fn apply_transaction_options_or_rollback(
+    txn: Transaction<'_>,
+    options: TransactionOptions,
+) -> crate::Result<Transaction<'_>> {
+    let mut txn = txn;
+    if let Err(err) = apply_transaction_options(&mut txn, options).await {
+        log_rollback_failure(txn.rollback().await);
+        return Err(err);
+    }
+    Ok(txn)
 }
 
 impl<'a, T> InsertGraphExecutor<'a, T>
@@ -1761,54 +2167,116 @@ where
     }
 }
 
+/// Save 执行器：按 dirty 列更新 + 图关系同步（R3 合并）。
+///
+/// [`Database::save`] 走自开事务（结束时提交/回滚），[`Transaction::save`]
+/// 使用外部事务（写完不提交不回滚，由调用方决定事务边界）。
 pub struct SaveExecutor<'a, T: WritableModel + crate::model::GraphWritable> {
-    db: &'a Database,
+    conn: SaveConn<'a, T>,
     model: &'a mut Tracked<T>,
 }
 
-impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable> SaveExecutor<'a, T> {
+/// Save 执行器的连接句柄（R3 合并；Database / 池连接 / 事务三条构造路径）。
+///
+/// 事务路径的写核心（[`save_dirty_columns_and_relations`] → 图同步链路）要求
+/// `&mut Transaction<'tx>`；`'tx` 与外层借用生命周期不同，且 `&'op mut
+/// Transaction<'a>` 无法收缩成 `&'op mut Transaction<'op>`（可变引用不变性）。
+/// 因此在 [`Transaction::save`] 构造时把事务句柄装进擦除 `'tx` 的运行闭包，
+/// [`SaveExecutor`] 的公开形状保持 `SaveExecutor<'a, T>` 不变；
+/// SQL 预览同样在构造时渲染（dirty 列集合在执行器存续期被独占借用，不可再变，
+/// 尽早渲染与调用时惰性渲染结果一致）。
+///
+/// 池连接路径（L24）与事务路径同构（预渲染 SQL + 擦除启动闭包，池连接的
+/// 内层生命周期同样需要擦除），但语义与 `Db` 一致：写核心自开事务、
+/// 结束时提交/回滚。
+enum SaveConn<'a, T: WritableModel + crate::model::GraphWritable> {
+    Db(&'a Database),
+    Pooled {
+        sql: crate::Result<SqlStatement>,
+        /// 在池连接自开的事务上执行写核心，并把模型句柄归还调用方。
+        run: SaveTxnRun<'a, T>,
+    },
+    Txn {
+        sql: crate::Result<SqlStatement>,
+        /// 在给定事务上执行写核心，并把模型句柄归还调用方
+        /// （后续 accept_changes / after_update 仍由执行器统一调度）。
+        run: SaveTxnRun<'a, T>,
+    },
+}
+
+/// 事务路径写核心的擦除启动器：消费 `&'a mut Tracked<T>`，
+/// 返回 (写结果, 模型句柄)。
+///
+/// 闭包只捕获事务句柄（模型是参数），因此外层 `+ Send` 仅要求
+/// `Transaction: Send`；返回的 future 不标注 `Send`，与合并前
+/// `TransactionSaveExecutor::execute` 的条件 Send 语义一致
+/// （`SaveExecutor` 仍在 `T: Send` 时自动满足 `Send`）。
+type SaveTxnRun<'a, T> = Box<
+    dyn FnOnce(
+            &'a mut Tracked<T>,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                    Output = (crate::Result<u64>, &'a mut Tracked<T>),
+                > + 'a,
+            >,
+        > + Send
+        + 'a,
+>;
+
+/// Save 执行器两条路径共用的收尾：写成功后接受 dirty 变更。
+fn finish_save<T: crate::model::Model>(affected: u64, model: &mut Tracked<T>) -> crate::Result<u64> {
+    if affected > 0 {
+        model.accept_changes();
+    }
+    Ok(affected)
+}
+
+impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
+    SaveExecutor<'a, T>
+{
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            return Ok(SqlStatement::batch(self.db.db_type(), Vec::new()));
+        match &self.conn {
+            SaveConn::Db(db) => {
+                let fields = self.model.dirty_columns();
+                if fields.is_empty() {
+                    return Ok(SqlStatement::batch(db.db_type(), Vec::new()));
+                }
+                db.update::<T>()
+                    .set_model_columns(self.model.as_model(), &fields)
+                    .to_sql()
+            }
+            // 事务 / 池连接路径构造时已渲染，dirty 列在执行器存续期不可再变
+            SaveConn::Txn { sql, .. } | SaveConn::Pooled { sql, .. } => sql.clone(),
         }
-        self.db
-            .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .to_sql()
     }
 
     pub async fn execute(self) -> crate::Result<u64> {
-        let SaveExecutor { db, model } = self;
-        let fields = model.dirty_columns();
-        let mut tx = db.begin().await?;
-        let result = async {
-            let mut affected = 0u64;
-            if !fields.is_empty() {
-                affected += tx
-                    .update::<T>()
-                    .set_model_columns(model.as_model(), &fields)
-                    .execute()
-                    .await?;
-            }
-            affected += model.sync_graph_relations(&mut tx).await?;
-            Ok::<u64, crate::OrmerError>(affected)
-        }
-        .await;
-
-        match result {
-            Ok(affected) => {
-                tx.commit().await?;
-                if affected > 0 {
-                    model.accept_changes();
+        let SaveExecutor { conn, mut model } = self;
+        let affected = match conn {
+            // 自开事务：写入核心共享（R3 合并），结束时提交/回滚
+            SaveConn::Db(db) => {
+                let mut tx = db.begin().await?;
+                match save_dirty_columns_and_relations(&mut tx, &mut model).await {
+                    Ok(affected) => {
+                        tx.commit().await?;
+                        affected
+                    }
+                    Err(err) => {
+                        log_rollback_failure(tx.rollback().await);
+                        return Err(err);
+                    }
                 }
-                Ok(affected)
             }
-            Err(err) => {
-                log_rollback_failure(tx.rollback().await);
-                Err(err)
+            // 外部事务：写完不提交不回滚，由调用方决定事务边界；
+            // 池连接：闭包内自开事务并提交/回滚（L24）
+            SaveConn::Txn { run, .. } | SaveConn::Pooled { run, .. } => {
+                let (result, m) = run(model).await;
+                model = m;
+                result?
             }
-        }
+        };
+        finish_save(affected, &mut model)
     }
 
     /// 同义词，等价于 [`Self::execute`]。
@@ -1821,45 +2289,54 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable> S
     where
         T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
     {
-        let SaveExecutor { db, model } = self;
+        let SaveExecutor { conn, mut model } = self;
         let mut ctx = crate::HookContext::new(crate::HookOperation::Update);
+        // 事务路径携带 `.transaction()` 标记（与合并前事务版语义一致）
+        if matches!(conn, SaveConn::Txn { .. }) {
+            ctx = ctx.transaction();
+        }
         // 与 Update/Delete 执行器同语义：受全局 without_hooks 范围开关控制
         if ctx.hooks_enabled() {
             crate::BeforeUpdate::before_update(model.as_model_mut(), &mut ctx).await?;
         }
 
-        let fields = model.dirty_columns();
-        let mut tx = db.begin().await?;
-        let result = async {
-            let mut affected = 0u64;
-            if !fields.is_empty() {
-                affected += tx
-                    .update::<T>()
-                    .set_model_columns(model.as_model(), &fields)
-                    .execute()
-                    .await?;
-            }
-            affected += model.sync_graph_relations(&mut tx).await?;
-            if affected > 0 && ctx.hooks_enabled() {
-                crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
-            }
-            Ok::<u64, crate::OrmerError>(affected)
-        }
-        .await;
-
-        match result {
-            Ok(affected) => {
-                tx.commit().await?;
-                if affected > 0 {
-                    model.accept_changes();
+        let affected = match conn {
+            // 自开事务：after_update 在提交前执行，失败会回滚（与合并前一致）
+            SaveConn::Db(db) => {
+                let mut tx = db.begin().await?;
+                let result = async {
+                    let affected =
+                        save_dirty_columns_and_relations(&mut tx, &mut model).await?;
+                    if affected > 0 && ctx.hooks_enabled() {
+                        crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
+                    }
+                    Ok::<u64, crate::OrmerError>(affected)
                 }
-                Ok(affected)
+                .await;
+                match result {
+                    Ok(affected) => {
+                        tx.commit().await?;
+                        affected
+                    }
+                    Err(err) => {
+                        log_rollback_failure(tx.rollback().await);
+                        return Err(err);
+                    }
+                }
             }
-            Err(err) => {
-                log_rollback_failure(tx.rollback().await);
-                Err(err)
+            // 外部事务：写完不提交不回滚，由调用方决定事务边界；
+            // 池连接：闭包内自开事务并提交/回滚（L24）
+            SaveConn::Txn { run, .. } | SaveConn::Pooled { run, .. } => {
+                let (result, m) = run(model).await;
+                model = m;
+                let affected = result?;
+                if affected > 0 && ctx.hooks_enabled() {
+                    crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
+                }
+                affected
             }
-        }
+        };
+        finish_save(affected, &mut model)
     }
 
     /// 跳过本次保存的钩子（等价于在 [`Self::execute_with_hooks`] 外层
@@ -1873,14 +2350,29 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable> S
 pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::InsertOrIgnoreExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrIgnoreExecutor` 的 SQLite 分支）。
+    #[cfg(feature = "sqlite")]
+    SqliteTxn(sqlite_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "postgresql")]
     PostgreSQL(postgresql_backend::InsertOrIgnoreExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrIgnoreExecutor` 的 PostgreSQL 分支）。
+    #[cfg(feature = "postgresql")]
+    PostgreSQLTxn(postgresql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "mysql")]
     MySQL(mysql_backend::InsertOrIgnoreExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrIgnoreExecutor` 的 MySQL 分支）。
+    #[cfg(feature = "mysql")]
+    MySQLTxn(mysql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "mssql")]
     MSSQL(mssql_backend::InsertOrIgnoreExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrIgnoreExecutor` 的 MSSQL 分支）。
+    #[cfg(feature = "mssql")]
+    MSSQLTxn(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     #[cfg(feature = "duckdb")]
     DuckDB(duckdb_backend::InsertOrIgnoreExecutor<'a, I>),
+    /// 事务路径变体（原 `TransactionInsertOrIgnoreExecutor` 的 DuckDB 分支）。
+    #[cfg(feature = "duckdb")]
+    DuckDBTxn(duckdb_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
     /// 能力矩阵门控产物：`insert_ignore: false` 的后端在
     /// [`Database::insert_or_ignore`] 构造时落入该变体。
     #[doc(hidden)]
@@ -1891,19 +2383,37 @@ pub enum InsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
     },
 }
 
+/// 旧事务插入或忽略执行器名过渡别名（已合并为 [`InsertOrIgnoreExecutor`]，
+/// 保留 re-export 以兼容现有导入路径）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionInsertOrIgnoreExecutor 已合并为 InsertOrIgnoreExecutor，请改用 InsertOrIgnoreExecutor"
+)]
+pub type TransactionInsertOrIgnoreExecutor<'a, I> = InsertOrIgnoreExecutor<'a, I>;
+
 impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
+            #[cfg(feature = "sqlite")]
+            InsertOrIgnoreExecutor::SqliteTxn(exec) => exec.to_sql(),
             #[cfg(feature = "postgresql")]
             InsertOrIgnoreExecutor::PostgreSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "postgresql")]
+            InsertOrIgnoreExecutor::PostgreSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mysql")]
             InsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mysql")]
+            InsertOrIgnoreExecutor::MySQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "mssql")]
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
+            #[cfg(feature = "mssql")]
+            InsertOrIgnoreExecutor::MSSQLTxn(exec) => exec.to_sql(),
             #[cfg(feature = "duckdb")]
             InsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
+            #[cfg(feature = "duckdb")]
+            InsertOrIgnoreExecutor::DuckDBTxn(exec) => exec.to_sql(),
             InsertOrIgnoreExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(*backend, *feature)),
@@ -1914,14 +2424,24 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         match self {
             #[cfg(feature = "sqlite")]
             InsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
+            #[cfg(feature = "sqlite")]
+            InsertOrIgnoreExecutor::SqliteTxn(exec) => exec.execute().await,
             #[cfg(feature = "postgresql")]
             InsertOrIgnoreExecutor::PostgreSQL(exec) => exec.execute().await,
+            #[cfg(feature = "postgresql")]
+            InsertOrIgnoreExecutor::PostgreSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mysql")]
             InsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
+            #[cfg(feature = "mysql")]
+            InsertOrIgnoreExecutor::MySQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "mssql")]
             InsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "mssql")]
+            InsertOrIgnoreExecutor::MSSQLTxn(exec) => exec.execute().await,
             #[cfg(feature = "duckdb")]
             InsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await.map(|_| ()),
+            #[cfg(feature = "duckdb")]
+            InsertOrIgnoreExecutor::DuckDBTxn(exec) => exec.execute().await,
             InsertOrIgnoreExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
@@ -2055,6 +2575,7 @@ impl Database {
     /// 拒绝由本入口与 `postgresql_backend::db_first_tables` 分别硬编码。
     pub async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
         #[cfg(feature = "influxdb")]
+        #[allow(irrefutable_let_patterns)]
         if let Database::InfluxDB(_) = self {
             return Err(unsupported_feature(
                 super::super::DbType::InfluxDB,
@@ -2102,6 +2623,7 @@ impl Database {
             Database::InfluxDB(db) => InsertExecutor::InfluxDB(
                 db,
                 models,
+                None,
                 std::marker::PhantomData,
             ),
         }
@@ -2296,17 +2818,7 @@ impl Database {
         &self,
         key: impl crate::model::PrimaryKey,
     ) -> crate::Result<Option<T>> {
-        let where_expr = primary_key_filter::<T>(key)?;
-
-        // 执行查询并取第一条
-        let results = self
-            .select::<T>()
-            .filter(|_| where_expr)
-            .range(..1)
-            .collect::<Vec<T>>()
-            .await?;
-
-        Ok(results.into_iter().next())
+        find_by_id_with_executor(self.select::<T>(), key).await
     }
 
     /// 查找单个模型的关联对象。
@@ -2323,11 +2835,7 @@ impl Database {
         S::Target: std::marker::Send + std::marker::Sync,
         S::Via: std::marker::Send + std::marker::Sync,
     {
-        let path = relation.path_info()?;
-        let key = owner.relation_key_value(relation_owner_key(path))?;
-        self.select::<T>()
-            .select_related_with_selection(vec![key], &relation)
-            .await
+        find_related_with_executor(&self.select::<T>(), owner, &relation).await
     }
 
     /// 批量预加载关联对象，避免循环查询产生 N+1。
@@ -2344,9 +2852,7 @@ impl Database {
         S::Target: std::marker::Send + std::marker::Sync,
         S::Via: std::marker::Send + std::marker::Sync,
     {
-        self.select::<T>()
-            .preload_models_with_selection(owners, relation)
-            .await
+        preload_with_executor(&self.select::<T>(), owners, relation).await
     }
 
     /// 创建 Select 查询执行器
@@ -2410,37 +2916,38 @@ impl Database {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         match self {
             #[cfg(feature = "sqlite")]
-            Database::Sqlite(db) => GroupedSelectExecutor::Sqlite(db.select_column::<T, V>()),
+            Database::Sqlite(db) => {
+                ProjectionSelectExecutor::Sqlite(db.select_column::<T, V>())
+            }
             #[cfg(feature = "postgresql")]
             Database::PostgreSQL(db) => {
-                GroupedSelectExecutor::PostgreSQL(db.select_column::<T, V>())
+                ProjectionSelectExecutor::PostgreSQL(db.select_column::<T, V>())
             }
             #[cfg(feature = "mysql")]
-            Database::MySQL(db) => GroupedSelectExecutor::MySQL(db.select_column::<T, V>()),
+            Database::MySQL(db) => ProjectionSelectExecutor::MySQL(db.select_column::<T, V>()),
             #[cfg(feature = "mssql")]
-            Database::MSSQL(db) => GroupedSelectExecutor::MSSQL(db.select_column::<T, V>()),
+            Database::MSSQL(db) => ProjectionSelectExecutor::MSSQL(db.select_column::<T, V>()),
             #[cfg(feature = "duckdb")]
-            Database::DuckDB(db) => GroupedSelectExecutor::DuckDB(db.select_column::<T, V>()),
+            Database::DuckDB(db) => ProjectionSelectExecutor::DuckDB(db.select_column::<T, V>()),
             #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(db) => {
-                // 能力矩阵门控：advanced_grouping 为 true 才走分组聚合执行分支
-                if Capabilities::of(super::super::DbType::ClickHouse).advanced_grouping {
-                    GroupedSelectExecutor::ClickHouse(db, GroupedSelect::new())
-                } else {
-                    GroupedSelectExecutor::Unsupported {
-                        backend: super::super::DbType::ClickHouse,
-                        feature: "GROUP BY aggregation on ClickHouse",
-                        _marker: std::marker::PhantomData,
-                    }
-                }
-            }
+            Database::ClickHouse(db) => match clickhouse_projection_gate(
+                super::super::DbType::ClickHouse,
+            ) {
+                None => ProjectionSelectExecutor::ClickHouse(db, ProjectionSelect::new()),
+                Some(feature) => ProjectionSelectExecutor::Unsupported {
+                    backend: super::super::DbType::ClickHouse,
+                    feature,
+                    _marker: std::marker::PhantomData,
+                },
+            },
             #[cfg(feature = "influxdb")]
-            Database::InfluxDB(_) => GroupedSelectExecutor::Unsupported {
+            Database::InfluxDB(_) => ProjectionSelectExecutor::Unsupported {
                 backend: super::super::DbType::InfluxDB,
-                feature: "GROUP BY aggregation on InfluxDB (InfluxQL GROUP BY only supports time buckets and tags)",
+                feature: clickhouse_projection_gate(super::super::DbType::InfluxDB)
+                    .unwrap_or("GROUP BY aggregation"),
                 _marker: std::marker::PhantomData,
             },
         }
@@ -2557,7 +3064,10 @@ impl Database {
         &'a self,
         model: &'a mut Tracked<T>,
     ) -> SaveExecutor<'a, T> {
-        SaveExecutor { db: self, model }
+        SaveExecutor {
+            conn: SaveConn::Db(self),
+            model,
+        }
     }
 
     pub fn update_graph<'a, T>(&'a self, model: &'a mut T) -> UpdateGraphExecutor<'a, T>
@@ -2654,49 +3164,21 @@ impl Database {
         F: for<'tx> FnOnce(&'tx mut Transaction<'_>) -> TransactionFuture<'tx, R>,
     {
         // 选项必须在 begin 阶段按后端语义下发（MySQL 的 SET TRANSACTION
-        // 只作用于"下一个事务"，begin 之后设置无效）。
-        let mut txn = self.begin_opts(options).await?;
-
-        match f(&mut txn).await {
-            Ok(value) => {
-                txn.commit().await?;
-                Ok(value)
-            }
-            Err(err) => {
-                log_rollback_failure(txn.rollback().await);
-                Err(err)
-            }
-        }
+        // 只作用于"下一个事务"，begin 之后设置无效）；收尾（提交/回滚）
+        // 与池层共用 run_txn_closure。
+        let txn = self.begin_opts(options).await?;
+        run_txn_closure(txn, f).await
     }
 
     async fn begin_opts(&self, options: TransactionOptions) -> crate::Result<Transaction<'_>> {
-        // 两个互补 cfg 的通配臂在单后端编译组合下会触发 unreachable 警告
-        #[allow(unreachable_patterns)]
-        match self {
-            #[cfg(feature = "mysql")]
-            Database::MySQL(db) => {
-                let txn = db.begin_with_opts(options).await?;
-                Ok(Transaction::MySQL(txn))
-            }
-            #[cfg(not(feature = "mysql"))]
-            _ => {
-                let mut txn = self.begin().await?;
-                if let Err(err) = apply_transaction_options(&mut txn, options).await {
-                    log_rollback_failure(txn.rollback().await);
-                    return Err(err);
-                }
-                Ok(txn)
-            }
-            #[cfg(feature = "mysql")]
-            _ => {
-                let mut txn = self.begin().await?;
-                if let Err(err) = apply_transaction_options(&mut txn, options).await {
-                    log_rollback_failure(txn.rollback().await);
-                    return Err(err);
-                }
-                Ok(txn)
-            }
+        // MySQL 的选项必须在 BEGIN 前下发（begin_with_opts），其余后端
+        // 走"先 BEGIN 再应用选项、失败回滚"的公共路径。
+        #[cfg(feature = "mysql")]
+        if let Database::MySQL(db) = self {
+            let txn = db.begin_with_opts(options).await?;
+            return Ok(Transaction::MySQL(txn));
         }
+        apply_transaction_options_or_rollback(self.begin().await?, options).await
     }
 
     /// 删除表 - 返回执行器
@@ -2725,7 +3207,8 @@ impl Database {
     ///
     /// 以 [`Capabilities::truncate`] 为准：QuestDB 不支持行级 DELETE，
     /// 这是清空表数据的唯一受支持手段（QuestDB 复用 PostgreSQL 连接，
-    /// 按运行时 `db_type` 判定，仍走 PostgreSQL 执行器分支）。
+    /// 按运行时 `db_type` 判定，仍走 PostgreSQL 执行器分支）；
+    /// MySQL/MSSQL/DuckDB 原生支持；SQLite 无 TRUNCATE 语法（保持 false）。
     pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
         if !Capabilities::of(self.db_type()).truncate {
             return TruncateTableExecutor::Unsupported {
@@ -2739,6 +3222,12 @@ impl Database {
             Database::PostgreSQL(db) => {
                 TruncateTableExecutor::PostgreSQL(db.truncate_table::<T>())
             }
+            #[cfg(feature = "mysql")]
+            Database::MySQL(db) => TruncateTableExecutor::MySQL(db.truncate_table::<T>()),
+            #[cfg(feature = "mssql")]
+            Database::MSSQL(db) => TruncateTableExecutor::MSSQL(db.truncate_table::<T>()),
+            #[cfg(feature = "duckdb")]
+            Database::DuckDB(db) => TruncateTableExecutor::DuckDB(db.truncate_table::<T>()),
             // 矩阵兜底：正常不可达（truncate=false 已在上面拦截），
             // 保留防御性拒绝以避免矩阵漂移时 panic。
             #[allow(unreachable_patterns)]
@@ -2751,60 +3240,25 @@ impl Database {
     }
 
     pub fn select_sql<T>(&self, sql: impl IntoRawSql) -> RawSelectExecutor<'_, T> {
-        RawSelectExecutor {
-            db: self,
-            sql: sql.into_raw_sql(),
-            _marker: std::marker::PhantomData,
-        }
+        RawSelectExecutor::from_conn(ConnRef::Db(self), sql.into_raw_sql())
     }
 
     /// 执行原生非查询 SQL 并返回影响的行数
+    ///
+    /// 注意：ClickHouse 与 InfluxDB 的执行通道（HTTP）不报告 affected rows，
+    /// 这两个后端恒返回 `Ok(0)`——即使语句实际修改了大量数据。调用方不能
+    /// 以返回值 0 区分"未影响任何行"与"后端不统计行数"；需要精确行数时
+    /// 应改用 `SELECT count()`（前后各查一次）或选择支持行数统计的后端。
     pub async fn execute_sql(&self, sql: impl IntoRawSql) -> crate::Result<u64> {
-        let sql = sql.into_raw_sql();
-        match self {
-            #[cfg(feature = "sqlite")]
-            Database::Sqlite(db) => {
-                let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => {
-                let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mysql")]
-            Database::MySQL(db) => {
-                let (sql, params) = sql.render(super::super::DbType::MySQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mssql")]
-            Database::MSSQL(db) => {
-                let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "duckdb")]
-            Database::DuckDB(db) => {
-                let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
-                db.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(db) => {
-                db.execute_sql(sql).await?;
-                Ok(0)
-            }
-            #[cfg(feature = "influxdb")]
-            Database::InfluxDB(db) => {
-                db.execute_sql(sql).await?;
-                Ok(0)
-            }
-        }
+        // L21：Database / 事务 / 池连接三路径共用一份后端分派。
+        exec_raw_sql_on(ConnRefMut::Db(self), sql.into_raw_sql()).await
     }
 
     /// Count rows in a table using backend-specific identifier quoting.
     pub async fn table_row_count(&self, table_name: &str) -> crate::Result<u64> {
         let sql = format!(
             "SELECT COUNT(*) FROM {}",
-            quote_table_name(self.db_type(), table_name)
+            common_helpers::quote_table_name_with_schema(self.db_type(), table_name)
         );
         let rows = self.select_sql::<i64>(sql).collect::<Vec<i64>>().await?;
         Ok(rows.into_iter().next().unwrap_or(0).max(0) as u64)
@@ -2832,7 +3286,7 @@ impl super::DbExecutor for Database {
         Database::select::<T>(self)
     }
 
-    fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+    fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         Database::select_column::<T, V>(self)
     }
 }
@@ -2886,14 +3340,15 @@ impl<'a, R: Model> DerivedTableSelectExecutor<'a, R> {
         let db_type = self.db.db_type();
         #[cfg(feature = "postgresql")]
         if matches!(db_type, crate::DbType::PostgreSQL) {
-            let (sql, params, rust_types) = self.select.to_sql_with_params_and_types(db_type);
+            let (sql, params, rust_types) =
+                self.select.try_to_sql_with_params_and_types(db_type)?;
             return Ok(SqlStatement::batch(
                 db_type,
                 vec![super::SingleSqlStatement::new(sql, params).with_param_rust_types(rust_types)],
             ));
         }
 
-        let (sql, params) = self.select.to_sql_with_params(db_type);
+        let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
         Ok(SqlStatement::single(db_type, sql, params))
     }
 }
@@ -2919,34 +3374,34 @@ where
             match self.db {
                 #[cfg(feature = "sqlite")]
                 Database::Sqlite(db) => {
-                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
                     db.select_raw::<R, C>(&sql, params).await
                 }
                 #[cfg(feature = "postgresql")]
                 Database::PostgreSQL(db) => {
                     let (sql, params, rust_types) =
-                        self.select.to_sql_with_params_and_types(db_type);
+                        self.select.try_to_sql_with_params_and_types(db_type)?;
                     db.select_raw_with_types::<R, C>(&sql, params, rust_types)
                         .await
                 }
                 #[cfg(feature = "mysql")]
                 Database::MySQL(db) => {
-                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
                     db.select_raw::<R, C>(&sql, params).await
                 }
                 #[cfg(feature = "mssql")]
                 Database::MSSQL(db) => {
-                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
                     db.select_raw::<R, C>(&sql, params).await
                 }
                 #[cfg(feature = "duckdb")]
                 Database::DuckDB(db) => {
-                    let (sql, params) = self.select.to_sql_with_params(db_type);
+                    let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
                     db.select_raw::<R, C>(&sql, params).await
                 }
                 #[cfg(feature = "clickhouse")]
             Database::ClickHouse(db) => {
-                let (sql, params) = self.select.to_sql_with_params(db_type);
+                let (sql, params) = self.select.try_to_sql_with_params(db_type)?;
                     let rows = db
                         .select_values(RawSql::new(sql).with_params(params), R::row_columns())
                         .await?;
@@ -3071,31 +3526,200 @@ where
     }
 }
 
+/// 统一层内部连接句柄（R3）：Database / Transaction / 池连接三条执行路径
+/// 共用一份执行器实现的关键。
+///
+/// `Txn` 持共享引用：raw select 路径的后端 `select_raw` 均为 `&self` 接收器，
+/// 且 `&Transaction` 的协变性允许把 `&'op Transaction<'a>` 收缩为
+/// `&'op Transaction<'op>`，避免 `&'a mut Transaction<'a>` 的不变性陷阱。
+/// 写路径（Save）需要 `&mut Transaction`，无法共享本句柄，见 [`SaveConn`]。
+#[derive(Clone, Copy)]
+pub(crate) enum ConnRef<'a> {
+    Db(&'a Database),
+    Txn(&'a Transaction<'a>),
+    /// 池连接路径（`PooledConnection::select_sql`）。
+    Pooled(&'a connection_pool::ConnectionWrapper),
+}
+
+/// 写路径连接句柄：与 [`ConnRef`] 同构，但事务变体持 `&mut Transaction`
+/// ——后端事务 `exec_raw` 为 `&mut self` 接收器，共享引用无法调用；
+/// 读路径（select_raw）无此需求，继续用 [`ConnRef`]。仅被
+/// [`exec_raw_sql_on`] 消费。`'tx` 独立于引用生命周期 `'a`：`&mut T`
+/// 对 `T` 不变，`&'a mut Transaction<'a>` 会阻断 `Transaction` 协变性
+/// 允许的生命周期收缩（见 `Transaction::execute_sql`）。
+pub(crate) enum ConnRefMut<'a, 'tx> {
+    Db(&'a Database),
+    Txn(&'a mut Transaction<'tx>),
+    Pooled(&'a connection_pool::ConnectionWrapper),
+}
+
+/// 原生非查询 SQL 的公共分派（L21）：[`Database::execute_sql`] /
+/// `Transaction::execute_sql` / `PooledConnection::execute_sql` 三条路径
+/// 共用一份后端 match（与 raw select 的 [`RawCollectFuture`] 三路合一
+/// 先例同构）。ClickHouse/InfluxDB 的执行通道（HTTP）不报告 affected
+/// rows，恒返回 `Ok(0)`。写路径：事务变体需 `&mut`，见 [`ConnRefMut`]。
+pub(crate) async fn exec_raw_sql_on(
+    conn: ConnRefMut<'_, '_>,
+    sql: RawSql,
+) -> crate::Result<u64> {
+    match conn {
+        #[cfg(feature = "sqlite")]
+        ConnRefMut::Db(Database::Sqlite(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "sqlite")]
+        ConnRefMut::Txn(Transaction::Sqlite(txn)) => {
+            let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
+            txn.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "postgresql")]
+        ConnRefMut::Db(Database::PostgreSQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "postgresql")]
+        ConnRefMut::Txn(Transaction::PostgreSQL(txn)) => {
+            let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
+            txn.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mysql")]
+        ConnRefMut::Db(Database::MySQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::MySQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mysql")]
+        ConnRefMut::Txn(Transaction::MySQL(txn)) => {
+            let (sql, params) = sql.render(super::super::DbType::MySQL)?;
+            txn.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mssql")]
+        ConnRefMut::Db(Database::MSSQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mssql")]
+        ConnRefMut::Txn(Transaction::MSSQL(txn)) => {
+            let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+            txn.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "duckdb")]
+        ConnRefMut::Db(Database::DuckDB(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "duckdb")]
+        ConnRefMut::Txn(Transaction::DuckDB(txn)) => {
+            let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
+            txn.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "postgresql")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::PostgreSQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mysql")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::MySQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::MySQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "mssql")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::MSSQL(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "duckdb")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::DuckDB(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "sqlite")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::Sqlite(db)) => {
+            let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
+            db.exec_raw(&sql, params).await
+        }
+        #[cfg(feature = "clickhouse")]
+        ConnRefMut::Db(Database::ClickHouse(db)) => {
+            db.execute_sql(sql).await?;
+            Ok(0)
+        }
+        #[cfg(feature = "clickhouse")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::ClickHouse(db)) => {
+            db.execute_sql(sql).await?;
+            Ok(0)
+        }
+        #[cfg(feature = "influxdb")]
+        ConnRefMut::Db(Database::InfluxDB(db)) => {
+            db.execute_sql(sql).await?;
+            Ok(0)
+        }
+        #[cfg(feature = "influxdb")]
+        ConnRefMut::Pooled(connection_pool::ConnectionWrapper::InfluxDB(db)) => {
+            db.execute_sql(sql).await?;
+            Ok(0)
+        }
+        // 事务路径不含 ClickHouse/InfluxDB（transactions: false），
+        // 仅剩 Transaction 的哨兵变体，做 void 消除。
+        ConnRefMut::Txn(Transaction::_Phantom(infallible, _)) => match *infallible {},
+    }
+}
+
 pub struct RawSelectExecutor<'a, T> {
-    db: &'a Database,
+    conn: ConnRef<'a>,
     sql: RawSql,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T> RawSelectExecutor<'a, T> {
+    pub(crate) fn from_conn(conn: ConnRef<'a>, sql: RawSql) -> Self {
+        Self {
+            conn,
+            sql,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
     pub fn collect<C>(self) -> RawCollectFuture<'a, T, C>
     where
         T: crate::model::FromRowValues + 'static,
         C: FromIterator<T> + 'static,
     {
         RawCollectFuture {
-            db: self.db,
+            conn: self.conn,
             sql: self.sql,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
+/// 旧事务 raw select 执行器名过渡别名（已合并为 [`RawSelectExecutor`]，
+/// 保留 re-export 以兼容现有导入路径；`'tx` 参数仅为兼容旧签名保留）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionRawSelectExecutor 已合并为 RawSelectExecutor，请改用 RawSelectExecutor"
+)]
+pub type TransactionRawSelectExecutor<'a, 'tx, T> = RawSelectExecutor<'a, T>;
+
+/// 旧池 raw select 执行器名过渡别名（已合并为 [`RawSelectExecutor`]，
+/// 保留 re-export 以兼容现有导入路径；`'pool` 参数仅为兼容旧签名保留）。
+#[deprecated(
+    since = "0.2.12",
+    note = "PooledRawSelectExecutor 已合并为 RawSelectExecutor，请改用 RawSelectExecutor"
+)]
+pub type PooledRawSelectExecutor<'conn, 'pool, T> = RawSelectExecutor<'conn, T>;
+
 pub struct RawCollectFuture<'a, T, C> {
-    db: &'a Database,
+    conn: ConnRef<'a>,
     sql: RawSql,
     _marker: std::marker::PhantomData<(T, C)>,
 }
+
+/// 旧事务 raw collect future 名过渡别名（已合并为 [`RawCollectFuture`]）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionRawCollectFuture 已合并为 RawCollectFuture，请改用 RawCollectFuture"
+)]
+pub type TransactionRawCollectFuture<'a, 'tx, T, C> = RawCollectFuture<'a, T, C>;
 
 impl<'a, T, C> std::future::IntoFuture for RawCollectFuture<'a, T, C>
 where
@@ -3108,35 +3732,87 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            match self.db {
+            // Database / Transaction / 池连接三路径在此共用一份后端分派
+            // （R3 合并；各路径的 render 与解码行为与合并前逐字一致）。
+            match self.conn {
                 #[cfg(feature = "sqlite")]
-                Database::Sqlite(db) => {
+                ConnRef::Db(Database::Sqlite(db)) => {
                     let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
+                #[cfg(feature = "sqlite")]
+                ConnRef::Txn(Transaction::Sqlite(txn)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
                 #[cfg(feature = "postgresql")]
-                Database::PostgreSQL(db) => {
+                ConnRef::Db(Database::PostgreSQL(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "postgresql")]
+                ConnRef::Txn(Transaction::PostgreSQL(txn)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mysql")]
+                ConnRef::Db(Database::MySQL(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mysql")]
+                ConnRef::Txn(Transaction::MySQL(txn)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mssql")]
+                ConnRef::Db(Database::MSSQL(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "mssql")]
+                ConnRef::Txn(Transaction::MSSQL(txn)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "duckdb")]
+                ConnRef::Db(Database::DuckDB(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "duckdb")]
+                ConnRef::Txn(Transaction::DuckDB(txn)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
+                    txn.select_raw::<T, C>(&sql, params).await
+                }
+                #[cfg(feature = "postgresql")]
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::PostgreSQL(db)) => {
                     let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
                 #[cfg(feature = "mysql")]
-                Database::MySQL(db) => {
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::MySQL(db)) => {
                     let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
                 #[cfg(feature = "mssql")]
-                Database::MSSQL(db) => {
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::MSSQL(db)) => {
                     let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
                 #[cfg(feature = "duckdb")]
-                Database::DuckDB(db) => {
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::DuckDB(db)) => {
                     let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
                     db.select_raw::<T, C>(&sql, params).await
                 }
+                #[cfg(feature = "sqlite")]
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::Sqlite(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
+                    db.select_raw::<T, C>(&sql, params).await
+                }
                 #[cfg(feature = "clickhouse")]
-            Database::ClickHouse(db) => {
-                let (sql, params) = self.sql.render(super::super::DbType::ClickHouse)?;
+                ConnRef::Db(Database::ClickHouse(db)) => {
+                    let (sql, params) = self.sql.render(super::super::DbType::ClickHouse)?;
                     let rows = db
                         .select_values(
                             crate::raw_sql::RawSql::new(sql).with_params(params),
@@ -3147,8 +3823,17 @@ where
                         .map(|values| T::from_row_values(&values))
                         .collect::<crate::Result<C>>()
                 }
+                #[cfg(feature = "clickhouse")]
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::ClickHouse(db)) => {
+                    let rows = db
+                        .select_values(self.sql, <T as crate::model::FromRowValues>::row_columns())
+                        .await?;
+                    rows.into_iter()
+                        .map(|values| T::from_row_values(&values))
+                        .collect::<crate::Result<C>>()
+                }
                 #[cfg(feature = "influxdb")]
-                Database::InfluxDB(db) => {
+                ConnRef::Db(Database::InfluxDB(db)) => {
                     let rows = db
                         .select_values(
                             self.sql,
@@ -3159,79 +3844,23 @@ where
                         .map(|values| T::from_row_values(&values))
                         .collect::<crate::Result<C>>()
                 }
+                #[cfg(feature = "influxdb")]
+                ConnRef::Pooled(connection_pool::ConnectionWrapper::InfluxDB(db)) => {
+                    let rows = db
+                        .select_values(self.sql, <T as crate::model::FromRowValues>::row_columns())
+                        .await?;
+                    rows.into_iter()
+                        .map(|values| T::from_row_values(&values))
+                        .collect::<crate::Result<C>>()
+                }
+                // 事务路径不含 ClickHouse/InfluxDB（transactions: false），
+                // 仅剩 Transaction 的哨兵变体，做 void 消除。
+                ConnRef::Txn(Transaction::_Phantom(infallible, _)) => match *infallible {},
             }
         })
     }
 }
 
-pub struct TransactionRawSelectExecutor<'a, 'tx, T> {
-    txn: &'a mut Transaction<'tx>,
-    sql: RawSql,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<'a, 'tx, T> TransactionRawSelectExecutor<'a, 'tx, T> {
-    pub fn collect<C>(self) -> TransactionRawCollectFuture<'a, 'tx, T, C>
-    where
-        T: crate::model::FromRowValues + 'static,
-        C: FromIterator<T> + 'static,
-    {
-        TransactionRawCollectFuture {
-            txn: self.txn,
-            sql: self.sql,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-pub struct TransactionRawCollectFuture<'a, 'tx, T, C> {
-    txn: &'a mut Transaction<'tx>,
-    sql: RawSql,
-    _marker: std::marker::PhantomData<(T, C)>,
-}
-
-impl<'a, 'tx, T, C> std::future::IntoFuture for TransactionRawCollectFuture<'a, 'tx, T, C>
-where
-    T: crate::model::FromRowValues + 'static + std::marker::Send,
-    C: FromIterator<T> + 'static,
-{
-    type Output = crate::Result<C>;
-    type IntoFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            match self.txn {
-                #[cfg(feature = "sqlite")]
-                Transaction::Sqlite(txn) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::Sqlite)?;
-                    txn.select_raw::<T, C>(&sql, params).await
-                }
-                #[cfg(feature = "postgresql")]
-                Transaction::PostgreSQL(txn) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::PostgreSQL)?;
-                    txn.select_raw::<T, C>(&sql, params).await
-                }
-                #[cfg(feature = "mysql")]
-                Transaction::MySQL(txn) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::MySQL)?;
-                    txn.select_raw::<T, C>(&sql, params).await
-                }
-                #[cfg(feature = "mssql")]
-                Transaction::MSSQL(txn) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::MSSQL)?;
-                    txn.select_raw::<T, C>(&sql, params).await
-                }
-                #[cfg(feature = "duckdb")]
-                Transaction::DuckDB(txn) => {
-                    let (sql, params) = self.sql.render(super::super::DbType::DuckDB)?;
-                    txn.select_raw::<T, C>(&sql, params).await
-                }
-                Transaction::_Phantom(infallible, _) => match *infallible {},
-            }
-        })
-    }
-}
 
 /// 统一的 SelectExecutor 枚举
 pub enum SelectExecutor<'a, T: Model> {
@@ -4062,7 +4691,11 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    /// COUNT 聚合函数
+    /// COUNT 聚合函数。
+    ///
+    /// 返回行数（`usize`）；关联/多表查询的同谓词行数统计
+    /// （`RelatedSelectExecutor::count` 等）在统一层强转为同一 `usize`
+    /// 类型，分页场景两个入口可直接混用。
     pub fn count<F, C>(self, f: F) -> AggregateFuture<'a, T, usize>
     where
         F: FnOnce(<T as Model>::Where) -> crate::query::builder::TypedColumn<C, T>,
@@ -4727,13 +5360,6 @@ pub enum CollectFuture<'a, T: Model, C: FromIterator<T>> {
         crate::query::builder::Select<T>,
         std::marker::PhantomData<C>,
     ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, C)>,
-    },
 }
 
 /// 统一的 FirstFuture 枚举
@@ -4753,13 +5379,6 @@ pub enum FirstFuture<'a, T: Model> {
         ClickHouseSelectBackend<'a>,
         crate::query::builder::Select<T>,
     ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a T>,
-    },
 }
 
 /// 统一的 AggregateFuture 枚举
@@ -4785,94 +5404,293 @@ pub enum AggregateFuture<'a, T: Model, R> {
         crate::query::builder::AggregateSelect<T, R>,
         std::marker::PhantomData<&'a R>,
     ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R)>,
-    },
 }
 
 crate::impl_unified_aggregate_future!(AggregateFuture);
 
-/// 统一的 RelatedSelectExecutor 枚举
-pub enum RelatedSelectExecutor<'a, T: Model, R: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::RelatedSelectExecutor<T, R>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::RelatedSelectExecutor<T, R>),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R)>,
-    },
+/// 统一层"主表 + N 个关联表"执行器家族（RelatedSelectExecutor /
+/// MultiTableSelectExecutor / FourTableSelectExecutor）的公共生成宏：
+/// 统一执行器枚举、同谓词 COUNT Future 枚举、Future 的 IntoFuture 委托与
+/// `count()` 入口一次生成，三个调用点只差类型名与关联表参数个数。
+///
+/// DuckDB 变体存在历史形态差异：RelatedSelectExecutor 为单字段，
+/// Multi/Four 为 `(executor, PhantomData)` 双字段——通过可选的
+/// `duckdb_extra` 注入额外字段以保持各自公开形状不变；`count()` 的
+/// 解构使用剩余模式 `(exec, ..)` 同时兼容两种形态（PhantomData 为零
+/// 大小，丢弃后重建语义等价）。
+///
+/// "主表行收集"Future 与 `collect()` 入口由
+/// [`impl_unified_multi_table_collect`] 单独生成：宏转录中 `$($r),+`
+/// 无法嵌套进可选段 `$(...)?`（可选段只有 1 个绑定，`+` 段有 N 个，
+/// 转录深度无法对齐），拆成独立宏后各自在顶层重绑关联表参数。
+/// Related 的 collect 由 `impl_unified_related_select_executor!` 生成，
+/// 不使用本宏族。
+macro_rules! impl_unified_multi_table_select_family {
+    (
+        $exec:ident, $future:ident,
+        $exec_doc:literal, $future_doc:literal, $count_doc:literal,
+        ($($r:ident),+)
+        $(, duckdb_extra { $($duck_extra:tt)* })?
+    ) => {
+        #[doc = $exec_doc]
+        pub enum $exec<'a, T: Model, $($r: Model),+> {
+            #[cfg(feature = "sqlite")]
+            Sqlite(
+                sqlite_backend::$exec<T, $($r),+>,
+                std::marker::PhantomData<&'a ()>,
+            ),
+            #[cfg(feature = "postgresql")]
+            PostgreSQL(postgresql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mysql")]
+            MySQL(mysql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mssql")]
+            MSSQL(mssql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "duckdb")]
+            DuckDB(
+                duckdb_backend::$exec<T, $($r),+>
+                $(, $($duck_extra)*)?
+            ),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            #[doc(hidden)]
+            Unsupported {
+                backend: super::super::DbType,
+                feature: &'static str,
+                _marker: std::marker::PhantomData<&'a (T, $($r),+)>,
+            },
+        }
+
+        #[doc = $future_doc]
+        pub enum $future<'a, T: Model, $($r: Model),+> {
+            #[cfg(feature = "sqlite")]
+            Sqlite(
+                sqlite_backend::$exec<T, $($r),+>,
+                std::marker::PhantomData<&'a ()>,
+            ),
+            #[cfg(feature = "postgresql")]
+            PostgreSQL(postgresql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mysql")]
+            MySQL(mysql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mssql")]
+            MSSQL(mssql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "duckdb")]
+            DuckDB(
+                duckdb_backend::$exec<T, $($r),+>,
+                std::marker::PhantomData<&'a ()>,
+            ),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            #[doc(hidden)]
+            Unsupported {
+                backend: super::super::DbType,
+                feature: &'static str,
+                _marker: std::marker::PhantomData<&'a (T, $($r),+)>,
+            },
+        }
+
+        crate::impl_unified_related_count_future!(
+            $future,
+            count,
+            [
+                'a,
+                T: crate::Model + 'static + std::marker::Send + std::marker::Sync,
+                $($r: crate::Model + 'static + std::marker::Send + std::marker::Sync),+
+            ],
+            ['a, T, $($r),+]
+        );
+
+        impl<'a, T: Model + 'static, $($r: Model + 'static),+> $exec<'a, T, $($r),+> {
+            #[doc = $count_doc]
+            pub fn count(self) -> $future<'a, T, $($r),+> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $exec::Sqlite(exec, phantom) => $future::Sqlite(exec, phantom),
+                    #[cfg(feature = "postgresql")]
+                    $exec::PostgreSQL(exec) => $future::PostgreSQL(exec),
+                    #[cfg(feature = "mysql")]
+                    $exec::MySQL(exec) => $future::MySQL(exec),
+                    #[cfg(feature = "mssql")]
+                    $exec::MSSQL(exec) => $future::MSSQL(exec),
+                    #[cfg(feature = "duckdb")]
+                    $exec::DuckDB(exec, ..) => {
+                        $future::DuckDB(exec, std::marker::PhantomData)
+                    }
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $exec::Unsupported {
+                        backend,
+                        feature,
+                        ..
+                    } => $future::Unsupported {
+                        backend,
+                        feature,
+                        _marker: std::marker::PhantomData,
+                    },
+                }
+            }
+        }
+    };
 }
 
-/// 统一的 MultiTableSelectExecutor 枚举
-pub enum MultiTableSelectExecutor<'a, T: Model, R1: Model, R2: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::MultiTableSelectExecutor<T, R1, R2>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(
-        duckdb_backend::MultiTableSelectExecutor<T, R1, R2>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R1, R2)>,
-    },
+/// "主表行收集"生成宏（L18：from3/from4 此前只能 count、无法取回行数据；
+/// SQL 只选择主表列，解码路径与 related collect 相同）：生成 `collect()`
+/// 方法、收集 Future 枚举及其 IntoFuture 委托。与
+/// [`impl_unified_multi_table_select_family`] 分离定义的原因见其文档。
+macro_rules! impl_unified_multi_table_collect {
+    (
+        $exec:ident, $collect_future:ident,
+        $method_doc:literal, $future_doc:literal,
+        ($($r:ident),+)
+    ) => {
+        impl<'a, T: Model + 'static, $($r: Model + 'static),+> $exec<'a, T, $($r),+> {
+            #[doc = $method_doc]
+            pub fn collect(self) -> $collect_future<'a, T, $($r),+> {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $exec::Sqlite(exec, phantom) => {
+                        $collect_future::Sqlite(exec, phantom)
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $exec::PostgreSQL(exec) => $collect_future::PostgreSQL(exec),
+                    #[cfg(feature = "mysql")]
+                    $exec::MySQL(exec) => $collect_future::MySQL(exec),
+                    #[cfg(feature = "mssql")]
+                    $exec::MSSQL(exec) => $collect_future::MSSQL(exec),
+                    #[cfg(feature = "duckdb")]
+                    $exec::DuckDB(exec, ..) => {
+                        $collect_future::DuckDB(exec, std::marker::PhantomData)
+                    }
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $exec::Unsupported {
+                        backend,
+                        feature,
+                        ..
+                    } => $collect_future::Unsupported {
+                        backend,
+                        feature,
+                        _marker: std::marker::PhantomData,
+                    },
+                }
+            }
+        }
+
+        #[doc = $future_doc]
+        pub enum $collect_future<'a, T: Model, $($r: Model),+> {
+            #[cfg(feature = "sqlite")]
+            Sqlite(
+                sqlite_backend::$exec<T, $($r),+>,
+                std::marker::PhantomData<&'a ()>,
+            ),
+            #[cfg(feature = "postgresql")]
+            PostgreSQL(postgresql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mysql")]
+            MySQL(mysql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "mssql")]
+            MSSQL(mssql_backend::$exec<'a, T, $($r),+>),
+            #[cfg(feature = "duckdb")]
+            DuckDB(
+                duckdb_backend::$exec<T, $($r),+>,
+                std::marker::PhantomData<&'a ()>,
+            ),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            #[doc(hidden)]
+            Unsupported {
+                backend: super::super::DbType,
+                feature: &'static str,
+                _marker: std::marker::PhantomData<&'a (T, $($r),+)>,
+            },
+        }
+
+        impl<
+            'a,
+            T: crate::Model + 'static + std::marker::Send + std::marker::Sync,
+            $($r: crate::Model + 'static + std::marker::Send + std::marker::Sync),+
+        > std::future::IntoFuture for $collect_future<'a, T, $($r),+>
+        where
+            Self: 'a,
+        {
+            type Output = crate::Result<Vec<T>>;
+            type IntoFuture = std::pin::Pin<
+                Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>,
+            >;
+
+            fn into_future(self) -> Self::IntoFuture {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $collect_future::Sqlite(exec, _) => {
+                        Box::pin(async move { exec.collect_rows().await })
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $collect_future::PostgreSQL(exec) => {
+                        Box::pin(async move { exec.collect_rows().await })
+                    }
+                    #[cfg(feature = "mysql")]
+                    $collect_future::MySQL(exec) => {
+                        Box::pin(async move { exec.collect_rows().await })
+                    }
+                    #[cfg(feature = "mssql")]
+                    $collect_future::MSSQL(exec) => {
+                        Box::pin(async move { exec.collect_rows().await })
+                    }
+                    #[cfg(feature = "duckdb")]
+                    $collect_future::DuckDB(exec, _) => {
+                        Box::pin(async move { exec.collect_rows().await })
+                    }
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    $collect_future::Unsupported {
+                        backend,
+                        feature,
+                        ..
+                    } => Box::pin(async move {
+                        Err(unsupported_feature(backend, feature))
+                    }),
+                }
+            }
+        }
+    };
 }
 
-/// 统一的 FourTableSelectExecutor 枚举
-pub enum FourTableSelectExecutor<'a, T: Model, R1: Model, R2: Model, R3: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::FourTableSelectExecutor<T, R1, R2, R3>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(
-        duckdb_backend::FourTableSelectExecutor<T, R1, R2, R3>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R1, R2, R3)>,
-    },
-}
+impl_unified_multi_table_select_family!(
+    RelatedSelectExecutor,
+    RelatedCountFuture,
+    "统一的 RelatedSelectExecutor 枚举",
+    "统一的关联查询同谓词行数统计 Future（page.md 缺失一：分页 total_count 场景）。\n\n结果为与原子查询同谓词的 `SELECT COUNT(*)`，不受 range()/order_by() 影响。",
+    "统计同谓词总行数（列表分页 total_count 用）：\n生成 `SELECT COUNT(*) FROM (<原子查询>)`，不受 range()/order_by() 影响。\n\n返回 `usize`（统一层把后端的 `i64` 行数强转），与\n[`SelectExecutor::count`] 的返回类型一致。",
+    (R)
+);
+
+impl_unified_multi_table_select_family!(
+    MultiTableSelectExecutor,
+    MultiTableCountFuture,
+    "统一的 MultiTableSelectExecutor 枚举",
+    "统一的三表关联查询同谓词行数统计 Future。",
+    "统计同谓词总行数（列表分页 total_count 用）。\n\n返回 `usize`（统一层把后端的 `i64` 行数强转），与\n[`SelectExecutor::count`] 的返回类型一致。",
+    (R1, R2),
+    duckdb_extra { std::marker::PhantomData<&'a ()> }
+);
+
+impl_unified_multi_table_collect!(
+    MultiTableSelectExecutor,
+    MultiTableCollectFuture,
+    "执行查询并收集主表行（L18）：多表关联 SQL 只选择主表列，\n返回 `Vec<T>`；关联表仅用于过滤。",
+    "统一的三表关联查询主表行收集 Future（L18：from3 此前只能 count）。\n\nSQL 只选择主表列，返回 `Vec<T>`。",
+    (R1, R2)
+);
+
+impl_unified_multi_table_select_family!(
+    FourTableSelectExecutor,
+    FourTableCountFuture,
+    "统一的 FourTableSelectExecutor 枚举",
+    "统一的四表关联查询同谓词行数统计 Future。",
+    "统计同谓词总行数（列表分页 total_count 用）。\n\n返回 `usize`（统一层把后端的 `i64` 行数强转），与\n[`SelectExecutor::count`] 的返回类型一致。",
+    (R1, R2, R3),
+    duckdb_extra { std::marker::PhantomData<&'a ()> }
+);
+
+impl_unified_multi_table_collect!(
+    FourTableSelectExecutor,
+    FourTableCollectFuture,
+    "执行查询并收集主表行（L18）：多表关联 SQL 只选择主表列，\n返回 `Vec<T>`；关联表仅用于过滤。",
+    "统一的四表关联查询主表行收集 Future（L18：from4 此前只能 count）。\n\nSQL 只选择主表列，返回 `Vec<T>`。",
+    (R1, R2, R3)
+);
 
 /// 统一的 InnerJoinedSelectExecutor 枚举
 pub enum InnerJoinedSelectExecutor<'a, T: Model, J: Model> {
@@ -5043,10 +5861,6 @@ impl<'a, T: Model + 'static + std::marker::Send + std::marker::Sync> std::future
             FirstFuture::ClickHouse(db, select) => {
                 Box::pin(async move { clickhouse_select_first_on_backend(db, select).await })
             }
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            FirstFuture::Unsupported {
-                backend, feature, ..
-            } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
         }
     }
 }
@@ -5079,229 +5893,6 @@ pub enum RelatedCollectFuture<'a, T: Model, R: Model> {
 
 crate::impl_unified_related_collect_future!(RelatedCollectFuture);
 
-/// 统一的关联查询同谓词行数统计 Future（page.md 缺失一：分页 total_count 场景）。
-///
-/// 结果为与原子查询同谓词的 `SELECT COUNT(*)`，不受 range()/order_by() 影响。
-pub enum RelatedCountFuture<'a, T: Model, R: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::RelatedSelectExecutor<T, R>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::RelatedSelectExecutor<'a, T, R>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(
-        duckdb_backend::RelatedSelectExecutor<T, R>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R)>,
-    },
-}
-
-/// 统一的三表关联查询同谓词行数统计 Future。
-pub enum MultiTableCountFuture<'a, T: Model, R1: Model, R2: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::MultiTableSelectExecutor<T, R1, R2>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::MultiTableSelectExecutor<'a, T, R1, R2>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(
-        duckdb_backend::MultiTableSelectExecutor<T, R1, R2>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R1, R2)>,
-    },
-}
-
-/// 统一的四表关联查询同谓词行数统计 Future。
-pub enum FourTableCountFuture<'a, T: Model, R1: Model, R2: Model, R3: Model> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(
-        sqlite_backend::FourTableSelectExecutor<T, R1, R2, R3>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::FourTableSelectExecutor<'a, T, R1, R2, R3>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(
-        duckdb_backend::FourTableSelectExecutor<T, R1, R2, R3>,
-        std::marker::PhantomData<&'a ()>,
-    ),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, R1, R2, R3)>,
-    },
-}
-
-crate::impl_unified_related_count_future!(
-    RelatedCountFuture,
-    count,
-    [
-        'a,
-        T: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R: crate::Model + 'static + std::marker::Send + std::marker::Sync
-    ],
-    ['a, T, R]
-);
-crate::impl_unified_related_count_future!(
-    MultiTableCountFuture,
-    count,
-    [
-        'a,
-        T: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R1: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R2: crate::Model + 'static + std::marker::Send + std::marker::Sync
-    ],
-    ['a, T, R1, R2]
-);
-crate::impl_unified_related_count_future!(
-    FourTableCountFuture,
-    count,
-    [
-        'a,
-        T: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R1: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R2: crate::Model + 'static + std::marker::Send + std::marker::Sync,
-        R3: crate::Model + 'static + std::marker::Send + std::marker::Sync
-    ],
-    ['a, T, R1, R2, R3]
-);
-
-impl<'a, T: Model + 'static, R: Model + 'static> RelatedSelectExecutor<'a, T, R> {
-    /// 统计同谓词总行数（列表分页 total_count 用）：
-    /// 生成 `SELECT COUNT(*) FROM (<原子查询>)`，不受 range()/order_by() 影响。
-    pub fn count(self) -> RelatedCountFuture<'a, T, R> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            RelatedSelectExecutor::Sqlite(exec, phantom) => {
-                RelatedCountFuture::Sqlite(exec, phantom)
-            }
-            #[cfg(feature = "postgresql")]
-            RelatedSelectExecutor::PostgreSQL(exec) => RelatedCountFuture::PostgreSQL(exec),
-            #[cfg(feature = "mysql")]
-            RelatedSelectExecutor::MySQL(exec) => RelatedCountFuture::MySQL(exec),
-            #[cfg(feature = "mssql")]
-            RelatedSelectExecutor::MSSQL(exec) => RelatedCountFuture::MSSQL(exec),
-            #[cfg(feature = "duckdb")]
-            RelatedSelectExecutor::DuckDB(exec) => {
-                RelatedCountFuture::DuckDB(exec, std::marker::PhantomData)
-            }
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            RelatedSelectExecutor::Unsupported {
-                backend,
-                feature,
-                ..
-            } => RelatedCountFuture::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
-        }
-    }
-}
-
-impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static>
-    MultiTableSelectExecutor<'a, T, R1, R2>
-{
-    /// 统计同谓词总行数（列表分页 total_count 用）。
-    pub fn count(self) -> MultiTableCountFuture<'a, T, R1, R2> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            MultiTableSelectExecutor::Sqlite(exec, phantom) => {
-                MultiTableCountFuture::Sqlite(exec, phantom)
-            }
-            #[cfg(feature = "postgresql")]
-            MultiTableSelectExecutor::PostgreSQL(exec) => {
-                MultiTableCountFuture::PostgreSQL(exec)
-            }
-            #[cfg(feature = "mysql")]
-            MultiTableSelectExecutor::MySQL(exec) => MultiTableCountFuture::MySQL(exec),
-            #[cfg(feature = "mssql")]
-            MultiTableSelectExecutor::MSSQL(exec) => MultiTableCountFuture::MSSQL(exec),
-            #[cfg(feature = "duckdb")]
-            MultiTableSelectExecutor::DuckDB(exec, phantom) => {
-                MultiTableCountFuture::DuckDB(exec, phantom)
-            }
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MultiTableSelectExecutor::Unsupported {
-                backend,
-                feature,
-                ..
-            } => MultiTableCountFuture::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
-        }
-    }
-}
-
-impl<'a, T: Model + 'static, R1: Model + 'static, R2: Model + 'static, R3: Model + 'static>
-    FourTableSelectExecutor<'a, T, R1, R2, R3>
-{
-    /// 统计同谓词总行数（列表分页 total_count 用）。
-    pub fn count(self) -> FourTableCountFuture<'a, T, R1, R2, R3> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            FourTableSelectExecutor::Sqlite(exec, phantom) => {
-                FourTableCountFuture::Sqlite(exec, phantom)
-            }
-            #[cfg(feature = "postgresql")]
-            FourTableSelectExecutor::PostgreSQL(exec) => {
-                FourTableCountFuture::PostgreSQL(exec)
-            }
-            #[cfg(feature = "mysql")]
-            FourTableSelectExecutor::MySQL(exec) => FourTableCountFuture::MySQL(exec),
-            #[cfg(feature = "mssql")]
-            FourTableSelectExecutor::MSSQL(exec) => FourTableCountFuture::MSSQL(exec),
-            #[cfg(feature = "duckdb")]
-            FourTableSelectExecutor::DuckDB(exec, phantom) => {
-                FourTableCountFuture::DuckDB(exec, phantom)
-            }
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            FourTableSelectExecutor::Unsupported {
-                backend,
-                feature,
-                ..
-            } => FourTableCountFuture::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
-        }
-    }
-}
-
-
 /// 统一的 Transaction 枚举
 pub enum Transaction<'a> {
     #[cfg(feature = "sqlite")]
@@ -5323,439 +5914,104 @@ pub enum Transaction<'a> {
     _Phantom(std::convert::Infallible, std::marker::PhantomData<&'a ()>),
 }
 
-pub struct TransactionSaveExecutor<'a, 'tx, T: WritableModel + crate::model::GraphWritable> {
-    txn: &'a mut Transaction<'tx>,
-    model: &'a mut Tracked<T>,
-}
+/// 旧事务保存执行器名过渡别名（已合并为 [`SaveExecutor`]，保留 re-export
+/// 以兼容现有导入路径；事务入口 [`Transaction::save`] 返回的就是
+/// [`SaveExecutor`] 的事务变体，`'tx` 参数仅为兼容旧签名保留）。
+#[deprecated(
+    since = "0.2.12",
+    note = "TransactionSaveExecutor 已合并为 SaveExecutor，请改用 SaveExecutor"
+)]
+pub type TransactionSaveExecutor<'a, 'tx, T> = SaveExecutor<'a, T>;
 
-impl<'a, 'tx, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
-    TransactionSaveExecutor<'a, 'tx, T>
+/// Save 执行器的共享核心：dirty 列更新 + 图关系同步，写路径在给定事务上执行。
+/// [`SaveExecutor`] 的自开事务路径与外部事务路径共用本函数，图保存语义只维护一份。
+async fn save_dirty_columns_and_relations<T>(
+    txn: &mut Transaction<'_>,
+    model: &mut Tracked<T>,
+) -> crate::Result<u64>
+where
+    T: WritableModel + crate::model::Model + crate::model::GraphWritable,
 {
-    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        let fields = self.model.dirty_columns();
-        if fields.is_empty() {
-            return Ok(SqlStatement::batch(self.txn.db_type(), Vec::new()));
-        }
-        self.txn
+    let fields = model.dirty_columns();
+    let mut affected = 0u64;
+    if !fields.is_empty() {
+        affected += txn
             .update::<T>()
-            .set_model_columns(self.model.as_model(), &fields)
-            .to_sql()
+            .set_model_columns(model.as_model(), &fields)
+            .execute()
+            .await?;
     }
+    affected += model.sync_graph_relations(txn).await?;
+    Ok(affected)
+}
 
-    pub async fn execute(self) -> crate::Result<u64> {
-        let TransactionSaveExecutor { txn, model } = self;
-        let fields = model.dirty_columns();
-        let mut affected = 0u64;
-        if !fields.is_empty() {
-            affected += txn
-                .update::<T>()
-                .set_model_columns(model.as_model(), &fields)
-                .execute()
-                .await?;
+/// 池连接 save 的写核心（L24）：在池连接上自开事务执行
+/// [`save_dirty_columns_and_relations`]，结束时提交/回滚（回滚失败走统一日志），
+/// 与 [`Database::save`] 的自开事务路径语义一致。
+async fn save_on_pooled_conn<T>(
+    conn: &connection_pool::PooledConnection<'_>,
+    model: &mut Tracked<T>,
+) -> crate::Result<u64>
+where
+    T: WritableModel + crate::model::Model + crate::model::GraphWritable,
+{
+    let mut tx = conn.begin().await?;
+    match save_dirty_columns_and_relations(&mut tx, model).await {
+        Ok(affected) => {
+            tx.commit().await?;
+            Ok(affected)
         }
-        affected += model.sync_graph_relations(txn).await?;
-        if affected > 0 {
-            model.accept_changes();
+        Err(err) => {
+            log_rollback_failure(tx.rollback().await);
+            Err(err)
         }
-        Ok(affected)
-    }
-
-    /// 同义词，等价于 [`Self::execute`]。
-    #[deprecated(since = "0.2.11", note = "use `execute()` instead")]
-    pub async fn exec(self) -> crate::Result<u64> {
-        self.execute().await
-    }
-
-    pub async fn execute_with_hooks(self) -> crate::Result<u64>
-    where
-        T: crate::BeforeUpdate + crate::AfterUpdate + Send + Sync,
-    {
-        let TransactionSaveExecutor { txn, model } = self;
-        let mut ctx = crate::HookContext::new(crate::HookOperation::Update).transaction();
-        crate::BeforeUpdate::before_update(model.as_model_mut(), &mut ctx).await?;
-
-        let fields = model.dirty_columns();
-        let mut affected = 0u64;
-        if !fields.is_empty() {
-            affected += txn
-                .update::<T>()
-                .set_model_columns(model.as_model(), &fields)
-                .execute()
-                .await?;
-        }
-        affected += model.sync_graph_relations(txn).await?;
-        if affected > 0 {
-            crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
-            model.accept_changes();
-        }
-        Ok(affected)
     }
 }
 
-/// 事务中的插入执行器
-pub enum TransactionInsertExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::TransactionInsertExecutor<'a, I>),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::TransactionInsertExecutor<'a, I>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::TransactionInsertExecutor<'a, I>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::TransactionInsertExecutor<'a, I>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::TransactionInsertExecutor<'a, I>),
-    // 哨兵变体：仅在未启用任何事务型后端（如仅 influxdb）时锚定 `'a` 与 `I`。
-    // [`std::convert::Infallible`] 无任何值，该变体在安全 Rust 中无法被构造，
-    // match 分支对它做 void 消除（`match *infallible {}`）而非 panic。
-    #[doc(hidden)]
-    _Phantom(std::convert::Infallible, std::marker::PhantomData<&'a I>),
-}
-
-impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a, I> {
-    pub fn on_conflict<F, C>(self, f: F) -> Self
+impl<'a, T: WritableModel + crate::model::GraphWritable> SaveExecutor<'a, T> {
+    /// 池连接路径构造（L24）：`PooledConnection::save` 委托此处。
+    ///
+    /// SQL 预渲染与启动闭包擦除同事务路径（池连接的内层生命周期 `'pool`
+    /// 与外层借用 `'a` 不同，同样需要擦除）；写核心自开事务并提交/回滚，
+    /// 语义与 [`Database::save`] 一致。
+    pub(crate) fn from_pooled<'pool>(
+        conn: &'a connection_pool::PooledConnection<'pool>,
+        model: &'a mut Tracked<T>,
+    ) -> Self
     where
-        F: FnOnce(<I::Model as Model>::Where) -> C,
-        C: crate::query::insert::ConflictColumns,
+        'pool: 'a,
     {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.on_conflict(f))
+        // SQL 预览在构造时渲染（dirty 列在执行器存续期被独占借用，不可再变）
+        let sql = {
+            let fields = model.dirty_columns();
+            if fields.is_empty() {
+                Ok(SqlStatement::batch(conn.db_type(), Vec::new()))
+            } else {
+                conn.update::<T>()
+                    .set_model_columns(model.as_model(), &fields)
+                    .to_sql()
             }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.on_conflict(f))
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.on_conflict(f))
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.on_conflict(f))
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.on_conflict(f))
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
+        };
+        SaveExecutor {
+            conn: SaveConn::Pooled {
+                sql,
+                run: Box::new(
+                    move |model: &'a mut Tracked<T>| -> Pin<
+                        Box<
+                            dyn Future<
+                                    Output = (crate::Result<u64>, &'a mut Tracked<T>),
+                                > + 'a,
+                        >,
+                    > {
+                        Box::pin(async move {
+                            let result = save_on_pooled_conn(conn, model).await;
+                            (result, model)
+                        })
+                    },
+                ),
+            },
+            model,
         }
-    }
-
-    pub fn on_constraint<Target>(self, target: Target) -> Self
-    where
-        Target: crate::query::insert::IntoInsertConflictTarget<I::Model>,
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.on_constraint(target))
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.on_constraint(target))
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.on_constraint(target))
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.on_constraint(target))
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.on_constraint(target))
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn conflict_where<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(<I::Model as Model>::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.conflict_where(f))
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.conflict_where(f))
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.conflict_where(f))
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.conflict_where(f))
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.conflict_where(f))
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn do_nothing(self) -> Self {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.do_nothing())
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.do_nothing())
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.do_nothing())
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.do_nothing())
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.do_nothing())
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn do_update(self) -> Self {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.do_update())
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.do_update())
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.do_update())
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.do_update())
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.do_update())
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn do_update_if<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(<I::Model as Model>::Where) -> W,
-        W: Into<WhereExpr>,
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.do_update_if(f))
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.do_update_if(f))
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => {
-                TransactionInsertExecutor::MySQL(exec.do_update_if(f))
-            }
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => {
-                TransactionInsertExecutor::MSSQL(exec.do_update_if(f))
-            }
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.do_update_if(f))
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn set<F>(self, f: F) -> Self
-    where
-        F: FnOnce(&mut <I::Model as Model>::Update),
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => {
-                TransactionInsertExecutor::Sqlite(exec.set(f))
-            }
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => {
-                TransactionInsertExecutor::PostgreSQL(exec.set(f))
-            }
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => TransactionInsertExecutor::MySQL(exec.set(f)),
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => TransactionInsertExecutor::MSSQL(exec.set(f)),
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => {
-                TransactionInsertExecutor::DuckDB(exec.set(f))
-            }
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => exec.to_sql(),
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => exec.to_sql(),
-            TransactionInsertExecutor::_Phantom(infallible, _) => match *infallible {},
-        }
-    }
-
-    pub async fn execute(
-        self,
-    ) -> crate::Result<<I::Model as crate::model::Model>::AutoIncrementKeyType> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertExecutor::Sqlite(exec) => exec.execute().await,
-            #[cfg(feature = "postgresql")]
-            TransactionInsertExecutor::PostgreSQL(exec) => exec.execute().await,
-            #[cfg(feature = "mysql")]
-            TransactionInsertExecutor::MySQL(exec) => exec.execute().await,
-            #[cfg(feature = "mssql")]
-            TransactionInsertExecutor::MSSQL(exec) => exec.execute().await,
-            #[cfg(feature = "duckdb")]
-            TransactionInsertExecutor::DuckDB(exec) => exec.execute().await,
-            TransactionInsertExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
-        crate::WithoutHooksExecutor(self)
-    }
-}
-
-/// 事务中的插入或更新执行器
-pub enum TransactionInsertOrUpdateExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::TransactionInsertOrUpdateExecutor<'a, I>),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::TransactionInsertOrUpdateExecutor<'a, I>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::TransactionInsertOrUpdateExecutor<'a, I>),
-    // 哨兵变体：同 [`TransactionInsertExecutor::_Phantom`]，`Infallible`
-    // 使其在安全 Rust 中不可构造，match 分支做 void 消除而非 panic。
-    #[doc(hidden)]
-    _Phantom(std::convert::Infallible, std::marker::PhantomData<&'a I>),
-}
-
-impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExecutor<'a, I> {
-    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertOrUpdateExecutor::Sqlite(exec) => exec.to_sql(),
-            #[cfg(feature = "postgresql")]
-            TransactionInsertOrUpdateExecutor::PostgreSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mysql")]
-            TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mssql")]
-            TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "duckdb")]
-            TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.to_sql(),
-            TransactionInsertOrUpdateExecutor::_Phantom(infallible, _) => match *infallible {},
-        }
-    }
-
-    pub async fn execute(self) -> crate::Result<()> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertOrUpdateExecutor::Sqlite(exec) => exec.execute().await,
-            #[cfg(feature = "postgresql")]
-            TransactionInsertOrUpdateExecutor::PostgreSQL(exec) => exec.execute().await,
-            #[cfg(feature = "mysql")]
-            TransactionInsertOrUpdateExecutor::MySQL(exec) => exec.execute().await,
-            #[cfg(feature = "mssql")]
-            TransactionInsertOrUpdateExecutor::MSSQL(exec) => exec.execute().await,
-            #[cfg(feature = "duckdb")]
-            TransactionInsertOrUpdateExecutor::DuckDB(exec) => exec.execute().await,
-            TransactionInsertOrUpdateExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
-        crate::WithoutHooksExecutor(self)
-    }
-}
-
-/// 事务中的插入或忽略执行器
-pub enum TransactionInsertOrIgnoreExecutor<'a, I: crate::model::Insertable> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::TransactionInsertOrIgnoreExecutor<'a, I>),
-    // 哨兵变体：同 [`TransactionInsertExecutor::_Phantom`]，`Infallible`
-    // 使其在安全 Rust 中不可构造，match 分支做 void 消除而非 panic。
-    #[doc(hidden)]
-    _Phantom(std::convert::Infallible, std::marker::PhantomData<&'a I>),
-}
-
-impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExecutor<'a, I> {
-    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.to_sql(),
-            #[cfg(feature = "postgresql")]
-            TransactionInsertOrIgnoreExecutor::PostgreSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mysql")]
-            TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.to_sql(),
-            #[cfg(feature = "mssql")]
-            TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.to_sql(),
-            #[cfg(feature = "duckdb")]
-            TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.to_sql(),
-            TransactionInsertOrIgnoreExecutor::_Phantom(infallible, _) => match *infallible {},
-        }
-    }
-
-    pub async fn execute(self) -> crate::Result<()> {
-        match self {
-            #[cfg(feature = "sqlite")]
-            TransactionInsertOrIgnoreExecutor::Sqlite(exec) => exec.execute().await,
-            #[cfg(feature = "postgresql")]
-            TransactionInsertOrIgnoreExecutor::PostgreSQL(exec) => exec.execute().await,
-            #[cfg(feature = "mysql")]
-            TransactionInsertOrIgnoreExecutor::MySQL(exec) => exec.execute().await,
-            #[cfg(feature = "mssql")]
-            TransactionInsertOrIgnoreExecutor::MSSQL(exec) => exec.execute().await,
-            #[cfg(feature = "duckdb")]
-            TransactionInsertOrIgnoreExecutor::DuckDB(exec) => exec.execute().await,
-            TransactionInsertOrIgnoreExecutor::_Phantom(infallible, _) => match infallible {},
-        }
-    }
-
-    pub fn without_hooks(self) -> crate::WithoutHooksExecutor<Self> {
-        crate::WithoutHooksExecutor(self)
     }
 }
 
@@ -5769,6 +6025,22 @@ pub(crate) fn isolation_level_sql(isolation: IsolationLevel) -> &'static str {
     }
 }
 
+/// 在事务开始后应用事务选项。
+///
+/// 可达路径仅为 SQLite/PostgreSQL/MSSQL/DuckDB（`begin_opts` 把 MySQL 固定
+/// 路由到 `begin_with_opts`（选项必须在 BEGIN 前下发），QuestDB/ClickHouse/
+/// InfluxDB 在 `begin()` 即被 `transactions: false` 拦截），其余后端在此
+/// 防御性拒绝，避免矩阵漂移时静默忽略选项或在 BEGIN 后错误地下发
+/// `SET TRANSACTION`。
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_variables)
+)]
 pub(crate) async fn apply_transaction_options(
     txn: &mut Transaction<'_>,
     options: TransactionOptions,
@@ -5786,25 +6058,6 @@ pub(crate) async fn apply_transaction_options(
         }
         #[cfg(feature = "postgresql")]
         super::super::DbType::PostgreSQL => {
-            if let Some(isolation) = options.isolation {
-                txn.execute_sql(format!(
-                    "SET TRANSACTION ISOLATION LEVEL {}",
-                    isolation_level_sql(isolation)
-                ))
-                .await?;
-            }
-            if options.read_only {
-                txn.execute_sql("SET TRANSACTION READ ONLY").await?;
-            }
-            Ok(())
-        }
-        #[cfg(feature = "questdb")]
-        super::super::DbType::QuestDB => Err(unsupported_feature(
-            super::super::DbType::QuestDB,
-            "transaction options",
-        )),
-        #[cfg(feature = "mysql")]
-        super::super::DbType::MySQL => {
             if let Some(isolation) = options.isolation {
                 txn.execute_sql(format!(
                     "SET TRANSACTION ISOLATION LEVEL {}",
@@ -5844,16 +6097,9 @@ pub(crate) async fn apply_transaction_options(
             }
             Ok(())
         }
-        #[cfg(feature = "clickhouse")]
-        super::super::DbType::ClickHouse => Err(unsupported_feature(
-            super::super::DbType::ClickHouse,
-            "transactions on ClickHouse",
-        )),
-        #[cfg(feature = "influxdb")]
-        super::super::DbType::InfluxDB => Err(unsupported_feature(
-            super::super::DbType::InfluxDB,
-            "transactions",
-        )),
+        // MySQL/QuestDB/ClickHouse/InfluxDB 正常不可达（见函数文档）。
+        #[allow(unreachable_patterns)]
+        _ => Err(unsupported_feature(txn.db_type(), "transaction options")),
     }
 }
 
@@ -5906,14 +6152,7 @@ impl<'a, 'tx> TransactionScope<'a, 'tx> {
         &self,
         key: impl crate::model::PrimaryKey,
     ) -> crate::Result<Option<T>> {
-        let where_expr = primary_key_filter::<T>(key)?;
-        let results = self
-            .select::<T>()
-            .filter(|_| where_expr)
-            .range(..1)
-            .collect::<Vec<T>>()
-            .await?;
-        Ok(results.into_iter().next())
+        find_by_id_with_executor(self.select::<T>(), key).await
     }
 }
 
@@ -5942,53 +6181,32 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn select_sql<T>(
-        &mut self,
-        sql: impl IntoRawSql,
-    ) -> TransactionRawSelectExecutor<'_, 'a, T> {
-        TransactionRawSelectExecutor {
-            txn: self,
-            sql: sql.into_raw_sql(),
-            _marker: std::marker::PhantomData,
-        }
+    pub fn select_sql<T>(&mut self, sql: impl IntoRawSql) -> RawSelectExecutor<'_, T> {
+        // 共享引用 + Transaction 协变性：`&mut Transaction<'a>` 在此降级为
+        // `&Transaction<'_>`，与 Database / 池路径共用一份 RawSelectExecutor。
+        RawSelectExecutor::from_conn(ConnRef::Txn(self), sql.into_raw_sql())
     }
 
+    /// 执行原生非查询 SQL 并返回影响的行数。
+    ///
+    /// 注意：事务后端不含 ClickHouse/InfluxDB（`transactions: false`），
+    /// 本方法返回值在各可达后端上均有精确行数语义。
     pub async fn execute_sql(&mut self, sql: impl IntoRawSql) -> crate::Result<u64> {
-        let sql = sql.into_raw_sql();
-        match self {
-            #[cfg(feature = "sqlite")]
-            Transaction::Sqlite(txn) => {
-                let (sql, params) = sql.render(super::super::DbType::Sqlite)?;
-                txn.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "postgresql")]
-            Transaction::PostgreSQL(txn) => {
-                let (sql, params) = sql.render(super::super::DbType::PostgreSQL)?;
-                txn.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => {
-                let (sql, params) = sql.render(super::super::DbType::MySQL)?;
-                txn.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "mssql")]
-            Transaction::MSSQL(txn) => {
-                let (sql, params) = sql.render(super::super::DbType::MSSQL)?;
-                txn.exec_raw(&sql, params).await
-            }
-            #[cfg(feature = "duckdb")]
-            Transaction::DuckDB(txn) => {
-                let (sql, params) = sql.render(super::super::DbType::DuckDB)?;
-                txn.exec_raw(&sql, params).await
-            }
-            Transaction::_Phantom(infallible, _) => match *infallible {},
-        }
+        // L21：Database / 事务 / 池连接三路径共用一份后端分派。
+        // 写路径：后端事务 exec_raw 为 &mut 接收器，走 ConnRefMut（见
+        // select_sql 的读路径注释；Transaction 协变性允许 &mut 收缩）。
+        exec_raw_sql_on(ConnRefMut::Txn(self), sql.into_raw_sql()).await
     }
 
+    /// 在事务内执行一段受 SAVEPOINT 保护的闭包，失败时回滚到 SAVEPOINT。
+    ///
+    /// 以 [`Capabilities::savepoints`] 为准：DuckDB 不支持 SAVEPOINT 语法，
+    /// 在此直接返回 `UnsupportedFeature` 而不是透传驱动层 Parser 错误。
     pub async fn savepoint<R, F>(&mut self, f: F) -> crate::Result<R>
     where
         F: for<'tx> FnOnce(&'tx mut Transaction<'a>) -> TransactionFuture<'tx, R>,
     {
+        Capabilities::ensure(self.db_type(), |caps| caps.savepoints, "savepoints")?;
         let name = format!(
             "__ormer_savepoint_{}",
             SAVEPOINT_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -6013,15 +6231,19 @@ impl<'a> Transaction<'a> {
                 Ok(value)
             }
             Err(err) => {
+                // 回滚到 SAVEPOINT / RELEASE 的失败不覆盖主错误，但不能
+                // 静默吞掉（L23：统一走回滚失败日志）。
                 if is_mssql {
-                    let _ = self
-                        .execute_sql(format!("ROLLBACK TRANSACTION {name}"))
-                        .await;
+                    log_rollback_failure(
+                        self.execute_sql(format!("ROLLBACK TRANSACTION {name}")).await,
+                    );
                 } else {
-                    let _ = self
-                        .execute_sql(format!("ROLLBACK TO SAVEPOINT {name}"))
-                        .await;
-                    let _ = self.execute_sql(format!("RELEASE SAVEPOINT {name}")).await;
+                    log_rollback_failure(
+                        self.execute_sql(format!("ROLLBACK TO SAVEPOINT {name}")).await,
+                    );
+                    log_rollback_failure(
+                        self.execute_sql(format!("RELEASE SAVEPOINT {name}")).await,
+                    );
                 }
                 Err(err)
             }
@@ -6084,17 +6306,7 @@ impl<'a> Transaction<'a> {
         &self,
         key: impl crate::model::PrimaryKey,
     ) -> crate::Result<Option<T>> {
-        let where_expr = primary_key_filter::<T>(key)?;
-
-        // 执行查询并取第一条
-        let results = self
-            .select::<T>()
-            .filter(|_| where_expr)
-            .range(..1)
-            .collect::<Vec<T>>()
-            .await?;
-
-        Ok(results.into_iter().next())
+        find_by_id_with_executor(self.select::<T>(), key).await
     }
 
     /// 创建 Select 查询执行器
@@ -6130,20 +6342,24 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         match self {
             #[cfg(feature = "sqlite")]
-            Transaction::Sqlite(txn) => GroupedSelectExecutor::Sqlite(txn.select_column::<T, V>()),
+            Transaction::Sqlite(txn) => {
+                ProjectionSelectExecutor::Sqlite(txn.select_column::<T, V>())
+            }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
-                GroupedSelectExecutor::PostgreSQL(txn.select_column::<T, V>())
+                ProjectionSelectExecutor::PostgreSQL(txn.select_column::<T, V>())
             }
             #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => GroupedSelectExecutor::MySQL(txn.select_column::<T, V>()),
+            Transaction::MySQL(txn) => ProjectionSelectExecutor::MySQL(txn.select_column::<T, V>()),
             #[cfg(feature = "mssql")]
-            Transaction::MSSQL(txn) => GroupedSelectExecutor::MSSQL(txn.select_column::<T, V>()),
+            Transaction::MSSQL(txn) => ProjectionSelectExecutor::MSSQL(txn.select_column::<T, V>()),
             #[cfg(feature = "duckdb")]
-            Transaction::DuckDB(txn) => GroupedSelectExecutor::DuckDB(txn.select_column::<T, V>()),
+            Transaction::DuckDB(txn) => {
+                ProjectionSelectExecutor::DuckDB(txn.select_column::<T, V>())
+            }
             Transaction::_Phantom(infallible, _) => match *infallible {},
         }
     }
@@ -6186,60 +6402,96 @@ impl<'a> Transaction<'a> {
         }
     }
 
+    /// 保存 tracked 模型的 dirty 变更（在当前事务上执行，写完不提交不回滚）。
+    ///
+    /// 返回合并后的 [`SaveExecutor`] 事务路径（旧名 [`TransactionSaveExecutor`]
+    /// 保留为过渡别名）。
     pub fn save<'op, T: WritableModel + crate::model::GraphWritable>(
         &'op mut self,
         model: &'op mut Tracked<T>,
-    ) -> TransactionSaveExecutor<'op, 'a, T> {
-        TransactionSaveExecutor { txn: self, model }
+    ) -> SaveExecutor<'op, T> {
+        // SQL 预览在构造时渲染（dirty 列在执行器存续期被独占借用，不可再变）
+        let sql = {
+            let fields = model.dirty_columns();
+            if fields.is_empty() {
+                Ok(SqlStatement::batch(self.db_type(), Vec::new()))
+            } else {
+                self.update::<T>()
+                    .set_model_columns(model.as_model(), &fields)
+                    .to_sql()
+            }
+        };
+        // 写核心启动闭包：`&'op mut Transaction<'a>` 在此装箱擦除 `'a`，
+        // SaveExecutor 的公开形状保持单生命周期
+        let txn = self;
+        SaveExecutor {
+            conn: SaveConn::Txn {
+                sql,
+                run: Box::new(
+                    move |model: &'op mut Tracked<T>| -> Pin<
+                        Box<
+                            dyn Future<
+                                    Output = (crate::Result<u64>, &'op mut Tracked<T>),
+                                > + 'op,
+                        >,
+                    > {
+                        Box::pin(async move {
+                            let result = save_dirty_columns_and_relations(txn, model).await;
+                            (result, model)
+                        })
+                    },
+                ),
+            },
+            model,
+        }
     }
 
-    /// 插入记录 - 返回执行器
-    pub fn insert<I: crate::model::Insertable>(
-        &mut self,
-        models: I,
-    ) -> TransactionInsertExecutor<'_, I> {
+    /// 插入记录 - 返回执行器（合并后返回 [`InsertExecutor`] 的事务变体，
+    /// 旧名 [`TransactionInsertExecutor`] 保留为过渡别名）。
+    pub fn insert<I: crate::model::Insertable>(&mut self, models: I) -> InsertExecutor<'_, I> {
         match self {
             #[cfg(feature = "sqlite")]
-            Transaction::Sqlite(txn) => TransactionInsertExecutor::Sqlite(txn.insert::<I>(models)),
+            Transaction::Sqlite(txn) => InsertExecutor::SqliteTxn(txn.insert::<I>(models)),
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
-                TransactionInsertExecutor::PostgreSQL(txn.insert::<I>(models))
+                InsertExecutor::PostgreSQLTxn(txn.insert::<I>(models))
             }
             #[cfg(feature = "mysql")]
-            Transaction::MySQL(txn) => TransactionInsertExecutor::MySQL(txn.insert::<I>(models)),
+            Transaction::MySQL(txn) => InsertExecutor::MySQLTxn(txn.insert::<I>(models)),
             #[cfg(feature = "mssql")]
-            Transaction::MSSQL(txn) => TransactionInsertExecutor::MSSQL(txn.insert::<I>(models)),
+            Transaction::MSSQL(txn) => InsertExecutor::MSSQLTxn(txn.insert::<I>(models)),
             #[cfg(feature = "duckdb")]
-            Transaction::DuckDB(txn) => TransactionInsertExecutor::DuckDB(txn.insert::<I>(models)),
+            Transaction::DuckDB(txn) => InsertExecutor::DuckDBTxn(txn.insert::<I>(models)),
             Transaction::_Phantom(infallible, _) => match *infallible {},
         }
     }
 
-    /// 插入或更新记录 - 返回执行器
+    /// 插入或更新记录 - 返回执行器（合并后返回 [`InsertOrUpdateExecutor`]
+    /// 的事务变体，旧名 [`TransactionInsertOrUpdateExecutor`] 保留为过渡别名）。
     pub fn insert_or_update<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
+    ) -> InsertOrUpdateExecutor<'_, I> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => {
-                TransactionInsertOrUpdateExecutor::Sqlite(txn.insert_or_update::<I>(models))
+                InsertOrUpdateExecutor::SqliteTxn(txn.insert_or_update::<I>(models))
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
-                TransactionInsertOrUpdateExecutor::PostgreSQL(txn.insert_or_update::<I>(models))
+                InsertOrUpdateExecutor::PostgreSQLTxn(txn.insert_or_update::<I>(models))
             }
             #[cfg(feature = "mysql")]
             Transaction::MySQL(txn) => {
-                TransactionInsertOrUpdateExecutor::MySQL(txn.insert_or_update::<I>(models))
+                InsertOrUpdateExecutor::MySQLTxn(txn.insert_or_update::<I>(models))
             }
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => {
-                TransactionInsertOrUpdateExecutor::MSSQL(txn.insert_or_update::<I>(models))
+                InsertOrUpdateExecutor::MSSQLTxn(txn.insert_or_update::<I>(models))
             }
             #[cfg(feature = "duckdb")]
             Transaction::DuckDB(txn) => {
-                TransactionInsertOrUpdateExecutor::DuckDB(txn.insert_or_update::<I>(models))
+                InsertOrUpdateExecutor::DuckDBTxn(txn.insert_or_update::<I>(models))
             }
             Transaction::_Phantom(infallible, _) => match *infallible {},
         }
@@ -6248,35 +6500,36 @@ impl<'a> Transaction<'a> {
     pub fn upsert<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> TransactionInsertOrUpdateExecutor<'_, I> {
+    ) -> InsertOrUpdateExecutor<'_, I> {
         self.insert_or_update(models)
     }
 
-    /// 插入或忽略记录 - 返回执行器
+    /// 插入或忽略记录 - 返回执行器（合并后返回 [`InsertOrIgnoreExecutor`]
+    /// 的事务变体，旧名 [`TransactionInsertOrIgnoreExecutor`] 保留为过渡别名）。
     pub fn insert_or_ignore<I: crate::model::Insertable>(
         &mut self,
         models: I,
-    ) -> TransactionInsertOrIgnoreExecutor<'_, I> {
+    ) -> InsertOrIgnoreExecutor<'_, I> {
         match self {
             #[cfg(feature = "sqlite")]
             Transaction::Sqlite(txn) => {
-                TransactionInsertOrIgnoreExecutor::Sqlite(txn.insert_or_ignore::<I>(models))
+                InsertOrIgnoreExecutor::SqliteTxn(txn.insert_or_ignore::<I>(models))
             }
             #[cfg(feature = "postgresql")]
             Transaction::PostgreSQL(txn) => {
-                TransactionInsertOrIgnoreExecutor::PostgreSQL(txn.insert_or_ignore::<I>(models))
+                InsertOrIgnoreExecutor::PostgreSQLTxn(txn.insert_or_ignore::<I>(models))
             }
             #[cfg(feature = "mysql")]
             Transaction::MySQL(txn) => {
-                TransactionInsertOrIgnoreExecutor::MySQL(txn.insert_or_ignore::<I>(models))
+                InsertOrIgnoreExecutor::MySQLTxn(txn.insert_or_ignore::<I>(models))
             }
             #[cfg(feature = "mssql")]
             Transaction::MSSQL(txn) => {
-                TransactionInsertOrIgnoreExecutor::MSSQL(txn.insert_or_ignore::<I>(models))
+                InsertOrIgnoreExecutor::MSSQLTxn(txn.insert_or_ignore::<I>(models))
             }
             #[cfg(feature = "duckdb")]
             Transaction::DuckDB(txn) => {
-                TransactionInsertOrIgnoreExecutor::DuckDB(txn.insert_or_ignore::<I>(models))
+                InsertOrIgnoreExecutor::DuckDBTxn(txn.insert_or_ignore::<I>(models))
             }
             Transaction::_Phantom(infallible, _) => match *infallible {},
         }
@@ -6288,7 +6541,7 @@ impl<'a> super::DbExecutor for Transaction<'a> {
         Transaction::select::<T>(self)
     }
 
-    fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
+    fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         Transaction::select_column::<T, V>(self)
     }
 }
@@ -6429,43 +6682,25 @@ crate::impl_unified_join_collect_future!(
     crate::Result<Vec<(Option<T>, J)>>
 );
 
-/// 统一的 MappedSelectExecutor 枚举
-pub enum MappedSelectExecutor<'a, T: Model, V> {
+/// 统一的 Projection 查询执行器枚举（字段投影与分组聚合合一）
+///
+/// 由原 `MappedSelectExecutor`（字段投影）与 `GroupedSelectExecutor`（分组聚合）
+/// 合并而来：`ProjectionSelect::grouping` 决定实际走的 SQL 路径。
+pub enum ProjectionSelectExecutor<'a, T: Model, V> {
     #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::MappedSelectExecutor<'a, T, V>),
+    Sqlite(sqlite_backend::ProjectionSelectExecutor<'a, T, V>),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::MappedSelectExecutor<'a, T, V>),
+    PostgreSQL(postgresql_backend::ProjectionSelectExecutor<'a, T, V>),
     #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::MappedSelectExecutor<'a, T, V>),
+    MySQL(mysql_backend::ProjectionSelectExecutor<'a, T, V>),
     #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::MappedSelectExecutor<'a, T, V>),
+    MSSQL(mssql_backend::ProjectionSelectExecutor<'a, T, V>),
     #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::MappedSelectExecutor<'a, T, V>),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, V)>,
-    },
-}
-
-/// 统一的 GroupedSelectExecutor 枚举
-pub enum GroupedSelectExecutor<'a, T: Model, V> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::GroupedSelectExecutor<'a, T, V>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::GroupedSelectExecutor<'a, T, V>),
+    DuckDB(duckdb_backend::ProjectionSelectExecutor<'a, T, V>),
     /// ClickHouse 分组聚合：渲染 GROUP BY 聚合 SQL 后走
     /// `select_named_values`（JSONEachRowWithNames）按投影顺序解码。
     #[cfg(feature = "clickhouse")]
-    ClickHouse(&'a clickhouse_backend::Database, GroupedSelect<T, V>),
+    ClickHouse(&'a clickhouse_backend::Database, ProjectionSelect<T, V>),
     #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
     #[doc(hidden)]
     Unsupported {
@@ -6475,7 +6710,19 @@ pub enum GroupedSelectExecutor<'a, T: Model, V> {
     },
 }
 
-impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type MappedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
+
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
+
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 添加 GROUP BY 字段
     pub fn group_by<F, G>(self, f: F) -> Self
     where
@@ -6484,23 +6731,27 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => GroupedSelectExecutor::Sqlite(exec.group_by(f)),
+            ProjectionSelectExecutor::Sqlite(exec) => {
+                ProjectionSelectExecutor::Sqlite(exec.group_by(f))
+            }
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => {
-                GroupedSelectExecutor::PostgreSQL(exec.group_by(f))
+            ProjectionSelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.group_by(f))
             }
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.group_by(f)),
+            ProjectionSelectExecutor::MySQL(exec) => ProjectionSelectExecutor::MySQL(exec.group_by(f)),
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.group_by(f)),
+            ProjectionSelectExecutor::MSSQL(exec) => ProjectionSelectExecutor::MSSQL(exec.group_by(f)),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.group_by(f)),
+            ProjectionSelectExecutor::DuckDB(exec) => {
+                ProjectionSelectExecutor::DuckDB(exec.group_by(f))
+            }
             #[cfg(feature = "clickhouse")]
-            GroupedSelectExecutor::ClickHouse(db, select) => {
-                GroupedSelectExecutor::ClickHouse(db, select.group_by(f))
+            ProjectionSelectExecutor::ClickHouse(db, select) => {
+                ProjectionSelectExecutor::ClickHouse(db, select.group_by(f))
             }
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
+            unsupported @ ProjectionSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -6512,23 +6763,27 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => GroupedSelectExecutor::Sqlite(exec.having(f)),
+            ProjectionSelectExecutor::Sqlite(exec) => {
+                ProjectionSelectExecutor::Sqlite(exec.having(f))
+            }
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => {
-                GroupedSelectExecutor::PostgreSQL(exec.having(f))
+            ProjectionSelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.having(f))
             }
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.having(f)),
+            ProjectionSelectExecutor::MySQL(exec) => ProjectionSelectExecutor::MySQL(exec.having(f)),
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.having(f)),
+            ProjectionSelectExecutor::MSSQL(exec) => ProjectionSelectExecutor::MSSQL(exec.having(f)),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.having(f)),
+            ProjectionSelectExecutor::DuckDB(exec) => {
+                ProjectionSelectExecutor::DuckDB(exec.having(f))
+            }
             #[cfg(feature = "clickhouse")]
-            GroupedSelectExecutor::ClickHouse(db, select) => {
-                GroupedSelectExecutor::ClickHouse(db, select.having(f))
+            ProjectionSelectExecutor::ClickHouse(db, select) => {
+                ProjectionSelectExecutor::ClickHouse(db, select.having(f))
             }
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
+            unsupported @ ProjectionSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
 
@@ -6540,28 +6795,32 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => GroupedSelectExecutor::Sqlite(exec.filter(f)),
+            ProjectionSelectExecutor::Sqlite(exec) => {
+                ProjectionSelectExecutor::Sqlite(exec.filter(f))
+            }
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => {
-                GroupedSelectExecutor::PostgreSQL(exec.filter(f))
+            ProjectionSelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.filter(f))
             }
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.filter(f)),
+            ProjectionSelectExecutor::MySQL(exec) => ProjectionSelectExecutor::MySQL(exec.filter(f)),
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.filter(f)),
+            ProjectionSelectExecutor::MSSQL(exec) => ProjectionSelectExecutor::MSSQL(exec.filter(f)),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.filter(f)),
+            ProjectionSelectExecutor::DuckDB(exec) => {
+                ProjectionSelectExecutor::DuckDB(exec.filter(f))
+            }
             #[cfg(feature = "clickhouse")]
-            GroupedSelectExecutor::ClickHouse(db, select) => {
-                GroupedSelectExecutor::ClickHouse(db, select.filter(f))
+            ProjectionSelectExecutor::ClickHouse(db, select) => {
+                ProjectionSelectExecutor::ClickHouse(db, select.filter(f))
             }
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            unsupported @ GroupedSelectExecutor::Unsupported { .. } => unsupported,
+            unsupported @ ProjectionSelectExecutor::Unsupported { .. } => unsupported,
         }
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C>(&self) -> GroupedCollectFuture<'a, T, V, C>
+    pub fn collect<C>(&self) -> ProjectionCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
@@ -6569,31 +6828,35 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => {
-                GroupedCollectFuture::Sqlite(exec.collect::<C>())
+            ProjectionSelectExecutor::Sqlite(exec) => {
+                ProjectionCollectFuture::Sqlite(exec.collect::<C>())
             }
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => {
-                GroupedCollectFuture::PostgreSQL(exec.collect::<C>())
+            ProjectionSelectExecutor::PostgreSQL(exec) => {
+                ProjectionCollectFuture::PostgreSQL(exec.collect::<C>())
             }
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => GroupedCollectFuture::MySQL(exec.collect::<C>()),
+            ProjectionSelectExecutor::MySQL(exec) => {
+                ProjectionCollectFuture::MySQL(exec.collect::<C>())
+            }
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => GroupedCollectFuture::MSSQL(exec.collect::<C>()),
+            ProjectionSelectExecutor::MSSQL(exec) => {
+                ProjectionCollectFuture::MSSQL(exec.collect::<C>())
+            }
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => {
-                GroupedCollectFuture::DuckDB(exec.collect::<C>())
+            ProjectionSelectExecutor::DuckDB(exec) => {
+                ProjectionCollectFuture::DuckDB(exec.collect::<C>())
             }
             #[cfg(feature = "clickhouse")]
-            GroupedSelectExecutor::ClickHouse(db, select) => GroupedCollectFuture::ClickHouse(
+            ProjectionSelectExecutor::ClickHouse(db, select) => ProjectionCollectFuture::ClickHouse(
                 *db,
                 select.clone(),
                 std::marker::PhantomData,
             ),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            GroupedSelectExecutor::Unsupported {
+            ProjectionSelectExecutor::Unsupported {
                 backend, feature, ..
-            } => GroupedCollectFuture::Unsupported {
+            } => ProjectionCollectFuture::Unsupported {
                 backend: *backend,
                 feature: *feature,
                 _marker: std::marker::PhantomData,
@@ -6608,51 +6871,55 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedSelectExecutor::Sqlite(exec) => Ok(exec.as_model::<R>()),
+            ProjectionSelectExecutor::Sqlite(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "postgresql")]
-            GroupedSelectExecutor::PostgreSQL(exec) => Ok(exec.as_model::<R>()),
+            ProjectionSelectExecutor::PostgreSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mysql")]
-            GroupedSelectExecutor::MySQL(exec) => Ok(exec.as_model::<R>()),
+            ProjectionSelectExecutor::MySQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "mssql")]
-            GroupedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
+            ProjectionSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "duckdb")]
-            GroupedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
+            ProjectionSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
             #[cfg(feature = "clickhouse")]
-            GroupedSelectExecutor::ClickHouse(_, _) => Err(unsupported_feature(
+            ProjectionSelectExecutor::ClickHouse(_, _) => Err(unsupported_feature(
                 super::super::DbType::ClickHouse,
                 "Model select_column on ClickHouse; use select_sql",
             )),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            GroupedSelectExecutor::Unsupported {
+            ProjectionSelectExecutor::Unsupported {
                 backend, feature, ..
             } => Err(unsupported_feature(backend, feature)),
         }
     }
 }
 
-impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
+impl<'a, T: Model, V> Clone for ProjectionSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         match self {
             #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => MappedSelectExecutor::Sqlite(exec.clone()),
+            ProjectionSelectExecutor::Sqlite(exec) => ProjectionSelectExecutor::Sqlite(exec.clone()),
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => {
-                MappedSelectExecutor::PostgreSQL(exec.clone_with_client())
+            ProjectionSelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.clone_with_client())
             }
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => {
-                MappedSelectExecutor::MySQL(exec.clone_with_pool())
+            ProjectionSelectExecutor::MySQL(exec) => {
+                ProjectionSelectExecutor::MySQL(exec.clone_with_pool())
             }
             #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => {
-                MappedSelectExecutor::MSSQL(exec.clone_with_pool())
+            ProjectionSelectExecutor::MSSQL(exec) => {
+                ProjectionSelectExecutor::MSSQL(exec.clone_with_pool())
             }
             #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.clone()),
+            ProjectionSelectExecutor::DuckDB(exec) => ProjectionSelectExecutor::DuckDB(exec.clone()),
+            #[cfg(feature = "clickhouse")]
+            ProjectionSelectExecutor::ClickHouse(db, select) => {
+                ProjectionSelectExecutor::ClickHouse(db, select.clone())
+            }
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedSelectExecutor::Unsupported {
+            ProjectionSelectExecutor::Unsupported {
                 backend, feature, ..
-            } => MappedSelectExecutor::Unsupported {
+            } => ProjectionSelectExecutor::Unsupported {
                 backend: *backend,
                 feature: *feature,
                 _marker: std::marker::PhantomData,
@@ -6661,43 +6928,22 @@ impl<'a, T: Model, V> Clone for MappedSelectExecutor<'a, T, V> {
     }
 }
 
-/// 统一的 MappedCollectFuture 枚举
-pub enum MappedCollectFuture<'a, T: Model + 'static, V: 'static, C: FromIterator<V> + 'static> {
+/// 统一的 Projection Collect Future 枚举（字段投影与分组聚合合一）
+pub enum ProjectionCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::MappedCollectFuture<'a, T, V, C>),
+    Sqlite(sqlite_backend::ProjectionCollectFuture<'a, T, V, C>),
     #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::MappedCollectFuture<'a, T, V, C>),
+    PostgreSQL(postgresql_backend::ProjectionCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::MappedCollectFuture<'a, T, V, C>),
+    MySQL(mysql_backend::ProjectionCollectFuture<'a, T, V, C>),
     #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::MappedCollectFuture<'a, T, V, C>),
+    MSSQL(mssql_backend::ProjectionCollectFuture<'a, T, V, C>),
     #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::MappedCollectFuture<'a, T, V, C>),
-    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-    #[doc(hidden)]
-    Unsupported {
-        backend: super::super::DbType,
-        feature: &'static str,
-        _marker: std::marker::PhantomData<&'a (T, V, C)>,
-    },
-}
-
-/// 统一的 GroupedCollectFuture 枚举
-pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
-    #[cfg(feature = "sqlite")]
-    Sqlite(sqlite_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "postgresql")]
-    PostgreSQL(postgresql_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "mssql")]
-    MSSQL(mssql_backend::GroupedCollectFuture<'a, T, V, C>),
-    #[cfg(feature = "duckdb")]
-    DuckDB(duckdb_backend::GroupedCollectFuture<'a, T, V, C>),
+    DuckDB(duckdb_backend::ProjectionCollectFuture<'a, T, V, C>),
     #[cfg(feature = "clickhouse")]
     ClickHouse(
         &'a clickhouse_backend::Database,
-        GroupedSelect<T, V>,
+        ProjectionSelect<T, V>,
         std::marker::PhantomData<C>,
     ),
     #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
@@ -6709,12 +6955,24 @@ pub enum GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
     },
 }
 
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type MappedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
+
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type GroupedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
+
 impl<
     'a,
     T: Model + 'static + std::marker::Send + std::marker::Sync,
     V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
     C: FromIterator<V> + 'static,
-> std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+> std::future::IntoFuture for ProjectionCollectFuture<'a, T, V, C>
 {
     type Output = crate::Result<C>;
     type IntoFuture =
@@ -6723,19 +6981,19 @@ impl<
     fn into_future(self) -> Self::IntoFuture {
         match self {
             #[cfg(feature = "sqlite")]
-            GroupedCollectFuture::Sqlite(future) => Box::pin(future.into_future()),
+            ProjectionCollectFuture::Sqlite(future) => Box::pin(future.into_future()),
             #[cfg(feature = "postgresql")]
-            GroupedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
+            ProjectionCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mysql")]
-            GroupedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
+            ProjectionCollectFuture::MySQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "mssql")]
-            GroupedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
+            ProjectionCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
             #[cfg(feature = "duckdb")]
-            GroupedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
+            ProjectionCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
             // 分组投影的输出列名由服务端返回（JSONEachRowWithNames 首行），
             // 按投影顺序解码为 V
             #[cfg(feature = "clickhouse")]
-            GroupedCollectFuture::ClickHouse(db, select, _) => Box::pin(async move {
+            ProjectionCollectFuture::ClickHouse(db, select, _) => Box::pin(async move {
                 let (sql, params) = select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
                 let (_, rows) = db
                     .select_named_values(RawSql::new(sql).with_params(params))
@@ -6745,7 +7003,7 @@ impl<
                     .collect()
             }),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            GroupedCollectFuture::Unsupported {
+            ProjectionCollectFuture::Unsupported {
                 backend, feature, ..
             } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
         }
@@ -6758,19 +7016,19 @@ pub enum ModelCollectWithFuture<'a, T: Model + 'static, V: 'static, C, M, F> {
     Sqlite(sqlite_backend::ModelCollectWithFuture<'a, T, V, C, M, F>),
     #[cfg(feature = "postgresql")]
     PostgreSQLCollect(
-        postgresql_backend::MappedCollectFuture<'a, T, V, Vec<V>>,
+        postgresql_backend::ProjectionCollectFuture<'a, T, V, Vec<V>>,
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
     #[cfg(feature = "mysql")]
     MySQLCollect(
-        mysql_backend::MappedCollectFuture<'a, T, V, Vec<V>>,
+        mysql_backend::ProjectionCollectFuture<'a, T, V, Vec<V>>,
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
     #[cfg(feature = "mssql")]
     MSSQLCollect(
-        mssql_backend::MappedCollectFuture<'a, T, V, Vec<V>>,
+        mssql_backend::ProjectionCollectFuture<'a, T, V, Vec<V>>,
         F,
         std::marker::PhantomData<&'a (T, C, M)>,
     ),
@@ -6788,26 +7046,28 @@ pub enum ModelCollectWithFuture<'a, T: Model + 'static, V: 'static, C, M, F> {
 impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 字段投影 - 将查询结果映射到单个字段或元组
     /// 支持：
-    /// - 单字段：map_to(|r| r.uid) -> MappedSelectExecutor<'a, T, i32>
-    /// - 元组：map_to(|r| (r.uid, r.id)) -> MappedSelectExecutor<'a, T, (i32, i32)>
-    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    /// - 单字段：map_to(|r| r.uid) -> ProjectionSelectExecutor<'a, T, i32>
+    /// - 元组：map_to(|r| (r.uid, r.id)) -> ProjectionSelectExecutor<'a, T, (i32, i32)>
+    pub fn map_to<F, M>(self, f: F) -> ProjectionSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(<T as Model>::Where) -> M,
         M: crate::query::builder::MapToResult,
     {
         match self {
             #[cfg(feature = "sqlite")]
-            SelectExecutor::Sqlite(exec) => MappedSelectExecutor::Sqlite(exec.map_to(f)),
+            SelectExecutor::Sqlite(exec) => ProjectionSelectExecutor::Sqlite(exec.map_to(f)),
             #[cfg(feature = "postgresql")]
-            SelectExecutor::PostgreSQL(exec) => MappedSelectExecutor::PostgreSQL(exec.map_to(f)),
+            SelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.map_to(f))
+            }
             #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => MappedSelectExecutor::MySQL(exec.map_to(f)),
+            SelectExecutor::MySQL(exec) => ProjectionSelectExecutor::MySQL(exec.map_to(f)),
             #[cfg(feature = "mssql")]
-            SelectExecutor::MSSQL(exec) => MappedSelectExecutor::MSSQL(exec.map_to(f)),
+            SelectExecutor::MSSQL(exec) => ProjectionSelectExecutor::MSSQL(exec.map_to(f)),
             #[cfg(feature = "duckdb")]
-            SelectExecutor::DuckDB(exec) => MappedSelectExecutor::DuckDB(exec.map_to(f)),
+            SelectExecutor::DuckDB(exec) => ProjectionSelectExecutor::DuckDB(exec.map_to(f)),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            SelectExecutor::ClickHouse(db, _) => MappedSelectExecutor::Unsupported {
+            SelectExecutor::ClickHouse(db, _) => ProjectionSelectExecutor::Unsupported {
                 backend: clickhouse_select_backend_db_type(db),
                 feature: "select capability on ClickHouse",
                 _marker: std::marker::PhantomData,
@@ -6816,47 +7076,44 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 选择列（支持聚合函数）- 转换为分组查询
-    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    pub fn select_column<F, V>(self, f: F) -> ProjectionSelectExecutor<'a, T, V>
     where
         F: FnOnce(<T as Model>::Where) -> V,
         V: crate::query::builder::SelectColumnResult,
     {
         match self {
             #[cfg(feature = "sqlite")]
-            SelectExecutor::Sqlite(exec) => GroupedSelectExecutor::Sqlite(exec.select_column(f)),
+            SelectExecutor::Sqlite(exec) => {
+                ProjectionSelectExecutor::Sqlite(exec.select_column(f))
+            }
             #[cfg(feature = "postgresql")]
             SelectExecutor::PostgreSQL(exec) => {
-                GroupedSelectExecutor::PostgreSQL(exec.select_column(f))
+                ProjectionSelectExecutor::PostgreSQL(exec.select_column(f))
             }
             #[cfg(feature = "mysql")]
-            SelectExecutor::MySQL(exec) => GroupedSelectExecutor::MySQL(exec.select_column(f)),
+            SelectExecutor::MySQL(exec) => ProjectionSelectExecutor::MySQL(exec.select_column(f)),
             #[cfg(feature = "mssql")]
-            SelectExecutor::MSSQL(exec) => GroupedSelectExecutor::MSSQL(exec.select_column(f)),
+            SelectExecutor::MSSQL(exec) => ProjectionSelectExecutor::MSSQL(exec.select_column(f)),
             #[cfg(feature = "duckdb")]
-            SelectExecutor::DuckDB(exec) => GroupedSelectExecutor::DuckDB(exec.select_column(f)),
-            // 能力矩阵门控：advanced_grouping 为 true 的后端走分组聚合执行分支
+            SelectExecutor::DuckDB(exec) => {
+                ProjectionSelectExecutor::DuckDB(exec.select_column(f))
+            }
+            // 能力矩阵门控与 Database / 池连接入口共用同一判定与文案
+            // （L19：clickhouse_projection_gate）。
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 let backend = clickhouse_select_backend_db_type(db);
-                if !Capabilities::of(backend).advanced_grouping {
-                    // 能力矩阵门控：InfluxQL 的 GROUP BY 仅支持时间桶与 tag
-                    #[cfg(feature = "influxdb")]
-                    let feature = if backend == super::super::DbType::InfluxDB {
-                        "GROUP BY aggregation on InfluxDB (InfluxQL GROUP BY only supports time buckets and tags)"
-                    } else {
-                        "GROUP BY aggregation"
-                    };
-                    #[cfg(not(feature = "influxdb"))]
-                    let feature = "GROUP BY aggregation";
-                    return GroupedSelectExecutor::Unsupported {
+                if let Some(feature) = clickhouse_projection_gate(backend) {
+                    return ProjectionSelectExecutor::Unsupported {
                         backend,
                         feature,
                         _marker: std::marker::PhantomData,
                     };
                 }
                 #[cfg(feature = "clickhouse")]
+                #[cfg_attr(not(feature = "influxdb"), allow(irrefutable_let_patterns))]
                 if let ClickHouseSelectBackend::ClickHouse(db) = db {
-                    return GroupedSelectExecutor::ClickHouse(db, select.select_column(f));
+                    return ProjectionSelectExecutor::ClickHouse(db, select.select_column(f));
                 }
                 #[cfg(not(feature = "clickhouse"))]
                 {
@@ -6864,7 +7121,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                     // 穷尽性保留
                     let _ = (select, f);
                 }
-                GroupedSelectExecutor::Unsupported {
+                ProjectionSelectExecutor::Unsupported {
                     backend,
                     feature: "GROUP BY aggregation",
                     _marker: std::marker::PhantomData,
@@ -7020,64 +7277,17 @@ where
     }
 }
 
-impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
-    pub fn as_model<R: Model>(self) -> crate::Result<DerivedSelect<R>>
-    where
-        T: Send + Sync + 'static,
-        V: Send + Sync + 'static,
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => Ok(exec.as_model::<R>()),
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedSelectExecutor::Unsupported {
-                backend, feature, ..
-            } => Err(unsupported_feature(backend, feature)),
-        }
-    }
+/// collect_with 的克隆式后端分支（L27：PostgreSQL/MySQL/MSSQL 三份同构
+/// 代码收敛）：`clone_with_*` → `collect::<Vec<V>>` → 装入对应 Collect 变体。
+/// `V` 由变体构造器的期望类型反向推断，宏内无需引用泛型参数。
+macro_rules! collect_with_clone_branch {
+    ($exec:ident, $f:ident, [$($variant:ident)::+], $clone:ident) => {{
+        let future = $exec.$clone().collect::<Vec<_>>();
+        $($variant)::+(future, $f, std::marker::PhantomData)
+    }};
+}
 
-    pub fn collect<C>(self) -> MappedCollectFuture<'a, T, V, C>
-    where
-        T: 'static,
-        V: crate::model::FromRowValues + 'static,
-        C: FromIterator<V> + 'static,
-    {
-        match self {
-            #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => MappedCollectFuture::Sqlite(exec.collect::<C>()),
-            #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => {
-                MappedCollectFuture::PostgreSQL(exec.clone_with_client().collect::<C>())
-            }
-            #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => {
-                MappedCollectFuture::MySQL(exec.clone_with_pool().collect::<C>())
-            }
-            #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => {
-                MappedCollectFuture::MSSQL(exec.clone_with_pool().collect::<C>())
-            }
-            #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => MappedCollectFuture::DuckDB(exec.collect::<C>()),
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedSelectExecutor::Unsupported {
-                backend, feature, ..
-            } => MappedCollectFuture::Unsupported {
-                backend,
-                feature,
-                _marker: std::marker::PhantomData,
-            },
-        }
-    }
-
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
@@ -7091,36 +7301,43 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     {
         match self {
             #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => {
+            ProjectionSelectExecutor::Sqlite(exec) => {
                 ModelCollectWithFuture::Sqlite(exec.collect_with::<C, F, M>(f))
             }
+            // 三个克隆式后端共用同一份组合逻辑（L27）
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => {
-                // PostgreSQL也支持collect_with，通过clone exec然后调用collect实现
-                let exec_clone = exec.clone_with_client();
-                let future = exec_clone.collect::<Vec<V>>();
-                ModelCollectWithFuture::PostgreSQLCollect(future, f, std::marker::PhantomData)
-            }
+            ProjectionSelectExecutor::PostgreSQL(exec) => collect_with_clone_branch!(
+                exec,
+                f,
+                [ModelCollectWithFuture::PostgreSQLCollect],
+                clone_with_client
+            ),
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => {
-                // MySQL也支持collect_with，通过clone exec然后调用collect实现
-                let exec_clone = exec.clone_with_pool();
-                let future = exec_clone.collect::<Vec<V>>();
-                ModelCollectWithFuture::MySQLCollect(future, f, std::marker::PhantomData)
-            }
+            ProjectionSelectExecutor::MySQL(exec) => collect_with_clone_branch!(
+                exec,
+                f,
+                [ModelCollectWithFuture::MySQLCollect],
+                clone_with_pool
+            ),
             #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => {
-                // MSSQL也支持collect_with，通过clone exec然后调用collect实现
-                let exec_clone = exec.clone_with_pool();
-                let future = exec_clone.collect::<Vec<V>>();
-                ModelCollectWithFuture::MSSQLCollect(future, f, std::marker::PhantomData)
-            }
+            ProjectionSelectExecutor::MSSQL(exec) => collect_with_clone_branch!(
+                exec,
+                f,
+                [ModelCollectWithFuture::MSSQLCollect],
+                clone_with_pool
+            ),
             #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => {
+            ProjectionSelectExecutor::DuckDB(exec) => {
                 ModelCollectWithFuture::DuckDB(exec.collect_with::<C, F, M>(f))
             }
+            #[cfg(feature = "clickhouse")]
+            ProjectionSelectExecutor::ClickHouse(_, _) => ModelCollectWithFuture::Unsupported {
+                backend: super::super::DbType::ClickHouse,
+                feature: "collect_with on ClickHouse; use select_sql",
+                _marker: std::marker::PhantomData,
+            },
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedSelectExecutor::Unsupported {
+            ProjectionSelectExecutor::Unsupported {
                 backend, feature, ..
             } => ModelCollectWithFuture::Unsupported {
                 backend,
@@ -7131,7 +7348,7 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
-impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     fn into_in_filter(self, column: String) -> crate::query::filter::FilterExpr {
         let in_subquery = |subquery: crate::Result<(String, Vec<crate::model::Value>)>| {
             crate::query::filter::FilterExpr::InSubqueryDynamic {
@@ -7142,17 +7359,24 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
 
         match self {
             #[cfg(feature = "sqlite")]
-            MappedSelectExecutor::Sqlite(exec) => in_subquery(exec.to_subquery_sql()),
+            ProjectionSelectExecutor::Sqlite(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "postgresql")]
-            MappedSelectExecutor::PostgreSQL(exec) => in_subquery(exec.to_subquery_sql()),
+            ProjectionSelectExecutor::PostgreSQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "mysql")]
-            MappedSelectExecutor::MySQL(exec) => in_subquery(exec.to_subquery_sql()),
+            ProjectionSelectExecutor::MySQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "mssql")]
-            MappedSelectExecutor::MSSQL(exec) => in_subquery(exec.to_subquery_sql()),
+            ProjectionSelectExecutor::MSSQL(exec) => in_subquery(exec.to_subquery_sql()),
             #[cfg(feature = "duckdb")]
-            MappedSelectExecutor::DuckDB(exec) => in_subquery(exec.to_subquery_sql()),
+            ProjectionSelectExecutor::DuckDB(exec) => in_subquery(exec.to_subquery_sql()),
+            #[cfg(feature = "clickhouse")]
+            ProjectionSelectExecutor::ClickHouse(_, _) => in_subquery(Err(
+                crate::OrmerError::UnsupportedFeature {
+                    backend: super::super::DbType::ClickHouse,
+                    feature: "subquery on ClickHouse; use select_sql",
+                },
+            )),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedSelectExecutor::Unsupported {
+            ProjectionSelectExecutor::Unsupported {
                 backend, feature, ..
             } => in_subquery(Err(crate::OrmerError::UnsupportedFeature {
                 backend,
@@ -7162,53 +7386,34 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
-// 为 MappedSelectExecutor 实现 IsInValues trait
+// 为 ProjectionSelectExecutor 实现 IsInValues trait
 impl<'a, T: Model, V: crate::query::builder::ColumnValueType> crate::query::builder::IsInValues<V>
-    for MappedSelectExecutor<'a, T, V>
+    for ProjectionSelectExecutor<'a, T, V>
 {
     fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
         crate::query::builder::WhereExpr::from_filter(self.into_in_filter(column))
     }
 }
 
-// 为 &MappedSelectExecutor 实现 IsInValues trait（引用版本）
+// 为 &ProjectionSelectExecutor 实现 IsInValues trait（引用版本）
 impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
-    crate::query::builder::IsInValues<V> for &'b MappedSelectExecutor<'a, T, V>
+    crate::query::builder::IsInValues<V> for &'b ProjectionSelectExecutor<'a, T, V>
 {
     fn to_in_expr(self, column: String) -> crate::query::builder::WhereExpr {
         crate::query::builder::WhereExpr::from_filter(self.clone().into_in_filter(column))
     }
 }
 
-impl<
-    'a,
-    T: Model + 'static + std::marker::Send + std::marker::Sync,
-    V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
-    C: FromIterator<V> + 'static,
-> std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+/// 克隆式 collect_with（PostgreSQL/MySQL/MSSQL Collect 变体）的公共
+/// 收尾（L27）：等待投影结果后逐项应用转换函数，三份同构循环收敛为一份。
+/// 后端 Collect 变体只实现 `IntoFuture`，调用方需先 `.into_future()`。
+async fn collect_with_map<V, M, C, F, Fut>(future: Fut, mapper: F) -> crate::Result<C>
+where
+    Fut: Future<Output = crate::Result<Vec<V>>>,
+    F: Fn(V) -> M,
+    C: FromIterator<M>,
 {
-    type Output = crate::Result<C>;
-    type IntoFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        match self {
-            #[cfg(feature = "sqlite")]
-            MappedCollectFuture::Sqlite(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "postgresql")]
-            MappedCollectFuture::PostgreSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mysql")]
-            MappedCollectFuture::MySQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "mssql")]
-            MappedCollectFuture::MSSQL(future) => Box::pin(future.into_future()),
-            #[cfg(feature = "duckdb")]
-            MappedCollectFuture::DuckDB(future) => Box::pin(future.into_future()),
-            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-            MappedCollectFuture::Unsupported {
-                backend, feature, ..
-            } => Box::pin(async move { Err(unsupported_feature(backend, feature)) }),
-        }
-    }
+    Ok(future.await?.into_iter().map(mapper).collect())
 }
 
 impl<'a, T, V, C, M, F> std::future::IntoFuture for ModelCollectWithFuture<'a, T, V, C, M, F>
@@ -7227,21 +7432,19 @@ where
         match self {
             #[cfg(feature = "sqlite")]
             ModelCollectWithFuture::Sqlite(future) => Box::pin(future.into_future()),
+            // 三个克隆式后端共用同一份 mapper 收尾（L27）
             #[cfg(feature = "postgresql")]
-            ModelCollectWithFuture::PostgreSQLCollect(future, mapper, _) => Box::pin(async move {
-                let vec = future.await?;
-                Ok(vec.into_iter().map(mapper).collect())
-            }),
+            ModelCollectWithFuture::PostgreSQLCollect(future, mapper, _) => {
+                Box::pin(collect_with_map(future.into_future(), mapper))
+            }
             #[cfg(feature = "mysql")]
-            ModelCollectWithFuture::MySQLCollect(future, mapper, _) => Box::pin(async move {
-                let vec = future.await?;
-                Ok(vec.into_iter().map(mapper).collect())
-            }),
+            ModelCollectWithFuture::MySQLCollect(future, mapper, _) => {
+                Box::pin(collect_with_map(future.into_future(), mapper))
+            }
             #[cfg(feature = "mssql")]
-            ModelCollectWithFuture::MSSQLCollect(future, mapper, _) => Box::pin(async move {
-                let vec = future.await?;
-                Ok(vec.into_iter().map(mapper).collect())
-            }),
+            ModelCollectWithFuture::MSSQLCollect(future, mapper, _) => {
+                Box::pin(collect_with_map(future.into_future(), mapper))
+            }
             #[cfg(feature = "duckdb")]
             ModelCollectWithFuture::DuckDB(future) => Box::pin(future.into_future()),
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
@@ -7356,19 +7559,7 @@ where
     }
 }
 
-impl<'a, T, V> BatchQuery<'a> for GroupedSelectExecutor<'a, T, V>
-where
-    T: Model + 'static + Send + Sync,
-    V: crate::model::FromRowValues + 'static + Send + Sync,
-{
-    type Output = Vec<V>;
-
-    fn into_batch_future(self) -> BatchQueryFuture<'a, Self::Output> {
-        Box::pin(async move { self.collect::<Vec<V>>().await })
-    }
-}
-
-impl<'a, T, V> BatchQuery<'a> for MappedSelectExecutor<'a, T, V>
+impl<'a, T, V> BatchQuery<'a> for ProjectionSelectExecutor<'a, T, V>
 where
     T: Model + 'static + Send + Sync,
     V: crate::model::FromRowValues + 'static + Send + Sync,
@@ -7500,6 +7691,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 // ClickHouse：走 JSONEachRow 字节游标，边拉边解码（真流式）；
                 // InfluxDB：无游标 API，保持缓冲实现
                 #[cfg(feature = "clickhouse")]
+                #[cfg_attr(not(feature = "influxdb"), allow(irrefutable_let_patterns))]
                 if let ClickHouseSelectBackend::ClickHouse(db) = db {
                     let (sql, params) =
                         select.try_to_sql_with_params(super::super::DbType::ClickHouse)?;
@@ -7516,6 +7708,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                     ));
                 }
                 #[cfg(feature = "influxdb")]
+                #[allow(irrefutable_let_patterns)]
                 if let ClickHouseSelectBackend::Influx(db) = db {
                     let rows = influx_select_models::<T, Vec<T>>(db, select).await?;
                     return Ok(SelectStreamIterator::ClickHouse(

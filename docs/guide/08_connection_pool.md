@@ -61,6 +61,20 @@ let reader = pool.read().get().await?;
 let users: Vec<User> = reader.select::<User>().collect().await?;
 ```
 
+数据库级读写分离使用 `Database::replicated`：读库连接轮询分发，`write()` / `scope()` / `transaction()` 始终走主库：
+
+```rust
+let db = Database::replicated(DbType::PostgreSQL)
+    .write("postgresql://user:pass@primary/dbname")
+    .read("postgresql://user:pass@replica1/dbname")
+    .read("postgresql://user:pass@replica2/dbname")
+    .connect()
+    .await?;
+
+db.write().insert(&user).execute().await?;
+let users: Vec<User> = db.read().select::<User>().collect().await?;
+```
+
 ### 自动管理
 
 ```rust

@@ -1699,12 +1699,6 @@ macro_rules! impl_unified_collect_future {
                         )
                         .await
                     }),
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-                    $future_name::Unsupported {
-                        backend, feature, ..
-                    } => Box::pin(async move {
-                        Err($crate::OrmerError::UnsupportedFeature { backend, feature })
-                    }),
                 }
             }
         }
@@ -1743,12 +1737,6 @@ macro_rules! impl_unified_aggregate_future {
                             db, aggregate,
                         )
                         .await
-                    }),
-                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
-                    $future_name::Unsupported {
-                        backend, feature, ..
-                    } => Box::pin(async move {
-                        Err($crate::OrmerError::UnsupportedFeature { backend, feature })
                     }),
                 }
             }
@@ -1978,6 +1966,10 @@ macro_rules! impl_unified_related_collect_future {
 /// 统一层关联/多表行数统计 Future 的 IntoFuture：委托到各后端执行器的
 /// `count()`（page.md 缺失一：列表分页 total_count 场景）。
 ///
+/// 后端执行器的 `count()` 返回 `i64`，统一层在此强转为 `usize`，与
+/// `SelectExecutor::count()`（单表 COUNT 聚合，同样输出 `usize`）保持同一
+/// 返回类型，分页场景两个入口可混用（L23）。
+///
 /// `$decl` 携带泛型与约束（用于 `impl<...>`），`$use` 为纯类型实参
 /// （用于 `Future<...>` 类型位置），两者由调用点成对给出。
 #[macro_export]
@@ -1987,23 +1979,31 @@ macro_rules! impl_unified_related_count_future {
         where
             Self: 'a,
         {
-            type Output = crate::Result<i64>;
+            type Output = crate::Result<usize>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
             fn into_future(self) -> Self::IntoFuture {
                 match self {
                     #[cfg(feature = "sqlite")]
-                    $future_name::Sqlite(exec, _) => Box::pin(async move { exec.$call().await }),
+                    $future_name::Sqlite(exec, _) => {
+                        Box::pin(async move { Ok(exec.$call().await? as usize) })
+                    }
                     #[cfg(feature = "postgresql")]
-                    $future_name::PostgreSQL(exec) => Box::pin(async move { exec.$call().await }),
+                    $future_name::PostgreSQL(exec) => {
+                        Box::pin(async move { Ok(exec.$call().await? as usize) })
+                    }
                     #[cfg(feature = "mysql")]
-                    $future_name::MySQL(exec) => Box::pin(async move { exec.$call().await }),
+                    $future_name::MySQL(exec) => {
+                        Box::pin(async move { Ok(exec.$call().await? as usize) })
+                    }
                     #[cfg(feature = "mssql")]
-                    $future_name::MSSQL(exec) => Box::pin(async move { exec.$call().await }),
+                    $future_name::MSSQL(exec) => {
+                        Box::pin(async move { Ok(exec.$call().await? as usize) })
+                    }
                     #[cfg(feature = "duckdb")]
                     $future_name::DuckDB(exec, _) => {
-                        Box::pin(async move { exec.$call().await })
+                        Box::pin(async move { Ok(exec.$call().await? as usize) })
                     }
                     #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
                     $future_name::Unsupported {

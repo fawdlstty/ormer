@@ -6,7 +6,7 @@ Ormer is a minimal, high-performance Rust ORM framework providing type-safe data
 
 - **Type Safety**: Compile-time type checking, strongly-typed query builder
 - **High Performance**: Zero-cost abstraction, async runtime, connection pool support
-- **Multi-Database**: Sqlite, PostgreSQL, QuestDB, MySQL, MSSQL
+- **Multi-Database**: Sqlite, PostgreSQL, QuestDB, MySQL, MSSQL, DuckDB, ClickHouse, InfluxDB
 - **Elegant API**: Chainable queries, macro-driven models, intuitive syntax
 
 ## Query Capabilities
@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .select::<User>()
         .filter(|u| u.age.ge(18))
         .order_by(|u| u.name.asc())
+        .range(0..10)
         .collect::<Vec<_>>()
         .await?;
     

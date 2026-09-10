@@ -33,7 +33,7 @@ ormer = { version = "0.2", features = ["sqlite"] }
 - Use `Database::connect(DbType::QuestDB, "...")` through the PostgreSQL wire protocol.
 - Supports insert/select/update, create/drop table, raw SQL, streams, connection pools, and step-by-step migrations.
 - A `#[hypertable(...)]` time field produces a QuestDB designated timestamp in `create_table`.
-- Row-level deletes, transactions, constraints, auto-increment/`RETURNING`, upserts, COPY, row locks, schema introspection, and advanced grouping are unsupported.
+- Row-level deletes, transactions, constraints, auto-increment/`RETURNING`, upserts, COPY, row locks, db-first entity generation (`generate_entities`), and advanced grouping are unsupported.
 
 **MySQL:**
 - `mysql://user:password@localhost/dbname`
@@ -61,8 +61,9 @@ ClickHouse is also used through `Database::connect(DbType::ClickHouse, "...")`.
 Use `execute_sql` and `select_sql<T>` for native operations. Transactions,
 relation writes, row updates, conflict writes, and `create_table::<T>()` without
 engine metadata return `UnsupportedFeature`. Every ClickHouse table must specify
-an engine such as `MergeTree ORDER BY (id)`; use `execute_sql(ormer::sql(...))`
-or `MigrationStep::Sql` for DDL that needs an engine. ClickHouse DDL is not
+an engine such as `MergeTree ORDER BY (id)`. Declare `#[clickhouse(engine = ...)]`
+on the model to call `create_table::<T>()` directly, or write the DDL with
+`execute_sql(ormer::sql(...))` or `MigrationStep::Sql`. ClickHouse DDL is not
 transactional, so migration steps execute one at a time and do not automatically
 roll back earlier steps when a later step fails.
 InfluxDB is used through `Database::connect(DbType::InfluxDB, "...")`.

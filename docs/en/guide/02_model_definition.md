@@ -23,7 +23,7 @@ struct User {
 - `#[primary]` - Primary key (supports composite primary keys)
 - `#[primary(auto)]` - Auto-increment primary key (only for single primary key or the first field of composite primary key)
 - `#[unique]` - Unique constraint (supports `group` and `name`)
-- `#[index]` - Index (supports `group`, `name`, `order`, and `where`)
+- `#[index]` - Index (supports `group`, `name`, `order`, `where`, `method`, `expression`, and `columns`)
 - `#[default(...)]` - Database default; use `#[default(expr = "...")]` for SQL expressions
 - `#[check(expr = "...")]` - CHECK constraint, with optional `name`
 - `#[foreign(Type)]` - Foreign key relationship, with optional `name`, `on_delete`, and `on_update`
@@ -37,7 +37,26 @@ struct User {
 - `#[version(u64)]` - Adds an automatic `version` column for optimistic locking
 - `#[ormer_ignore]` - Excludes a field from database columns; useful for dynamic table route values
 
-PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite and MySQL use the final table-name component.
+PostgreSQL and MSSQL preserve the schema prefix in `#[table = "schema.table"]`; SQLite, MySQL, and QuestDB use the final table-name component.
+
+### Table Options
+
+Dialect-specific table options are declared with per-dialect container attributes:
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events"]
+#[mysql(engine = "InnoDB", charset = "utf8mb4")]
+#[postgresql(fillfactor = 80)]
+#[clickhouse(engine = "MergeTree", order_by = "(tenant_id, occurred_at)")]
+struct Event {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+}
+```
+
+MySQL supports `engine`, `charset`, and `collation`; PostgreSQL supports `storage` and `fillfactor`; MSSQL supports `filegroup`; ClickHouse supports `engine`, `order_by`, `partition_by`, `ttl`, and `settings`. Models declaring `#[clickhouse(engine = ...)]` can call `create_table::<T>()` directly.
 
 ## DbFirst Entity Generation
 
@@ -79,8 +98,6 @@ struct Order {
     tenant_id: i64,
     deleted_at: Option<chrono::NaiveDateTime>,
 }
-
-use OrderFilterExt;
 
 let orders: Vec<Order> = db
     .select::<Order>()
@@ -558,7 +575,7 @@ id: i32,
 product_id: i32,
 ```
 
-Use `primary_field_names()` to get the Rust primary key field names, `model.promary_fields()` to get the current primary key field value tuple, and `primary_key_columns()` to get the SQL primary key column names. Composite primary keys are returned in field declaration order.
+Use `primary_field_names()` to get the Rust primary key field names, `model.primary_fields()` to get the current primary key field value tuple, and `primary_key_columns()` to get the SQL primary key column names. Composite primary keys are returned in field declaration order.
 
 ## Table Operations
 

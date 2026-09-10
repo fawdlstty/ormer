@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "ormer"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "async-trait",
  "bb8",
@@ -2820,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "ormer-derive"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "proc-macro2",
  "quote",

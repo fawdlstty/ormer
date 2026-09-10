@@ -9,10 +9,14 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 **数据库特性:**
-- `Sqlite` - Sqlite/libSQL/SQLite
+- `sqlite` - Sqlite/libSQL/SQLite
 - `postgresql` - PostgreSQL
+- `questdb` - QuestDB（PostgreSQL wire 协议）
 - `mysql` - MySQL
 - `mssql` - Microsoft SQL Server
+- `duckdb` - DuckDB
+- `clickhouse` - ClickHouse
+- `influxdb` - InfluxDB
 
 ## 完整示例
 

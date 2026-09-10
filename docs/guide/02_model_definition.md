@@ -23,7 +23,7 @@ struct User {
 - `#[primary]` - 主键（支持复合主键）
 - `#[primary(auto)]` - 自增主键（仅单主键或复合主键的第一个字段）
 - `#[unique]` - 唯一约束（支持 `group`、`name` 参数）
-- `#[index]` - 索引（支持 `group`、`name`、`order`、`where` 参数）
+- `#[index]` - 索引（支持 `group`、`name`、`order`、`where`、`method`、`expression`、`columns` 参数）
 - `#[default(...)]` - 数据库默认值；SQL 表达式使用 `#[default(expr = "...")]`
 - `#[check(expr = "...")]` - CHECK 约束，可配置 `name`
 - `#[foreign(Type)]` - 外键关系；可配置 `name`、`on_delete`、`on_update`
@@ -37,7 +37,26 @@ struct User {
 - `#[version(u64)]` - 自动添加 `version` 列，用于乐观锁
 - `#[ormer_ignore]` - 字段不映射为数据库列，可用于动态表路由值
 
-PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite 和 MySQL 会使用最后一段表名。
+PostgreSQL 和 MSSQL 会保留 `#[table = "schema.table"]` 中的 schema 前缀；SQLite、MySQL 和 QuestDB 会使用最后一段表名。
+
+### 建表选项
+
+方言专属的建表选项通过各自的容器属性声明：
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events"]
+#[mysql(engine = "InnoDB", charset = "utf8mb4")]
+#[postgresql(fillfactor = 80)]
+#[clickhouse(engine = "MergeTree", order_by = "(tenant_id, occurred_at)")]
+struct Event {
+    #[primary]
+    id: i64,
+    tenant_id: i64,
+}
+```
+
+MySQL 支持 `engine`、`charset`、`collation`，PostgreSQL 支持 `storage`、`fillfactor`，MSSQL 支持 `filegroup`，ClickHouse 支持 `engine`、`order_by`、`partition_by`、`ttl`、`settings`。声明了 `#[clickhouse(engine = ...)]` 的模型可直接 `create_table::<T>()`。
 
 ## DbFirst 生成实体
 
@@ -78,8 +97,6 @@ struct Order {
     tenant_id: i64,
     deleted_at: Option<chrono::NaiveDateTime>,
 }
-
-use OrderFilterExt;
 
 let orders: Vec<Order> = db
     .select::<Order>()
@@ -554,7 +571,7 @@ id: i32,
 product_id: i32,
 ```
 
-通过 `primary_field_names()` 获取 Rust 主键字段名列表，`model.promary_fields()` 获取当前主键字段值元组；通过 `primary_key_columns()` 获取 SQL 主键列名列表。复合主键按字段声明顺序返回。
+通过 `primary_field_names()` 获取 Rust 主键字段名列表，`model.primary_fields()` 获取当前主键字段值元组；通过 `primary_key_columns()` 获取 SQL 主键列名列表。复合主键按字段声明顺序返回。
 
 ## 表操作
 

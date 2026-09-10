@@ -18,15 +18,33 @@ struct DbTypeAttrs {
 }
 
 pub fn derive_db_value(input: DeriveInput) -> TokenStream {
+    match derive_db_value_inner(input) {
+        Ok(tokens) => tokens,
+        // 属性解析/校验失败统一走 compile_error，而不是让派生宏 panic
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn derive_db_value_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let inner_type = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0].ty,
-            _ => panic!("DbValue can only be derived for single-field tuple structs"),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    name,
+                    "DbValue can only be derived for single-field tuple structs",
+                ))
+            }
         },
-        _ => panic!("DbValue can only be derived for single-field tuple structs"),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                name,
+                "DbValue can only be derived for single-field tuple structs",
+            ))
+        }
     };
-    let db_types = extract_db_types(&input);
+    let db_types = extract_db_types(&input)?;
 
     let sqlite_arm = db_types.sqlite.map(|ty| {
         quote! {
@@ -71,7 +89,7 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
         }
     });
 
-    quote! {
+    Ok(quote! {
         impl ::ormer::model::DbValue for #name {
             fn to_value(&self) -> ::ormer::model::Value {
                 ::ormer::model::Value::from(self.0.clone())
@@ -90,7 +108,10 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
                     #mssql_arm
                     #duckdb_arm
                     #clickhouse_arm
-                    _ => panic!("db_type mapping for {} is not configured", stringify!(#name)),
+                    // 未配置的后端解析为空串：空串不是合法 SQL 类型，
+                    // 建表/迁移入口据此返回 UnsupportedFeature 而不是 panic，
+                    // 长驻服务不会因连接到未配置映射的后端而崩溃。
+                    _ => "",
                 }
             }
         }
@@ -166,10 +187,10 @@ pub fn derive_db_value(input: DeriveInput) -> TokenStream {
                 )
             }
         }
-    }
+    })
 }
 
-fn extract_db_types(input: &DeriveInput) -> DbTypeAttrs {
+fn extract_db_types(input: &DeriveInput) -> syn::Result<DbTypeAttrs> {
     let mut db_types = DbTypeAttrs::default();
     for attr in &input.attrs {
         if !attr.path().is_ident("db_type") {
@@ -196,8 +217,7 @@ fn extract_db_types(input: &DeriveInput) -> DbTypeAttrs {
                 return Err(meta.error("unsupported #[db_type] argument"));
             }
             Ok(())
-        })
-        .expect("Failed to parse #[db_type] attribute");
+        })?;
     }
-    db_types
+    Ok(db_types)
 }

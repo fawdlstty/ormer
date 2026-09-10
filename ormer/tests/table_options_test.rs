@@ -36,17 +36,17 @@ fn table_options() -> Option<TableOptions> {
 
 #[test]
 fn dialect_attributes_are_gated_by_backend_features() {
-    let options = table_options();
+    let _options = table_options();
 
     #[cfg(feature = "mysql")]
-    assert_eq!(options.unwrap().mysql_engine, Some("InnoDB"));
+    assert_eq!(_options.unwrap().mysql_engine, Some("InnoDB"));
     #[cfg(all(
         not(feature = "mysql"),
         not(feature = "postgresql"),
         not(feature = "mssql"),
         not(feature = "clickhouse")
     ))]
-    assert!(options.is_none());
+    assert!(_options.is_none());
 }
 
 #[cfg(feature = "postgresql")]

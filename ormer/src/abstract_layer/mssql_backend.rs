@@ -8,7 +8,7 @@ use crate::hooks::{HookContext, HookOperation};
 use crate::migration::{SchemaColumn, schema_column};
 use crate::model::{DbBackendTypeMapper, Model, Value, WritableModel};
 use crate::query::builder::{
-    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
+    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, ProjectionSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::filter::FilterExpr;
@@ -50,6 +50,13 @@ fn build_traced_mssql_query<'a>(
     Ok(query)
 }
 
+/// SQL Server 错误码结构化提取（L10）：`Error::Server(TokenError)` 携带精确
+/// code（2601/2627 唯一冲突、1205 死锁等），在 trace 包装层拍平成字符串前
+/// 提取，文本启发式仅兜底。
+fn mssql_server_error_code(error: &tiberius::error::Error) -> Option<String> {
+    error.code().map(|code| code.to_string())
+}
+
 async fn traced_mssql_execute(
     client: &mut MssqlClient,
     sql: &str,
@@ -62,7 +69,11 @@ async fn traced_mssql_execute(
             trace.finish_ok();
             Ok(result.total() as u64)
         }
-        Err(error) => Err(trace.finish_external_error("tiberius::Query::execute", error)),
+        Err(error) => {
+            let code = mssql_server_error_code(&error);
+            let error = trace.finish_external_error("tiberius::Query::execute", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -78,7 +89,11 @@ async fn traced_mssql_query(
             trace.finish_ok();
             stream.into_first_result().trace().await
         }
-        Err(error) => Err(trace.finish_external_error("tiberius::Query::query", error)),
+        Err(error) => {
+            let code = mssql_server_error_code(&error);
+            let error = trace.finish_external_error("tiberius::Query::query", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -86,7 +101,7 @@ fn decode_mssql_model_rows<T: Model>(rows: Vec<tiberius::Row>) -> crate::Result<
     let mut results = Vec::new();
     for row in rows {
         let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-            extract_value_from_row(&row, i)
+            convert_mssql_model_value::<T>(&row, i)
         })?;
         results.push(model);
     }
@@ -115,7 +130,7 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             let int_type = match rust_type {
                 "i8" | "i16" | "u8" => "SMALLINT",
                 "i32" | "u16" => "INT",
-                "i64" | "u32" | "u64" => "BIGINT",
+                "i64" | "u32" | "u64" | "usize" | "isize" => "BIGINT",
                 _ => "INT",
             };
             if is_auto_increment {
@@ -134,6 +149,8 @@ impl DbBackendTypeMapper for MSSQLTypeMapper {
             "u16" => "INT",
             "u32" => "BIGINT",
             "u64" => "BIGINT",
+            "usize" => "BIGINT",
+            "isize" => "BIGINT",
             "f32" => "REAL",
             "f64" => "FLOAT",
             "Decimal" | "rust_decimal::Decimal" | "BigDecimal" | "bigdecimal::BigDecimal" => {
@@ -446,6 +463,14 @@ impl Database {
         }
     }
 
+    /// 清空表数据 - 返回执行器（`TRUNCATE TABLE`）
+    pub fn truncate_table<T: WritableModel>(&self) -> TruncateTableExecutor<'_, T> {
+        TruncateTableExecutor {
+            pool: self.pool.clone(),
+            _marker: PhantomData,
+        }
+    }
+
     pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
         InsertExecutor {
             pool: self.pool.clone(),
@@ -570,16 +595,17 @@ impl Database {
         if models.is_empty() {
             return Ok(());
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
-        common_helpers::append_mssql_merge_update_clause::<T>(&mut sql);
-        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
+        // 按参数上限（2100）分块的 MERGE 语句组，与执行器 to_sql 同源
+        let statements = common_helpers::build_mssql_merge_statements::<T>(models, true)?;
 
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
-            bind_value(&mut query, param)?;
+        for statement in &statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            query.execute(&mut *client).trace().await?;
         }
-        query.execute(&mut *client).trace().await?;
         Ok(())
     }
 
@@ -587,16 +613,19 @@ impl Database {
         if models.is_empty() {
             return Ok(0);
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<T>(models);
-        common_helpers::append_mssql_merge_insert_clause::<T>(&mut sql);
+        let statements = common_helpers::build_mssql_merge_statements::<T>(models, false)?;
 
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&sql);
-        for param in &all_values {
-            bind_value(&mut query, param)?;
+        let mut total = 0u64;
+        for statement in &statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            let result = query.execute(&mut *client).trace().await?;
+            total += result.total() as u64;
         }
-        let result = query.execute(&mut *client).trace().await?;
-        Ok(result.total() as u64)
+        Ok(total)
     }
 
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
@@ -637,9 +666,9 @@ impl Database {
 
     pub fn select_mapped<T: Model, V>(
         &self,
-        mapped: crate::query::builder::MappedSelect<T, V>,
-    ) -> MappedSelectExecutor<'_, T, V> {
-        MappedSelectExecutor {
+        mapped: crate::query::builder::ProjectionSelect<T, V>,
+    ) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
             select: mapped,
             pool: self.pool.clone(),
             _marker: PhantomData,
@@ -648,9 +677,9 @@ impl Database {
 
     pub fn select_grouped<T: Model, V>(
         &self,
-        grouped: GroupedSelect<T, V>,
-    ) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
+        grouped: ProjectionSelect<T, V>,
+    ) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
             select: grouped,
             pool: self.pool.clone(),
             _marker: PhantomData,
@@ -862,9 +891,9 @@ impl Database {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1087,6 +1116,48 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 
     fn to_sql(&self) -> crate::Result<SqlStatement> {
         DropTableExecutor::to_sql(self)
+    }
+
+    async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
+        let mut client = self.pool.lock().await;
+        for statement in sql.statements {
+            Query::new(&statement.sql)
+                .execute(&mut *client)
+                .trace()
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+/// 清空表执行器：生成 `TRUNCATE TABLE t`。
+pub struct TruncateTableExecutor<'a, T: crate::model::WritableModel> {
+    pool: Pool,
+    _marker: PhantomData<(T, &'a ())>,
+}
+
+impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    pub fn to_sql(&self) -> crate::Result<SqlStatement> {
+        Ok(SqlStatement::single(
+            DbType::MSSQL,
+            format!(
+                "TRUNCATE TABLE {}",
+                common_helpers::quote_table_name::<T>(DbType::MSSQL)
+            ),
+            Vec::new(),
+        ))
+    }
+
+    pub async fn execute(self) -> crate::Result<()> {
+        <Self as SqlExecutor>::execute(self).await
+    }
+}
+
+impl<'a, T: crate::model::WritableModel> SqlExecutor for TruncateTableExecutor<'a, T> {
+    type Output = ();
+
+    fn to_sql(&self) -> crate::Result<SqlStatement> {
+        TruncateTableExecutor::to_sql(self)
     }
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
@@ -1373,11 +1444,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-        common_helpers::append_mssql_merge_update_clause::<I::Model>(&mut sql);
-        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+        // 按参数上限（2100）分块（与 execute 路径同源）
+        let statements = common_helpers::build_mssql_merge_statements::<I::Model>(&refs, true)?;
+        Ok(mssql_insert_batch(statements))
     }
 
     pub async fn execute(self) -> crate::Result<u64> {
@@ -1398,15 +1467,19 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
         }
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param)?;
+        let mut total = 0u64;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            let result = query.execute(&mut *client).trace().await?;
+            total += result.total() as u64;
         }
-        let result = query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
-        Ok(result.total() as u64)
+        Ok(total)
     }
 }
 
@@ -1423,10 +1496,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+        // 按参数上限（2100）分块（与 execute 路径同源）
+        let statements = common_helpers::build_mssql_merge_statements::<I::Model>(&refs, false)?;
+        Ok(mssql_insert_batch(statements))
     }
 
     pub async fn execute(self) -> crate::Result<u64> {
@@ -1461,15 +1533,19 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
         }
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param)?;
+        let mut total = 0u64;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            let result = query.execute(&mut *client).trace().await?;
+            total += result.total() as u64;
         }
-        let result = query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
-        Ok(result.total() as u64)
+        Ok(total)
     }
 }
 
@@ -1522,19 +1598,24 @@ pub struct RightJoinedSelectExecutor<'a, T: Model, J: Model> {
     _marker: PhantomData<&'a ()>,
 }
 
-/// 映射查询结果执行器
-pub struct MappedSelectExecutor<'a, T: Model, V> {
-    select: crate::query::builder::MappedSelect<T, V>,
+/// Projection 查询执行器（字段投影与分组聚合合一）
+pub struct ProjectionSelectExecutor<'a, T: Model, V> {
+    select: ProjectionSelect<T, V>,
     pool: Pool,
     _marker: PhantomData<&'a ()>,
 }
 
-/// 分组查询执行器
-pub struct GroupedSelectExecutor<'a, T: Model, V> {
-    select: GroupedSelect<T, V>,
-    pool: Pool,
-    _marker: PhantomData<&'a ()>,
-}
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type MappedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
+
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 
 /// 删除执行器
 pub struct DeleteExecutor<'a, T: Model> {
@@ -1643,9 +1724,9 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1786,11 +1867,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-        common_helpers::append_mssql_merge_update_clause::<I::Model>(&mut sql);
-        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+        // 按参数上限（2100）分块（与 execute 路径同源）
+        let statements = common_helpers::build_mssql_merge_statements::<I::Model>(&refs, true)?;
+        Ok(mssql_insert_batch(statements))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -1813,13 +1892,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param)?;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            query.execute(&mut *client).trace().await?;
         }
-        query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -1838,10 +1919,9 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::MSSQL, Vec::new()));
         }
-        let (mut sql, all_values) = common_helpers::build_mssql_merge_source::<I::Model>(&refs);
-        common_helpers::append_mssql_merge_insert_clause::<I::Model>(&mut sql);
-
-        Ok(SqlStatement::single(DbType::MSSQL, sql, all_values))
+        // 按参数上限（2100）分块（与 execute 路径同源）
+        let statements = common_helpers::build_mssql_merge_statements::<I::Model>(&refs, false)?;
+        Ok(mssql_insert_batch(statements))
     }
 
     pub async fn execute(self) -> crate::Result<()> {
@@ -1864,13 +1944,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
         let mut client = self.pool.lock().await;
-        let mut query = Query::new(&statement.sql);
-        for param in &statement.params {
-            bind_value(&mut query, param)?;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let mut query = Query::new(&statement.sql);
+            for param in &statement.params {
+                bind_value(&mut query, param)?;
+            }
+            query.execute(&mut *client).trace().await?;
         }
-        query.execute(&mut *client).trace().await?;
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -1953,19 +2035,33 @@ impl_related_count_mssql!(
 );
 
 
-/// 映射收集 Future
-pub struct MappedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
-    executor: MappedSelectExecutor<'a, T, V>,
+/// Projection 收集 Future（字段投影与分组聚合合一）
+pub struct ProjectionCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
+    executor: ProjectionSelectExecutor<'a, T, V>,
     _marker: CollectMarker<'a, C>,
 }
 
-/// 分组收集 Future
-pub struct GroupedCollectFuture<'a, T: Model, V, C: FromIterator<V>> {
-    executor: GroupedSelectExecutor<'a, T, V>,
-    _marker: CollectMarker<'a, C>,
-}
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type MappedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
 
-/// 流式查询
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type GroupedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
+
+/// 流式查询。
+///
+/// # 物化语义（重要）
+///
+/// MSSQL 的 `SelectStream` **不是真流式**：[`SelectStream::into_iter`] 会先由
+/// tiberius 把结果集的**全部行**物化进内存（`Vec<T>`），再逐条吐出。大表查询
+/// 的内存占用与 `collect::<Vec<T>>()` 相当，基于"stream 省内存"的预期消费
+/// 大表有 OOM 风险；大表应配合 `range()` 分页或 `filter()` 收敛结果集。
+/// （改造成 tiberius `QueryStream` 逐行读取涉及连接生命周期重构，暂未实施。）
 pub struct SelectStream<'a, T: Model> {
     executor: SelectExecutor<'a, T>,
     _marker: PhantomData<&'a ()>,
@@ -2061,12 +2157,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    pub fn map_to<F, M>(self, f: F) -> ProjectionSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(T::Where) -> M,
         M: crate::query::builder::MapToResult,
     {
-        MappedSelectExecutor {
+        ProjectionSelectExecutor {
             select: self.select.map_to(f),
             pool: self.pool,
             _marker: PhantomData,
@@ -2086,12 +2182,12 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
-    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    pub fn select_column<F, V>(self, f: F) -> ProjectionSelectExecutor<'a, T, V>
     where
         F: FnOnce(T::Where) -> V,
         V: crate::query::builder::SelectColumnResult,
     {
-        GroupedSelectExecutor {
+        ProjectionSelectExecutor {
             select: self.select.select_column(f),
             pool: self.pool,
             _marker: PhantomData,
@@ -2218,8 +2314,8 @@ impl<'a, T: Model + 'static> SelectExecutor<'a, T> {
     }
 }
 
-// GroupedSelectExecutor 实现
-impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
+// ProjectionSelectExecutor 实现（分组聚合方法）
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 添加 GROUP BY 字段
     pub fn group_by<F, G>(self, f: F) -> Self
     where
@@ -2269,16 +2365,12 @@ impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
 }
 
 impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static>
-    GroupedSelectExecutor<'a, T, V>
+    ProjectionSelectExecutor<'a, T, V>
 {
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C> {
-        GroupedCollectFuture {
-            executor: GroupedSelectExecutor {
-                select: self.select.clone(),
-                pool: self.pool.clone(),
-                _marker: PhantomData,
-            },
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> ProjectionCollectFuture<'a, T, V, C> {
+        ProjectionCollectFuture {
+            executor: self.clone_with_pool(),
             _marker: PhantomData,
         }
     }
@@ -2575,30 +2667,10 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
     }
 }
 
-impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
     pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
         self.select.try_to_sql_with_params(DbType::MSSQL)
-    }
-
-    /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
-    where
-        T: 'static,
-        V: crate::model::FromRowValues + 'static,
-    {
-        MappedCollectFuture {
-            executor: self.clone_with_pool(),
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
-    where
-        T: Send + Sync + 'static,
-        V: Send + Sync + 'static,
-    {
-        self.select.as_model::<R>()
     }
 
     /// 克隆executor（保持相同的pool引用）
@@ -2647,6 +2719,43 @@ impl_backend_four_table_executor_methods_with_lifetime!(
     FourTableSelect
 );
 
+/// 多表（3/4 表）查询的主表行收集（L18）：SQL 只选择主表列，
+/// 解码与 related collect 相同；统一层 collect() 经此入口取回行数据。
+macro_rules! impl_multi_table_collect_mssql {
+    ($executor:ident, $t:ident, [$($g:tt)*], [$($ty:tt)*]) => {
+        impl<$($g)*> $executor<$($ty)*> {
+            pub(crate) async fn collect_rows(self) -> crate::Result<Vec<$t>> {
+                let (sql, params) =
+                    self.select.try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
+                let mut client = self.pool.lock().await;
+                let rows = traced_mssql_query(&mut client, &sql, &params).await?;
+
+                let mut results = Vec::new();
+                for row in rows {
+                    let model =
+                        common_helpers::decode_model_from_indexed_values::<$t, _>(0, |i| {
+                            convert_mssql_model_value::<$t>(&row, i)
+                        })?;
+                    results.push(model);
+                }
+                Ok(results)
+            }
+        }
+    };
+}
+impl_multi_table_collect_mssql!(
+    MultiTableSelectExecutor,
+    T,
+    ['a, T: Model, R1: Model, R2: Model],
+    ['a, T, R1, R2]
+);
+impl_multi_table_collect_mssql!(
+    FourTableSelectExecutor,
+    T,
+    ['a, T: Model, R1: Model, R2: Model, R3: Model],
+    ['a, T, R1, R2, R3]
+);
+
 // IntoFuture 实现
 impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
     std::future::IntoFuture for CollectFuture<'a, T, C>
@@ -2669,7 +2778,7 @@ impl<'a, T: Model + 'static + std::marker::Send, C: FromIterator<T> + 'static>
             let mut results = Vec::new();
             for row in rows {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                    extract_value_from_row(&row, i)
+                    convert_mssql_model_value::<T>(&row, i)
                 })?;
                 results.push(model);
             }
@@ -2691,7 +2800,7 @@ impl<
         Box::pin(async move {
             let (sql, params) = self
                 .aggregate_select
-                .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
+                .try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = self.pool.lock().await;
             let rows = traced_mssql_query(&mut client, &sql, &params).await?;
             if rows.is_empty() {
@@ -2736,11 +2845,11 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let mut results = Vec::new();
             for row in rows {
                 let t_model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                    extract_value_from_row(&row, i)
+                    convert_mssql_model_value::<T>(&row, i)
                 })?;
                 let j_model = common_helpers::decode_optional_model_from_indexed_values::<J, _>(
                     t_col_count,
-                    |i| extract_value_from_row(&row, i),
+                    |i| convert_mssql_model_value_at::<J>(&row, i, i - t_col_count),
                 )?;
                 results.push((t_model, j_model));
             }
@@ -2768,11 +2877,11 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             let mut results = Vec::new();
             for row in rows {
                 let t_model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                    extract_value_from_row(&row, i)
+                    convert_mssql_model_value::<T>(&row, i)
                 })?;
                 let j_model =
                     common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
-                        extract_value_from_row(&row, i)
+                        convert_mssql_model_value_at::<J>(&row, i, i - t_col_count)
                     })?;
                 results.push((t_model, j_model));
             }
@@ -2801,11 +2910,11 @@ impl<'a, T: Model + 'static + std::marker::Send, J: Model + 'static + std::marke
             for row in rows {
                 let t_model =
                     common_helpers::decode_optional_model_from_indexed_values::<T, _>(0, |i| {
-                        extract_value_from_row(&row, i)
+                        convert_mssql_model_value::<T>(&row, i)
                     })?;
                 let j_model =
                     common_helpers::decode_model_from_indexed_values::<J, _>(t_col_count, |i| {
-                        extract_value_from_row(&row, i)
+                        convert_mssql_model_value_at::<J>(&row, i, i - t_col_count)
                     })?;
                 results.push((t_model, j_model));
             }
@@ -2830,14 +2939,14 @@ where
             let (sql, params) = self
                 .executor
                 .select
-                .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
+                .try_to_sql_with_params(crate::abstract_layer::DbType::MSSQL)?;
             let mut client = self.executor.pool.lock().await;
             let rows = traced_mssql_query(&mut client, &sql, &params).await?;
 
             let mut results = Vec::new();
             for row in rows {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                    extract_value_from_row(&row, i)
+                    convert_mssql_model_value::<T>(&row, i)
                 })?;
                 results.push(model);
             }
@@ -2851,39 +2960,7 @@ impl<
     T: Model + 'static + std::marker::Send + std::marker::Sync,
     V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
     C: FromIterator<V> + 'static,
-> std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
-{
-    type Output = crate::Result<C>;
-    type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let (sql, params) = self
-                .executor
-                .select
-                .to_sql_with_params(crate::abstract_layer::DbType::MSSQL);
-            let mut client = self.executor.pool.lock().await;
-            let rows = traced_mssql_query(&mut client, &sql, &params).await?;
-
-            let mut results = Vec::new();
-            for row in rows {
-                let v = common_helpers::decode_row_values_from_indexed_values(
-                    row.columns().len(),
-                    |i| extract_value_from_row(&row, i),
-                )?;
-                results.push(v);
-            }
-            Ok(results.into_iter().collect())
-        })
-    }
-}
-
-impl<
-    'a,
-    T: Model + 'static + std::marker::Send + std::marker::Sync,
-    V: crate::model::FromRowValues + 'static + std::marker::Send + std::marker::Sync,
-    C: FromIterator<V> + 'static,
-> std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
+> std::future::IntoFuture for ProjectionCollectFuture<'a, T, V, C>
 {
     type Output = crate::Result<C>;
     type IntoFuture = MssqlBoxFuture<'a, Self::Output>;
@@ -2911,6 +2988,10 @@ impl<
 }
 
 impl<'a, T: Model + 'static> SelectStream<'a, T> {
+    /// 返回异步迭代器。
+    ///
+    /// 注意：本方法先物化全部结果行（见 [`SelectStream`] 的"物化语义"文档），
+    /// 迭代器只是在内存 `Vec` 上逐条派发，不减少峰值内存。
     pub async fn into_iter(self) -> crate::Result<SelectStreamIterator<'a, T>> {
         let (sql, params) = self
             .executor
@@ -2922,7 +3003,7 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let mut results = Vec::new();
         for row in rows {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
-                extract_value_from_row(&row, i)
+                convert_mssql_model_value::<T>(&row, i)
             })?;
             results.push(model);
         }
@@ -3006,6 +3087,75 @@ fn extract_value_from_row(row: &tiberius::Row, idx: usize) -> crate::Result<Valu
     }
     // 值为 NULL 或无法识别的类型
     Ok(Value::Null)
+}
+
+/// 模型路径（带列 schema）的列值解码入口。
+/// - Duration 列以 BIGINT 微秒存储（写入侧 [`bind_value`]），转换为 `Value::Duration`；
+/// - JSON 列以 NVARCHAR 文本存储，解析为 `Value::Json`；
+/// - 非可空列解得 NULL（含驱动未识别类型被静置为 NULL）时显式报错（含列名）。
+///
+/// 裸值路径（聚合/原生查询无列 schema）仍走 [`extract_value_from_row`]。
+fn convert_mssql_model_value_at<T: Model>(
+    row: &tiberius::Row,
+    row_index: usize,
+    model_column_index: usize,
+) -> crate::Result<Value> {
+    let columns = T::column_schema();
+    let column = columns
+        .get(model_column_index)
+        .ok_or_else(|| crate::ormer_error!("Column index out of bounds: {}", model_column_index))?;
+    let rust_type = column.data_type.unwrap_or(column.rust_type);
+
+    let value = extract_value_from_row(row, row_index)?;
+
+    if matches!(value, Value::Null) {
+        if column.is_nullable {
+            return Ok(Value::Null);
+        }
+        return Err(crate::ormer_error!(
+            "Failed to parse non-nullable column '{}' ({}): NULL or unsupported type",
+            column.name,
+            rust_type
+        ));
+    }
+
+    match rust_type {
+        // MSSQL 以 BIGINT 微秒存储 Duration（写入侧 bind_value）
+        "Duration" | "std::time::Duration" => match value {
+            Value::Integer(micros) if micros >= 0 => Ok(Value::Duration(
+                std::time::Duration::from_micros(micros as u64),
+            )),
+            _ => Err(crate::ormer_error!(
+                "Failed to parse column '{}' (expected Duration microseconds)",
+                column.name
+            )),
+        },
+        // JSON 列以 JSON 文本返回，解析为 Json 值
+        "JsonValue" | "serde_json::Value" => match value {
+            Value::Text(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .map(Value::Json)
+                .map_err(|err| {
+                    crate::ormer_error!(
+                        "Failed to parse column '{}' (expected JSON text): {}",
+                        column.name,
+                        err
+                    )
+                }),
+            _ => Err(crate::ormer_error!(
+                "Failed to parse column '{}' (expected JSON text)",
+                column.name
+            )),
+        },
+        _ => Ok(value),
+    }
+}
+
+/// 模型路径的列值解码入口（行索引与列索引一致时）。
+fn convert_mssql_model_value<T: Model>(
+    row: &tiberius::Row,
+    column_index: usize,
+) -> crate::Result<Value> {
+    convert_mssql_model_value_at::<T>(row, column_index, column_index)
 }
 
 fn decimal_text_to_mssql_numeric(value: &str) -> crate::Result<Numeric> {

@@ -103,11 +103,9 @@ QuestDB 与 InfluxDB 不支持数组谓词，构造查询时返回 `UnsupportedF
 
 ### 模型级过滤器
 
-`#[filter]` 会为模型生成同名链式方法。使用前导入派生出的扩展 trait：
+`#[filter]` 会为模型生成同名链式方法（扩展 trait 由派生生成本地作用域，同模块内无需导入）：
 
 ```rust
-use OrderFilterExt;
-
 let orders: Vec<Order> = db
     .select::<Order>()
     .filter_tenant(tenant_id)
@@ -147,6 +145,27 @@ let users: Vec<User> = db
 .range(10..20)
 .range(..5)
 .range(10..)
+```
+
+深分页可用游标分页：`cursor_by` 声明游标列（需与排序一致），`fetch_page` 返回带 `next_cursor()` 的 `CursorPage`，游标传给 `after()` 取下一页：
+
+```rust
+let page = db
+    .select::<User>()
+    .order_by_desc(|u| u.id)
+    .cursor_by(|u| u.id)
+    .limit(10)
+    .fetch_page()
+    .await?;
+
+let next = db
+    .select::<User>()
+    .order_by_desc(|u| u.id)
+    .cursor_by(|u| u.id)
+    .after(page.next_cursor().expect("还有下一页"))
+    .limit(10)
+    .fetch_page()
+    .await?;
 ```
 
 ## 去重查询

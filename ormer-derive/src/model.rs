@@ -3,18 +3,25 @@ use quote::{ToTokens, quote};
 use syn::{DeriveInput, Lit, Meta, Token, parse::Parse, spanned::Spanned};
 
 pub fn derive_model(input: DeriveInput) -> TokenStream {
+    match derive_model_inner(input) {
+        Ok(tokens) => tokens,
+        // 属性解析/校验失败统一走 compile_error，而不是让派生宏 panic
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
     let update_name = syn::Ident::new(&format!("{name}Update"), name.span());
 
     // 提取表名
-    let table_name = extract_table_name(&input);
-    let (table_options, table_options_warning_item) = extract_table_options(&input);
-    let table_options_view = table_options.clone();
+    let table_name = extract_table_name(&input)?;
+    let (table_options, table_options_warning_item) = extract_table_options(&input)?;
     let table_options_model = table_options.clone();
     let table_options_method = table_options.clone();
-    let filters = extract_model_filters(&input);
-    let version = extract_version_attr(&input);
+    let filters = extract_model_filters(&input)?;
+    let version = extract_version_attr(&input)?;
 
     // 检查是否为元组结构体（用于包装现有模型）
     let is_tuple_struct = matches!(&input.data, syn::Data::Struct(data) if matches!(&data.fields, syn::Fields::Unnamed(_)));
@@ -27,22 +34,30 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("Model must have named fields or be a tuple struct wrapper"),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    name,
+                    "Model must have named fields or be a tuple struct wrapper",
+                ))
+            }
         },
-        _ => panic!("Model must be a struct"),
+        _ => return Err(syn::Error::new_spanned(name, "Model must be a struct")),
     };
 
-    let mut field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    let mut field_infos: Vec<_> = fields
+        .iter()
+        .map(FieldInfo::new)
+        .collect::<syn::Result<Vec<_>>>()?;
     // #[embed] 字段上的列级约束会在嵌入展开时被静默丢弃，展开期直接报编译错误
     if let Some(error) = field_infos
         .iter()
         .filter(|info| info.embed.is_some())
         .find_map(|info| embed_constraint_error(info.field))
     {
-        return error.to_compile_error();
+        return Err(error);
     }
-    let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
-    let hypertable_space_info_method = hypertable_space_info_method(&field_infos);
+    let hypertable_route_key_method = hypertable_route_key_method(&field_infos)?;
+    let hypertable_space_info_method = hypertable_space_info_method(&field_infos)?;
     let mut normal_index = 0;
     for info in &mut field_infos {
         if !info.is_relation() && !info.is_ignored {
@@ -56,11 +71,14 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .filter(|info| !info.is_relation() && !info.is_ignored)
         .collect();
     if let Some(version) = &version {
-        if normal_fields
+        if let Some(info) = normal_fields
             .iter()
-            .any(|info| info.column_name == version.column || info.field_name == "version")
+            .find(|info| info.column_name == version.column || info.field_name == "version")
         {
-            panic!("#[version(u64)] creates a version column; do not declare a version field");
+            return Err(syn::Error::new_spanned(
+                info.field,
+                "#[version(u64)] creates a version column; do not declare a version field",
+            ));
         }
     }
     let value_fields: Vec<_> = field_infos
@@ -81,21 +99,38 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
 
     // 至少需要一个主键
     if primary_keys.is_empty() {
-        panic!("Model must have at least one #[primary] field");
+        return Err(syn::Error::new_spanned(
+            name,
+            "Model must have at least one #[primary] field",
+        ));
     }
 
     // 检查是否有多个主键且标记了 auto（只有第一个主键可以是 auto）
-    let auto_count = primary_keys.iter().filter(|info| info.primary_auto).count();
-    if auto_count > 1 {
-        panic!("Only one primary key field can have #[primary(auto)]");
+    let auto_primary_keys: Vec<_> = primary_keys
+        .iter()
+        .filter(|info| info.primary_auto)
+        .collect();
+    if auto_primary_keys.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            auto_primary_keys[1].field,
+            "Only one primary key field can have #[primary(auto)]",
+        ));
+    }
+    // auto 只对第一个主键生效；标在其他主键上必须报错而不是静默忽略
+    if let Some(offending) = primary_keys.iter().skip(1).find(|info| info.primary_auto) {
+        return Err(syn::Error::new_spanned(
+            offending.field,
+            "#[primary(auto)] is only allowed on the first primary key field",
+        ));
     }
 
     // 获取第一个主键（用于向后兼容）
     let is_auto_increment = primary_keys[0].primary_auto;
     if is_auto_increment && is_uuid_type(&primary_keys[0].rust_type) {
-        panic!(
-            "UUID primary key cannot use #[primary(auto)]; generate UUID in Rust or use a database default"
-        );
+        return Err(syn::Error::new_spanned(
+            primary_keys[0].field,
+            "UUID primary key cannot use #[primary(auto)]; generate UUID in Rust or use a database default",
+        ));
     }
 
     // 生成 AutoIncrementKeyType
@@ -1441,7 +1476,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             let prefix = &embed.prefix;
             quote! {
                 for column in <#field_type as ::ormer::model::Embed>::COLUMNS {
-                    columns.push(Box::leak(format!("{}{}", #prefix, column).into_boxed_str()));
+                    columns.push(::ormer::model::intern_concat(#prefix, column));
                 }
             }
         } else {
@@ -1475,8 +1510,11 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 quote! {
                     for schema in <#field_type as ::ormer::model::Embed>::COLUMN_SCHEMA {
                         columns.push(::ormer::model::ColumnSchema {
-                            rust_name: Box::leak(format!("{}.{}", #field_name, schema.rust_name).into_boxed_str()),
-                            name: Box::leak(format!("{}{}", #prefix, schema.name).into_boxed_str()),
+                            rust_name: ::ormer::model::intern_concat(
+                                #field_name,
+                                ::ormer::model::intern_concat(".", schema.rust_name),
+                            ),
+                            name: ::ormer::model::intern_concat(#prefix, schema.name),
                             rust_type: schema.rust_type,
                             is_primary: false,
                             is_auto_increment: false,
@@ -1596,7 +1634,10 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .iter()
         .filter(|info| !info.json_schema.is_empty())
         .flat_map(|info| {
+            // path 首元素是字段名（决定代理类型名），SQL 列名必须用
+            // #[column] 解析后的列名，否则重命名的 JSON 列会查错列
             let field_path = [info.field_name.to_string()];
+            let column = info.column_name.as_str();
             let wrapper_name = json_proxy_type_name(name, &field_path, "Where");
             let root_fields = info
                 .json_schema
@@ -1605,7 +1646,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             let root_defaults = info
                 .json_schema
                 .iter()
-                .map(|root| json_where_child_default(name, root, &field_path));
+                .map(|root| json_where_child_default(name, root, &field_path, column));
             let wrapper = quote! {
                 pub struct #wrapper_name {
                     #(#root_fields,)*
@@ -1622,7 +1663,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             info.json_schema
                 .iter()
                 .filter(|root| root.leaf.is_none())
-                .map(move |root| json_where_struct(name, root, &field_path))
+                .map(move |root| json_where_struct(name, root, &field_path, column))
                 .chain(std::iter::once(wrapper))
         });
     let json_update_structs = field_infos
@@ -1630,6 +1671,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         .filter(|info| !info.json_schema.is_empty())
         .flat_map(|info| {
             let field_path = [info.field_name.to_string()];
+            let column = info.column_name.as_str();
             let wrapper_name = json_proxy_type_name(name, &field_path, "Update");
             let root_fields = info
                 .json_schema
@@ -1638,7 +1680,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             let root_defaults = info
                 .json_schema
                 .iter()
-                .map(|root| json_update_child_default(root, &field_path));
+                .map(|root| json_update_child_default(root, &field_path, column));
             let root_calls = info.json_schema.iter().map(json_update_child_call);
             let wrapper = quote! {
                 pub struct #wrapper_name {
@@ -1665,7 +1707,7 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
             info.json_schema
                 .iter()
                 .filter(|root| root.leaf.is_none())
-                .map(move |root| json_update_struct(name, root, &field_path))
+                .map(move |root| json_update_struct(name, root, &field_path, column))
                 .chain(std::iter::once(wrapper))
         });
 
@@ -1714,53 +1756,6 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
                 let mut assignments = Vec::new();
                 #(#update_assignment_fields)*
                 assignments
-            }
-        }
-
-        impl ::ormer::ViewModel for #name {
-            const TABLE_NAME: &'static str = #table_name;
-            const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
-            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#all_column_schema_entries),*];
-            const TABLE_OPTIONS: Option<::ormer::model::TableOptions> = #table_options_view;
-
-            type QueryBuilder = ::ormer::Select<Self>;
-            type Where = #where_name;
-
-            #dynamic_columns_method
-            #dynamic_column_schema_method
-
-            fn query() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn select() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
-                #from_row_version_record
-                let __ormer_model = Self {
-                    #(#from_row_fields),*
-                };
-                #from_row_version_after
-                Ok(__ormer_model)
-            }
-
-            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
-                if values.len() < <Self as ::ormer::ViewModel>::columns().len() {
-                    return Err(::ormer::ormer_error!(
-                        "Expected {} values for {}",
-                        <Self as ::ormer::ViewModel>::columns().len(),
-                        stringify!(#name)
-                    ));
-                }
-                let mut __ormer_value_index = 0usize;
-                let __ormer_model = Self {
-                    #(#from_row_values_fields),*
-                };
-                #from_row_values_version_record
-                #from_row_values_version_after
-                Ok(__ormer_model)
             }
         }
 
@@ -1963,54 +1958,69 @@ pub fn derive_model(input: DeriveInput) -> TokenStream {
         }
     };
 
-    quote! {
+    Ok(quote! {
         #table_options_warning_item
         #generated
-    }
+    })
 }
 
 pub fn derive_insert_model(input: DeriveInput) -> TokenStream {
+    match derive_insert_model_inner(input) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn derive_insert_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
-    let table_name = extract_table_name(&input);
+    let table_name = extract_table_name(&input)?;
 
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("InsertModel must have named fields"),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    name,
+                    "InsertModel must have named fields",
+                ))
+            }
         },
-        _ => panic!("InsertModel must be a struct"),
+        _ => return Err(syn::Error::new_spanned(name, "InsertModel must be a struct")),
     };
 
-    let assignment_fields = fields.iter().map(|field| {
-        let field_name = field
-            .ident
-            .as_ref()
-            .expect("InsertModel field must be named");
-        let column_name = extract_column_name(field);
-        if active_value_inner_type(&field.ty).is_some() {
-            quote! {
-                match &self.#field_name {
-                    ::ormer::ActiveValue::NotSet => {}
-                    ::ormer::ActiveValue::Set(value)
-                    | ::ormer::ActiveValue::Unchanged(value) => {
-                        assignments.push(::ormer::query::insert::InsertAssignment::value(
-                            #column_name,
-                            value.clone(),
-                        ));
+    let assignment_fields = fields
+        .iter()
+        .map(|field| {
+            let field_name = field
+                .ident
+                .as_ref()
+                .expect("InsertModel field must be named");
+            let column_name = extract_column_name(field)?;
+            if active_value_inner_type(&field.ty).is_some() {
+                Ok(quote! {
+                    match &self.#field_name {
+                        ::ormer::ActiveValue::NotSet => {}
+                        ::ormer::ActiveValue::Set(value)
+                        | ::ormer::ActiveValue::Unchanged(value) => {
+                            assignments.push(::ormer::query::insert::InsertAssignment::value(
+                                #column_name,
+                                value.clone(),
+                            ));
+                        }
                     }
-                }
+                })
+            } else {
+                Ok(quote! {
+                    assignments.push(::ormer::query::insert::InsertAssignment::value(
+                        #column_name,
+                        self.#field_name.clone(),
+                    ));
+                })
             }
-        } else {
-            quote! {
-                assignments.push(::ormer::query::insert::InsertAssignment::value(
-                    #column_name,
-                    self.#field_name.clone(),
-                ));
-            }
-        }
-    });
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
-    quote! {
+    Ok(quote! {
         impl<T: ::ormer::Model> ::ormer::model::InsertModel<T> for #name {
             fn insert_table_name(&self) -> &'static str {
                 #table_name
@@ -2022,27 +2032,40 @@ pub fn derive_insert_model(input: DeriveInput) -> TokenStream {
                 assignments
             }
         }
-    }
+    })
 }
 
 pub fn derive_embed(input: DeriveInput) -> TokenStream {
+    match derive_embed_inner(input) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn derive_embed_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
 
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("Embed must have named fields"),
+            _ => return Err(syn::Error::new_spanned(name, "Embed must have named fields")),
         },
-        _ => panic!("Embed must be a struct"),
+        _ => return Err(syn::Error::new_spanned(name, "Embed must be a struct")),
     };
 
-    let field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
+    let field_infos: Vec<_> = fields
+        .iter()
+        .map(FieldInfo::new)
+        .collect::<syn::Result<Vec<_>>>()?;
     if field_infos
         .iter()
         .any(|info| info.is_relation() || info.is_primary || info.embed.is_some())
     {
-        panic!("Embed cannot use #[primary], relation attributes, or nested #[embed]");
+        return Err(syn::Error::new_spanned(
+            name,
+            "Embed cannot use #[primary], relation attributes, or nested #[embed]",
+        ));
     }
     let normal_fields: Vec<_> = field_infos.iter().filter(|info| !info.is_ignored).collect();
     // Embed 结构体成员字段上的列级约束同样会被静默丢弃（EmbedColumnSchema
@@ -2051,7 +2074,7 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         .iter()
         .find_map(|info| embed_constraint_error(info.field))
     {
-        return error.to_compile_error();
+        return Err(error);
     }
 
     let field_names: Vec<String> = normal_fields
@@ -2132,7 +2155,7 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         let column_name = &info.column_name;
         quote! {
             #field_name: ::ormer::query::builder::TypedColumn::new(
-                Box::leak(format!("{}{}", prefix, #column_name).into_boxed_str())
+                ::ormer::model::intern_prefixed(prefix, #column_name)
             )
         }
     });
@@ -2264,7 +2287,7 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
         }
     });
 
-    quote! {
+    Ok(quote! {
         pub struct #where_name {
             #(#where_fields),*
         }
@@ -2344,32 +2367,43 @@ pub fn derive_embed(input: DeriveInput) -> TokenStream {
                 ))
             }
         }
-    }
+    })
 }
 
 pub fn derive_view_model(input: DeriveInput) -> TokenStream {
+    match derive_view_model_inner(input) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let name = &input.ident;
     let where_name = syn::Ident::new(&format!("{name}Where"), name.span());
-    let table_name = extract_table_name(&input);
+    let table_name = extract_table_name(&input)?;
 
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => &fields.named,
-            _ => panic!("ViewModel must have named fields"),
+            _ => return Err(syn::Error::new_spanned(name, "ViewModel must have named fields")),
         },
-        _ => panic!("ViewModel must be a struct"),
+        _ => return Err(syn::Error::new_spanned(name, "ViewModel must be a struct")),
     };
 
-    let field_infos: Vec<_> = fields.iter().map(FieldInfo::new).collect();
-    let hypertable_route_key_method = hypertable_route_key_method(&field_infos);
-    let hypertable_space_info_method = hypertable_space_info_method(&field_infos);
+    let field_infos: Vec<_> = fields
+        .iter()
+        .map(FieldInfo::new)
+        .collect::<syn::Result<Vec<_>>>()?;
+    let hypertable_route_key_method = hypertable_route_key_method(&field_infos)?;
+    let hypertable_space_info_method = hypertable_space_info_method(&field_infos)?;
     if field_infos
         .iter()
         .any(|info| info.is_primary || info.is_relation())
     {
-        panic!(
-            "ViewModel cannot use #[primary], #[has_many], #[belongs_to], #[has_one], or #[through]"
-        );
+        return Err(syn::Error::new_spanned(
+            name,
+            "ViewModel cannot use #[primary], #[has_many], #[belongs_to], #[has_one], or #[through]",
+        ));
     }
 
     let normal_fields: Vec<_> = field_infos.iter().filter(|info| !info.is_ignored).collect();
@@ -2584,7 +2618,7 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
         }
     });
 
-    quote! {
+    Ok(quote! {
         pub struct #where_name {
             #(#where_fields),*
         }
@@ -2600,42 +2634,6 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
         impl #where_name {
             pub fn field(&self, name: impl Into<String>) -> ::ormer::query::builder::DynamicColumn<#name> {
                 ::ormer::query::builder::DynamicColumn::new(name)
-            }
-        }
-
-        impl ::ormer::ViewModel for #name {
-            const TABLE_NAME: &'static str = #table_name;
-            const COLUMNS: &'static [&'static str] = &[#(#field_names_lit),*];
-            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = &[#(#column_schema_entries),*];
-
-            type QueryBuilder = ::ormer::Select<Self>;
-            type Where = #where_name;
-
-            fn query() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn select() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
-                Ok(Self {
-                    #(#from_row_fields),*
-                })
-            }
-
-            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
-                if values.len() < <Self as ::ormer::ViewModel>::COLUMNS.len() {
-                    return Err(::ormer::ormer_error!(
-                        "Expected {} values for {}",
-                        <Self as ::ormer::ViewModel>::COLUMNS.len(),
-                        stringify!(#name)
-                    ));
-                }
-                Ok(Self {
-                    #(#from_row_values_fields),*
-                })
             }
         }
 
@@ -2729,16 +2727,13 @@ pub fn derive_view_model(input: DeriveInput) -> TokenStream {
                 <Self as ::ormer::model::PrimaryFields>::primary_fields(self)
             }
         }
-    }
+    })
 }
 
-fn normalize_type_string(type_str: String) -> String {
-    type_str
-        .replace(" :: ", "::")
-        .replace(" < ", "<")
-        .replace(" >", ">")
-        .replace(" , ", ",")
-}
+// model.rs 与 model_enum.rs 共用的属性解析/类型工具统一放在 shared 模块
+use crate::shared::{
+    extract_column_name, is_string_type, normalize_type_string, option_inner_type, to_snake_case,
+};
 
 #[derive(Clone)]
 enum RelationKindAttr {
@@ -2848,10 +2843,10 @@ struct JsonSchemaNode {
 }
 
 impl<'a> FieldInfo<'a> {
-    fn new(field: &'a syn::Field) -> Self {
+    fn new(field: &'a syn::Field) -> syn::Result<Self> {
         let field_name = field.ident.as_ref().unwrap();
         let field_type = &field.ty;
-        let column_name = extract_column_name(field);
+        let column_name = extract_column_name(field)?;
         let type_str = normalize_type_string(quote! { #field_type }.to_string());
         let is_nullable = type_str.starts_with("Option<");
         let rust_type = if is_nullable {
@@ -2865,8 +2860,8 @@ impl<'a> FieldInfo<'a> {
             type_str
         };
 
-        let data_type_type = extract_data_type_type(field);
-        validate_data_type(field, data_type_type.as_ref());
+        let data_type_type = extract_data_type_type(field)?;
+        validate_data_type(field, data_type_type.as_ref())?;
         let effective_data_type_type = data_type_type.as_ref().map(|data_type| {
             if option_inner_type(field_type).is_some() {
                 option_inner_type(data_type)
@@ -2894,12 +2889,15 @@ impl<'a> FieldInfo<'a> {
             })
             .unwrap_or(false);
         let data_type = data_type_tokens(effective_data_type_type.as_ref());
-        let hypertable = extract_hypertable(field, field_type);
-        let (is_primary, primary_auto) = extract_primary_attr(field);
-        let relation = extract_relation_field(field);
-        let embed = extract_embed_attr(field);
+        let hypertable = extract_hypertable(field, field_type)?;
+        let (is_primary, primary_auto) = extract_primary_attr(field)?;
+        let relation = extract_relation_field(field)?;
+        let embed = extract_embed_attr(field)?;
         if relation.is_some() && embed.is_some() {
-            panic!("relation fields cannot use #[embed]");
+            return Err(syn::Error::new_spanned(
+                field,
+                "relation fields cannot use #[embed]",
+            ));
         }
         if embed.is_some()
             && field
@@ -2907,11 +2905,14 @@ impl<'a> FieldInfo<'a> {
                 .iter()
                 .any(|attr| attr.path().is_ident("primary"))
         {
-            panic!("#[embed] fields cannot be primary keys");
+            return Err(syn::Error::new_spanned(
+                field,
+                "#[embed] fields cannot be primary keys",
+            ));
         }
         let relation_default = relation_default_expr(relation.as_ref());
 
-        Self {
+        Ok(Self {
             field,
             field_name,
             field_type,
@@ -2923,9 +2924,9 @@ impl<'a> FieldInfo<'a> {
             relation,
             relation_default,
             embed,
-            unique_attr: extract_unique_attr(field),
-            index_attr: extract_index_attr(field),
-            foreign_key: extract_foreign_key(field),
+            unique_attr: extract_unique_attr(field)?,
+            index_attr: extract_index_attr(field)?,
+            foreign_key: extract_foreign_key(field)?,
             data_type,
             db_value_type_expr,
             effective_data_type_type,
@@ -2933,8 +2934,8 @@ impl<'a> FieldInfo<'a> {
             has_data_type_newtype_fallback,
             has_i32_data_type,
             has_vec_i32_data_type,
-            default: extract_default(field),
-            check: extract_check(field),
+            default: extract_default(field)?,
+            check: extract_check(field)?,
             hypertable: hypertable.duration,
             has_hypertable_time: hypertable.is_time,
             hypertable_route: hypertable.route,
@@ -2948,7 +2949,7 @@ impl<'a> FieldInfo<'a> {
                     }
                 })
                 .unwrap_or_else(|| quote! { None }),
-            json_paths: extract_json_paths(field),
+            json_paths: extract_json_paths(field)?,
             json_schema: Vec::new(),
             is_ignored: field
                 .attrs
@@ -2956,16 +2957,16 @@ impl<'a> FieldInfo<'a> {
                 .any(|attr| attr.path().is_ident("ormer_ignore")),
             normal_index: None,
         }
-        .with_json_schema()
+        .with_json_schema()?)
     }
 
-    fn with_json_schema(mut self) -> Self {
+    fn with_json_schema(mut self) -> syn::Result<Self> {
         let mut roots = Vec::new();
         for schema in self.json_paths.clone() {
-            insert_json_schema(&mut roots, schema);
+            insert_json_schema(&mut roots, schema)?;
         }
         self.json_schema = roots;
-        self
+        Ok(self)
     }
 
     fn is_relation(&self) -> bool {
@@ -3000,42 +3001,85 @@ fn embed_constraint_error(field: &syn::Field) -> Option<syn::Error> {
     })
 }
 
-fn extract_primary_attr(field: &syn::Field) -> (bool, bool) {
-    for attr in &field.attrs {
-        if attr.path().is_ident("primary") {
-            let is_auto = if let Meta::List(list) = &attr.meta {
-                list.tokens.to_string().contains("auto")
-            } else {
-                false
-            };
-            return (true, is_auto);
-        }
-    }
-    (false, false)
+/// `#[primary]` / `#[primary(auto)]` / `#[primary(auto = true)]` 的嵌套参数解析。
+/// 只认 `auto`（及 `auto = bool`），未知参数报错——此前用子串匹配 `contains("auto")`，
+/// `#[primary(authorized)]` 也会被误判为 auto。
+struct PrimaryAttrParser {
+    is_auto: bool,
 }
 
-fn extract_json_paths(field: &syn::Field) -> Vec<JsonPathSchema> {
+impl Parse for PrimaryAttrParser {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        let mut is_auto = false;
+        while !input.is_empty() {
+            let ident: syn::Ident = input.parse()?;
+            if ident == "auto" {
+                if input.peek(Token![=]) {
+                    input.parse::<Token![=]>()?;
+                    let value: syn::LitBool = input.parse()?;
+                    is_auto = value.value;
+                } else {
+                    is_auto = true;
+                }
+            } else {
+                return Err(syn::Error::new(
+                    ident.span(),
+                    "unsupported #[primary] argument (expected `auto`)",
+                ));
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self { is_auto })
+    }
+}
+
+fn extract_primary_attr(field: &syn::Field) -> syn::Result<(bool, bool)> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("primary") {
+            let is_auto = match &attr.meta {
+                Meta::List(list) => {
+                    syn::parse2::<PrimaryAttrParser>(list.tokens.clone())?.is_auto
+                }
+                Meta::Path(_) => false,
+                Meta::NameValue(_) => {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[primary] must use #[primary] or #[primary(auto)]",
+                    ))
+                }
+            };
+            return Ok((true, is_auto));
+        }
+    }
+    Ok((false, false))
+}
+
+fn extract_json_paths(field: &syn::Field) -> syn::Result<Vec<JsonPathSchema>> {
     let schema_attrs: Vec<_> = field
         .attrs
         .iter()
         .filter(|attr| attr.path().is_ident("field"))
         .collect();
     if schema_attrs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let field_type = &field.ty;
     let type_str = normalize_type_string(quote! { #field_type }.to_string());
     if !type_str.contains("serde_json") || !type_str.contains("Value") {
-        panic!("#[field(path)] is only supported on serde_json::Value columns");
+        return Err(syn::Error::new_spanned(
+            field,
+            "#[field(path)] is only supported on serde_json::Value columns",
+        ));
     }
 
     schema_attrs
         .into_iter()
         .map(|attr| match &attr.meta {
             Meta::List(list) => {
-                let parsed: JsonPathAttrParser =
-                    syn::parse2(list.tokens.clone()).expect("invalid #[field(path)] schema");
+                let parsed: JsonPathAttrParser = syn::parse2(list.tokens.clone())?;
                 let mut schema = JsonPathSchema::from(parsed);
                 if !schema.is_array
                     && schema
@@ -3051,9 +3095,12 @@ fn extract_json_paths(field: &syn::Field) -> Vec<JsonPathSchema> {
                     let value_type = schema.value_type.take().expect("array type");
                     schema.value_type = vec_inner_type(&value_type).cloned();
                 }
-                schema
+                Ok(schema)
             }
-            _ => panic!("#[field] JSON schema must use #[field(path: Type)]"),
+            _ => Err(syn::Error::new_spanned(
+                attr,
+                "#[field] JSON schema must use #[field(path: Type)]",
+            )),
         })
         .collect()
 }
@@ -3114,9 +3161,12 @@ impl From<JsonPathAttrParser> for JsonPathSchema {
     }
 }
 
-fn insert_json_schema(roots: &mut Vec<JsonSchemaNode>, schema: JsonPathSchema) {
+fn insert_json_schema(roots: &mut Vec<JsonSchemaNode>, schema: JsonPathSchema) -> syn::Result<()> {
     if schema.path.is_empty() {
-        panic!("JSON path schema cannot be empty");
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "JSON path schema cannot be empty",
+        ));
     }
     let first = syn::Ident::new(&schema.path[0], proc_macro2::Span::call_site());
     let root_index = roots
@@ -3130,9 +3180,15 @@ fn insert_json_schema(roots: &mut Vec<JsonSchemaNode>, schema: JsonPathSchema) {
             });
             roots.len() - 1
         });
+    let overlap_error = || {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "JSON path schema overlaps an existing parent path",
+        )
+    };
     let mut node = &mut roots[root_index];
     if node.leaf.is_some() {
-        panic!("JSON path schema overlaps an existing parent path");
+        return Err(overlap_error());
     }
     let names: Vec<String> = schema.path.iter().skip(1).cloned().collect();
     let total_parts = names.len();
@@ -3150,24 +3206,27 @@ fn insert_json_schema(roots: &mut Vec<JsonSchemaNode>, schema: JsonPathSchema) {
                     children: Vec::new(),
                     leaf: None,
                 });
-                node.children
-                    .last_mut()
-                    .expect("just pushed JSON schema node")
+                // 上面刚 push，索引必然存在
+                node.children.last_mut().expect("just pushed JSON schema node")
             }
         };
         if node.leaf.is_some() {
-            panic!("JSON path schema overlaps an existing parent path");
+            return Err(overlap_error());
         }
         if index + 1 == total_parts {
             node.leaf = Some(schema.clone());
             if !node.children.is_empty() {
-                panic!("JSON path schema overlaps existing child paths");
+                return Err(syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "JSON path schema overlaps existing child paths",
+                ));
             }
         }
     }
     if total_parts == 0 {
         node.leaf = Some(schema);
     }
+    Ok(())
 }
 fn json_schema_type_name(parts: &[String], suffix: &str) -> syn::Ident {
     let mut name = parts.join("_");
@@ -3235,10 +3294,10 @@ fn json_where_leaf_default(
     leaf: &JsonPathSchema,
     name: &syn::Ident,
     parent_path: &[String],
+    column: &str,
 ) -> TokenStream {
     let mut path = parent_path.to_vec();
     path.push(name.to_string());
-    let column = parent_path.first().expect("JSON path starts with a column");
     let path = json_path_lits(&path[1..]);
     if leaf.is_array {
         quote! { #name: ::ormer::query::builder::StaticJsonArrayExpr::new(#column, #path) }
@@ -3269,15 +3328,21 @@ fn json_where_child_default(
     _model: &syn::Ident,
     child: &JsonSchemaNode,
     parent_path: &[String],
+    column: &str,
 ) -> TokenStream {
     let name = child.name.as_ref().expect("JSON schema child has a name");
     if let Some(leaf) = child.leaf.as_ref() {
-        return json_where_leaf_default(leaf, name, parent_path);
+        return json_where_leaf_default(leaf, name, parent_path, column);
     }
     quote! { #name: Default::default() }
 }
 
-fn json_where_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]) -> TokenStream {
+fn json_where_struct(
+    model: &syn::Ident,
+    node: &JsonSchemaNode,
+    path: &[String],
+    column: &str,
+) -> TokenStream {
     let node_name = node.name.as_ref().expect("JSON schema node has a name");
     let mut full_path = path.to_vec();
     full_path.push(node_name.to_string());
@@ -3287,7 +3352,7 @@ fn json_where_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String])
         .children
         .iter()
         .filter(|child| child.leaf.is_none())
-        .map(|child| json_where_struct(model, child, &full_path));
+        .map(|child| json_where_struct(model, child, &full_path, column));
     let child_fields = node
         .children
         .iter()
@@ -3295,7 +3360,7 @@ fn json_where_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String])
     let child_defaults = node
         .children
         .iter()
-        .map(|child| json_where_child_default(model, child, &full_path));
+        .map(|child| json_where_child_default(model, child, &full_path, column));
 
     quote! {
         #(#child_structs)*
@@ -3329,12 +3394,11 @@ fn json_update_child_field(
     quote! { pub #name: #child_type }
 }
 
-fn json_update_child_default(child: &JsonSchemaNode, parent_path: &[String]) -> TokenStream {
+fn json_update_child_default(child: &JsonSchemaNode, parent_path: &[String], column: &str) -> TokenStream {
     let name = child.name.as_ref().expect("JSON schema child has a name");
     if child.leaf.is_some() {
         let mut path = parent_path.to_vec();
         path.push(name.to_string());
-        let column = parent_path.first().expect("JSON path starts with a column");
         let path = json_path_lits(&path[1..]);
         return quote! { #name: ::ormer::query::builder::StaticJsonUpdate::new(#column, #path) };
     }
@@ -3353,7 +3417,12 @@ fn json_update_child_call(child: &JsonSchemaNode) -> TokenStream {
     quote! { self.#name.collect_assignments(assignments); }
 }
 
-fn json_update_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]) -> TokenStream {
+fn json_update_struct(
+    model: &syn::Ident,
+    node: &JsonSchemaNode,
+    path: &[String],
+    column: &str,
+) -> TokenStream {
     let node_name = node.name.as_ref().expect("JSON schema node has a name");
     let mut full_path = path.to_vec();
     full_path.push(node_name.to_string());
@@ -3363,7 +3432,7 @@ fn json_update_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]
         .children
         .iter()
         .filter(|child| child.leaf.is_none())
-        .map(|child| json_update_struct(model, child, &full_path));
+        .map(|child| json_update_struct(model, child, &full_path, column));
     let child_fields = node
         .children
         .iter()
@@ -3371,7 +3440,7 @@ fn json_update_struct(model: &syn::Ident, node: &JsonSchemaNode, path: &[String]
     let child_defaults = node
         .children
         .iter()
-        .map(|child| json_update_child_default(child, &full_path));
+        .map(|child| json_update_child_default(child, &full_path, column));
     let collect_calls = node.children.iter().map(json_update_child_call);
 
     quote! {
@@ -3419,6 +3488,7 @@ fn extract_compress_attr(field: &syn::Field) -> Option<syn::Ident> {
         "lz4" => "Lz4",
         "zlib" => "Zlib",
         "zstd" => "Zstd",
+        // 在 FieldInfo::new 的两次独立调用中无法向上传播 syn::Result，保留 panic
         _ => panic!(
             "unsupported #[compress] algorithm `{}`; expected pglz, lz4, zlib, or zstd",
             if algorithm.is_empty() {
@@ -3438,117 +3508,135 @@ fn relation_default_expr(relation: Option<&RelationField>) -> Option<proc_macro2
     })
 }
 
-fn extract_relation_field(field: &syn::Field) -> Option<RelationField> {
-    let field_name = field.ident.as_ref()?.clone();
+fn extract_relation_field(field: &syn::Field) -> syn::Result<Option<RelationField>> {
+    let Some(field_name) = field.ident.as_ref() else {
+        return Ok(None);
+    };
+    let field_name = field_name.clone();
     for attr in &field.attrs {
         if attr.path().is_ident("has_many") {
-            let (target_type, target_key) = parse_has_many(attr);
-            return Some(RelationField {
+            let (target_type, target_key) = parse_has_many(attr)?;
+            return Ok(Some(RelationField {
                 field_name,
                 target_type,
                 kind: RelationKindAttr::HasMany,
                 local_key: String::new(),
                 target_key,
                 through: None,
-            });
+            }));
         }
         if attr.path().is_ident("belongs_to") {
-            let local_key = parse_belongs_to(attr);
-            let target_type = option_inner_type(&field.ty)
-                .cloned()
-                .unwrap_or_else(|| panic!("#[belongs_to] field must be Option<T>"));
-            return Some(RelationField {
+            let local_key = parse_belongs_to(attr)?;
+            let target_type = option_inner_type(&field.ty).cloned().ok_or_else(|| {
+                syn::Error::new_spanned(attr, "#[belongs_to] field must be Option<T>")
+            })?;
+            return Ok(Some(RelationField {
                 field_name,
                 target_type,
                 kind: RelationKindAttr::BelongsTo,
                 local_key,
                 target_key: String::new(),
                 through: None,
-            });
+            }));
         }
         if attr.path().is_ident("has_one") {
-            let (target_type, target_key) = parse_has_one(attr);
+            let (target_type, target_key) = parse_has_one(attr)?;
             if option_inner_type(&field.ty).is_none() {
-                panic!("#[has_one] field must be Option<T>");
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[has_one] field must be Option<T>",
+                ));
             }
-            return Some(RelationField {
+            return Ok(Some(RelationField {
                 field_name,
                 target_type,
                 kind: RelationKindAttr::HasOne,
                 local_key: String::new(),
                 target_key,
                 through: None,
-            });
+            }));
         }
         if attr.path().is_ident("through") {
-            let through = parse_through(attr);
-            let target_type = vec_inner_type(&field.ty)
-                .cloned()
-                .unwrap_or_else(|| panic!("#[through] field must be Vec<T>"));
-            return Some(RelationField {
+            let through = parse_through(attr)?;
+            let target_type = vec_inner_type(&field.ty).cloned().ok_or_else(|| {
+                syn::Error::new_spanned(attr, "#[through] field must be Vec<T>")
+            })?;
+            return Ok(Some(RelationField {
                 field_name,
                 target_type,
                 kind: RelationKindAttr::Through,
                 local_key: String::new(),
                 target_key: String::new(),
                 through: Some(through),
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
-fn parse_has_many(attr: &syn::Attribute) -> (syn::Type, String) {
+fn parse_has_many(attr: &syn::Attribute) -> syn::Result<(syn::Type, String)> {
     if let Meta::List(list) = &attr.meta {
         let tokens_str = list.tokens.to_string();
         let parts: Vec<&str> = tokens_str.split('.').collect();
         if parts.len() == 2 {
-            let target_type: syn::Type =
-                syn::parse_str(parts[0].trim()).expect("#[has_many] target type is invalid");
-            return (target_type, parts[1].trim().to_string());
+            let target_type: syn::Type = syn::parse_str(parts[0].trim())
+                .map_err(|_| syn::Error::new_spanned(attr, "#[has_many] target type is invalid"))?;
+            return Ok((target_type, parts[1].trim().to_string()));
         }
     }
-    panic!("#[has_many] must use #[has_many(Target.foreign_key)]");
+    Err(syn::Error::new_spanned(
+        attr,
+        "#[has_many] must use #[has_many(Target.foreign_key)]",
+    ))
 }
 
-fn parse_has_one(attr: &syn::Attribute) -> (syn::Type, String) {
+fn parse_has_one(attr: &syn::Attribute) -> syn::Result<(syn::Type, String)> {
     if let Meta::List(list) = &attr.meta {
         let tokens_str = list.tokens.to_string();
         let parts: Vec<&str> = tokens_str.split('.').collect();
         if parts.len() == 2 {
-            let target_type: syn::Type =
-                syn::parse_str(parts[0].trim()).expect("#[has_one] target type is invalid");
-            return (target_type, parts[1].trim().to_string());
+            let target_type: syn::Type = syn::parse_str(parts[0].trim())
+                .map_err(|_| syn::Error::new_spanned(attr, "#[has_one] target type is invalid"))?;
+            return Ok((target_type, parts[1].trim().to_string()));
         }
     }
-    panic!("#[has_one] must use #[has_one(Target.foreign_key)]");
+    Err(syn::Error::new_spanned(
+        attr,
+        "#[has_one] must use #[has_one(Target.foreign_key)]",
+    ))
 }
 
-fn parse_belongs_to(attr: &syn::Attribute) -> String {
+fn parse_belongs_to(attr: &syn::Attribute) -> syn::Result<String> {
     if let Meta::List(list) = &attr.meta {
         let key = list.tokens.to_string().trim().to_string();
         if !key.is_empty() {
-            return key;
+            return Ok(key);
         }
     }
-    panic!("#[belongs_to] must use #[belongs_to(local_foreign_key)]");
+    Err(syn::Error::new_spanned(
+        attr,
+        "#[belongs_to] must use #[belongs_to(local_foreign_key)]",
+    ))
 }
 
-fn parse_through(attr: &syn::Attribute) -> ThroughAttr {
+fn parse_through(attr: &syn::Attribute) -> syn::Result<ThroughAttr> {
     if let Meta::List(list) = &attr.meta {
         let tokens_str = list.tokens.to_string();
         let parts: Vec<&str> = tokens_str.split('.').collect();
         if parts.len() == 2 {
-            return ThroughAttr {
+            return Ok(ThroughAttr {
                 via_relation: parts[0].trim().to_string(),
                 target_relation: parts[1].trim().to_string(),
-            };
+            });
         }
     }
-    panic!("#[through] must use #[through(via_relation.target_relation)]");
+    Err(syn::Error::new_spanned(
+        attr,
+        "#[through] must use #[through(via_relation.target_relation)]",
+    ))
 }
 
-fn extract_embed_attr(field: &syn::Field) -> Option<EmbedAttr> {
+fn extract_embed_attr(field: &syn::Field) -> syn::Result<Option<EmbedAttr>> {
     for attr in &field.attrs {
         if attr.path().is_ident("embed") {
             let mut prefix = String::new();
@@ -3562,15 +3650,25 @@ fn extract_embed_attr(field: &syn::Field) -> Option<EmbedAttr> {
                     } else {
                         Err(meta.error("unsupported #[embed] argument"))
                     }
-                })
-                .expect("Failed to parse #[embed] attribute");
+                })?;
             }
-            return Some(EmbedAttr { prefix });
+            // 空 prefix 会生成 `column.starts_with("")` 恒真守卫，吞掉 embed
+            // 之后所有普通字段与 #[version] 列的赋值臂，这里在派生期直接拒绝
+            if prefix.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[embed] requires a non-empty prefix; use #[embed(prefix = \"...\")] \
+                     (an empty prefix would shadow the columns declared after the embed field)",
+                ));
+            }
+            return Ok(Some(EmbedAttr { prefix }));
         }
     }
-    None
+    Ok(None)
 }
 
+// 在 graph 关系代码生成的 map 闭包内部调用（无法向上传播 syn::Result），
+// via 关系引用不存在属于用户拼写错误，但保持 panic 以控制改造范围
 fn through_via_type<'a>(
     relation: &RelationField,
     relation_fields: &'a [RelationField],
@@ -3586,7 +3684,7 @@ fn through_via_type<'a>(
         .unwrap_or_else(|| panic!("#[through] via relation must reference a relation field"))
 }
 
-fn extract_model_filters(input: &DeriveInput) -> Vec<ModelFilter> {
+fn extract_model_filters(input: &DeriveInput) -> syn::Result<Vec<ModelFilter>> {
     input
         .attrs
         .iter()
@@ -3595,34 +3693,54 @@ fn extract_model_filters(input: &DeriveInput) -> Vec<ModelFilter> {
         .collect()
 }
 
-fn parse_model_filter(attr: &syn::Attribute) -> ModelFilter {
+fn parse_model_filter(attr: &syn::Attribute) -> syn::Result<ModelFilter> {
     let Meta::List(list) = &attr.meta else {
-        panic!("#[filter] must use #[filter(filter_name, |m| expr)]");
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[filter] must use #[filter(filter_name, |m| expr)]",
+        ));
     };
     let parser = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated;
-    let args = list
-        .parse_args_with(parser)
-        .expect("Failed to parse #[filter] attribute");
+    let args = list.parse_args_with(parser)?;
     if args.len() != 2 {
-        panic!("#[filter] must use #[filter(filter_name, |m| expr)]");
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[filter] must use #[filter(filter_name, |m| expr)]",
+        ));
     }
 
     let name = match &args[0] {
         syn::Expr::Path(path) if path.path.segments.len() == 1 => {
             path.path.segments[0].ident.clone()
         }
-        _ => panic!("#[filter] name must be an identifier"),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &args[0],
+                "#[filter] name must be an identifier",
+            ))
+        }
     };
     if !name.to_string().starts_with("filter_") {
-        panic!("#[filter] name must start with filter_");
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[filter] name must start with filter_",
+        ));
     }
 
     let body = match &args[1] {
         syn::Expr::Closure(closure) => closure.clone(),
-        _ => panic!("#[filter] second argument must be a closure"),
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &args[1],
+                "#[filter] second argument must be a closure",
+            ))
+        }
     };
     if body.inputs.is_empty() {
-        panic!("#[filter] closure must receive the model where object");
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[filter] closure must receive the model where object",
+        ));
     }
 
     let model_ident = body.inputs[0].clone();
@@ -3631,42 +3749,65 @@ fn parse_model_filter(attr: &syn::Attribute) -> ModelFilter {
         match input {
             syn::Pat::Type(pat_ty) => {
                 let syn::Pat::Ident(pat_ident) = pat_ty.pat.as_ref() else {
-                    panic!("#[filter] closure arguments must be simple identifiers");
+                    return Err(syn::Error::new_spanned(
+                        input,
+                        "#[filter] closure arguments must be simple identifiers",
+                    ));
                 };
                 filter_args.push(FilterArg {
                     ident: pat_ident.ident.clone(),
                     ty: (*pat_ty.ty).clone(),
                 });
             }
-            syn::Pat::Ident(_) => panic!("#[filter] closure extra arguments must have types"),
-            _ => panic!("#[filter] closure arguments must be simple identifiers"),
+            syn::Pat::Ident(_) => {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "#[filter] closure extra arguments must have types",
+                ))
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    input,
+                    "#[filter] closure arguments must be simple identifiers",
+                ))
+            }
         }
     }
 
-    ModelFilter {
+    Ok(ModelFilter {
         name,
         args: filter_args,
         body_expr: body.body,
         model_ident,
-    }
+    })
 }
 
-fn extract_version_attr(input: &DeriveInput) -> Option<VersionAttr> {
+fn extract_version_attr(input: &DeriveInput) -> syn::Result<Option<VersionAttr>> {
     let mut version = None;
     for attr in &input.attrs {
         if !attr.path().is_ident("version") {
             continue;
         }
         if version.is_some() {
-            panic!("Model can only have one #[version(...)] attribute");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "Model can only have one #[version(...)] attribute",
+            ));
         }
         let Meta::List(list) = &attr.meta else {
-            panic!("#[version] must use #[version(u64)]");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[version] must use #[version(u64)]",
+            ));
         };
-        let ty: syn::Type = syn::parse2(list.tokens.clone()).expect("#[version] type is invalid");
+        let ty: syn::Type =
+            syn::parse2(list.tokens.clone()).map_err(|_| syn::Error::new_spanned(attr, "#[version] type is invalid"))?;
         let rust_type = normalize_type_string(quote! { #ty }.to_string());
         if rust_type != "u64" {
-            panic!("#[version] currently supports only #[version(u64)]");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[version] currently supports only #[version(u64)]",
+            ));
         }
         version = Some(VersionAttr {
             column: "version".to_string(),
@@ -3674,7 +3815,7 @@ fn extract_version_attr(input: &DeriveInput) -> Option<VersionAttr> {
             initial: 1,
         });
     }
-    version
+    Ok(version)
 }
 
 /// 为元组结构体包装模型生成实现（例如：struct NewUser(User);）
@@ -3683,7 +3824,7 @@ fn derive_model_tuple_wrapper(
     name: &syn::Ident,
     _where_name: &syn::Ident,
     table_name: String,
-) -> TokenStream {
+) -> syn::Result<TokenStream> {
     let track_method = quote! {
         pub fn track(self) -> ::ormer::Tracked<Self> {
             ::ormer::Tracked::new(self)
@@ -3695,48 +3836,30 @@ fn derive_model_tuple_wrapper(
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Unnamed(fields) => {
                 if fields.unnamed.len() != 1 {
-                    panic!("Tuple struct wrapper must have exactly one field");
+                    return Err(syn::Error::new_spanned(
+                        name,
+                        "Tuple struct wrapper must have exactly one field",
+                    ));
                 }
                 &fields.unnamed[0].ty
             }
-            _ => panic!("Expected unnamed fields"),
+            _ => return Err(syn::Error::new_spanned(name, "Expected unnamed fields")),
         },
-        _ => panic!("Expected struct"),
+        _ => return Err(syn::Error::new_spanned(name, "Expected struct")),
     };
 
     // 生成代码：元组结构体包装器将委托给内部类型的所有 Model 功能，但使用自定义表名
-    quote! {
-        impl ::ormer::ViewModel for #name {
-            const TABLE_NAME: &'static str = #table_name;
-            const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
-            const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = <#inner_type as ::ormer::Model>::COLUMN_SCHEMA;
-
-            type QueryBuilder = ::ormer::Select<Self>;
-            type Where = <#inner_type as ::ormer::Model>::Where;
-
-            fn query() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn select() -> Self::QueryBuilder {
-                ::ormer::Select::new()
-            }
-
-            fn from_row(row: &::ormer::Row) -> ::ormer::Result<Self> {
-                let inner = <#inner_type as ::ormer::Model>::from_row(row)?;
-                Ok(#name(inner))
-            }
-
-            fn from_row_values(values: &[::ormer::Value]) -> ::ormer::Result<Self> {
-                let inner = <#inner_type as ::ormer::Model>::from_row_values(values)?;
-                Ok(#name(inner))
-            }
-        }
-
+    Ok(quote! {
         impl ::ormer::Model for #name {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = <#inner_type as ::ormer::Model>::COLUMNS;
             const COLUMN_SCHEMA: &'static [::ormer::model::ColumnSchema] = <#inner_type as ::ormer::Model>::COLUMN_SCHEMA;
+
+            // 表选项与动态列信息同样委托内层：内层方言表选项（引擎/字符集等）与
+            // embed/data-enum 展开列不能在包装层丢失，否则建表语句与 from_row_values
+            // 的列数校验会与内层错位
+            const TABLE_OPTIONS: Option<::ormer::model::TableOptions> =
+                <#inner_type as ::ormer::Model>::TABLE_OPTIONS;
 
             type AutoIncrementKeyType = <#inner_type as ::ormer::Model>::AutoIncrementKeyType;
 
@@ -3749,6 +3872,18 @@ fn derive_model_tuple_wrapper(
 
             fn hypertable_route_key() -> Option<&'static str> {
                 <#inner_type as ::ormer::Model>::hypertable_route_key()
+            }
+
+            fn table_options() -> Option<::ormer::model::TableOptions> {
+                <#inner_type as ::ormer::Model>::table_options()
+            }
+
+            fn columns() -> Vec<&'static str> {
+                <#inner_type as ::ormer::Model>::columns()
+            }
+
+            fn column_schema() -> Vec<::ormer::model::ColumnSchema> {
+                <#inner_type as ::ormer::Model>::column_schema()
             }
 
             fn query() -> Self::QueryBuilder {
@@ -3891,7 +4026,7 @@ fn derive_model_tuple_wrapper(
                 &self.0
             }
         }
-    }
+    })
 }
 
 #[derive(Default)]
@@ -3916,37 +4051,51 @@ impl DialectTableOptions {
             && self.number.is_none()
     }
 
-    fn set_string(field: &mut Option<String>, name: &str, value: String) {
+    fn set_string(field: &mut Option<String>, name: &str, value: String) -> syn::Result<()> {
         if value.trim().is_empty() {
-            panic!("#{name} table option must not be empty");
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("#{name} table option must not be empty"),
+            ));
         }
         if field.is_some() {
-            panic!("duplicate {name} table option");
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("duplicate {name} table option"),
+            ));
         }
         *field = Some(value);
+        Ok(())
     }
 
-    fn set_fillfactor(&mut self, value: u8) {
+    fn set_fillfactor(&mut self, value: u8) -> syn::Result<()> {
         if !(10..=100).contains(&value) {
-            panic!("PostgreSQL fillfactor must be between 10 and 100");
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "PostgreSQL fillfactor must be between 10 and 100",
+            ));
         }
         if self.number.is_some() {
-            panic!("duplicate fillfactor table option");
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "duplicate fillfactor table option",
+            ));
         }
         self.number = Some(value);
+        Ok(())
     }
 }
 
 /// InfluxDB 模型标注校验（声明了 `#[influxdb(...)]` 时启用）：
 /// 必须有且仅有一个时间类型 `#[primary]` 字段（不支持 auto），
 /// `#[index]` 字段必须为 `String` 类型。
-fn validate_influxdb_fields(input: &DeriveInput) {
+fn validate_influxdb_fields(input: &DeriveInput) -> syn::Result<()> {
     let syn::Data::Struct(syn::DataStruct {
         fields: syn::Fields::Named(fields),
         ..
     }) = &input.data
     else {
-        return;
+        return Ok(());
     };
     let mut primary_count = 0usize;
     let mut primary_is_time = false;
@@ -3962,19 +4111,20 @@ fn validate_influxdb_fields(input: &DeriveInput) {
         let mut is_primary = false;
         for attr in &field.attrs {
             if attr.path().is_ident("primary") {
-                is_primary = true;
-                if let syn::Meta::List(list) = &attr.meta {
-                    if list.tokens.to_string().contains("auto") {
-                        primary_is_auto = true;
-                    }
-                }
+                // 复用 #[primary] 参数的严格解析（见 extract_primary_attr）
+                let (primary, is_auto) = extract_primary_attr(field)?;
+                is_primary = primary;
+                primary_is_auto |= is_auto;
             } else if attr.path().is_ident("index") {
                 // group/name/order/where 参数对 InfluxDB 无意义，忽略
                 let normalized = type_string.replace(' ', "");
                 if normalized != "String" {
-                    panic!(
-                        "#[index] field `{field_name}` must be String when the model declares #[influxdb(...)] (tags cannot be Option<String> or numeric)"
-                    );
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        format!(
+                            "#[index] field `{field_name}` must be String when the model declares #[influxdb(...)] (tags cannot be Option<String> or numeric)"
+                        ),
+                    ));
                 }
             }
         }
@@ -3984,15 +4134,20 @@ fn validate_influxdb_fields(input: &DeriveInput) {
         }
     }
     if primary_count != 1 || !primary_is_time {
-        panic!(
-            "models declaring #[influxdb(...)] require exactly one time-typed #[primary] field as the timestamp (found {primary_count})"
-        );
+        return Err(syn::Error::new_spanned(
+            input.ident.clone(),
+            format!(
+                "models declaring #[influxdb(...)] require exactly one time-typed #[primary] field as the timestamp (found {primary_count})"
+            ),
+        ));
     }
     if primary_is_auto {
-        panic!(
-            "#[primary(auto)] is not allowed on models declaring #[influxdb(...)]: the timestamp must be provided by the application"
-        );
+        return Err(syn::Error::new_spanned(
+            input.ident.clone(),
+            "#[primary(auto)] is not allowed on models declaring #[influxdb(...)]: the timestamp must be provided by the application",
+        ));
     }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -4027,14 +4182,14 @@ impl ModelTableOptions {
 
 fn extract_table_options(
     input: &DeriveInput,
-) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
+) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
     let mut options = ModelTableOptions::default();
     let has_influxdb_attr = input
         .attrs
         .iter()
         .any(|attr| attr.path().is_ident("influxdb"));
     if has_influxdb_attr {
-        validate_influxdb_fields(input);
+        validate_influxdb_fields(input)?;
     }
     for attr in &input.attrs {
         let dialect = if attr.path().is_ident("mysql") {
@@ -4047,7 +4202,10 @@ fn extract_table_options(
             &mut options.clickhouse
         } else if attr.path().is_ident("influxdb") {
             let Meta::List(_) = &attr.meta else {
-                panic!("influxdb table options must use #[influxdb(...)]");
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "influxdb table options must use #[influxdb(...)]",
+                ));
             };
             attr.parse_nested_meta(|meta| {
                 let name = meta
@@ -4071,15 +4229,17 @@ fn extract_table_options(
                 }
                 options.influxdb.retention = Some(expr);
                 Ok(())
-            })
-            .expect("Failed to parse influxdb table options");
+            })?;
             continue;
         } else {
             continue;
         };
 
         let Meta::List(_) = &attr.meta else {
-            panic!("dialect table options must use #[dialect(...)]");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "dialect table options must use #[dialect(...)]",
+            ));
         };
         attr.parse_nested_meta(|meta| {
             let name = meta
@@ -4098,29 +4258,29 @@ fn extract_table_options(
             match (name.as_str(), &expr.lit) {
                 ("fillfactor", Lit::Int(lit)) => {
                     let value = lit.base10_parse::<u8>()?;
-                    dialect.set_fillfactor(value);
+                    dialect.set_fillfactor(value)?;
                 }
                 ("fillfactor", Lit::Str(lit)) => {
                     let value = lit
                         .value()
                         .parse::<u8>()
                         .map_err(|error| syn::Error::new(lit.span(), error.to_string()))?;
-                    dialect.set_fillfactor(value);
+                    dialect.set_fillfactor(value)?;
                 }
                 (_, Lit::Str(lit)) => {
                     let value = lit.value();
                     if name == "engine" {
-                        DialectTableOptions::set_string(&mut dialect.first, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.first, &name, value)?;
                     } else if name == "charset" || name == "storage" || name == "filegroup" {
-                        DialectTableOptions::set_string(&mut dialect.second, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.second, &name, value)?;
                     } else if name == "collation" || name == "order_by" {
-                        DialectTableOptions::set_string(&mut dialect.third, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.third, &name, value)?;
                     } else if name == "partition_by" {
-                        DialectTableOptions::set_string(&mut dialect.fourth, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.fourth, &name, value)?;
                     } else if name == "ttl" {
-                        DialectTableOptions::set_string(&mut dialect.fifth, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.fifth, &name, value)?;
                     } else if name == "settings" {
-                        DialectTableOptions::set_string(&mut dialect.sixth, &name, value);
+                        DialectTableOptions::set_string(&mut dialect.sixth, &name, value)?;
                     } else {
                         return Err(syn::Error::new(
                             meta.path.span(),
@@ -4136,12 +4296,11 @@ fn extract_table_options(
                 }
             }
             Ok(())
-        })
-        .expect("Failed to parse dialect table options");
+        })?;
     }
 
     if options.is_empty() {
-        return (quote! { None }, quote! {});
+        return Ok((quote! { None }, quote! {}));
     }
 
     let mysql = if options.mysql.is_empty() {
@@ -4239,110 +4398,74 @@ fn extract_table_options(
         }
         #warning_ident!();
     };
-    (table_options.clone(), warning_item)
+    Ok((table_options.clone(), warning_item))
 }
 
-fn extract_table_name(input: &DeriveInput) -> String {
-    // 查找 #[table = "name"] 或 #[table(schema = "...", name = "...")] 属性
+fn extract_table_name(input: &DeriveInput) -> syn::Result<String> {
+    // 查找 #[table = "name"] 或 #[table(schema = "...", name = "...")] 属性；
+    // 形态不完整（裸 #[table]、非字符串值、缺 name=）时直接报编译错误，
+    // 不再静默回退到默认表名
     for attr in &input.attrs {
         if attr.path().is_ident("table") {
-            if let Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr) = &meta.value {
-                    if let Lit::Str(lit) = &expr.lit {
-                        return lit.value();
+            match &attr.meta {
+                Meta::NameValue(meta) => {
+                    if let syn::Expr::Lit(expr) = &meta.value
+                        && let Lit::Str(lit) = &expr.lit
+                    {
+                        return Ok(lit.value());
                     }
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[table] must use #[table = \"name\"] or #[table(name = \"...\")]",
+                    ));
                 }
-            }
-            if matches!(&attr.meta, Meta::List(_)) {
-                let mut schema = None;
-                let mut name = None;
-                attr.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("schema") {
-                        let value = meta.value()?;
-                        let lit: syn::LitStr = value.parse()?;
-                        schema = Some(lit.value());
-                        Ok(())
-                    } else if meta.path.is_ident("name") {
-                        let value = meta.value()?;
-                        let lit: syn::LitStr = value.parse()?;
-                        name = Some(lit.value());
-                        Ok(())
-                    } else {
-                        Err(meta.error("unsupported #[table] argument"))
-                    }
-                })
-                .expect("Failed to parse #[table] attribute");
+                Meta::List(_) => {
+                    let mut schema = None;
+                    let mut name = None;
+                    attr.parse_nested_meta(|meta| {
+                        if meta.path.is_ident("schema") {
+                            let value = meta.value()?;
+                            let lit: syn::LitStr = value.parse()?;
+                            schema = Some(lit.value());
+                            Ok(())
+                        } else if meta.path.is_ident("name") {
+                            let value = meta.value()?;
+                            let lit: syn::LitStr = value.parse()?;
+                            name = Some(lit.value());
+                            Ok(())
+                        } else {
+                            Err(meta.error("unsupported #[table] argument"))
+                        }
+                    })?;
 
-                if let Some(name) = name {
-                    return if let Some(schema) = schema {
-                        format!("{schema}.{name}")
-                    } else {
-                        name
-                    };
+                    if let Some(name) = name {
+                        return Ok(if let Some(schema) = schema {
+                            format!("{schema}.{name}")
+                        } else {
+                            name
+                        });
+                    }
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[table(...)] requires name = \"...\"",
+                    ));
+                }
+                Meta::Path(_) => {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[table] must use #[table = \"name\"] or #[table(name = \"...\")]",
+                    ));
                 }
             }
         }
     }
 
     // 默认使用结构体名的蛇形形式
-    to_snake_case(&input.ident.to_string())
+    Ok(to_snake_case(&input.ident.to_string()))
 }
 
-fn extract_column_name(field: &syn::Field) -> String {
-    let default_name = field.ident.as_ref().unwrap().to_string();
-
-    for attr in &field.attrs {
-        if attr.path().is_ident("column") {
-            if let Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr) = &meta.value
-                    && let Lit::Str(lit) = &expr.lit
-                {
-                    return lit.value();
-                }
-            }
-
-            if let Meta::List(list) = &attr.meta {
-                if let Ok(lit) = syn::parse2::<syn::LitStr>(list.tokens.clone()) {
-                    return lit.value();
-                }
-
-                let mut name = None;
-                attr.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("name") {
-                        let value = meta.value()?;
-                        let lit: syn::LitStr = value.parse()?;
-                        name = Some(lit.value());
-                        Ok(())
-                    } else {
-                        Err(meta.error("unsupported #[column] argument"))
-                    }
-                })
-                .expect("Failed to parse #[column] attribute");
-
-                if let Some(name) = name {
-                    return name;
-                }
-            }
-        }
-    }
-
-    default_name
-}
-
-fn to_snake_case(s: &str) -> String {
-    let mut result = String::new();
-    for (i, c) in s.chars().enumerate() {
-        if c.is_uppercase() {
-            if i > 0 {
-                result.push('_');
-            }
-            result.push(c.to_lowercase().next().unwrap());
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
+// extract_column_name / to_snake_case / normalize_type_string /
+// option_inner_type / is_string_type 统一使用 crate::shared 中的实现
 
 #[derive(Default)]
 struct UniqueAttr {
@@ -4351,36 +4474,44 @@ struct UniqueAttr {
 }
 
 /// 提取 unique 属性。
-fn extract_unique_attr(field: &syn::Field) -> UniqueAttr {
+fn extract_unique_attr(field: &syn::Field) -> syn::Result<UniqueAttr> {
     for attr in &field.attrs {
         if attr.path().is_ident("unique") {
             let mut unique = UniqueAttr {
                 group: Some(0),
                 name: None,
             };
-            if let Meta::List(list) = &attr.meta {
-                let _ = list;
-                attr.parse_nested_meta(|meta| {
-                    if meta.path.is_ident("group") {
-                        let value = meta.value()?;
-                        let lit: syn::LitInt = value.parse()?;
-                        unique.group = Some(lit.base10_parse::<i32>()?);
-                        Ok(())
-                    } else if meta.path.is_ident("name") {
-                        let value = meta.value()?;
-                        let lit: syn::LitStr = value.parse()?;
-                        unique.name = Some(lit.value());
-                        Ok(())
-                    } else {
-                        Err(meta.error("unsupported #[unique] argument"))
-                    }
-                })
-                .expect("Failed to parse #[unique] attribute");
+            match &attr.meta {
+                Meta::List(_) => {
+                    attr.parse_nested_meta(|meta| {
+                        if meta.path.is_ident("group") {
+                            let value = meta.value()?;
+                            let lit: syn::LitInt = value.parse()?;
+                            unique.group = Some(lit.base10_parse::<i32>()?);
+                            Ok(())
+                        } else if meta.path.is_ident("name") {
+                            let value = meta.value()?;
+                            let lit: syn::LitStr = value.parse()?;
+                            unique.name = Some(lit.value());
+                            Ok(())
+                        } else {
+                            Err(meta.error("unsupported #[unique] argument"))
+                        }
+                    })?;
+                }
+                Meta::Path(_) => {}
+                // `#[unique = "..."]` 会静默丢掉名字参数，必须在派生期拒绝
+                Meta::NameValue(_) => {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[unique] must use #[unique] or #[unique(group = ..., name = ...)]",
+                    ));
+                }
             }
-            return unique;
+            return Ok(unique);
         }
     }
-    UniqueAttr::default()
+    Ok(UniqueAttr::default())
 }
 
 #[derive(Default)]
@@ -4394,7 +4525,7 @@ struct IndexAttr {
     columns: Option<String>,
 }
 
-fn extract_index_attr(field: &syn::Field) -> Option<IndexAttr> {
+fn extract_index_attr(field: &syn::Field) -> syn::Result<Option<IndexAttr>> {
     for attr in &field.attrs {
         if attr.path().is_ident("index") {
             let mut index = IndexAttr::default();
@@ -4438,13 +4569,12 @@ fn extract_index_attr(field: &syn::Field) -> Option<IndexAttr> {
                     } else {
                         Err(meta.error("unsupported #[index] argument"))
                     }
-                })
-                .expect("Failed to parse #[index] attribute");
+                })?;
             }
-            return Some(index);
+            return Ok(Some(index));
         }
     }
-    None
+    Ok(None)
 }
 
 fn option_i32_tokens(value: Option<i32>) -> proc_macro2::TokenStream {
@@ -4524,15 +4654,15 @@ fn is_builtin_non_db_value_type(ty: &syn::Type) -> bool {
     }
 }
 
-fn validate_data_type(field: &syn::Field, data_type: Option<&syn::Type>) {
+fn validate_data_type(field: &syn::Field, data_type: Option<&syn::Type>) -> syn::Result<()> {
     let Some(data_type) = data_type else {
-        return;
+        return Ok(());
     };
 
     let field_is_optional = option_inner_type(&field.ty).is_some();
     let data_type_is_optional = option_inner_type(data_type).is_some();
     if field_is_optional == data_type_is_optional {
-        return;
+        return Ok(());
     }
 
     let field_name = field
@@ -4542,29 +4672,43 @@ fn validate_data_type(field: &syn::Field, data_type: Option<&syn::Type>) {
         .unwrap_or_else(|| "<unnamed>".to_string());
 
     if field_is_optional {
-        panic!(
-            "field `{field_name}` is nullable, so its database type must use \
-             #[data_type(Option<...>)]"
-        );
+        return Err(syn::Error::new_spanned(
+            field,
+            format!(
+                "field `{field_name}` is nullable, so its database type must use \
+                 #[data_type(Option<...>)]"
+            ),
+        ));
     }
 
-    panic!(
-        "field `{field_name}` is not nullable, so its database type must not use \
-         #[data_type(Option<...>)]"
-    );
+    Err(syn::Error::new_spanned(
+        field,
+        format!(
+            "field `{field_name}` is not nullable, so its database type must not use \
+             #[data_type(Option<...>)]"
+        ),
+    ))
 }
 
-fn extract_data_type_type(field: &syn::Field) -> Option<syn::Type> {
+fn extract_data_type_type(field: &syn::Field) -> syn::Result<Option<syn::Type>> {
     for attr in &field.attrs {
         if attr.path().is_ident("data_type") {
-            if let Meta::List(list) = &attr.meta {
-                if let Ok(data_type) = syn::parse2::<syn::Type>(list.tokens.clone()) {
-                    return Some(data_type);
-                }
-            }
+            return match &attr.meta {
+                Meta::List(list) => syn::parse2::<syn::Type>(list.tokens.clone())
+                    .map(Some)
+                    .map_err(|_| {
+                        syn::Error::new_spanned(attr, "#[data_type] type is invalid")
+                    }),
+                // `#[data_type = "INT"]` / 裸 `#[data_type]` 此前被静默当作
+                // 未声明处理，必须在派生期拒绝
+                Meta::NameValue(_) | Meta::Path(_) => Err(syn::Error::new_spanned(
+                    attr,
+                    "#[data_type] must use #[data_type(Type)]",
+                )),
+            };
         }
     }
-    None
+    Ok(None)
 }
 
 fn is_i32_type(ty: &syn::Type) -> bool {
@@ -4581,18 +4725,6 @@ fn is_i32_type(ty: &syn::Type) -> bool {
 
 fn is_uuid_type(type_name: &str) -> bool {
     matches!(type_name, "Uuid" | "uuid::Uuid")
-}
-
-fn is_string_type(ty: &syn::Type) -> bool {
-    match ty {
-        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
-            .path
-            .segments
-            .last()
-            .map(|segment| segment.ident == "String")
-            .unwrap_or(false),
-        _ => false,
-    }
 }
 
 fn is_vec_i32_type(ty: &syn::Type) -> bool {
@@ -4632,29 +4764,6 @@ fn should_use_data_type_newtype_fallback(ty: &syn::Type) -> bool {
             type_path.path.segments.len() > 1 && !is_builtin_non_db_value_type(ty)
         }
         _ => false,
-    }
-}
-
-fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
-    match ty {
-        syn::Type::Path(type_path) if type_path.qself.is_none() => {
-            let segment = type_path.path.segments.last()?;
-            if segment.ident != "Option" {
-                return None;
-            }
-
-            match &segment.arguments {
-                syn::PathArguments::AngleBracketed(args) => args.args.first().and_then(|arg| {
-                    if let syn::GenericArgument::Type(inner) = arg {
-                        Some(inner)
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
-            }
-        }
-        _ => None,
     }
 }
 
@@ -4769,6 +4878,8 @@ fn field_to_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
             }
         }
     } else if info.has_vec_i32_data_type {
+        // 该函数在多处喂给 quote! 的 map 闭包内调用，无法向上传播 syn::Result，
+        // 校验类 panic 保留（Vec<i32> 的 data_type 配了非 Vec 字段属于声明错误）
         let Some(_) = vec_inner_type(field_type) else {
             panic!("#[data_type(Vec<i32>)] requires a Vec<T> field");
         };
@@ -4842,6 +4953,7 @@ fn field_assign_value_expr(info: &FieldInfo<'_>) -> proc_macro2::TokenStream {
             }
         }
     } else if info.has_vec_i32_data_type {
+        // 同上：quote! 生成路径内的校验类 panic 保留
         let inner_type =
             vec_inner_type(field_type).expect("#[data_type(Vec<i32>)] requires a Vec<T> field");
         quote! {
@@ -4924,6 +5036,7 @@ fn field_from_vec_i32_expr(
 ) -> proc_macro2::TokenStream {
     let field_name = field.ident.as_ref().unwrap();
     let field_type = &field.ty;
+    // 同上：quote! 生成路径内的校验类 panic 保留
     let inner_type =
         vec_inner_type(field_type).expect("#[data_type(Vec<i32>)] requires a Vec<T> field");
 
@@ -4975,7 +5088,9 @@ mod view_model_tests {
 
         let tokens = derive_view_model(input).to_string();
 
-        assert!(tokens.contains("impl :: ormer :: ViewModel for ViewUser"));
+        // ViewModel 通过 ormer 侧的 blanket impl `impl<T: Model> ViewModel for T` 提供，
+        // 派生只生成一份 `impl Model`，不再输出重复的 `impl ViewModel`。
+        assert!(!tokens.contains("impl :: ormer :: ViewModel for ViewUser"));
         assert!(tokens.contains("impl :: ormer :: Model for ViewUser"));
         assert!(!tokens.contains("impl :: ormer :: WritableModel for ViewUser"));
         assert!(tokens.contains("type Update = ()"));
@@ -4992,52 +5107,61 @@ struct HypertableAttr {
     space_count: Option<u16>,
 }
 
-fn hypertable_space_info_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::TokenStream {
+fn hypertable_space_info_method(field_infos: &[FieldInfo<'_>]) -> syn::Result<proc_macro2::TokenStream> {
     let space_fields = field_infos
         .iter()
         .filter(|info| info.hypertable_space_count.is_some())
         .collect::<Vec<_>>();
     if space_fields.len() > 1 {
-        panic!("only one field can use #[hypertable_space] per model");
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "only one field can use #[hypertable_space] per model",
+        ));
     }
 
     if let Some(info) = space_fields.first() {
         let key = info.column_name.as_str();
-        let partitions = info.hypertable_space_count.expect("space partition count");
-        quote! {
+        // 过滤条件保证 space_count 必然存在
+        let partitions = info
+            .hypertable_space_count
+            .expect("space partition count");
+        Ok(quote! {
             fn hypertable_space_info() -> Option<(&'static str, u16)> {
                 Some((#key, #partitions))
             }
-        }
+        })
     } else {
-        quote! {}
+        Ok(quote! {})
     }
 }
 
-fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> proc_macro2::TokenStream {
+fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> syn::Result<proc_macro2::TokenStream> {
     let route_fields = field_infos
         .iter()
         .filter(|info| info.hypertable_route)
         .collect::<Vec<_>>();
     if route_fields.len() > 1 {
-        panic!("only one String field can use bare #[hypertable] per model");
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "only one String field can use bare #[hypertable] per model",
+        ));
     }
 
     if let Some(info) = route_fields.first() {
         let key = info.column_name.as_str();
-        quote! {
+        Ok(quote! {
             fn hypertable_route_key() -> Option<&'static str> {
                 Some(#key)
             }
-        }
+        })
     } else {
-        quote! {}
+        Ok(quote! {})
     }
 }
 
-fn validate_hypertable_space_field(field: &syn::Field, field_type: &syn::Type) {
+fn validate_hypertable_space_field(field: &syn::Field, field_type: &syn::Type) -> syn::Result<()> {
     if is_string_type(field_type) {
-        return;
+        return Ok(());
     }
 
     let field_name = field
@@ -5045,68 +5169,80 @@ fn validate_hypertable_space_field(field: &syn::Field, field_type: &syn::Type) {
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| "<unnamed>".to_string());
-    panic!("bare #[hypertable] requires field `{field_name}` to be String");
+    Err(syn::Error::new_spanned(
+        field,
+        format!("bare #[hypertable] requires field `{field_name}` to be String"),
+    ))
 }
 
 /// 提取 hypertable 属性信息。
 /// 支持语法：
 /// - #[hypertable(Duration::from_hours(1))]：TimescaleDB 时间分片时长
 /// - #[hypertable]：TimescaleDB 空间分区，默认 4 个分区
-fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> HypertableAttr {
+fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> syn::Result<HypertableAttr> {
     for attr in &field.attrs {
         if attr.path().is_ident("hypertable") {
-            match &attr.meta {
+            return match &attr.meta {
                 Meta::List(list) if !list.tokens.is_empty() => {
                     let tokens = &list.tokens;
-                    return HypertableAttr {
+                    Ok(HypertableAttr {
                         duration: quote! { Some(#tokens) },
                         is_time: true,
                         route: false,
                         space: quote! { None },
                         space_count: None,
-                    };
+                    })
                 }
                 Meta::Path(_) => {
-                    validate_hypertable_space_field(field, field_type);
-                    return HypertableAttr {
+                    validate_hypertable_space_field(field, field_type)?;
+                    Ok(HypertableAttr {
                         duration: quote! { None },
                         is_time: false,
                         route: false,
                         space: quote! { Some(4_u16) },
                         space_count: Some(4),
-                    };
+                    })
                 }
-                Meta::List(_) => {
-                    panic!("#[hypertable(...)] requires a std::time::Duration");
-                }
-                _ => panic!("#[hypertable] must use #[hypertable] or #[hypertable(...)]"),
-            }
+                Meta::List(_) => Err(syn::Error::new_spanned(
+                    attr,
+                    "#[hypertable(...)] requires a std::time::Duration",
+                )),
+                Meta::NameValue(_) => Err(syn::Error::new_spanned(
+                    attr,
+                    "#[hypertable] must use #[hypertable] or #[hypertable(...)]",
+                )),
+            };
         }
     }
-    HypertableAttr {
+    Ok(HypertableAttr {
         duration: quote! { None },
         is_time: false,
         route: false,
         space: quote! { None },
         space_count: None,
-    }
+    })
 }
 
 /// 提取 foreign 属性的外键信息
 /// 支持两种语法：
 /// - #[foreign(Type)] - 新语法，自动关联到目标 model 的主键
 /// - #[foreign(Type.field)] - 旧语法，显式指定字段
-fn extract_default(field: &syn::Field) -> proc_macro2::TokenStream {
+fn extract_default(field: &syn::Field) -> syn::Result<proc_macro2::TokenStream> {
     for attr in &field.attrs {
         if !attr.path().is_ident("default") {
             continue;
         }
 
         let Meta::List(list) = &attr.meta else {
-            panic!("#[default] must use #[default(...)]");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[default] must use #[default(...)]",
+            ));
         };
 
         let mut expression = None;
+        // 裸字面量（#[default("now()")] 等）解析不了 nested meta，这里的解析错误
+        // 必须吞掉，走下面的字面量分支
         let _ = attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("expr") {
                 let value = meta.value()?;
@@ -5119,49 +5255,57 @@ fn extract_default(field: &syn::Field) -> proc_macro2::TokenStream {
         });
 
         if let Some(expression) = expression {
-            return quote! {
+            return Ok(quote! {
                 Some(::ormer::model::ColumnDefault::Expression(#expression))
-            };
+            });
         }
 
         match syn::parse2::<Lit>(list.tokens.clone()) {
             Ok(Lit::Str(value)) => {
                 let value = value.value();
-                return quote! {
+                return Ok(quote! {
                     Some(::ormer::model::ColumnDefault::String(#value))
-                };
+                });
             }
             Ok(Lit::Int(value)) => {
                 let value = value.to_string();
-                return quote! {
+                return Ok(quote! {
                     Some(::ormer::model::ColumnDefault::Number(#value))
-                };
+                });
             }
             Ok(Lit::Float(value)) => {
                 let value = value.to_string();
-                return quote! {
+                return Ok(quote! {
                     Some(::ormer::model::ColumnDefault::Number(#value))
-                };
+                });
             }
             Ok(Lit::Bool(value)) => {
-                return quote! {
+                return Ok(quote! {
                     Some(::ormer::model::ColumnDefault::Boolean(#value))
-                };
+                });
             }
-            _ => panic!("#[default] supports string, number, bool, or expr = \"...\""),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[default] supports string, number, bool, or expr = \"...\"",
+                ))
+            }
         }
     }
-    quote! { None }
+    Ok(quote! { None })
 }
 
-fn extract_check(field: &syn::Field) -> proc_macro2::TokenStream {
+fn extract_check(field: &syn::Field) -> syn::Result<proc_macro2::TokenStream> {
     for attr in &field.attrs {
         if !attr.path().is_ident("check") {
             continue;
         }
 
         if !matches!(&attr.meta, Meta::List(_)) {
-            panic!("#[check] must use #[check(expr = \"...\")]");
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[check] must use #[check(expr = \"...\")]",
+            ));
         }
 
         let mut expr = None;
@@ -5180,141 +5324,162 @@ fn extract_check(field: &syn::Field) -> proc_macro2::TokenStream {
             } else {
                 Err(meta.error("unsupported #[check] argument"))
             }
-        })
-        .expect("Failed to parse #[check] attribute");
+        })?;
 
-        let expr = expr.expect("#[check] requires expr = \"...\"");
+        let expr = expr.ok_or_else(|| {
+            syn::Error::new_spanned(attr, "#[check] requires expr = \"...\"")
+        })?;
         let name = option_string_tokens(name.as_deref());
-        return quote! {
+        return Ok(quote! {
             Some(::ormer::model::CheckConstraint {
                 name: #name,
                 expr: #expr,
             })
-        };
+        });
     }
-    quote! { None }
+    Ok(quote! { None })
 }
 
 fn normalize_type_path(value: &str) -> String {
     value.split_whitespace().collect::<String>()
 }
 
-fn foreign_action_tokens(value: &str) -> proc_macro2::TokenStream {
+fn foreign_action_tokens(value: &str) -> syn::Result<proc_macro2::TokenStream> {
     let normalized = value
         .trim()
         .trim_matches('"')
         .to_ascii_lowercase()
         .replace('_', "");
     match normalized.as_str() {
-        "noaction" => quote! { ::ormer::model::ForeignKeyAction::NoAction },
-        "restrict" => quote! { ::ormer::model::ForeignKeyAction::Restrict },
-        "cascade" => quote! { ::ormer::model::ForeignKeyAction::Cascade },
-        "setnull" => quote! { ::ormer::model::ForeignKeyAction::SetNull },
-        "setdefault" => quote! { ::ormer::model::ForeignKeyAction::SetDefault },
-        _ => panic!("unsupported foreign-key action: {value}"),
+        "noaction" => Ok(quote! { ::ormer::model::ForeignKeyAction::NoAction }),
+        "restrict" => Ok(quote! { ::ormer::model::ForeignKeyAction::Restrict }),
+        "cascade" => Ok(quote! { ::ormer::model::ForeignKeyAction::Cascade }),
+        "setnull" => Ok(quote! { ::ormer::model::ForeignKeyAction::SetNull }),
+        "setdefault" => Ok(quote! { ::ormer::model::ForeignKeyAction::SetDefault }),
+        _ => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            format!("unsupported foreign-key action: {value}"),
+        )),
     }
 }
 
-fn extract_foreign_key(field: &syn::Field) -> proc_macro2::TokenStream {
+fn extract_foreign_key(field: &syn::Field) -> syn::Result<proc_macro2::TokenStream> {
     for attr in &field.attrs {
         if attr.path().is_ident("foreign") {
-            if let Meta::List(list) = &attr.meta {
-                let tokens = list.tokens.to_string();
-                let parts: Vec<&str> = tokens.split(',').collect();
-                let target = parts
-                    .first()
-                    .map(|part| part.trim())
-                    .filter(|part| !part.is_empty())
-                    .expect("#[foreign] requires a target model");
-                let target = normalize_type_path(target);
-                let (ref_type, ref_field) =
-                    if let Some((ref_type, ref_field)) = target.split_once('.') {
-                        (ref_type.to_string(), Some(ref_field.to_string()))
-                    } else {
-                        (target, None)
-                    };
-                let ref_type: syn::Type =
-                    syn::parse_str(&ref_type).expect("#[foreign] target model is invalid");
+            // 裸 #[foreign] / #[foreign = "..."] 此前被静默当作无外键处理，
+            // 必须在派生期拒绝
+            let Meta::List(list) = &attr.meta else {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "#[foreign] must use #[foreign(Type)] or #[foreign(Type.field)]",
+                ));
+            };
+            let tokens = list.tokens.to_string();
+            let parts: Vec<&str> = tokens.split(',').collect();
+            let target = parts
+                .first()
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .ok_or_else(|| {
+                    syn::Error::new_spanned(attr, "#[foreign] requires a target model")
+                })?;
+            let target = normalize_type_path(target);
+            let (ref_type, ref_field) =
+                if let Some((ref_type, ref_field)) = target.split_once('.') {
+                    (ref_type.to_string(), Some(ref_field.to_string()))
+                } else {
+                    (target, None)
+                };
+            let ref_type: syn::Type = syn::parse_str(&ref_type)
+                .map_err(|_| syn::Error::new_spanned(attr, "#[foreign] target model is invalid"))?;
 
-                let mut constraint_name = None;
-                let mut on_delete = None;
-                let mut on_update = None;
-                for part in parts.into_iter().skip(1) {
-                    let Some((key, value)) = part.split_once('=') else {
-                        panic!("#[foreign] options must use key = value");
-                    };
-                    match key.trim() {
-                        "name" => {
-                            constraint_name = Some(value.trim().trim_matches('"').to_string());
-                        }
-                        "on_delete" => on_delete = Some(foreign_action_tokens(value)),
-                        "on_update" => on_update = Some(foreign_action_tokens(value)),
-                        other => panic!("unsupported #[foreign] option: {other}"),
+            let mut constraint_name = None;
+            let mut on_delete = None;
+            let mut on_update = None;
+            for part in parts.into_iter().skip(1) {
+                let Some((key, value)) = part.split_once('=') else {
+                    return Err(syn::Error::new_spanned(
+                        attr,
+                        "#[foreign] options must use key = value",
+                    ));
+                };
+                match key.trim() {
+                    "name" => {
+                        constraint_name = Some(value.trim().trim_matches('"').to_string());
+                    }
+                    "on_delete" => on_delete = Some(foreign_action_tokens(value)?),
+                    "on_update" => on_update = Some(foreign_action_tokens(value)?),
+                    other => {
+                        return Err(syn::Error::new(
+                            proc_macro2::Span::call_site(),
+                            format!("unsupported #[foreign] option: {other}"),
+                        ))
                     }
                 }
+            }
 
-                let constraint_name = option_string_tokens(constraint_name.as_deref());
-                let on_delete = on_delete
-                    .map(|action| quote! { Some(#action) })
-                    .unwrap_or_else(|| quote! { None });
-                let on_update = on_update
-                    .map(|action| quote! { Some(#action) })
-                    .unwrap_or_else(|| quote! { None });
-                let field_name = field.ident.as_ref().unwrap().to_string();
-                let ref_type_name = normalize_type_path(&quote! { #ref_type }.to_string())
-                    .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
-                let ref_fn_name = syn::Ident::new(
-                    &format!("__ormer_fk_{field_name}_{ref_type_name}"),
-                    proc_macro2::Span::call_site(),
-                );
+            let constraint_name = option_string_tokens(constraint_name.as_deref());
+            let on_delete = on_delete
+                .map(|action| quote! { Some(#action) })
+                .unwrap_or_else(|| quote! { None });
+            let on_update = on_update
+                .map(|action| quote! { Some(#action) })
+                .unwrap_or_else(|| quote! { None });
+            let field_name = field.ident.as_ref().unwrap().to_string();
+            let ref_type_name = normalize_type_path(&quote! { #ref_type }.to_string())
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "_");
+            let ref_fn_name = syn::Ident::new(
+                &format!("__ormer_fk_{field_name}_{ref_type_name}"),
+                proc_macro2::Span::call_site(),
+            );
 
-                if let Some(ref_field) = ref_field {
-                    return quote! {
-                        {
-                            fn #ref_fn_name() -> &'static str {
-                                <#ref_type as ::ormer::Model>::column_name_for_field(#ref_field)
-                                    .unwrap_or(#ref_field)
-                            }
-                            Some(::ormer::model::ForeignKeyInfo {
-                                name: #constraint_name,
-                                ref_table: <#ref_type as ::ormer::Model>::TABLE_NAME,
-                                ref_column: #ref_field,
-                                ref_column_fn: Some(#ref_fn_name),
-                                on_delete: #on_delete,
-                                on_update: #on_update,
-                            })
-                        }
-                    };
-                }
-
-                return quote! {
+            if let Some(ref_field) = ref_field {
+                return Ok(quote! {
                     {
                         fn #ref_fn_name() -> &'static str {
-                            <#ref_type as ::ormer::Model>::primary_key_columns()[0]
+                            <#ref_type as ::ormer::Model>::column_name_for_field(#ref_field)
+                                .unwrap_or(#ref_field)
                         }
                         Some(::ormer::model::ForeignKeyInfo {
                             name: #constraint_name,
                             ref_table: <#ref_type as ::ormer::Model>::TABLE_NAME,
-                            ref_column: "",
+                            ref_column: #ref_field,
                             ref_column_fn: Some(#ref_fn_name),
                             on_delete: #on_delete,
                             on_update: #on_update,
                         })
                     }
-                };
+                });
             }
+
+            return Ok(quote! {
+                {
+                    fn #ref_fn_name() -> &'static str {
+                        <#ref_type as ::ormer::Model>::primary_key_columns()[0]
+                    }
+                    Some(::ormer::model::ForeignKeyInfo {
+                        name: #constraint_name,
+                        ref_table: <#ref_type as ::ormer::Model>::TABLE_NAME,
+                        ref_column: "",
+                        ref_column_fn: Some(#ref_fn_name),
+                        on_delete: #on_delete,
+                        on_update: #on_update,
+                    })
+                }
+            });
         }
     }
     // 没有 foreign 属性
-    quote! { None }
+    Ok(quote! { None })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // 校验失败统一展开为 compile_error!，断言错误文本出现在产物中
+
     #[test]
-    #[should_panic(expected = "field `optional_status` is nullable")]
     fn rejects_non_nullable_data_type_for_option_field() {
         let input: DeriveInput = syn::parse_quote! {
             struct InvalidModel {
@@ -5324,11 +5489,14 @@ mod tests {
                 optional_status: Option<i32>,
             }
         };
-        derive_model(input);
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("field `optional_status` is nullable"),
+            "{tokens}"
+        );
     }
 
     #[test]
-    #[should_panic(expected = "field `status` is not nullable")]
     fn rejects_nullable_data_type_for_non_option_field() {
         let input: DeriveInput = syn::parse_quote! {
             struct InvalidModel {
@@ -5338,14 +5506,123 @@ mod tests {
                 status: i32,
             }
         };
-        derive_model(input);
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("field `status` is not nullable"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_embed_without_prefix() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct InvalidEmbedModel {
+                #[primary]
+                id: i32,
+                #[embed]
+                address: std::collections::HashMap<String, String>,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("#[embed] requires a non-empty prefix"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_embed_prefix() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct InvalidEmbedModel {
+                #[primary]
+                id: i32,
+                #[embed(prefix = "")]
+                address: std::collections::HashMap<String, String>,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("#[embed] requires a non-empty prefix"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_auto_on_non_first_composite_primary_key() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct CompositeModel {
+                #[primary]
+                tenant_id: i32,
+                #[primary(auto)]
+                id: i32,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("#[primary(auto)] is only allowed on the first primary key field"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn json_proxy_uses_renamed_column() {
+        let input: DeriveInput = syn::parse_quote! {
+            struct JsonModel {
+                #[primary]
+                id: i32,
+                #[column(name = "payload")]
+                #[field(settings.active: bool)]
+                data: serde_json::Value,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        // #[column] 重命名后的列名必须进入 JSON 代理表达式，而不是字段名 data
+        assert!(
+            tokens.contains("StaticJsonExpr :: new (\"payload\""),
+            "expected renamed column in JSON proxy, got: {tokens}"
+        );
+        assert!(
+            !tokens.contains("StaticJsonExpr :: new (\"data\""),
+            "JSON proxy must not fall back to the field name: {tokens}"
+        );
+    }
+
+    #[test]
+    fn tuple_wrapper_delegates_table_options_and_dynamic_columns() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[table = "wrapped_users"]
+            struct WrappedUser(User);
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains(
+                "const TABLE_OPTIONS : Option < :: ormer :: model :: TableOptions > = \
+                 < User as :: ormer :: Model > :: TABLE_OPTIONS"
+            ),
+            "wrapper must delegate TABLE_OPTIONS to the inner model: {tokens}"
+        );
+        assert!(
+            tokens.contains("fn table_options () -> Option < :: ormer :: model :: TableOptions >"),
+            "{tokens}"
+        );
+        assert!(
+            tokens.contains("fn columns () -> Vec < & 'static str > { < User as :: ormer :: Model > :: columns ()"),
+            "wrapper must delegate dynamic columns to the inner model: {tokens}"
+        );
+        assert!(
+            tokens.contains(
+                "fn column_schema () -> Vec < :: ormer :: model :: ColumnSchema > { \
+                 < User as :: ormer :: Model > :: column_schema ()"
+            ),
+            "{tokens}"
+        );
     }
 
     #[test]
     fn unwraps_nullable_data_type_for_backend_mapping() {
         let field: syn::Field =
             syn::parse_quote! { #[data_type(Option<i32>)] optional_status: Option<i32> };
-        let info = FieldInfo::new(&field);
+        let info = FieldInfo::new(&field).expect("valid field");
         assert!(info.has_i32_data_type);
 
         let effective_type = info

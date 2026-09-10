@@ -10,7 +10,6 @@
 pub mod _test_common;
 
 use _test_common::create_db_connection;
-use ormer::model::Model;
 
 define_test_user!(CountUserA, "fix_count_a_users");
 define_test_role!(CountRoleA, "fix_count_a_roles");

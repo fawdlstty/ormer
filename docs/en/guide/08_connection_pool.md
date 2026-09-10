@@ -61,6 +61,20 @@ let reader = pool.read().get().await?;
 let users: Vec<User> = reader.select::<User>().collect().await?;
 ```
 
+Database-level splitting uses `Database::replicated`: read connections are handed out round-robin, while `write()` / `scope()` / `transaction()` always target the primary:
+
+```rust
+let db = Database::replicated(DbType::PostgreSQL)
+    .write("postgresql://user:pass@primary/dbname")
+    .read("postgresql://user:pass@replica1/dbname")
+    .read("postgresql://user:pass@replica2/dbname")
+    .connect()
+    .await?;
+
+db.write().insert(&user).execute().await?;
+let users: Vec<User> = db.read().select::<User>().collect().await?;
+```
+
 ### Auto Management
 
 ```rust

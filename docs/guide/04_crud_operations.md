@@ -19,7 +19,7 @@ db.insert(&User {
 
 ### 插入并返回 (RETURNING)
 
-插入后返回所有插入的行数据（支持 PostgreSQL、SQLite、MSSQL）：
+插入后返回所有插入的行数据（支持 PostgreSQL、SQLite、MSSQL、DuckDB）：
 
 ```rust
 let users: Vec<User> = db.insert(&vec![user1, user2]).returning().await?;
@@ -44,9 +44,8 @@ db.insert(&[user1, user2])
 
 大批量插入会按后端参数上限自动拆批；PostgreSQL 在无冲突处理、无自增键返回且值类型可安全序列化时会自动使用 `COPY FROM STDIN`。
 
-### 
-
 > 批量插入返回的自增 id 不可靠：MySQL 取最后一条语句的 `last_insert_id`、SQLite 取 `last_insert_rowid`、PostgreSQL 取 RETURNING 首行。只有单行插入的返回值有意义；批量场景请改用 `RETURNING`（PostgreSQL/SQLite）或逐条插入。
+
 ### 部分插入和表单模型
 
 `insert_partial::<User>()` 只写入通过 `set` 指定的列；`default` 表示 INSERT 时省略该列以使用数据库默认值：

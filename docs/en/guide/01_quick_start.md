@@ -9,10 +9,14 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 **Database Features:**
-- `Sqlite` - Sqlite/libSQL/SQLite
+- `sqlite` - Sqlite/libSQL/SQLite
 - `postgresql` - PostgreSQL
+- `questdb` - QuestDB (PostgreSQL wire protocol)
 - `mysql` - MySQL
 - `mssql` - Microsoft SQL Server
+- `duckdb` - DuckDB
+- `clickhouse` - ClickHouse
+- `influxdb` - InfluxDB
 
 ## Complete Example
 

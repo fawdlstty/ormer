@@ -11,7 +11,7 @@ use crate::model::{
     quote_qualified_identifier, split_schema_table_name,
 };
 use crate::query::builder::{
-    FourTableSelect, GroupedSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect,
+    FourTableSelect, InnerJoinedSelect, LeftJoinedSelect, MultiTableSelect, ProjectionSelect,
     RelatedSelect, RightJoinedSelect, Select, WhereExpr,
 };
 use crate::query::expr::SqlExpr;
@@ -119,7 +119,13 @@ async fn traced_pg_query(
             trace.finish_ok();
             Ok(rows)
         }
-        Err(error) => Err(trace.finish_external_error("tokio_postgres::Client::query", error)),
+        Err(error) => {
+            // 结构化 SQLSTATE 优先（L10）：trace 包装层拍平成字符串前先提取
+            // code，文本启发式仅兜底
+            let code = error.code().map(|state| state.code().to_string());
+            let error = trace.finish_external_error("tokio_postgres::Client::query", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -135,7 +141,12 @@ async fn traced_pg_execute(
             trace.finish_ok();
             Ok(rows)
         }
-        Err(error) => Err(trace.finish_external_error("tokio_postgres::Client::execute", error)),
+        Err(error) => {
+            // 同上：结构化 SQLSTATE 优先
+            let code = error.code().map(|state| state.code().to_string());
+            let error = trace.finish_external_error("tokio_postgres::Client::execute", error);
+            Err(error.with_driver_code(code))
+        }
     }
 }
 
@@ -265,6 +276,52 @@ pub(crate) fn pg_insert_param_rust_types<T: Model>(
 
 const POSTGRES_COPY_MIN_ROWS: usize = 1024;
 
+/// 有自增列的批量插入语句组：按绑定参数上限分块（列集为不含自增列的
+/// `insert_columns`），每块追加 `RETURNING {pk}` 并推导参数类型；
+/// 行数未超限时仍为单条语句，语句形态与历史行为一致。
+fn pg_auto_increment_returning_batch<M: Model>(
+    refs: &[&M],
+    conflict: Option<&InsertConflict>,
+) -> crate::Result<SqlStatement> {
+    let statements = common_helpers::build_chunked_insert_statements_for_columns::<M>(
+        DbType::PostgreSQL,
+        M::insert_columns().len(),
+        refs,
+        |chunk| {
+            let (sql, params) = common_helpers::build_insert_statement_with_conflict::<M>(
+                DbType::PostgreSQL,
+                chunk,
+                conflict,
+            )?;
+            Ok(common_helpers::InsertSqlStatement {
+                sql,
+                params,
+                row_count: chunk.len(),
+            })
+        },
+    )?;
+    let pk_col = M::COLUMN_SCHEMA
+        .iter()
+        .find(|c| c.is_auto_increment)
+        .map(|c| c.name)
+        .unwrap_or("id");
+
+    Ok(SqlStatement::batch(
+        DbType::PostgreSQL,
+        statements
+            .into_iter()
+            .map(|statement| {
+                let rust_types = pg_insert_param_rust_types::<M>(statement.row_count, conflict);
+                SingleSqlStatement::new(
+                    format!("{} RETURNING {pk_col}", statement.sql),
+                    statement.params,
+                )
+                .with_param_rust_types(rust_types)
+            })
+            .collect(),
+    ))
+}
+
 /// 按实际写入列推导 upsert 语句的参数类型（行数 × 每行列类型）。
 fn pg_upsert_param_rust_types<T: Model>(row_count: usize, columns: &[&str]) -> Vec<&'static str> {
     let per_row: Vec<&'static str> = columns
@@ -281,6 +338,33 @@ fn pg_upsert_param_rust_types<T: Model>(row_count: usize, columns: &[&str]) -> V
         rust_types.extend(per_row.iter().copied());
     }
     rust_types
+}
+
+/// 构建批量 insert-or-ignore 语句组（`ON CONFLICT (pk) DO NOTHING`，按绑定
+/// 参数上限分块）：`Database::insert_or_ignore_batch` 与执行器 to_sql 共用
+/// 同一入口，to_sql 展示与实际执行的语句保持一致。
+fn build_pg_insert_or_ignore_statements<T: Model>(
+    models: &[&T],
+) -> crate::Result<Vec<common_helpers::InsertSqlStatement>> {
+    let columns = T::insert_columns();
+    let primary_key =
+        common_helpers::quote_column_list(DbType::PostgreSQL, &T::primary_key_columns());
+    common_helpers::build_chunked_insert_statements::<T>(DbType::PostgreSQL, models, |chunk| {
+        let (mut sql, params) = common_helpers::build_batch_insert_statement::<T>(
+            DbType::PostgreSQL,
+            "INSERT INTO",
+            T::table_name_for_db(DbType::PostgreSQL),
+            &columns,
+            chunk,
+            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
+        );
+        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
+        Ok(common_helpers::InsertSqlStatement {
+            sql,
+            params,
+            row_count: chunk.len(),
+        })
+    })
 }
 
 fn pg_copy_escape(value: &str) -> String {
@@ -1940,25 +2024,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         }
 
         if common_helpers::auto_increment_column::<I::Model>().is_some() {
-            let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
-                DbType::PostgreSQL,
-                &refs,
-                self.conflict.as_ref(),
-            )?;
-            let rust_types =
-                pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
-            let pk_col = I::Model::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            return Ok(SqlStatement::batch(
-                DbType::PostgreSQL,
-                vec![
-                    SingleSqlStatement::new(format!("{sql} RETURNING {pk_col}"), all_values)
-                        .with_param_rust_types(rust_types),
-                ],
-            ));
+            return pg_auto_increment_returning_batch::<I::Model>(&refs, self.conflict.as_ref());
         }
 
         let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
@@ -2368,30 +2434,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        let columns = I::Model::insert_columns();
-        let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::PostgreSQL,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
-            &columns,
-            &refs,
-            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-        );
-
-        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
-
-        let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
+        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导
+        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&refs)?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
-            vec![SingleSqlStatement::new(sql, all_values).with_param_rust_types(rust_types)],
+            statements
+                .into_iter()
+                .map(|statement| {
+                    let rust_types = pg_upsert_param_rust_types::<I::Model>(
+                        statement.row_count,
+                        &I::Model::insert_columns(),
+                    );
+                    SingleSqlStatement::new(statement.sql, statement.params)
+                        .with_param_rust_types(rust_types)
+                })
+                .collect(),
         ))
     }
 
@@ -3397,37 +3455,20 @@ impl Database {
         Ok(())
     }
 
-    /// 批量插入或忽略记录（遇到重复键时忽略）
+    /// 批量插入或忽略记录（遇到重复键时忽略；按绑定参数上限分块）
     pub async fn insert_or_ignore_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        let columns = T::insert_columns();
-        let primary_key_columns = T::primary_key_columns();
-        let primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
-
-        // 构建批量插入或忽略的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
-            DbType::PostgreSQL,
-            "INSERT INTO",
-            T::table_name_for_db(DbType::PostgreSQL),
-            &columns,
-            models,
-            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-        );
-
-        // 添加 ON CONFLICT DO NOTHING 子句
-        sql.push_str(&format!(" ON CONFLICT ({primary_key}) DO NOTHING"));
-
-        // 获取列的rust_type信息（排除自增主键，优先使用data_type覆盖）
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
-        pg_execute_with_types(&self.client, &sql, &all_values, &rust_types).await?;
+        // INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
+        // 与执行器 to_sql 共用同一语句构建入口（分块 + 每块参数类型）
+        let statements = build_pg_insert_or_ignore_statements::<T>(models)?;
+        for statement in statements {
+            let rust_types = pg_upsert_param_rust_types::<T>(statement.row_count, &T::insert_columns());
+            pg_execute_with_types(&self.client, &statement.sql, &statement.params, &rust_types)
+                .await?;
+        }
         Ok(())
     }
 
@@ -3441,9 +3482,9 @@ impl Database {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             client: &self.client,
             _marker: PhantomData,
         }
@@ -3816,25 +3857,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
         }
 
         if common_helpers::auto_increment_column::<I::Model>().is_some() {
-            let (sql, all_values) = common_helpers::build_insert_statement_with_conflict::<I::Model>(
-                DbType::PostgreSQL,
-                &refs,
-                self.conflict.as_ref(),
-            )?;
-            let rust_types =
-                pg_insert_param_rust_types::<I::Model>(refs.len(), self.conflict.as_ref());
-            let pk_col = I::Model::COLUMN_SCHEMA
-                .iter()
-                .find(|c| c.is_auto_increment)
-                .map(|c| c.name)
-                .unwrap_or("id");
-            return Ok(SqlStatement::batch(
-                DbType::PostgreSQL,
-                vec![
-                    SingleSqlStatement::new(format!("{sql} RETURNING {pk_col}"), all_values)
-                        .with_param_rust_types(rust_types),
-                ],
-            ));
+            return pg_auto_increment_returning_batch::<I::Model>(&refs, self.conflict.as_ref());
         }
 
         let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
@@ -4017,29 +4040,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
-        let columns = I::Model::insert_columns();
-        let primary_key_columns = I::Model::primary_key_columns();
-        let primary_key =
-            common_helpers::quote_column_list(DbType::PostgreSQL, &primary_key_columns);
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<I::Model>(
-            DbType::PostgreSQL,
-            "INSERT INTO",
-            <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
-            &columns,
-            &refs,
-            common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
-        );
-        sql.push_str(&format!(" ON CONFLICT ({}) DO NOTHING", primary_key));
-
-        let rust_types: Vec<&str> = I::Model::COLUMN_SCHEMA
-            .iter()
-            .filter(|col| !col.is_auto_increment)
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
+        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导
+        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&refs)?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
-            vec![SingleSqlStatement::new(sql, all_values).with_param_rust_types(rust_types)],
+            statements
+                .into_iter()
+                .map(|statement| {
+                    let rust_types = pg_upsert_param_rust_types::<I::Model>(
+                        statement.row_count,
+                        &I::Model::insert_columns(),
+                    );
+                    SingleSqlStatement::new(statement.sql, statement.params)
+                        .with_param_rust_types(rust_types)
+                })
+                .collect(),
         ))
     }
 
@@ -4050,9 +4066,12 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
-        let statement = &sql.statements[0];
-        let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
-        pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types).await?;
+        // 分块语句逐条执行（to_sql 可能产出多块）
+        for statement in &sql.statements {
+            let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
+            pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
+                .await?;
+        }
         self.models.run_after_insert(hook_ctx).await?;
         Ok(())
     }
@@ -4138,9 +4157,9 @@ impl<'a> Transaction<'a> {
     }
 
     /// 创建分组聚合查询执行器
-    pub fn select_column<T: Model, V>(&self) -> GroupedSelectExecutor<'_, T, V> {
-        GroupedSelectExecutor {
-            select: GroupedSelect::<T, V>::new(),
+    pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
+        ProjectionSelectExecutor {
+            select: ProjectionSelect::<T, V>::new(),
             client: self.client(),
             _marker: PhantomData,
         }
@@ -4208,31 +4227,28 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    /// 批量插入或更新记录（遇到重复键时更新）
+    /// 批量插入或更新记录（遇到重复键时更新；自增感知 + 按参数上限分块，
+    /// 与非事务版共用 `build_auto_increment_aware_upsert_statements`）
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
         if models.is_empty() {
             return Ok(());
         }
 
-        // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
-        let (mut sql, all_values) = common_helpers::build_batch_insert_statement::<T>(
+        // INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
+        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        let statements = common_helpers::build_auto_increment_aware_upsert_statements::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
             T::table_name_for_db(DbType::PostgreSQL),
-            T::COLUMNS,
             models,
-            common_helpers::BatchInsertValuesMode::All,
-        );
-
-        // 添加 ON CONFLICT DO UPDATE 子句（公共 helper：全主键模型退化为 DO NOTHING）
-        common_helpers::append_standard_upsert_clause::<T>(DbType::PostgreSQL, &mut sql, T::COLUMNS)?;
-
-        // 获取列的rust_type信息
-        let rust_types: Vec<&str> = T::COLUMN_SCHEMA
-            .iter()
-            .map(|col| col.data_type.unwrap_or(col.rust_type))
-            .collect();
-        pg_execute_with_types(self.client(), &sql, &all_values, &rust_types).await?;
+            |sql, columns| common_helpers::append_standard_upsert_clause::<T>(DbType::PostgreSQL, sql, columns),
+        )?;
+        for statement in statements {
+            let rust_types =
+                pg_upsert_param_rust_types::<T>(statement.row_count, &statement.columns);
+            pg_execute_with_types(self.client(), &statement.sql, &statement.params, &rust_types)
+                .await?;
+        }
 
         Ok(())
     }
@@ -4266,35 +4282,39 @@ pub struct SelectExecutor<'a, T: Model> {
     _marker: PhantomData<T>,
 }
 
-/// 映射查询结果执行器
-pub struct MappedSelectExecutor<'a, T: Model, V> {
-    select: crate::query::builder::MappedSelect<T, V>,
+/// Projection 查询执行器（字段投影与分组聚合合一）
+pub struct ProjectionSelectExecutor<'a, T: Model, V> {
+    select: ProjectionSelect<T, V>,
     client: &'a tokio_postgres::Client,
     _marker: PhantomData<(T, V)>,
 }
 
-/// 分组聚合查询执行器
-pub struct GroupedSelectExecutor<'a, T: Model, V> {
-    select: GroupedSelect<T, V>,
-    client: &'a tokio_postgres::Client,
-    _marker: PhantomData<(T, V)>,
-}
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type MappedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 
-impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedSelectExecutor 已合并为 ProjectionSelectExecutor，请改用 ProjectionSelectExecutor"
+)]
+pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
+
+impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 生成子查询SQL和参数
     pub fn to_subquery_sql(&self) -> crate::Result<(String, Vec<crate::model::Value>)> {
         self.select.try_to_sql_with_params(DbType::PostgreSQL)
     }
 
     /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> MappedCollectFuture<'a, T, V, C>
+    pub fn collect<C: FromIterator<V> + 'static>(&self) -> ProjectionCollectFuture<'a, T, V, C>
     where
         T: 'static,
         V: crate::model::FromRowValues + 'static,
     {
-        MappedCollectFuture {
-            select: self.select.clone(),
-            client: self.client,
+        ProjectionCollectFuture {
+            executor: self.clone_with_client(),
             _marker: PhantomData,
         }
     }
@@ -4307,6 +4327,45 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
         self.select.as_model::<R>()
     }
 
+    /// 添加 GROUP BY 字段
+    pub fn group_by<F, G>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> G,
+        G: crate::query::builder::GroupByColumns,
+    {
+        Self {
+            select: self.select.group_by(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 HAVING 条件
+    pub fn having<F, W>(self, f: F) -> Self
+    where
+        F: FnOnce(<T as Model>::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
+    {
+        Self {
+            select: self.select.having(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 添加 WHERE 条件（分组前过滤）
+    pub fn filter<F, W>(self, f: F) -> Self
+    where
+        F: FnOnce(T::Where) -> W,
+        W: Into<crate::query::builder::WhereExpr>,
+    {
+        Self {
+            select: self.select.filter(f),
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
     /// 克隆executor（保持相同的client引用）
     pub fn clone_with_client(&self) -> Self {
         Self {
@@ -4317,19 +4376,30 @@ impl<'a, T: Model, V> MappedSelectExecutor<'a, T, V> {
     }
 }
 
-/// 映射查询收集Future
-pub struct MappedCollectFuture<'a, T: Model, V, C> {
-    select: crate::query::builder::MappedSelect<T, V>,
-    client: &'a tokio_postgres::Client,
+/// Projection 收集 Future（字段投影与分组聚合合一）
+pub struct ProjectionCollectFuture<'a, T: Model, V, C> {
+    executor: ProjectionSelectExecutor<'a, T, V>,
     _marker: PhantomData<(T, V, C)>,
 }
+
+#[deprecated(
+    since = "0.2.12",
+    note = "MappedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type MappedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
+
+#[deprecated(
+    since = "0.2.12",
+    note = "GroupedCollectFuture 已合并为 ProjectionCollectFuture，请改用 ProjectionCollectFuture"
+)]
+pub type GroupedCollectFuture<'a, T, V, C> = ProjectionCollectFuture<'a, T, V, C>;
 
 impl<
     'a,
     T: Model + 'static + Send,
     V: crate::model::FromRowValues + 'static + Send,
     C: FromIterator<V> + 'static,
-> std::future::IntoFuture for MappedCollectFuture<'a, T, V, C>
+> std::future::IntoFuture for ProjectionCollectFuture<'a, T, V, C>
 {
     type Output = crate::Result<C>;
     type IntoFuture =
@@ -4337,17 +4407,62 @@ impl<
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let param_rust_types = self.select.param_rust_types();
-            let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
-            let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
+            if self.executor.select.is_grouped() {
+                // 分组聚合路径（与原 GroupedCollectFuture 完全一致）
+                let (sql, params) = self
+                    .executor
+                    .select
+                    .try_to_sql_with_params(DbType::PostgreSQL)?;
 
-            let mut results = Vec::new();
-            for row in rows {
-                let v = pg_decode_row_values_from_row(&row, row.columns().len())?;
-                results.push(v);
+                // 对于PostgreSQL,我们需要智能地转换参数类型
+                // 如果SQL中包含::bigint(通常在HAVING子句中),使用i64
+                // 否则使用i32
+                let use_i64 = sql.contains("::bigint");
+
+                let integer_rust_type = if use_i64 { "i64" } else { "i32" };
+
+                let pg_params = values_to_params_with_integer_hint(&params, integer_rust_type);
+
+                let param_refs = pg_param_refs(&pg_params);
+
+                let rows = self
+                    .executor
+                    .client
+                    .query(&sql, &param_refs)
+                    .trace()
+                    .await?;
+
+                let mut results = Vec::new();
+                let column_count = self.executor.select.column_count();
+                for row in rows {
+                    let v = pg_decode_row_values_from_row(&row, column_count)?;
+                    results.push(v);
+                }
+
+                Ok(results.into_iter().collect())
+            } else {
+                // 无分组路径（与原 MappedCollectFuture 完全一致）
+                let param_rust_types = self.executor.select.param_rust_types();
+                let (sql, params) = self
+                    .executor
+                    .select
+                    .try_to_sql_with_params(DbType::PostgreSQL)?;
+                let rows = pg_query_for_query(
+                    self.executor.client,
+                    &sql,
+                    &params,
+                    &param_rust_types,
+                )
+                .await?;
+
+                let mut results = Vec::new();
+                for row in rows {
+                    let v = pg_decode_row_values_from_row(&row, row.columns().len())?;
+                    results.push(v);
+                }
+
+                Ok(results.into_iter().collect())
             }
-
-            Ok(results.into_iter().collect())
         })
     }
 }
@@ -4632,13 +4747,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 映射查询结果到自定义类型
-    pub fn map_to<F, M>(self, f: F) -> MappedSelectExecutor<'a, T, M::Output>
+    pub fn map_to<F, M>(self, f: F) -> ProjectionSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(T::Where) -> M,
         M: crate::query::builder::MapToResult,
     {
         let mapped_select = self.select.map_to(f);
-        MappedSelectExecutor {
+        ProjectionSelectExecutor {
             select: mapped_select,
             client: self.client,
             _marker: PhantomData,
@@ -4659,13 +4774,13 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     }
 
     /// 选择列（支持聚合函数）- 转换为分组查询
-    pub fn select_column<F, V>(self, f: F) -> GroupedSelectExecutor<'a, T, V>
+    pub fn select_column<F, V>(self, f: F) -> ProjectionSelectExecutor<'a, T, V>
     where
         F: FnOnce(T::Where) -> V,
         V: crate::query::builder::SelectColumnResult,
     {
         let grouped_select = self.select.select_column(f);
-        GroupedSelectExecutor {
+        ProjectionSelectExecutor {
             select: grouped_select,
             client: self.client,
             _marker: PhantomData,
@@ -4817,7 +4932,8 @@ impl<'a, T: Model + 'static + Send, R: crate::model::FromValue + 'static + Send>
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let (mut sql, params) = self.aggregate_select.to_sql_with_params(DbType::PostgreSQL);
+            let (mut sql, params) =
+                self.aggregate_select.try_to_sql_with_params(DbType::PostgreSQL)?;
 
             // 对于 AVG 聚合,PostgreSQL 返回 NUMERIC 类型,需要 CAST 为 FLOAT8
             // 这样可以避免 tokio-postgres 不支持 NUMERIC 类型的问题
@@ -5817,8 +5933,8 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let pg_params = values_to_params_for_query(&params, &param_rust_types)?;
         let param_refs = pg_param_refs(&pg_params);
 
-        // 从 StreamConnection 获取 client 引用
-        let client = *self.conn.expect_postgresql();
+        // 从 StreamConnection 获取 client 引用（变体不匹配返回错误而非 panic）
+        let client = *self.conn.expect_postgresql()?;
 
         // 使用 query_raw 获取 RowStream
         let row_stream = client.query_raw(&sql, param_refs).trace().await?;
@@ -5887,7 +6003,7 @@ impl<'a, T: Model, R: Model> RelatedSelectExecutor<'a, T, R> {
 
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
-        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
         let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
@@ -5930,9 +6046,15 @@ impl_backend_multi_table_executor_methods_with_lifetime!(
 );
 
 impl<'a, T: Model, R1: Model, R2: Model> MultiTableSelectExecutor<'a, T, R1, R2> {
+    /// 多表查询的主表行收集入口（L18）：统一层 collect() 经此取回行数据，
+    /// 实现复用既有 collect_inner。
+    pub(crate) async fn collect_rows(self) -> crate::Result<Vec<T>> {
+        self.collect_inner().await
+    }
+
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
-        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
         let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
@@ -6011,9 +6133,15 @@ impl_backend_four_table_executor_methods_with_lifetime!(
 );
 
 impl<'a, T: Model, R1: Model, R2: Model, R3: Model> FourTableSelectExecutor<'a, T, R1, R2, R3> {
+    /// 多表查询的主表行收集入口（L18）：统一层 collect() 经此取回行数据，
+    /// 实现复用既有 collect_inner。
+    pub(crate) async fn collect_rows(self) -> crate::Result<Vec<T>> {
+        self.collect_inner().await
+    }
+
     async fn collect_inner(self) -> crate::Result<Vec<T>> {
         let param_rust_types = self.select.param_rust_types();
-        let (sql, params) = self.select.to_sql_with_params(DbType::PostgreSQL);
+        let (sql, params) = self.select.try_to_sql_with_params(DbType::PostgreSQL)?;
         let rows = pg_query_for_query(self.client, &sql, &params, &param_rust_types).await?;
 
         let mut results = Vec::new();
@@ -6241,12 +6369,6 @@ pub struct RightJoinCollectFuture<'a, T: Model, J: Model> {
     _marker: PhantomData<(T, J)>,
 }
 
-/// Grouped Collect future（分组聚合查询）
-pub struct GroupedCollectFuture<'a, T: Model, V, C> {
-    executor: GroupedSelectExecutor<'a, T, V>,
-    _marker: PhantomData<(T, V, C)>,
-}
-
 impl<'a, T: Model + 'static + Send, J: Model + 'static + Send> std::future::IntoFuture
     for RightJoinCollectFuture<'a, T, J>
 {
@@ -6469,6 +6591,17 @@ fn convert_postgres_value(
                 });
             }
         }
+        // INTERVAL 列解码为 Duration（与主 SELECT 路径 pg_value_from_row_cell 一致）
+        Type::INTERVAL => {
+            if let Ok(v) = row.try_get::<_, Option<PgInterval>>(index) {
+                return Ok(match v {
+                    Some(val) => {
+                        crate::model::Value::Duration(from_postgres_interval(val))
+                    }
+                    None => crate::model::Value::Null,
+                });
+            }
+        }
         Type::JSON | Type::JSONB => {
             if let Ok(v) = row.try_get::<_, Option<PgJsonText>>(index) {
                 return Ok(match v {
@@ -6486,117 +6619,6 @@ fn convert_postgres_value(
     )))
 }
 
-impl<'a, T: Model, V> GroupedSelectExecutor<'a, T, V> {
-    /// 执行查询并收集结果
-    pub fn collect<C: FromIterator<V> + 'static>(&self) -> GroupedCollectFuture<'a, T, V, C>
-    where
-        T: 'static,
-        V: crate::model::FromRowValues + 'static,
-    {
-        GroupedCollectFuture {
-            executor: GroupedSelectExecutor {
-                select: self.select.clone(),
-                client: self.client,
-                _marker: PhantomData,
-            },
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_model<R: Model>(self) -> crate::query::builder::DerivedSelect<R>
-    where
-        T: Send + Sync + 'static,
-        V: Send + Sync + 'static,
-    {
-        self.select.as_model::<R>()
-    }
-
-    /// 添加 GROUP BY 字段
-    pub fn group_by<F, G>(self, f: F) -> Self
-    where
-        F: FnOnce(<T as Model>::Where) -> G,
-        G: crate::query::builder::GroupByColumns,
-    {
-        Self {
-            select: self.select.group_by(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加 HAVING 条件
-    pub fn having<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(<T as Model>::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        Self {
-            select: self.select.having(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-
-    /// 添加 WHERE 条件（分组前过滤）
-    pub fn filter<F, W>(self, f: F) -> Self
-    where
-        F: FnOnce(T::Where) -> W,
-        W: Into<crate::query::builder::WhereExpr>,
-    {
-        Self {
-            select: self.select.filter(f),
-            client: self.client,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<
-    'a,
-    T: Model + 'static + Send,
-    V: crate::model::FromRowValues + 'static + Send,
-    C: FromIterator<V> + 'static,
-> std::future::IntoFuture for GroupedCollectFuture<'a, T, V, C>
-{
-    type Output = crate::Result<C>;
-    type IntoFuture =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
-
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let (sql, params) = self
-                .executor
-                .select
-                .try_to_sql_with_params(DbType::PostgreSQL)?;
-
-            // 对于PostgreSQL,我们需要智能地转换参数类型
-            // 如果SQL中包含::bigint(通常在HAVING子句中),使用i64
-            // 否则使用i32
-            let use_i64 = sql.contains("::bigint");
-
-            let integer_rust_type = if use_i64 { "i64" } else { "i32" };
-            let pg_params = values_to_params_with_integer_hint(&params, integer_rust_type);
-
-            let param_refs = pg_param_refs(&pg_params);
-
-            let rows = self
-                .executor
-                .client
-                .query(&sql, &param_refs)
-                .trace()
-                .await?;
-
-            let mut results = Vec::new();
-            let column_count = self.executor.select.column_count();
-            for row in rows {
-                let v = pg_decode_row_values_from_row(&row, column_count)?;
-                results.push(v);
-            }
-
-            Ok(results.into_iter().collect())
-        })
-    }
-}
 
 #[cfg(test)]
 mod block_delete_tests {

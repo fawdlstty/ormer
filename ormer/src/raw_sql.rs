@@ -114,8 +114,7 @@ impl RawSql {
                 if let Some(next) = copy_dollar_quoted(&self.sql, i, &mut out) {
                     i = next;
                 } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    i = copy_char(&self.sql, i, &mut out);
                 }
             } else if bytes[i] == b'{' {
                 if let Some((name, next)) = parse_braced_param(&self.sql, i) {
@@ -134,8 +133,7 @@ impl RawSql {
                     out.push_str(&placeholder(db_type, params.len()));
                     i = next;
                 } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    i = copy_char(&self.sql, i, &mut out);
                 }
             } else if bytes[i] == b':' {
                 if let Some((name, next)) = parse_colon_param(&self.sql, i) {
@@ -145,12 +143,10 @@ impl RawSql {
                     out.push_str(&placeholder(db_type, params.len()));
                     i = next;
                 } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    i = copy_char(&self.sql, i, &mut out);
                 }
             } else {
-                out.push(bytes[i] as char);
-                i += 1;
+                i = copy_char(&self.sql, i, &mut out);
             }
         }
 
@@ -213,6 +209,22 @@ impl<T: AsRef<str>> IntoRawSql for T {
 
 fn starts_with(bytes: &[u8], idx: usize, pat: &[u8]) -> bool {
     bytes.get(idx..idx + pat.len()) == Some(pat)
+}
+
+/// 普通拷贝路径按 char 边界拷贝 `start` 处的完整字符并返回下一字节位置。
+///
+/// 主循环的 ASCII 定界（引号/注释/`$`/`{`/`:`）保证 `start` 总在 char
+/// 边界上；若按单字节 `u8 as char` 拷贝，多字节 UTF-8 序列的每个字节会
+/// 被映射成 U+0080-U+00FF 的拉丁字符（mojibake）。引号、注释、`[...]`、
+/// `$$` 等豁免分支内的字节扫描不受影响：UTF-8 连续字节均 >= 0x80，
+/// 不会与 ASCII 定界符混淆。
+fn copy_char(sql: &str, start: usize, out: &mut String) -> usize {
+    let end = sql[start..]
+        .chars()
+        .next()
+        .map_or(sql.len(), |ch| start + ch.len_utf8());
+    out.push_str(&sql[start..end]);
+    end
 }
 
 fn copy_line_comment(sql: &str, start: usize, out: &mut String) -> usize {

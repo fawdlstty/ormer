@@ -16,15 +16,21 @@ use std::sync::Arc as DuckDbArc;
 /// 使用 `Arc<turso::Connection>` 共享所有权。多个流式查询可以共享同一个连接，
 /// 当最后一个 Arc 引用被 drop 时，连接会自动释放。
 ///
+/// ## DuckDB
+///
+/// 使用 `Arc<duckcompat::Connection>` 共享所有权，语义同 SQLite；
+/// 查询结果由后端在进入异步迭代器之前物化。
+///
 /// ## PostgreSQL
 ///
-/// 使用 `bb8::PooledConnection<'a, PostgresConnectionManager>` 借用连接。
-/// 连接的生命周期由bb8连接池管理，当PooledConnection被drop时会自动返回连接池。
+/// 使用 `&tokio_postgres::Client` 借用连接，真正的 `RowStream` 逐行拉取，
+/// 连接生命周期由调用方（连接池/Database）管理。
 ///
-/// ## MySQL
+/// ## MySQL/MSSQL
 ///
-/// 使用 `mysql_async::Conn` 拥有连接所有权。当 `StreamConnection` 被 drop 时，
-/// 连接会自动返回到连接池。这是 mysql_async 库的内置行为。
+/// 不经此类型：MySQL 流式路径直接通过 `pool.get_conn()` 持有连接，
+/// MSSQL 的 `SelectStream` 持有后端 `SelectExecutor`（结果物化语义，
+/// 见 `mssql_backend::SelectStream` 文档）。
 ///
 /// # 示例
 ///
@@ -52,78 +58,63 @@ pub enum StreamConnection<'a> {
     #[cfg(feature = "postgresql")]
     PostgreSQL(&'a tokio_postgres::Client),
 
-    /// MySQL 连接 - 拥有连接所有权，Drop 时自动返回连接池
-    #[cfg(feature = "mysql")]
-    MySQL(mysql_async::Conn),
-
-    /// MSSQL 连接 - 使用Client引用
-    #[cfg(feature = "mssql")]
-    MSSQL(&'a tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>),
-
     #[doc(hidden)]
     __Lifetime(PhantomData<&'a ()>),
 }
 
 impl<'a> StreamConnection<'a> {
+    /// 取 SQLite/Turso 连接；变体不匹配说明流式连接被错误地跨后端传递，
+    /// 返回错误而非 panic。
     #[cfg(feature = "sqlite")]
-    pub fn expect_sqlite(&self) -> &Arc<turso::Connection> {
+    pub fn expect_sqlite(&self) -> crate::Result<&Arc<turso::Connection>> {
         match self {
-            StreamConnection::Sqlite(conn) => conn,
-            _ => unreachable!("Expected Sqlite connection"),
+            StreamConnection::Sqlite(conn) => Ok(conn),
+            _ => Err(crate::ormer_error!(
+                "expected a SQLite StreamConnection, got {:?}",
+                self.db_kind()
+            )),
         }
     }
 
+    /// 取 PostgreSQL 连接；变体不匹配返回错误而非 panic。
     #[cfg(feature = "postgresql")]
-    pub fn expect_postgresql(&self) -> &&'a tokio_postgres::Client {
+    pub fn expect_postgresql(&self) -> crate::Result<&&'a tokio_postgres::Client> {
         match self {
-            StreamConnection::PostgreSQL(client) => client,
-            _ => unreachable!("Expected PostgreSQL connection"),
+            StreamConnection::PostgreSQL(client) => Ok(client),
+            _ => Err(crate::ormer_error!(
+                "expected a PostgreSQL StreamConnection, got {:?}",
+                self.db_kind()
+            )),
         }
     }
 
+    /// 取 DuckDB 连接；变体不匹配返回错误而非 panic。
     #[cfg(feature = "duckdb")]
     pub fn expect_duckdb(
         &self,
-    ) -> &DuckDbArc<super::super::duckdb_backend::duckcompat::Connection> {
+    ) -> crate::Result<&DuckDbArc<super::super::duckdb_backend::duckcompat::Connection>> {
         match self {
-            StreamConnection::DuckDB(conn) => conn,
-            _ => unreachable!("Expected DuckDB connection"),
+            StreamConnection::DuckDB(conn) => Ok(conn),
+            _ => Err(crate::ormer_error!(
+                "expected a DuckDB StreamConnection, got {:?}",
+                self.db_kind()
+            )),
         }
     }
-}
 
-impl<'a> Drop for StreamConnection<'a> {
-    fn drop(&mut self) {
+    #[cfg_attr(
+        not(any(feature = "postgresql", feature = "duckdb", feature = "sqlite")),
+        allow(dead_code)
+    )]
+    fn db_kind(&self) -> &'static str {
         match self {
             #[cfg(feature = "sqlite")]
-            StreamConnection::Sqlite(_) => {
-                // Arc 会在最后一个引用释放时自动清理
-                // 不需要显式操作
-            }
-
+            StreamConnection::Sqlite(_) => "sqlite",
             #[cfg(feature = "duckdb")]
-            StreamConnection::DuckDB(_) => {}
-
+            StreamConnection::DuckDB(_) => "duckdb",
             #[cfg(feature = "postgresql")]
-            StreamConnection::PostgreSQL(_) => {
-                // bb8::PooledConnection 在 Drop 时会自动返回连接池
-                // 不需要显式释放
-            }
-
-            #[cfg(feature = "mysql")]
-            StreamConnection::MySQL(conn) => {
-                // mysql_async::Conn 在 Drop 时会自动返回连接池
-                // 显式 drop 确保立即释放
-                let _ = conn;
-            }
-
-            #[cfg(feature = "mssql")]
-            StreamConnection::MSSQL(_) => {
-                // tiberius::Client 引用，生命周期结束时自动释放
-                // 不需要显式操作
-            }
-
-            StreamConnection::__Lifetime(_) => {}
+            StreamConnection::PostgreSQL(_) => "postgresql",
+            StreamConnection::__Lifetime(_) => "(lifetime placeholder)",
         }
     }
 }

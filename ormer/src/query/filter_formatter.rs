@@ -4,6 +4,21 @@ use crate::model::{Value, normalize_table_name_for_db, quote_column_reference};
 use crate::query::expr::SqlExpr;
 use crate::query::filter::FilterExpr;
 
+/// SQLite 上 Decimal 家族以 TEXT 存储，数值语义的比较需要显式
+/// `CAST(... AS NUMERIC)`；comparison_sql / Between / IN 共用此判定。
+fn sqlite_needs_numeric_cast(db_type: DbType, value: &Value) -> bool {
+    #[cfg(feature = "sqlite")]
+    {
+        matches!(db_type, DbType::Sqlite)
+            && matches!(value, Value::Decimal(_) | Value::BigDecimal(_))
+    }
+    #[cfg(not(feature = "sqlite"))]
+    {
+        let _ = (db_type, value);
+        false
+    }
+}
+
 /// 通用的 WHERE 条件格式化器
 ///
 /// 用于将 FilterExpr 格式化为 SQL WHERE 子句，并收集参数
@@ -89,6 +104,18 @@ impl FilterFormatter {
         param_idx: &mut i32,
         params: &mut Vec<Value>,
     ) -> String {
+        // 空查询/空字段列表在校验路径（validate_filter_for_db）已报错；
+        // 这里是未走校验的渲染路径的兜底，渲染错误占位（零占位符）。
+        // 判定必须先于任何参数 push（含下方 query_sql），保证参数计数
+        // 与占位符数量对齐。
+        if search.query.trim().is_empty() {
+            return invalid_filter_marker(
+                "full-text search requires a non-empty query (call .query(\"...\"))",
+            );
+        }
+        if search.exprs.is_empty() {
+            return invalid_filter_marker("full-text search requires at least one field");
+        }
         let expr_sql = |expr: &SqlExpr, param_idx: &mut i32, params: &mut Vec<Value>| {
             expr.to_sql(
                 self.db_type,
@@ -104,20 +131,22 @@ impl FilterFormatter {
             params,
             self.table_prefix.as_deref(),
         );
-        if search.exprs.is_empty() {
-            unreachable!("empty full-text search is gated by validate_filter_for_db");
-        }
 
         match self.db_type {
             #[cfg(feature = "postgresql")]
             DbType::PostgreSQL => {
-                let language = search.language.as_deref().unwrap_or("simple");
-                let language_sql = SqlExpr::Value(Value::Text(language.to_string())).to_sql(
-                    self.db_type,
-                    param_idx,
-                    params,
-                    None,
-                );
+                // language 未显式设置时内联 'simple' 字面量而不产生绑定参数，
+                // 与 collect_filter_param_rust_types 的收集条件（language.is_some
+                // 才收集 String）保持一致；显式设置时仍渲染为占位符。
+                let language_sql = match search.language.as_deref() {
+                    Some(language) => SqlExpr::Value(Value::Text(language.to_string())).to_sql(
+                        self.db_type,
+                        param_idx,
+                        params,
+                        None,
+                    ),
+                    None => "'simple'".to_string(),
+                };
                 let fields = search
                     .exprs
                     .iter()
@@ -208,10 +237,10 @@ impl FilterFormatter {
             }
             #[cfg(feature = "questdb")]
             DbType::QuestDB => {
-                unreachable!("QuestDB full-text search is gated by validate_filter_for_db")
+                invalid_filter_marker("full-text search is not supported on QuestDB")
             }
             #[cfg(feature = "influxdb")]
-            _ => unreachable!("InfluxDB full-text search is gated by validate_filter_for_db"),
+            _ => invalid_filter_marker("full-text search is not supported on InfluxDB"),
         }
     }
 
@@ -319,14 +348,12 @@ impl FilterFormatter {
             }
             FilterExpr::InSubqueryDynamic { column, subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery
-                    .render(self.db_type)
-                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
+                let (subquery_sql, subquery_params) =
+                    render_dynamic_subquery(subquery, self.db_type);
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
-                write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql).unwrap_or_else(
-                    |e| panic!("Failed to write dynamic subquery IN clause: {}", e),
-                );
+                write!(sql, "{} IN ({})", self.quoted_column(column), subquery_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write dynamic subquery IN clause: {}", e));
                 self.append_subquery_params(&subquery_params, param_idx, params);
             }
             FilterExpr::NotInSubquery {
@@ -348,9 +375,8 @@ impl FilterFormatter {
             }
             FilterExpr::NotInSubqueryDynamic { column, subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery
-                    .render(self.db_type)
-                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
+                let (subquery_sql, subquery_params) =
+                    render_dynamic_subquery(subquery, self.db_type);
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(
@@ -395,12 +421,24 @@ impl FilterFormatter {
                 *param_idx += 1;
                 let max_placeholder = placeholder(self.db_type, *param_idx as usize);
                 *param_idx += 1;
+                // 与 comparison_sql 对齐：SQLite 上 Decimal 走 BETWEEN 时
+                // 两侧同样 CAST AS NUMERIC，避免 TEXT 比较漏行。
+                let numeric_cast = sqlite_needs_numeric_cast(self.db_type, min)
+                    || sqlite_needs_numeric_cast(self.db_type, max);
+                let col_sql = quote_column_reference(self.db_type, &col_name);
+                let (col_sql, min_placeholder, max_placeholder) = if numeric_cast {
+                    (
+                        format!("CAST({col_sql} AS NUMERIC)"),
+                        format!("CAST({min_placeholder} AS NUMERIC)"),
+                        format!("CAST({max_placeholder} AS NUMERIC)"),
+                    )
+                } else {
+                    (col_sql, min_placeholder, max_placeholder)
+                };
                 write!(
                     sql,
                     "{} BETWEEN {} AND {}",
-                    quote_column_reference(self.db_type, &col_name),
-                    min_placeholder,
-                    max_placeholder
+                    col_sql, min_placeholder, max_placeholder
                 )
                 .unwrap_or_else(|e| panic!("Failed to write BETWEEN clause: {}", e));
                 params.push(min.clone().into());
@@ -419,9 +457,8 @@ impl FilterFormatter {
             }
             FilterExpr::ExistsDynamic { subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery
-                    .render(self.db_type)
-                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
+                let (subquery_sql, subquery_params) =
+                    render_dynamic_subquery(subquery, self.db_type);
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "EXISTS ({})", subquery_sql)
@@ -441,9 +478,8 @@ impl FilterFormatter {
             }
             FilterExpr::NotExistsDynamic { subquery } => {
                 use std::fmt::Write;
-                let (subquery_sql, subquery_params) = subquery
-                    .render(self.db_type)
-                    .unwrap_or_else(|error| panic!("invalid dynamic subquery: {error}"));
+                let (subquery_sql, subquery_params) =
+                    render_dynamic_subquery(subquery, self.db_type);
                 let subquery_sql =
                     rebase_subquery_sql(&subquery_sql, self.db_type, *param_idx as usize - 1);
                 write!(sql, "NOT EXISTS ({})", subquery_sql)
@@ -617,7 +653,7 @@ impl FilterFormatter {
                     crate::DbType::MSSQL => format!("CONTAINS({}, {})", expr_sql, query_sql),
                     #[cfg(feature = "questdb")]
                     crate::DbType::QuestDB => {
-                        unreachable!("QuestDB text search is gated by validate_filter_for_db")
+                        invalid_filter_marker("text search is not supported on QuestDB")
                     }
                     #[cfg(any(
                         feature = "duckdb",
@@ -638,13 +674,20 @@ impl FilterFormatter {
                 )
                 .unwrap_or_else(|e| panic!("Failed to write full-text search clause: {}", e));
             }
-            FilterExpr::InvalidDynamicField { .. } => {
-                unreachable!("invalid dynamic field is gated by validate_filter_for_db")
+            FilterExpr::InvalidDynamicField { model, field } => {
+                // 非 try_ 路径没有 Result 通道可返回错误：渲染一个必定触发
+                // 数据库错误（"列不存在"）的占位引用，并把原因写进 SQL 注释，
+                // 让错误以 Database 错误而不是 panic 的形式抛出（try_ 路径
+                // 由 validate_filter_for_db 提前拦截并返回 Err）。
+                sql.push_str(&invalid_filter_marker(&format!(
+                    "Field '{field}' does not exist on model {model}"
+                )));
             }
-            FilterExpr::Unsupported { backend, feature } => panic!(
-                "{} cannot be rendered for {backend:?}; validate the filter before formatting",
-                feature
-            ),
+            FilterExpr::Unsupported { backend, feature } => {
+                sql.push_str(&invalid_filter_marker(&format!(
+                    "{feature} cannot be rendered for {backend:?}; validate the filter before formatting"
+                )));
+            }
         }
     }
 
@@ -671,6 +714,18 @@ impl FilterFormatter {
                 .unwrap_or_else(|e| panic!("Failed to write expression IN clause: {}", e));
             return;
         }
+        // 与 comparison_sql / format_column_values_clause 对齐：SQLite 上
+        // Decimal 家族以 TEXT 存储，IN 值列表同样 CAST AS NUMERIC（任一值
+        // 命中即整组转换，整数参数 CAST 无副作用），避免 TEXT 比较漏行。
+        let numeric_cast = values.iter().any(|value| match value {
+            SqlExpr::Value(inner) => sqlite_needs_numeric_cast(self.db_type, inner),
+            _ => false,
+        });
+        let expr_sql = if numeric_cast {
+            format!("CAST({expr_sql} AS NUMERIC)")
+        } else {
+            expr_sql
+        };
         write!(
             sql,
             "{} {} (",
@@ -682,12 +737,18 @@ impl FilterFormatter {
             if idx > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&value.to_sql(
+            let value_sql = value.to_sql(
                 self.db_type,
                 param_idx,
                 params,
                 self.table_prefix.as_deref(),
-            ));
+            );
+            if numeric_cast {
+                write!(sql, "CAST({value_sql} AS NUMERIC)")
+                    .unwrap_or_else(|e| panic!("Failed to write IN value clause: {}", e));
+            } else {
+                sql.push_str(&value_sql);
+            }
         }
         sql.push(')');
     }
@@ -701,6 +762,8 @@ impl FilterFormatter {
     /// - 已含 `.` 的列视为已限定，保持原样，避免重复加前缀；
     /// - 未限定列按注册顺序匹配关联表列清单，命中则限定到该关联表别名
     ///   （多表查询中关联表过滤列必须限定到 t1/t2/t3，而不是主表 t0）；
+    ///   别名为空串时渲染为裸引用（LATERAL 内层子查询只 FROM 关联表
+    ///   本体、无别名，关联表列必须裸引用才能解析到内层表）；
     /// - 未命中关联表时回落到主表前缀（未设置前缀则保持原样，
     ///   单表查询行为不变）。
     fn qualified_column(&self, column: &str) -> String {
@@ -709,7 +772,11 @@ impl FilterFormatter {
         }
         for (alias, columns) in &self.related_tables {
             if columns.iter().any(|candidate| *candidate == column) {
-                return format!("{}.{}", alias, column);
+                return if alias.is_empty() {
+                    column.to_owned()
+                } else {
+                    format!("{}.{}", alias, column)
+                };
             }
         }
         match self.table_prefix.as_deref() {
@@ -735,14 +802,31 @@ impl FilterFormatter {
                 .unwrap_or_else(|e| panic!("Failed to write {} clause: {}", keyword, e));
             return;
         }
-        write!(sql, "{} {} (", self.quoted_column(column), keyword)
+        // 与 comparison_sql 对齐：SQLite 上 Decimal 列表比较同样 CAST AS
+        // NUMERIC（任一值命中即整组转换，整数参数 CAST 无副作用）。
+        let numeric_cast = values
+            .iter()
+            .any(|value| sqlite_needs_numeric_cast(self.db_type, value));
+        let col_sql = self.quoted_column(column);
+        let col_sql = if numeric_cast {
+            format!("CAST({col_sql} AS NUMERIC)")
+        } else {
+            col_sql
+        };
+        write!(sql, "{} {} (", col_sql, keyword)
             .unwrap_or_else(|e| panic!("Failed to write {} clause: {}", keyword, e));
         for (i, value) in values.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
-            write!(sql, "{}", placeholder(self.db_type, *param_idx as usize))
-                .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
+            let placeholder_sql = placeholder(self.db_type, *param_idx as usize);
+            if numeric_cast {
+                write!(sql, "CAST({placeholder_sql} AS NUMERIC)")
+                    .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
+            } else {
+                write!(sql, "{}", placeholder_sql)
+                    .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
+            }
             params.push(value.clone().into());
             *param_idx += 1;
         }
@@ -929,9 +1013,10 @@ impl FilterFormatter {
             return format!("has({full_col_name}, {param_placeholder})");
         }
 
-        #[cfg(feature = "sqlite")]
-        if matches!(self.db_type, DbType::Sqlite)
-            && matches!(_value, Value::Decimal(_) | Value::BigDecimal(_))
+        // SQLite 把 Decimal 存为 TEXT：数值比较需要显式 CAST AS NUMERIC
+        // （comparison_sql / Between / IN 共用同一判定，保证同一列在不同
+        // 操作符下行为一致）。
+        if sqlite_needs_numeric_cast(self.db_type, _value)
             && matches!(operator, ">" | ">=" | "<" | "<=")
         {
             return format!(
@@ -941,6 +1026,35 @@ impl FilterFormatter {
         }
 
         format!("{} {} {}", full_col_name, operator, param_placeholder)
+    }
+}
+
+/// 渲染层兜底：无法在 `(String, Vec<Value>)` 签名上返回错误的过滤片段
+/// （InvalidDynamicField / Unsupported / 动态子查询渲染失败）统一渲染为
+/// 一个不存在的占位列引用，并把原因写进 SQL 注释。
+///
+/// 占位引用在各后端都会在 prepare/执行期报"列不存在"错误，错误以
+/// `Database` 错误而不是 panic 的形式抛出；注释中剔除 `*/` 防止用户
+/// 输入提前闭合注释。
+pub(crate) fn invalid_filter_marker(reason: &str) -> String {
+    format!(
+        "__ormer_invalid_filter__ /* ormer error: {} */",
+        reason.replace("*/", "* /")
+    )
+}
+
+/// 动态子查询渲染结果：失败时退化为占位引用（零占位符、零参数），
+/// 保持 rust 类型收集与占位符计数对齐。
+fn render_dynamic_subquery(
+    subquery: &crate::query::filter::DynamicSubquery,
+    db_type: DbType,
+) -> (String, Vec<Value>) {
+    match subquery.render(db_type) {
+        Ok(rendered) => rendered,
+        Err(error) => (
+            invalid_filter_marker(&format!("invalid dynamic subquery: {error}")),
+            Vec::new(),
+        ),
     }
 }
 

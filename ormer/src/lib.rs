@@ -51,35 +51,44 @@ pub use migration::{
     feature = "influxdb"
 ))]
 pub use abstract_layer::{
-    BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture, BlockDeleteExecutor,
-    BlockDeleteResult, CollectFuture, ConnectionPool, CreateTableExecutor, Database, DbExecutor,
-    DeleteExecutor, DerivedTableCollectFuture, DerivedTableSelectExecutor,
-    DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor, DropTableExecutor,
-    GroupedCollectFuture, GroupedSelectExecutor, IncludedCollectFuture, IncludedSelectExecutor,
-    InsertExecutor, InsertGraphExecutor, InsertOrIgnoreExecutor, InsertOrUpdateExecutor,
-    InsertPartialExecutor, IsolationLevel, LeftJoinCollectFuture, LeftJoinedSelectExecutor,
-    MappedCollectFuture, MappedSelectExecutor, ModelCollectWithFuture, NestedInclude,
-    PooledConnection, PooledDatabaseScope, PooledRawSelectExecutor, RawCollectFuture,
-    RawSelectExecutor, RelatedCollectFuture, RelatedSelectExecutor, RelationNestedLoader,
-    ReplicatedConnectionPool, ReplicatedDatabase, ReplicatedDatabaseBuilder,
-    ReplicatedPoolBuilder, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
+    AggregateFuture, BatchFuture, BatchManyFuture, BatchQueries, BatchQuery, BatchQueryFuture,
+    BlockDeleteExecutor, BlockDeleteResult, CollectFuture, ConnectionPool, CreateTableExecutor,
+    Database, DatabaseScope, DbExecutor, DeleteExecutor, DerivedTableCollectFuture,
+    DerivedTableSelectExecutor, DoubleIncludedCollectFuture, DoubleIncludedSelectExecutor,
+    DropTableExecutor, FirstFuture, FourTableCountFuture, IncludedCollectFuture,
+    IncludedSelectExecutor, InnerJoinedSelectExecutor, InsertExecutor, InsertGraphExecutor,
+    InsertOrIgnoreExecutor, InsertOrUpdateExecutor, InsertPartialExecutor, IsolationLevel,
+    LeftJoinCollectFuture, LeftJoinedSelectExecutor, ModelCollectWithFuture,
+    MultiTableCountFuture, NestedInclude, PooledConnection, PooledDatabaseScope,
+    ProjectionCollectFuture, ProjectionSelectExecutor, RawCollectFuture, RawSelectExecutor,
+    RelatedCollectFuture, RelatedCountFuture, RelatedSelectExecutor, RelationNestedLoader,
+    ReplicatedConnectionPool, ReplicatedDatabase, ReplicatedDatabaseBuilder, ReplicatedPoolBuilder,
+    RightJoinedSelectExecutor, SaveExecutor, ScopedDeleteExecutor, ScopedUpdateExecutor,
     SelectExecutor, SelectStream, SelectStreamIterator, SingleSqlStatement, SqlExecutor,
-    SqlStatement, Transaction, TransactionFuture, TransactionInsertExecutor,
-    TransactionInsertOrIgnoreExecutor, TransactionInsertOrUpdateExecutor, TransactionOptions,
-    TransactionRawCollectFuture, TransactionRawSelectExecutor, TransactionSaveExecutor,
-    TruncateTableExecutor, UpdateExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
+    SqlStatement, Transaction, TransactionFuture, TransactionOptions, TruncateTableExecutor,
+    UnionSelectExecutor, UpdateExecutor, UpdateGraphExecutor, WithoutHooksExecutor,
+};
+// 旧类型名过渡别名（已合并，保留 re-export 以兼容现有导入路径）：
+// - Mapped/Grouped* → Projection*（R2）
+// - Transaction*Insert* / TransactionRaw* / TransactionSave* → 合并入对应普通执行器（R3）
+// - PooledRawSelectExecutor → RawSelectExecutor（R3）
+#[allow(deprecated)]
+pub use abstract_layer::{
+    GroupedCollectFuture, GroupedSelectExecutor, MappedCollectFuture, MappedSelectExecutor,
+    PooledRawSelectExecutor, TransactionInsertExecutor, TransactionInsertOrIgnoreExecutor,
+    TransactionInsertOrUpdateExecutor, TransactionRawCollectFuture, TransactionRawSelectExecutor,
+    TransactionSaveExecutor,
 };
 pub use error::{ConstraintKind, DatabaseErrorKind, OrmerError, Result};
 pub use hooks::{HookContext, HookOperation};
 pub use model::{
     ActiveValue, AfterDelete, AfterInsert, AfterUpdate, BeforeDelete, BeforeInsert, BeforeUpdate,
     CompressionAlgorithm, DbValue, Embed, EmbedWhere, FieldType, FieldTypeProvider, FromRowValues,
-    FromValue, GraphWritable, InsertModel, Insertable, Model, ModelEnum,
-    ModelEnumProvider, NoInclude, PrimaryFields, PrimaryKey, Relation, RelationHandle,
-    RelationInfo, RelationKind, RelationPathInfo, RelationQuery, RelationSelection, Row,
-    TableOptions, TableRoute, TableRouteValue, ThroughInfo, ThroughRelation, TrackableModel,
-    Tracked, Value, ViewModel, WritableModel, effective_primary_key_columns,
-    generate_create_table_sql, generate_create_table_sql_with_name,
+    FromValue, GraphWritable, InsertModel, Insertable, Model, NoInclude, PrimaryFields, PrimaryKey,
+    Relation, RelationHandle, RelationInfo, RelationKind, RelationPathInfo, RelationQuery,
+    RelationSelection, Row, TableOptions, TableRoute, TableRouteValue, ThroughInfo,
+    ThroughRelation, TrackableModel, Tracked, Value, ViewModel, WritableModel,
+    effective_primary_key_columns, generate_create_table_sql, generate_create_table_sql_with_name,
 };
 #[cfg(feature = "clickhouse")]
 pub use model::{
@@ -87,14 +96,18 @@ pub use model::{
 };
 pub use ormer_derive::{DbValue, Embed, FieldType, InsertModel, Model, ModelEnum, ViewModel, raw};
 pub use query::builder::{
-    CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn, DynamicColumnSet,
-    FilterQuery, GroupByColumns, GroupedSelect, InnerJoinedSelect, IntoArrayValue,
-    IntoGroupingSets, IntoJsonPath, IntoJsonScalar, IsInValue, IsInValues, LeftJoinedSelect,
-    MapToResult, MappedSelect, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor,
-    RecursiveColumns, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
+    AggregateSelect, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn,
+    DynamicColumnSet, FilterQuery, FourTableSelect, GroupByColumns, InnerJoinedSelect,
+    IntoArrayValue, IntoGroupingSets, IntoJsonPath, IntoJsonScalar, IsInValue, IsInValues,
+    LeftJoinedSelect, MapToResult, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor,
+    ProjectionSelect, RecursiveColumns, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
     SelectColumnResult, SetOp, StaticJsonArrayExpr, StaticJsonExpr, StaticJsonUpdate,
-    SubqueryParam, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery, from_derived,
+    SubqueryParam, TypedColumn, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery,
+    from_derived,
 };
+// 旧类型名过渡别名（已合并为 ProjectionSelect，保留 re-export 以兼容现有导入路径）
+#[allow(deprecated)]
+pub use query::builder::{GroupedSelect, MappedSelect};
 pub use query::expr::{
     CaseMatchBuilder, IntervalExpr, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, JsonScalarKind,
     NowExpr, RawExpr, RawExprSegment, RawSqlExpr, SqlExpr, TimePart, TimeUnit, TypedExpr,

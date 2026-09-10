@@ -37,6 +37,8 @@ let sql = Select::<User>::new()
     .to_sql();
 ```
 
+> 构建器的无参 `to_sql()` 仅用于预览：使用默认方言、不做能力校验，输出随启用的 feature 变化。需要与实际执行一致的精确 SQL 时，请用执行器的 `to_sql()`（真实方言并校验），例如 `db.select::<User>().to_sql()?`。
+
 ### 多字段选择 + 分组
 
 ```rust
@@ -159,6 +161,19 @@ let rows: Vec<User> = db
 ```
 
 `DISTINCT ON` 在 PostgreSQL / DuckDB 使用原生语法，其他数据库改写为窗口函数；`ORDER BY` 必须以分区 key 开头。
+
+多字段全文检索可用 DSL：`fields` 指定检索列、`query` 提供检索词、`mode` 选择匹配模式（`FullTextMode::Natural` 默认 / `Boolean` / `WebSearch`），可选 `language` 设置语言、`rank(FullTextRank::Relevance)` 按相关度排序：
+
+```rust
+let rows: Vec<Article> = db
+    .select::<Article>()
+    .fields(|a| (a.title, a.body))
+    .query("rust ormer")
+    .mode(ormer::FullTextMode::Boolean)
+    .rank(ormer::FullTextRank::Relevance)
+    .collect()
+    .await?;
+```
 
 `serde_json::Value` 字段可声明静态 JSON path 和数组 path：
 
@@ -294,7 +309,7 @@ let page: Vec<(User, Option<Role>)> = db
 
 ### 派生表 JOIN
 
-`Select`、`MappedSelect`、`GroupedSelect` 可通过 `as_model::<R>()` 提升为派生表。无主键的投影结果类型使用 `ViewModel`。
+`Select` 与 `ProjectionSelect`（`select_column` / `map_to` 的返回类型）可通过 `as_model::<R>()` 提升为派生表。无主键的投影结果类型使用 `ViewModel`。
 
 ```rust
 #[derive(Debug, ormer::ViewModel)]
@@ -495,6 +510,20 @@ let sql = Select::<User>::new()
 
 操作数支持各自的 `order_by` 和 `range`；渲染时两个操作数都会括号包装（`(SELECT ...) UNION (SELECT ...)`），操作数内的 ORDER BY/LIMIT 保留在括号内、对其自身生效：
 
+```rust
+let sql = Select::<User>::new()
+    .filter(|u| u.age.gt(30))
+    .order_by(|u| u.name)
+    .range(..10)
+    .union(
+        Select::<User>::new()
+            .filter(|u| u.age.lt(18))
+            .order_by_desc(|u| u.age)
+            .range(..5),
+    )
+    .to_sql();
+```
+
 集合查询通过 `select_union` 执行：
 
 ```rust
@@ -521,20 +550,6 @@ let total = db
 ```
 
 同一谓词与 `range()` 组合即可实现"当页数据 + 总条数"，两者谓词一致、不会漂移。
-
-```rust
-let sql = Select::<User>::new()
-    .filter(|u| u.age.gt(30))
-    .order_by(|u| u.name)
-    .range(..10)
-    .union(
-        Select::<User>::new()
-            .filter(|u| u.age.lt(18))
-            .order_by_desc(|u| u.age)
-            .range(..5),
-    )
-    .to_sql();
-```
 
 ## 完整示例
 

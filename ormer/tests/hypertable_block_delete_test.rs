@@ -16,12 +16,20 @@ struct TsEvent {
     time: chrono::DateTime<chrono::Utc>,
 }
 
+#[cfg_attr(
+    not(any(feature = "postgresql", feature = "questdb")),
+    allow(dead_code)
+)]
 fn day(text: &str) -> chrono::DateTime<chrono::Utc> {
     use chrono::TimeZone;
     let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S").unwrap();
     chrono::Utc.from_utc_datetime(&naive)
 }
 
+#[cfg_attr(
+    not(any(feature = "postgresql", feature = "questdb")),
+    allow(dead_code)
+)]
 fn seed_events() -> Vec<TsEvent> {
     vec![
         TsEvent {
@@ -43,6 +51,10 @@ fn seed_events() -> Vec<TsEvent> {
     ]
 }
 
+#[cfg_attr(
+    not(any(feature = "postgresql", feature = "questdb")),
+    allow(dead_code)
+)]
 async fn remaining_ids(db: &ormer::Database) -> ormer::Result<Vec<i64>> {
     let mut ids: Vec<i64> = db
         .select::<TsEvent>()

@@ -33,7 +33,7 @@ ormer = { version = "0.2", features = ["sqlite"] }
 - 通过 `Database::connect(DbType::QuestDB, "...")` 使用 PostgreSQL wire 协议。
 - 支持 insert/select/update、建表/删表、原生 SQL、流式查询、连接池和逐条迁移。
 - 模型时间字段标注 `#[hypertable(...)]` 时，QuestDB 建表会生成 designated timestamp。
-- 不支持行级删除、事务、约束、自增/`RETURNING`、upsert、COPY、行锁、schema introspection 和高级分组。
+- 不支持行级删除、事务、约束、自增/`RETURNING`、upsert、COPY、行锁、db-first 实体生成（`generate_entities`）和高级分组。
 
 **MySQL:**
 - `mysql://user:password@localhost/dbname`
@@ -57,7 +57,7 @@ DuckDB 可通过统一的 `Database::connect(DbType::DuckDB, "app.duckdb")` 使�
 `Vec<i32>`、`Vec<i64>`、`Vec<Option<i64>>` 和 `Vec<String>` 字段会映射为 DuckDB list。
 ClickHouse 同样通过统一的 `Database::connect(DbType::ClickHouse, "...")` 使用。
 原生操作使用 `execute_sql` 和 `select_sql<T>`；事务、关系写入、行式更新、冲突写入和没有 engine 元数据的 `create_table::<T>()` 会返回 `UnsupportedFeature`。
-ClickHouse 建表必须显式指定 engine，例如 `MergeTree ORDER BY (id)`；需要 engine 的 DDL 请使用 `execute_sql(ormer::sql(...))` 或 `MigrationStep::Sql`。
+ClickHouse 建表必须显式指定 engine，例如 `MergeTree ORDER BY (id)`；在模型上声明 `#[clickhouse(engine = ...)]` 后可直接 `create_table::<T>()`，也可用 `execute_sql(ormer::sql(...))` 或 `MigrationStep::Sql` 手写 DDL。
 ClickHouse DDL 不支持事务，迁移步骤逐条执行；中途失败时已执行的步骤不会自动回滚。
 InfluxDB 通过 `Database::connect(DbType::InfluxDB, "...")` 使用。
 `insert` 会被渲染为 Line Protocol 批量写入，`select` 复用统一查询构建器渲染为 InfluxQL/SQL 子集；

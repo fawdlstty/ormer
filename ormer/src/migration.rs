@@ -8,7 +8,7 @@ use crate::abstract_layer::DbType;
 #[cfg(any(feature = "sqlite", feature = "duckdb"))]
 use crate::abstract_layer::common::common_helpers;
 use crate::abstract_layer::common::{Database, Transaction};
-use crate::db_first::{DbFirstIndex, DbFirstTable};
+use crate::db_first::{DbFirstForeignKey, DbFirstIndex, DbFirstTable};
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
 use crate::model::CompressionAlgorithm;
 use crate::model::{ColumnSchema, WritableModel};
@@ -118,13 +118,6 @@ pub enum MigrationStep {
 impl MigrationStep {
     pub fn sql(&self, db_type: DbType) -> crate::Result<String> {
         let table = crate::model::quote_qualified_identifier(db_type, table_name(self));
-        let columns = |names: &[String]| {
-            names
-                .iter()
-                .map(|name| crate::model::quote_identifier(db_type, name))
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
 
         match self {
             Self::CreateType { definition, .. } | Self::AlterType { definition, .. } => {
@@ -258,25 +251,17 @@ impl MigrationStep {
                 unique,
                 ..
             } => {
-                let unique = if *unique { " UNIQUE" } else { "" };
-                let if_not_exists = match db_type {
-                    #[cfg(feature = "mysql")]
-                    DbType::MySQL => "",
-                    #[cfg(feature = "mssql")]
-                    DbType::MSSQL => "",
-                    #[cfg(feature = "sqlite")]
-                    DbType::Sqlite => " IF NOT EXISTS",
-                    #[cfg(feature = "postgresql")]
-                    DbType::PostgreSQL => " IF NOT EXISTS",
-                    #[cfg(feature = "questdb")]
-                    DbType::QuestDB => " IF NOT EXISTS",
-                    #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-                    _ => " IF NOT EXISTS",
-                };
-                Ok(format!(
-                    "CREATE{unique} INDEX{if_not_exists} {} ON {table} ({})",
-                    crate::model::quote_identifier(db_type, name),
-                    columns(index_columns)
+                let columns_sql = index_columns
+                    .iter()
+                    .map(|column| crate::model::quote_identifier(db_type, column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Ok(crate::model::render_create_index(
+                    db_type,
+                    name,
+                    table_name(self),
+                    &columns_sql,
+                    *unique,
                 ))
             }
             Self::DropIndex { name, .. } => {
@@ -911,7 +896,11 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
         }
 
-        // 外键只为本次新增的列补建（已有列的外键差异检测属后续收敛项）
+        // ---- 外键集合管理 ----
+        // 新增列的外键随 AddColumn 后补 AddForeignKey；已有列上的 `#[foreign]`
+        // 增删通过与 db_first 自省结果做集合 diff 检测，库内外键不再与模型
+        // 静默漂移（不支持相应 DDL 的后端记录 warning 或拒绝，见
+        // push_foreign_key_diff_steps）。
         if !added_columns.is_empty() {
             for column in T::COLUMN_SCHEMA {
                 if !added_columns.contains(column.name) {
@@ -950,6 +939,9 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                     });
                 }
             }
+        }
+        if let Some(db_first_table) = &introspected_table {
+            push_foreign_key_diff_steps::<T>(db_type, table_name, db_first_table, &mut plan)?;
         }
 
         // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
@@ -1513,21 +1505,6 @@ fn index_migration_step(
         }
     }
 
-    let unique_sql = if unique { " UNIQUE" } else { "" };
-    let if_not_exists = match db_type {
-        #[cfg(feature = "mysql")]
-        DbType::MySQL => "",
-        #[cfg(feature = "mssql")]
-        DbType::MSSQL => "",
-        #[cfg(feature = "sqlite")]
-        DbType::Sqlite => " IF NOT EXISTS",
-        #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => " IF NOT EXISTS",
-        #[cfg(feature = "questdb")]
-        DbType::QuestDB => " IF NOT EXISTS",
-        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
-        _ => " IF NOT EXISTS",
-    };
     let columns_sql = columns
         .iter()
         .map(|column| {
@@ -1545,12 +1522,10 @@ fn index_migration_step(
         .find_map(|column| column.index_where)
         .map(|where_clause| format!(" WHERE {where_clause}"))
         .unwrap_or_default();
+    // IF NOT EXISTS 后端分派与标识符引用统一走建表路径的公共入口
+    let sql = crate::model::render_create_index(db_type, &name, table, &columns_sql, unique);
     Ok(MigrationStep::Sql {
-        sql: format!(
-            "CREATE{unique_sql} INDEX{if_not_exists} {} ON {} ({columns_sql}){predicate}",
-            crate::model::quote_identifier(db_type, &name),
-            crate::model::quote_qualified_identifier(db_type, table),
-        ),
+        sql: format!("{sql}{predicate}"),
     })
 }
 
@@ -1828,6 +1803,130 @@ fn default_index_name(table_name: &str, expected: &ExpectedIndexDef<'_>) -> Stri
             .map(|group| format!("idx_{table}_{group}"))
             .unwrap_or_else(|| format!("idx_{table}_{}", expected.columns[0].name))
     }
+}
+
+/// 比较外键引用目标是否一致（忽略 schema 前缀差异）。
+fn foreign_key_target_matches(actual: &DbFirstForeignKey, ref_table: &str, ref_column: &str) -> bool {
+    actual.ref_column == ref_column
+        && crate::model::table_name_without_schema(&actual.ref_table)
+            == crate::model::table_name_without_schema(ref_table)
+}
+
+/// 为已存在的外键约束生成 DROP 步骤。
+///
+/// 返回 `Ok(true)` 表示已生成步骤；返回 `Ok(false)` 表示该后端无法/无法安全
+/// 删除（SQLite 无相应 DDL、自省拿不到约束名），此时已在计划中记录 warning。
+fn push_drop_foreign_key_step(
+    db_type: DbType,
+    table_name: &str,
+    foreign_key: &DbFirstForeignKey,
+    plan: &mut MigrationPlan,
+) -> crate::Result<bool> {
+    #[cfg(feature = "sqlite")]
+    if matches!(db_type, DbType::Sqlite) {
+        plan.warnings.push(format!(
+            "keeping foreign key on column {} because SQLite cannot drop constraints; \
+             rebuild the table with a hand-written migration",
+            foreign_key.column
+        ));
+        return Ok(false);
+    }
+    let Some(constraint_name) = foreign_key.name.as_deref() else {
+        plan.warnings.push(format!(
+            "keeping foreign key on column {} because its constraint name is unknown \
+             to introspection; drop it with a hand-written migration",
+            foreign_key.column
+        ));
+        return Ok(false);
+    };
+    // MySQL 删除外键需要 FOREIGN KEY 关键字（DROP CONSTRAINT 仅 8.0.19+ 支持）
+    #[cfg(feature = "mysql")]
+    let keyword = if matches!(db_type, DbType::MySQL) {
+        "FOREIGN KEY"
+    } else {
+        "CONSTRAINT"
+    };
+    #[cfg(not(feature = "mysql"))]
+    let keyword = "CONSTRAINT";
+    plan.warnings.push(format!(
+        "dropping foreign key constraint {constraint_name} because it is not declared in the model"
+    ));
+    plan.push(MigrationStep::Sql {
+        sql: format!(
+            "ALTER TABLE {} DROP {keyword} {}",
+            crate::model::quote_qualified_identifier(db_type, table_name),
+            crate::model::quote_identifier(db_type, constraint_name)
+        ),
+    });
+    Ok(true)
+}
+
+/// 已有列的外键集合 diff：期望集合（模型 `#[foreign]`）vs 实际集合（自省）。
+///
+/// - 期望有实际没有 → `AddForeignKey`；
+/// - 实际有期望没有（或引用目标变化，按列名先 drop 再 add）→ `DROP` 步骤；
+/// - SQLite 无法给已有表补外键，直接报 UnmigratableSchema 引导显式重建；
+/// - QuestDB/ClickHouse/InfluxDB 不进入此函数（自省在 plan() 更早处已拦截）。
+fn push_foreign_key_diff_steps<T: WritableModel>(
+    db_type: DbType,
+    table_name: &str,
+    db_first_table: &DbFirstTable,
+    plan: &mut MigrationPlan,
+) -> crate::Result<()> {
+    let actual_by_column: BTreeMap<&str, &DbFirstForeignKey> = db_first_table
+        .foreign_keys
+        .iter()
+        .map(|foreign_key| (foreign_key.column.as_str(), foreign_key))
+        .collect();
+
+    for column in T::COLUMN_SCHEMA {
+        let Some(expected) = &column.foreign_key else {
+            continue;
+        };
+        let ref_table =
+            crate::model::normalize_table_name_for_db(db_type, expected.ref_table).to_string();
+        let ref_column = expected.get_ref_column();
+        if let Some(actual) = actual_by_column.get(column.name) {
+            if foreign_key_target_matches(actual, &ref_table, ref_column) {
+                continue;
+            }
+            // 引用目标变化：先删旧约束；删不掉时跳过重建，避免留下半成品状态
+            if !push_drop_foreign_key_step(db_type, table_name, actual, plan)? {
+                continue;
+            }
+        }
+        #[cfg(feature = "sqlite")]
+        if matches!(db_type, DbType::Sqlite) {
+            return Err(crate::OrmerError::unmigratable_schema(
+                table_name,
+                format!(
+                    "Cannot add foreign key for existing column {}; \
+                     SQLite requires an explicit table-rebuild migration",
+                    column.name
+                ),
+            ));
+        }
+        plan.push(MigrationStep::AddForeignKey {
+            table: table_name.to_string(),
+            column: column.name.to_string(),
+            ref_table,
+            ref_column: ref_column.to_string(),
+        });
+    }
+
+    // 实际有期望没有 → 删除
+    let expected_fk_columns: BTreeSet<&str> = T::COLUMN_SCHEMA
+        .iter()
+        .filter(|column| column.foreign_key.is_some())
+        .map(|column| column.name)
+        .collect();
+    for foreign_key in &db_first_table.foreign_keys {
+        if expected_fk_columns.contains(foreign_key.column.as_str()) {
+            continue;
+        }
+        push_drop_foreign_key_step(db_type, table_name, foreign_key, plan)?;
+    }
+    Ok(())
 }
 
 /// 渲染 `ALTER TABLE ... ALTER COLUMN ... SET/DROP DEFAULT` 步骤
@@ -2113,10 +2212,13 @@ fn sqlite_rebuild_sql<T: WritableModel>(
         let Some(actual) = actual_by_name.get(column.name) else {
             continue;
         };
-        insert_columns.push(column.name);
+        // 重建语句里的列名一律引用：保留字清单补全后，未引用的保留字列
+        // 会在这里拼出非法 SQL，与建表路径的引号化口径保持一致。
+        let quoted_column = crate::model::quote_identifier(DbType::Sqlite, column.name);
+        insert_columns.push(quoted_column.clone());
         let target_type = column_type_definition(DbType::Sqlite, column);
         let expression = if types_equivalent(DbType::Sqlite, &actual.type_name, &target_type) {
-            column.name.to_string()
+            quoted_column
         } else {
             if let Some(validation) = sqlite_conversion_validation_sql(
                 &check_table,
@@ -2128,7 +2230,7 @@ fn sqlite_rebuild_sql<T: WritableModel>(
                 validation_statements.push(validation.clone());
                 validation_statements.push(validation);
             }
-            sqlite_conversion_expression(column.name, &actual.type_name, &target_type)?
+            sqlite_conversion_expression(&quoted_column, &actual.type_name, &target_type)?
         };
         select_expressions.push(expression);
     }
@@ -2639,10 +2741,12 @@ impl Database {
 
     pub async fn apply_migrations<M: Migration>(&self, migrations: &[M]) -> crate::Result<usize> {
         #[cfg(feature = "clickhouse")]
+        #[allow(irrefutable_let_patterns)]
         if let Database::ClickHouse(db) = self {
             return db.apply_migrations(migrations).await;
         }
         #[cfg(feature = "influxdb")]
+        #[allow(irrefutable_let_patterns)]
         if let Database::InfluxDB(db) = self {
             return db.apply_migrations(migrations).await;
         }
@@ -2718,10 +2822,12 @@ impl Database {
 
     async fn ensure_migration_table(&self) -> crate::Result<()> {
         #[cfg(feature = "clickhouse")]
+        #[allow(irrefutable_let_patterns)]
         if let Database::ClickHouse(db) = self {
             return db.ensure_migration_table().await;
         }
         #[cfg(feature = "influxdb")]
+        #[allow(irrefutable_let_patterns)]
         if let Database::InfluxDB(_) = self {
             // measurement 由首条写入自动创建
             return Ok(());
@@ -2831,6 +2937,19 @@ impl Database {
 
     /// 迁移用的表级自省（索引/默认值/外键）。复用各后端 db_first 的既有
     /// 自省结构，不自建第二套抽象；找不到目标表时返回 None。
+    ///
+    /// 仅启用 clickhouse/influxdb 时所有分支都 diverge，尾部代码不可达，
+    /// 这是 cfg 组合下的预期形态。
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unreachable_code)
+    )]
     async fn db_first_table_for(
         &self,
         table_name: &str,
