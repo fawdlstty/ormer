@@ -99,15 +99,15 @@ pub use query::builder::{
     AggregateSelect, CursorPage, DerivedSelect, DerivedTableSelect, DynamicColumn,
     DynamicColumnSet, FilterQuery, FourTableSelect, GroupByColumns, InnerJoinedSelect,
     IntoArrayValue, IntoGroupingSets, IntoJsonPath, IntoJsonScalar, IsInValue, IsInValues,
-    LeftJoinedSelect, MapToResult, MultiTableSelect, NamedFilterQuery, NumericColumn, PageCursor,
+    LeftJoinedSelect, MapToResult, MultiTableSelect, NamedFilterQuery, PageCursor,
     ProjectionSelect, RecursiveColumns, RelatedSelect, RightJoinedSelect, RowValueCompare, Select,
     SelectColumnResult, SetOp, StaticJsonArrayExpr, StaticJsonExpr, StaticJsonUpdate,
     SubqueryParam, TypedColumn, UnionSelect, WhereColumn, WhereExpr, WithoutFilterQuery,
     from_derived,
 };
-// 旧类型名过渡别名（已合并为 ProjectionSelect，保留 re-export 以兼容现有导入路径）
+// 旧类型名过渡别名（已合并为 ProjectionSelect / TypedColumn，保留 re-export 以兼容现有导入路径）
 #[allow(deprecated)]
-pub use query::builder::{GroupedSelect, MappedSelect};
+pub use query::builder::{GroupedSelect, MappedSelect, NumericColumn};
 pub use query::expr::{
     CaseMatchBuilder, IntervalExpr, IntoRowExpr, IntoSqlExpr, IntoTypedExpr, JsonScalarKind,
     NowExpr, RawExpr, RawExprSegment, RawSqlExpr, SqlExpr, TimePart, TimeUnit, TypedExpr,
