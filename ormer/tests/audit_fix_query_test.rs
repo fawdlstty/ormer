@@ -444,14 +444,13 @@ async fn sqlite_decimal_between_matches_numerically() -> Result<(), Box<dyn std:
     let _ = db.drop_table::<AfqProduct>().execute().await;
     db.create_table::<AfqProduct>().execute().await?;
 
-    let _ = db
-        .insert(vec![
-            AfqProduct { id: 1, price: decimal("9.50") },
-            AfqProduct { id: 2, price: decimal("10.00") },
-            AfqProduct { id: 3, price: decimal("10.50") },
-        ])
-        .execute()
-        .await?;
+    db.insert(vec![
+        AfqProduct { id: 1, price: decimal("9.50") },
+        AfqProduct { id: 2, price: decimal("10.00") },
+        AfqProduct { id: 3, price: decimal("10.50") },
+    ])
+    .execute()
+    .await?;
 
     let rows: Vec<AfqProduct> = db
         .select::<AfqProduct>()

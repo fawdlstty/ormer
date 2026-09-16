@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -79,6 +79,7 @@ duckdb = ["sqlite", "dep:duckdb"]
 clickhouse = ["sqlite", "dep:clickhouse", "dep:serde"]
 influxdb = ["dep:reqwest"]
 
+# cargo clippy --features full --all-targets -- -D warnings
 # cargo publish -p ormer-derive --allow-dirty --registry crates-io
 # cargo publish -p ormer --allow-dirty --registry crates-io
 # cd docs && npm run docs:build && cd ..

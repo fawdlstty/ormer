@@ -50,11 +50,10 @@ fn assert_raw_params(params: &[ormer::Value]) {
 fn raw_update_sql(db_type: ormer::DbType) -> (String, Vec<ormer::Value>) {
     let fallback = "anonymous";
     let mut update = <RawExprUser as ormer::Model>::Update::default();
-    (|u: &mut <RawExprUser as ormer::Model>::Update| {
-        u.name = u
-            .name
-            .set_expr(ormer::raw!("COALESCE({u.name}, {fallback})"));
-    })(&mut update);
+    let u = &mut update;
+    u.name = u
+        .name
+        .set_expr(ormer::raw!("COALESCE({u.name}, {fallback})"));
     let assignments =
         <<RawExprUser as ormer::Model>::Update as ormer::UpdateFields>::assignments(&update);
 

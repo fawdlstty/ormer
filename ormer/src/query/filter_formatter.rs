@@ -298,7 +298,7 @@ impl FilterFormatter {
                 )
                 .unwrap_or_else(|e| panic!("Failed to write SQL WHERE clause: {}", e));
 
-                params.push(value.clone().into());
+                params.push(value.clone());
                 *param_idx += 1;
             }
             FilterExpr::ColumnComparison {
@@ -441,8 +441,8 @@ impl FilterFormatter {
                     col_sql, min_placeholder, max_placeholder
                 )
                 .unwrap_or_else(|e| panic!("Failed to write BETWEEN clause: {}", e));
-                params.push(min.clone().into());
-                params.push(max.clone().into());
+                params.push(min.clone());
+                params.push(max.clone());
             }
             FilterExpr::Exists {
                 subquery_sql,
@@ -495,10 +495,10 @@ impl FilterFormatter {
             } => {
                 self.format_relation_exists(
                     sql,
-                    *owner_table,
-                    *owner_key,
-                    *target_table,
-                    *target_key,
+                    owner_table,
+                    owner_key,
+                    target_table,
+                    target_key,
                     filter.as_deref(),
                     param_idx,
                     params,
@@ -516,13 +516,13 @@ impl FilterFormatter {
             } => {
                 self.format_through_relation_exists(
                     sql,
-                    *owner_table,
-                    *owner_key,
-                    *via_table,
-                    *via_owner_key,
-                    *via_target_key,
-                    *target_table,
-                    *target_key,
+                    owner_table,
+                    owner_key,
+                    via_table,
+                    via_owner_key,
+                    via_target_key,
+                    target_table,
+                    target_key,
                     filter.as_deref(),
                     param_idx,
                     params,
@@ -771,7 +771,7 @@ impl FilterFormatter {
             return column.to_owned();
         }
         for (alias, columns) in &self.related_tables {
-            if columns.iter().any(|candidate| *candidate == column) {
+            if columns.contains(&column) {
                 return if alias.is_empty() {
                     column.to_owned()
                 } else {
@@ -827,7 +827,7 @@ impl FilterFormatter {
                 write!(sql, "{}", placeholder_sql)
                     .unwrap_or_else(|e| panic!("Failed to write parameter placeholder: {}", e));
             }
-            params.push(value.clone().into());
+            params.push(value.clone());
             *param_idx += 1;
         }
         sql.push(')');

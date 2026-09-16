@@ -171,7 +171,7 @@ pub(crate) fn validate_model_constraints<T: Model>(
     }
     for (name, columns) in expected_indexes.values() {
         let found = actual_indexes.iter().any(|index| {
-            name.map_or(true, |expected| expected == index.name.as_str())
+            name.is_none_or(|expected| expected == index.name.as_str())
                 && index.columns.len() == columns.len()
                 && index
                     .columns
@@ -241,7 +241,7 @@ pub(crate) fn validate_model_constraints<T: Model>(
 
 #[allow(dead_code)]
 fn foreign_key_action_matches(expected: Option<ForeignKeyAction>, actual: Option<&str>) -> bool {
-    expected.map_or(true, |expected| {
+    expected.is_none_or(|expected| {
         actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected.as_sql()))
     })
 }
@@ -253,7 +253,7 @@ fn constraint_name_matches(db_type: DbType, expected: Option<&str>, actual: &str
     if matches!(db_type, DbType::Sqlite) {
         return true;
     }
-    expected.map_or(true, |expected| expected == actual)
+    expected.is_none_or(|expected| expected == actual)
 }
 
 #[allow(dead_code)]

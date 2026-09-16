@@ -654,7 +654,7 @@ fn clickhouse_json_value(value: &serde_json::Value) -> crate::Result<crate::mode
                 let integers = values
                     .iter()
                     .map(|value| match value {
-                        Value::Integer(value) => Ok(Some(i64::from(*value))),
+                        Value::Integer(value) => Ok(Some(*value)),
                         Value::BigInt(value) => i64::try_from(*value).map(Some).map_err(|_| {
                             crate::ormer_error!(
                                 "ClickHouse integer array value is out of i64 range"

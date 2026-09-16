@@ -324,7 +324,7 @@ pub fn parse_ddl_foreign_keys(create_sql: &str) -> Vec<DbFirstForeignKey> {
         let ref_cols = ddl_parenthesized_list(after_references);
         let on_delete = ddl_parse_action_clause(&item, "ON DELETE");
         let on_update = ddl_parse_action_clause(&item, "ON UPDATE");
-        for (column, ref_column) in local_cols.into_iter().zip(ref_cols.into_iter()) {
+        for (column, ref_column) in local_cols.into_iter().zip(ref_cols) {
             foreign_keys.push(DbFirstForeignKey {
                 name: (!name.is_empty()).then_some(name.clone()),
                 column,
@@ -469,7 +469,7 @@ pub fn validate_table_constraints<T: Model>(
     }
     let action_matches = |expected: Option<crate::model::ForeignKeyAction>,
                           actual: Option<&str>| {
-        expected.map_or(true, |expected| {
+        expected.is_none_or(|expected| {
             actual.is_some_and(|actual| actual.eq_ignore_ascii_case(expected.as_sql()))
         })
     };

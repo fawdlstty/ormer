@@ -306,7 +306,7 @@ impl Database {
                         ));
                     }
                     // 查询结果中可能内嵌 error 字段
-                    for error in parse_query_errors(&body) {
+                    if let Some(error) = parse_query_errors(&body).into_iter().next() {
                         return Err(error);
                     }
                     return Ok(0);
@@ -426,9 +426,8 @@ impl Database {
     pub(crate) fn inline_sql(sql: &str, params: &[Value]) -> crate::Result<String> {
         let mut result = String::with_capacity(sql.len() + params.len() * 8);
         let mut param_index = 0;
-        let mut chars = sql.chars().peekable();
         let mut in_string = false;
-        while let Some(character) = chars.next() {
+        for character in sql.chars() {
             match character {
                 '\'' => {
                     in_string = !in_string;
@@ -463,7 +462,7 @@ impl Database {
         let (sql, params) = sql.render(crate::abstract_layer::DbType::InfluxDB)?;
         let q = Self::inline_sql(&sql, &params)?;
         let series = self.query_influxql(&q).await?;
-        Ok(flatten_series_values(&series, columns)?)
+        flatten_series_values(&series, columns)
     }
 
     /// 执行原生语句/查询，返回行值（单列规则与 ClickHouse 一致）。
@@ -694,12 +693,12 @@ fn chunk_line_protocol(lines: &str) -> Vec<String> {
     let mut current = String::new();
     let mut current_lines = 0usize;
     for line in lines.lines() {
-        if current_lines >= WRITE_CHUNK_LINES || current.len() + line.len() + 1 > WRITE_CHUNK_BYTES
+        if (current_lines >= WRITE_CHUNK_LINES
+            || current.len() + line.len() + 1 > WRITE_CHUNK_BYTES)
+            && !current.is_empty()
         {
-            if !current.is_empty() {
-                chunks.push(std::mem::take(&mut current));
-                current_lines = 0;
-            }
+            chunks.push(std::mem::take(&mut current));
+            current_lines = 0;
         }
         current.push_str(line);
         current.push('\n');
@@ -1187,7 +1186,7 @@ fn value_to_nanoseconds(value: &Value) -> crate::Result<i64> {
             .and_hms_opt(0, 0, 0)
             .and_then(|value| value.and_utc().timestamp_nanos_opt())
             .ok_or_else(|| crate::ormer_error!("InfluxDB timestamp is out of range")),
-        Value::Integer(value) => Ok(i64::from(*value)),
+        Value::Integer(value) => Ok(*value),
         Value::BigInt(value) => i64::try_from(*value)
             .map_err(|_| crate::ormer_error!("InfluxDB timestamp is out of range")),
         Value::Text(value) => value
@@ -1579,7 +1578,7 @@ mod tests {
 
     #[test]
     fn line_protocol_renders_tags_fields_and_timestamp() {
-        let points = vec![
+        let points = [
             CpuUsage {
                 time: chrono::DateTime::from_timestamp(1_700_000_000, 123).unwrap(),
                 host: "server-1".to_string(),

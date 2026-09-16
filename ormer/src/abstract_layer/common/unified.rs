@@ -207,7 +207,6 @@ fn relation_filter_values(values: Vec<Value>) -> Vec<crate::query::filter::Value
         .into_iter()
         .filter(|value| !matches!(value, Value::Null))
         .filter(|value| seen.insert(common_helpers::model_value_key(value)))
-        .map(Into::into)
         .collect()
 }
 
@@ -671,12 +670,14 @@ impl<'a> DatabaseScope<'a> {
         find_by_id_with_executor(self.select::<T>(), key).await
     }
 
-    pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+    pub async fn find_related<T, S>(
         &self,
         owner: &T,
         relation: S,
     ) -> crate::Result<Vec<S::Target>>
     where
+        T: Model + 'static + Send + Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
         S::Target: Send + Sync,
         S::Via: Send + Sync,
@@ -684,12 +685,14 @@ impl<'a> DatabaseScope<'a> {
         find_related_with_executor(&self.select::<T>(), owner, &relation).await
     }
 
-    pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+    pub async fn preload<T, S>(
         &self,
         owners: &mut [T],
         relation: S,
     ) -> crate::Result<()>
     where
+        T: Model + 'static + Send + Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
         S::Target: Send + Sync,
         S::Via: Send + Sync,
@@ -959,7 +962,7 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             CreateTableExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
             #[cfg(feature = "influxdb")]
             CreateTableExecutor::InfluxDB(..) => Err(unsupported_feature(
                 super::super::DbType::InfluxDB,
@@ -1051,7 +1054,7 @@ impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             DropTableExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
             #[cfg(feature = "influxdb")]
             DropTableExecutor::InfluxDB(..) => {
                 let table = crate::model::quote_qualified_identifier(
@@ -1130,7 +1133,7 @@ impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
             TruncateTableExecutor::DuckDB(exec) => exec.to_sql(),
             TruncateTableExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
         }
     }
 
@@ -1315,7 +1318,7 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             InsertPartialExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
         }
     }
 
@@ -1697,7 +1700,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
                 backend,
                 feature,
                 ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
             #[cfg(feature = "influxdb")]
             InsertExecutor::InfluxDB(..) => Err(unsupported_feature(
                 super::super::DbType::InfluxDB,
@@ -1999,7 +2002,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             InsertOrUpdateExecutor::DuckDBTxn(exec) => exec.to_sql(),
             InsertOrUpdateExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
         }
     }
 
@@ -2211,18 +2214,11 @@ enum SaveConn<'a, T: WritableModel + crate::model::GraphWritable> {
 /// `Transaction: Send`；返回的 future 不标注 `Send`，与合并前
 /// `TransactionSaveExecutor::execute` 的条件 Send 语义一致
 /// （`SaveExecutor` 仍在 `T: Send` 时自动满足 `Send`）。
-type SaveTxnRun<'a, T> = Box<
-    dyn FnOnce(
-            &'a mut Tracked<T>,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                    Output = (crate::Result<u64>, &'a mut Tracked<T>),
-                > + 'a,
-            >,
-        > + Send
-        + 'a,
->;
+/// 写核心闭包返回的 future：产出 (写结果, 归还的模型句柄)。
+type SaveTxnFuture<'a, T> =
+    Pin<Box<dyn Future<Output = (crate::Result<u64>, &'a mut Tracked<T>)> + 'a>>;
+
+type SaveTxnRun<'a, T> = Box<dyn FnOnce(&'a mut Tracked<T>) -> SaveTxnFuture<'a, T> + Send + 'a>;
 
 /// Save 执行器两条路径共用的收尾：写成功后接受 dirty 变更。
 fn finish_save<T: crate::model::Model>(affected: u64, model: &mut Tracked<T>) -> crate::Result<u64> {
@@ -2257,7 +2253,7 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
             // 自开事务：写入核心共享（R3 合并），结束时提交/回滚
             SaveConn::Db(db) => {
                 let mut tx = db.begin().await?;
-                match save_dirty_columns_and_relations(&mut tx, &mut model).await {
+                match save_dirty_columns_and_relations(&mut tx, model).await {
                     Ok(affected) => {
                         tx.commit().await?;
                         affected
@@ -2276,7 +2272,7 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
                 result?
             }
         };
-        finish_save(affected, &mut model)
+        finish_save(affected, model)
     }
 
     /// 同义词，等价于 [`Self::execute`]。
@@ -2306,7 +2302,7 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
                 let mut tx = db.begin().await?;
                 let result = async {
                     let affected =
-                        save_dirty_columns_and_relations(&mut tx, &mut model).await?;
+                        save_dirty_columns_and_relations(&mut tx, model).await?;
                     if affected > 0 && ctx.hooks_enabled() {
                         crate::AfterUpdate::after_update(model.as_model(), &mut ctx).await?;
                     }
@@ -2336,7 +2332,7 @@ impl<'a, T: WritableModel + crate::model::Model + crate::model::GraphWritable>
                 affected
             }
         };
-        finish_save(affected, &mut model)
+        finish_save(affected, model)
     }
 
     /// 跳过本次保存的钩子（等价于在 [`Self::execute_with_hooks`] 外层
@@ -2416,7 +2412,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             InsertOrIgnoreExecutor::DuckDBTxn(exec) => exec.to_sql(),
             InsertOrIgnoreExecutor::Unsupported {
                 backend, feature, ..
-            } => Err(unsupported_feature(*backend, *feature)),
+            } => Err(unsupported_feature(*backend, feature)),
         }
     }
 
@@ -2822,15 +2818,14 @@ impl Database {
     }
 
     /// 查找单个模型的关联对象。
-    pub async fn find_related<
-        T: Model + 'static + std::marker::Send + std::marker::Sync,
-        S: RelationSelection<T>,
-    >(
+    pub async fn find_related<T, S>(
         &self,
         owner: &T,
         relation: S,
     ) -> crate::Result<Vec<S::Target>>
     where
+        T: Model + 'static + std::marker::Send + std::marker::Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + std::marker::Send + std::marker::Sync,
         S::Target: std::marker::Send + std::marker::Sync,
         S::Via: std::marker::Send + std::marker::Sync,
@@ -2839,15 +2834,14 @@ impl Database {
     }
 
     /// 批量预加载关联对象，避免循环查询产生 N+1。
-    pub async fn preload<
-        T: Model + 'static + std::marker::Send + std::marker::Sync,
-        S: RelationSelection<T>,
-    >(
+    pub async fn preload<T, S>(
         &self,
         owners: &mut [T],
         relation: S,
     ) -> crate::Result<()>
     where
+        T: Model + 'static + std::marker::Send + std::marker::Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + std::marker::Send + std::marker::Sync,
         S::Target: std::marker::Send + std::marker::Sync,
         S::Via: std::marker::Send + std::marker::Sync,
@@ -4662,7 +4656,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
             #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
             SelectExecutor::ClickHouse(db, select) => {
                 CollectFuture::ClickHouse(
-                    db.clone(),
+                    *db,
                     select.clone(),
                     std::marker::PhantomData,
                 )
@@ -5140,7 +5134,7 @@ fn append_scoped_filters<T: Model>(
             // 已有 WHERE：把既有条件整体加括号再 AND，防止
             // "WHERE pk = ? OR pk = ?" 这类 OR 分支绕过租户过滤
             Some(insert_at) => {
-                single.sql.insert_str(insert_at, "(");
+                single.sql.insert(insert_at, '(');
                 single.sql.push_str(") AND ");
                 single.sql.push_str(&scope_sql);
             }
@@ -5244,7 +5238,7 @@ impl<'a, T: Model> NamedFilterQuery<T> for ScopedDeleteExecutor<'a, T> {
 
 impl<'a, T: Model> WithoutFilterQuery<T> for ScopedDeleteExecutor<'a, T> {
     fn without_filter(mut self, name: &'static str) -> Self {
-        if !self.disabled_filters.iter().any(|item| *item == name) {
+        if !self.disabled_filters.contains(&name) {
             self.disabled_filters.push(name);
         }
         self
@@ -5323,7 +5317,7 @@ impl<'a, T: Model> NamedFilterQuery<T> for ScopedUpdateExecutor<'a, T> {
 
 impl<'a, T: Model> WithoutFilterQuery<T> for ScopedUpdateExecutor<'a, T> {
     fn without_filter(mut self, name: &'static str) -> Self {
-        if !self.disabled_filters.iter().any(|item| *item == name) {
+        if !self.disabled_filters.contains(&name) {
             self.disabled_filters.push(name);
         }
         self
@@ -5995,20 +5989,12 @@ impl<'a, T: WritableModel + crate::model::GraphWritable> SaveExecutor<'a, T> {
         SaveExecutor {
             conn: SaveConn::Pooled {
                 sql,
-                run: Box::new(
-                    move |model: &'a mut Tracked<T>| -> Pin<
-                        Box<
-                            dyn Future<
-                                    Output = (crate::Result<u64>, &'a mut Tracked<T>),
-                                > + 'a,
-                        >,
-                    > {
-                        Box::pin(async move {
-                            let result = save_on_pooled_conn(conn, model).await;
-                            (result, model)
-                        })
-                    },
-                ),
+                run: Box::new(move |model: &'a mut Tracked<T>| -> SaveTxnFuture<'a, T> {
+                    Box::pin(async move {
+                        let result = save_on_pooled_conn(conn, model).await;
+                        (result, model)
+                    })
+                }),
             },
             model,
         }
@@ -6120,7 +6106,7 @@ impl<'a, 'tx> TransactionScope<'a, 'tx> {
     }
 
     /// 撤销同名 context filter（scope 级或查询级命名过滤器）。
-    pub fn without_filter<T: Model>(mut self, name: &'static str) -> Self {
+    pub fn without_filter(mut self, name: &'static str) -> Self {
         self.context_filters
             .retain(|filter| filter.name() != name);
         self
@@ -6427,20 +6413,12 @@ impl<'a> Transaction<'a> {
         SaveExecutor {
             conn: SaveConn::Txn {
                 sql,
-                run: Box::new(
-                    move |model: &'op mut Tracked<T>| -> Pin<
-                        Box<
-                            dyn Future<
-                                    Output = (crate::Result<u64>, &'op mut Tracked<T>),
-                                > + 'op,
-                        >,
-                    > {
-                        Box::pin(async move {
-                            let result = save_dirty_columns_and_relations(txn, model).await;
-                            (result, model)
-                        })
-                    },
-                ),
+                run: Box::new(move |model: &'op mut Tracked<T>| -> SaveTxnFuture<'op, T> {
+                    Box::pin(async move {
+                        let result = save_dirty_columns_and_relations(txn, model).await;
+                        (result, model)
+                    })
+                }),
             },
             model,
         }
@@ -6582,7 +6560,7 @@ impl<'a, T: Model, J: Model> LeftJoinedSelectExecutor<'a, T, J> {
                 backend, feature, ..
             } => LeftJoinCollectFuture::Unsupported {
                 backend: *backend,
-                feature: *feature,
+                feature,
                 _marker: std::marker::PhantomData,
             },
         }
@@ -6623,7 +6601,7 @@ impl<'a, T: Model, J: Model> InnerJoinedSelectExecutor<'a, T, J> {
                 backend, feature, ..
             } => InnerJoinCollectFuture::Unsupported {
                 backend: *backend,
-                feature: *feature,
+                feature,
                 _marker: std::marker::PhantomData,
             },
         }
@@ -6666,7 +6644,7 @@ impl<'a, T: Model, J: Model> RightJoinedSelectExecutor<'a, T, J> {
                 backend, feature, ..
             } => RightJoinCollectFuture::Unsupported {
                 backend: *backend,
-                feature: *feature,
+                feature,
                 _marker: std::marker::PhantomData,
             },
         }
@@ -6849,7 +6827,7 @@ impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
             }
             #[cfg(feature = "clickhouse")]
             ProjectionSelectExecutor::ClickHouse(db, select) => ProjectionCollectFuture::ClickHouse(
-                *db,
+                db,
                 select.clone(),
                 std::marker::PhantomData,
             ),
@@ -6858,7 +6836,7 @@ impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
                 backend, feature, ..
             } => ProjectionCollectFuture::Unsupported {
                 backend: *backend,
-                feature: *feature,
+                feature,
                 _marker: std::marker::PhantomData,
             },
         }
@@ -6921,7 +6899,7 @@ impl<'a, T: Model, V> Clone for ProjectionSelectExecutor<'a, T, V> {
                 backend, feature, ..
             } => ProjectionSelectExecutor::Unsupported {
                 backend: *backend,
-                feature: *feature,
+                feature,
                 _marker: std::marker::PhantomData,
             },
         }
@@ -7127,6 +7105,42 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
                     _marker: std::marker::PhantomData,
                 }
             }
+        }
+    }
+
+    /// 字段投影到 ViewModel - 按目标视图声明的列集合投影源表列，
+    /// 典型用于跳过 blob 等大字段的元数据查询。
+    pub fn map_to_view<V: crate::model::ViewModel>(
+        self,
+    ) -> ProjectionSelectExecutor<'a, T, V> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            SelectExecutor::Sqlite(exec) => {
+                ProjectionSelectExecutor::Sqlite(exec.map_to_view::<V>())
+            }
+            #[cfg(feature = "postgresql")]
+            SelectExecutor::PostgreSQL(exec) => {
+                ProjectionSelectExecutor::PostgreSQL(exec.map_to_view::<V>())
+            }
+            #[cfg(feature = "mysql")]
+            SelectExecutor::MySQL(exec) => {
+                ProjectionSelectExecutor::MySQL(exec.map_to_view::<V>())
+            }
+            #[cfg(feature = "mssql")]
+            SelectExecutor::MSSQL(exec) => {
+                ProjectionSelectExecutor::MSSQL(exec.map_to_view::<V>())
+            }
+            #[cfg(feature = "duckdb")]
+            SelectExecutor::DuckDB(exec) => {
+                ProjectionSelectExecutor::DuckDB(exec.map_to_view::<V>())
+            }
+            // 能力矩阵门控与 select_column 共用同一判定与文案。
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            SelectExecutor::ClickHouse(db, _) => ProjectionSelectExecutor::Unsupported {
+                backend: clickhouse_select_backend_db_type(db),
+                feature: "view-model projection",
+                _marker: std::marker::PhantomData,
+            },
         }
     }
 }
@@ -7718,9 +7732,9 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
                 }
                 // cfg 门控保证上方两个 if-let 覆盖所有可构造的后端变体；
                 // 落到这里只能是手工混用构造的值，返回错误而非 panic。
-                return Err(crate::OrmerError::invalid_operation(
+                Err(crate::OrmerError::invalid_operation(
                     "SelectStream::ClickHouse backend matched neither arm",
-                ));
+                ))
             }
         }
     }

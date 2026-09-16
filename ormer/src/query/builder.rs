@@ -641,6 +641,7 @@ fn append_filter_clause(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_select_tail(
     sql: &mut String,
     filters: &[FilterExpr],
@@ -1469,7 +1470,7 @@ fn assert_derived_model_column_count<R: Model>(actual: usize) {
 /// `range()` 族 API 是链式的、返回 `Self`，不携带 `Result`，因此用钳制
 /// 语义替代下溢 panic。
 fn range_limit(start: Option<usize>, end: usize) -> usize {
-    end.checked_sub(start.unwrap_or(0)).unwrap_or(0)
+    end.saturating_sub(start.unwrap_or(0))
 }
 
 fn append_limit_offset_clause(
@@ -2530,9 +2531,11 @@ pub type GroupedSelect<T, V> = ProjectionSelect<T, V>;
 
 #[derive(Clone)]
 pub(crate) struct DerivedSelectSql {
-    render:
-        Arc<dyn Fn(DbType) -> (String, Vec<crate::model::Value>, Vec<&'static str>) + Send + Sync>,
+    render: Arc<DerivedSelectRender>,
 }
+
+type DerivedSelectRender =
+    dyn Fn(DbType) -> (String, Vec<crate::model::Value>, Vec<&'static str>) + Send + Sync;
 
 impl DerivedSelectSql {
     fn new(
@@ -3093,10 +3096,9 @@ impl<T: Model, V> ProjectionSelect<T, V> {
         );
         write!(
             &mut sql,
-            "SELECT {}{}{} FROM {}",
+            "SELECT {}{} FROM {}",
             distinct_str,
             columns,
-            "",
             table_name_with_lock_hint(&table_name, self.lock, db_type)
         )
         .expect("Failed to write SELECT clause");
@@ -3673,6 +3675,39 @@ impl<T: Model> Select<T> {
             column_names: result.column_names(),
             column_exprs: result.sql_exprs(),
             alias_names: result.alias_names(),
+            distinct: self.distinct,
+            distinct_on: self.distinct_on,
+            lock: self.lock,
+            grouping: None,
+            table_route: self.table_route,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影到 ViewModel - 按目标视图声明的列集合投影源表列。
+    ///
+    /// 典型用途是跳过 blob 等大字段（视图不声明的列不会出现在 SELECT 里），
+    /// 结果按视图字段顺序经 `FromRowValues` 解码。要求视图列是源模型列的
+    /// 子集，构造期断言。
+    pub fn map_to_view<V: crate::model::ViewModel>(self) -> ProjectionSelect<T, V> {
+        for column in V::COLUMNS {
+            assert!(
+                T::COLUMNS.contains(column),
+                "ViewModel column {} not found on model {}",
+                column,
+                T::TABLE_NAME,
+            );
+        }
+        ProjectionSelect {
+            filters: self.filters,
+            context_filters: self.context_filters,
+            disabled_context_filters: self.disabled_context_filters,
+            order_by: self.order_by,
+            range_start: self.range_start,
+            range_end: self.range_end,
+            column_names: V::COLUMNS.iter().map(|column| column.to_string()).collect(),
+            column_exprs: Vec::new(),
+            alias_names: Vec::new(),
             distinct: self.distinct,
             distinct_on: self.distinct_on,
             lock: self.lock,
@@ -4264,10 +4299,9 @@ impl<T: Model> Select<T> {
         };
         write!(
             &mut sql,
-            "SELECT {}{}{} FROM {}",
+            "SELECT {}{} FROM {}",
             distinct_str,
             projection_sql,
-            "",
             table_name_with_lock_hint(&table_name, self.lock, db_type)
         )
         .unwrap_or_else(|e| panic!("Failed to write SQL: {}", e));
@@ -4457,8 +4491,7 @@ impl<T: Model> Select<T> {
             let join_name = crate::model::quote_identifier(db_type, &join.name);
             write!(
                 &mut sql,
-                " INNER JOIN {join_name} AS {join_name} ON {}.{} = {join_name}.{}",
-                "t0",
+                " INNER JOIN {join_name} AS {join_name} ON t0.{} = {join_name}.{}",
                 crate::model::quote_identifier(db_type, &join.left_column),
                 crate::model::quote_identifier(db_type, &join.right_column),
             )
@@ -5281,6 +5314,7 @@ impl<T: Model> DynamicColumn<T> {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     fn column_or_invalid(&self) -> Result<&'static str, FilterExpr> {
         self.column_name
             .ok_or_else(|| invalid_dynamic_field(self.model, self.requested_field.clone()))
@@ -6969,12 +7003,8 @@ impl<T: ColumnValueType, S> TypedColumn<T, S> {
             "Type does not support comparison operations"
         );
         let value = value.into_sql_expr();
-        let inner = if self.aggregate_func.is_some() {
-            let column = format!(
-                "{}({})",
-                self.aggregate_func.as_ref().expect("checked aggregate"),
-                self.column_name
-            );
+        let inner = if let Some(aggregate_func) = self.aggregate_func.as_ref() {
+            let column = format!("{aggregate_func}({})", self.column_name);
             match value {
                 SqlExpr::Value(value) => FilterExpr::Comparison {
                     column,

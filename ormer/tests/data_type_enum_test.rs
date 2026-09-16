@@ -144,7 +144,7 @@ fn data_type_enum_without_field_type_uses_i32_values() -> ormer::Result<()> {
 #[test]
 fn data_type_i32_where_uses_database_type_for_in_filter() -> ormer::Result<()> {
     let sql = ormer::Select::<DataTypeWrappedModel>::new()
-        .filter(|w| w.status.is_in(&[1, 2, 3]))
+        .filter(|w| w.status.is_in([1, 2, 3]))
         .to_sql();
     assert!(sql.contains("status IN"), "SQL: {sql}");
     assert!(

@@ -336,7 +336,7 @@ fn derive_enum_field_type(
 enum DbTypeAttr {
     Native,
     String,
-    Numeric(syn::Type),
+    Numeric(Box<syn::Type>),
 }
 
 struct VariantFieldInfo<'a> {
@@ -935,7 +935,7 @@ fn extract_db_type_attr(input: &DeriveInput) -> syn::Result<DbTypeAttr> {
                 if is_string_type(&ty) {
                     Ok(DbTypeAttr::String)
                 } else {
-                    Ok(DbTypeAttr::Numeric(ty))
+                    Ok(DbTypeAttr::Numeric(Box::new(ty)))
                 }
             }
             Meta::NameValue(_) => Err(syn::Error::new_spanned(

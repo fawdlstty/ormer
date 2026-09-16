@@ -825,12 +825,12 @@ impl SqlExpr {
     ) -> String {
         match self {
             SqlExpr::Column(column) => {
-                let col_name = if table_prefix.is_some()
+                let col_name = if let Some(prefix) = table_prefix
                     && !column.contains('.')
                     && !column.contains('(')
                     && !column.contains(' ')
                 {
-                    format!("{}.{}", table_prefix.unwrap(), column)
+                    format!("{prefix}.{column}")
                 } else {
                     column.clone()
                 };
@@ -2004,7 +2004,7 @@ pub(crate) fn validate_filter_for_db(
         FilterExpr::Unsupported { backend, feature } => {
             Err(crate::OrmerError::UnsupportedFeature {
                 backend: *backend,
-                feature: *feature,
+                feature,
             })
         }
         FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {

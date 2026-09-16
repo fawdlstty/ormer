@@ -2506,6 +2506,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         }
     }
 
+    /// 字段投影到 ViewModel（按目标视图列集合投影，典型用于跳过 blob 等大字段）
+    pub fn map_to_view<V: crate::model::ViewModel>(
+        self,
+    ) -> ProjectionSelectExecutor<'a, T, V> {
+        ProjectionSelectExecutor {
+            select: self.select.map_to_view::<V>(),
+            conn: self.conn,
+            _marker: PhantomData,
+        }
+    }
+
     /// 忽略指定字段，查询时用默认常量替代真实列值
     pub fn ignore<F, M>(self, f: F) -> Self
     where

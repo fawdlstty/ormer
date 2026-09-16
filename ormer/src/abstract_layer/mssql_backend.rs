@@ -67,7 +67,7 @@ async fn traced_mssql_execute(
     match query.execute(client).await {
         Ok(result) => {
             trace.finish_ok();
-            Ok(result.total() as u64)
+            Ok(result.total())
         }
         Err(error) => {
             let code = mssql_server_error_code(&error);
@@ -2164,6 +2164,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     {
         ProjectionSelectExecutor {
             select: self.select.map_to(f),
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影到 ViewModel（按目标视图列集合投影，典型用于跳过 blob 等大字段）
+    pub fn map_to_view<V: crate::model::ViewModel>(
+        self,
+    ) -> ProjectionSelectExecutor<'a, T, V> {
+        ProjectionSelectExecutor {
+            select: self.select.map_to_view::<V>(),
             pool: self.pool,
             _marker: PhantomData,
         }

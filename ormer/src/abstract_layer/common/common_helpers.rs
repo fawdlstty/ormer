@@ -600,15 +600,15 @@ pub fn resolve_influx_time_key<T: Model>(db_type: DbType) -> crate::Result<Strin
 
 /// Raw time-range bounds for backends whose server owns shard boundaries.
 /// Returns `None` for a safe no-op; reversed `between` remains an error.
+type TimeDeleteBounds = (
+    Option<chrono::DateTime<chrono::Utc>>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 pub fn time_delete_bounds(
     range: BlockRange,
     now: chrono::DateTime<chrono::Utc>,
-) -> crate::Result<
-    Option<(
-        Option<chrono::DateTime<chrono::Utc>>,
-        chrono::DateTime<chrono::Utc>,
-    )>,
-> {
+) -> crate::Result<Option<TimeDeleteBounds>> {
     match range {
         BlockRange::Before { cutoff } => Ok(Some((None, cutoff))),
         BlockRange::Between { start, end } => {
@@ -1070,7 +1070,7 @@ fn bulk_source_columns<'a>(
 ) -> Vec<&'a str> {
     pk_columns
         .iter()
-        .map(|column| *column)
+        .copied()
         .chain(set_columns.iter().map(String::as_str))
         .collect()
 }
@@ -2610,7 +2610,7 @@ pub fn build_insert_statement_with_conflict<T: Model>(
             feature = "mysql",
             feature = "duckdb"
         ))]
-        append_insert_conflict_clause::<T>(db_type, &mut sql, &mut values, conflict)?;
+        append_insert_conflict_clause(db_type, &mut sql, &mut values, conflict)?;
     }
 
     Ok((sql, values))
@@ -2699,7 +2699,7 @@ pub fn build_insert_statements_with_conflict<T: Model>(
     feature = "mysql",
     feature = "duckdb"
 ))]
-fn append_insert_conflict_clause<T: Model>(
+fn append_insert_conflict_clause(
     db_type: DbType,
     sql: &mut String,
     params: &mut Vec<Value>,
@@ -2716,17 +2716,17 @@ fn append_insert_conflict_clause<T: Model>(
     match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => {
-            append_standard_insert_conflict_clause::<T>(DbType::PostgreSQL, sql, params, conflict)
+            append_standard_insert_conflict_clause(DbType::PostgreSQL, sql, params, conflict)
         }
         #[cfg(feature = "sqlite")]
         DbType::Sqlite => {
-            append_standard_insert_conflict_clause::<T>(DbType::Sqlite, sql, params, conflict)
+            append_standard_insert_conflict_clause(DbType::Sqlite, sql, params, conflict)
         }
         #[cfg(feature = "mysql")]
         DbType::MySQL => append_mysql_insert_conflict_clause(sql, params, conflict),
         #[cfg(feature = "duckdb")]
         DbType::DuckDB => {
-            append_standard_insert_conflict_clause::<T>(DbType::DuckDB, sql, params, conflict)
+            append_standard_insert_conflict_clause(DbType::DuckDB, sql, params, conflict)
         }
         #[cfg(feature = "mssql")]
         DbType::MSSQL => Err(crate::ormer_error!(
@@ -2742,7 +2742,7 @@ fn append_insert_conflict_clause<T: Model>(
 }
 
 #[cfg(any(feature = "postgresql", feature = "sqlite", feature = "duckdb"))]
-fn append_standard_insert_conflict_clause<T: Model>(
+fn append_standard_insert_conflict_clause(
     db_type: DbType,
     sql: &mut String,
     params: &mut Vec<Value>,

@@ -348,7 +348,7 @@ fn build_pg_insert_or_ignore_statements<T: Model>(
 ) -> crate::Result<Vec<common_helpers::InsertSqlStatement>> {
     let columns = T::insert_columns();
     let primary_key =
-        common_helpers::quote_column_list(DbType::PostgreSQL, &T::primary_key_columns());
+        common_helpers::quote_column_list(DbType::PostgreSQL, T::primary_key_columns());
     common_helpers::build_chunked_insert_statements::<T>(DbType::PostgreSQL, models, |chunk| {
         let (mut sql, params) = common_helpers::build_batch_insert_statement::<T>(
             DbType::PostgreSQL,
@@ -805,7 +805,7 @@ fn postgres_numeric_to_string(
     let sign = cursor.read_u16::<BigEndian>()?;
     let display_scale = cursor.read_u16::<BigEndian>()? as usize;
 
-    return match sign {
+    match sign {
         NUMERIC_NAN => Ok("NaN".to_string()),
         NUMERIC_PINF => Ok("Infinity".to_string()),
         NUMERIC_NINF => Ok("-Infinity".to_string()),
@@ -846,7 +846,7 @@ fn postgres_numeric_to_string(
             Ok(digits)
         }
         _ => Err("invalid NUMERIC sign".into()),
-    };
+    }
 }
 
 fn pg_datetime_value_from_row(
@@ -1796,7 +1796,54 @@ async fn ensure_routed_table_on_client<T: Model>(
         let statement_sql = questdb_nonce_sql(db_type, &statement.sql);
         traced_pg_execute_empty(client, statement_sql.as_ref()).await?;
     }
+    mark_schema_ensured(db_type, table);
     Ok(())
+}
+
+/// 剥出 schema 限定表名（如 `ticket.tickets`）里的 schema 段；无 schema
+/// 前缀，或 QuestDB（无 schema 概念、表名本就剥掉前缀）返回 `None`。
+fn schema_of_qualified_table(db_type: DbType, table_name: &str) -> Option<&str> {
+    if db_type.is_questdb() {
+        return None;
+    }
+    let (schema, _) = table_name.rsplit_once('.')?;
+    if schema.is_empty() {
+        return None;
+    }
+    Some(schema)
+}
+
+/// 进程级"已确认存在 schema"缓存：同 schema 多张表首次建表只需真正下发
+/// 一次 CREATE SCHEMA，其余直接跳过（进程外删 schema 不感知，需重启进程）。
+static ENSURED_SCHEMAS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn ensured_schemas() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    ENSURED_SCHEMAS
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 带 schema 限定的表名（如 `#[table = "ticket.tickets"]`）对应的幂等
+/// 建 schema 语句；无 schema 前缀，或 schema 已在全局缓存中确认存在时
+/// 返回 `None`，不再生成重复 DDL。
+fn create_schema_sql_if_qualified(db_type: DbType, table_name: &str) -> Option<String> {
+    let schema = schema_of_qualified_table(db_type, table_name)?;
+    if ensured_schemas().contains(schema) {
+        return None;
+    }
+    Some(format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        crate::model::quote_identifier(db_type, schema),
+    ))
+}
+
+/// 建表语句执行成功后，把表名里的 schema 记入全局缓存。
+fn mark_schema_ensured(db_type: DbType, table_name: &str) {
+    if let Some(schema) = schema_of_qualified_table(db_type, table_name) {
+        ensured_schemas().insert(schema.to_string());
+    }
 }
 
 pub struct CreateTableExecutor<'a, T: crate::model::Model> {
@@ -1815,6 +1862,12 @@ impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         let table_name = self.table_name.as_deref().unwrap_or(T::TABLE_NAME);
         let mut statements = Vec::new();
+
+        // schema 限定的表依赖目标 schema 已存在，缺失时 CREATE TABLE 直接
+        // 报错；建表流程最前面补一条幂等的 CREATE SCHEMA IF NOT EXISTS。
+        if let Some(create_schema_sql) = create_schema_sql_if_qualified(self.db_type, table_name) {
+            statements.push(SingleSqlStatement::new(create_schema_sql, Vec::new()));
+        }
 
         if !self.db_type.is_questdb() {
             for column in T::COLUMN_SCHEMA.iter() {
@@ -1896,6 +1949,10 @@ impl<'a, T: crate::model::Model> SqlExecutor for CreateTableExecutor<'a, T> {
             let statement_sql = questdb_nonce_sql(self.db_type, &statement.sql);
             traced_pg_execute_empty(self.client, statement_sql.as_ref()).await?;
         }
+        mark_schema_ensured(
+            self.db_type,
+            self.table_name.as_deref().unwrap_or(T::TABLE_NAME),
+        );
         Ok(())
     }
 }
@@ -3289,7 +3346,7 @@ impl Database {
             }
         }
 
-        let actual_table = self.db_first_table(&schema_name, &table_name).await?;
+        let actual_table = self.db_first_table(schema_name, table_name).await?;
         crate::db_first::validate_model_constraints::<T>(
             crate::abstract_layer::DbType::PostgreSQL,
             &actual_table,
@@ -4471,6 +4528,43 @@ impl<
 mod tests {
     use super::*;
 
+    #[test]
+    fn create_schema_sql_only_for_schema_qualified_tables() {
+        assert_eq!(
+            create_schema_sql_if_qualified(DbType::PostgreSQL, "ticket.tickets").as_deref(),
+            Some("CREATE SCHEMA IF NOT EXISTS ticket"),
+        );
+        // 非保留字 schema 不加引号
+        assert_eq!(
+            create_schema_sql_if_qualified(DbType::PostgreSQL, "auth.schema_table_users").as_deref(),
+            Some("CREATE SCHEMA IF NOT EXISTS auth"),
+        );
+        assert_eq!(
+            create_schema_sql_if_qualified(DbType::PostgreSQL, "collect.collect_exception_logs")
+                .as_deref(),
+            Some("CREATE SCHEMA IF NOT EXISTS collect"),
+        );
+        // 无 schema 前缀 / QuestDB（无 schema 概念）/ 空前缀
+        assert!(create_schema_sql_if_qualified(DbType::PostgreSQL, "tickets").is_none());
+        #[cfg(feature = "questdb")]
+        assert!(create_schema_sql_if_qualified(DbType::QuestDB, "ticket.tickets").is_none());
+        assert!(create_schema_sql_if_qualified(DbType::PostgreSQL, ".tickets").is_none());
+    }
+
+    #[test]
+    fn create_schema_sql_skipped_after_schema_marked_ensured() {
+        // 未标记时正常生成
+        assert_eq!(
+            create_schema_sql_if_qualified(DbType::PostgreSQL, "ormer_cache_a.t").as_deref(),
+            Some("CREATE SCHEMA IF NOT EXISTS ormer_cache_a"),
+        );
+        // 执行成功后记入全局缓存：同 schema 的表不再生成建 schema 语句
+        mark_schema_ensured(DbType::PostgreSQL, "ormer_cache_a.t");
+        assert!(create_schema_sql_if_qualified(DbType::PostgreSQL, "ormer_cache_a.t2").is_none());
+        // 其他 schema 不受影响
+        assert!(create_schema_sql_if_qualified(DbType::PostgreSQL, "ormer_cache_b.t").is_some());
+    }
+
     struct CompositePkModel;
 
     impl Model for CompositePkModel {
@@ -4753,6 +4847,18 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         M: crate::query::builder::MapToResult,
     {
         let mapped_select = self.select.map_to(f);
+        ProjectionSelectExecutor {
+            select: mapped_select,
+            client: self.client,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影到 ViewModel（按目标视图列集合投影，典型用于跳过 blob 等大字段）
+    pub fn map_to_view<V: crate::model::ViewModel>(
+        self,
+    ) -> ProjectionSelectExecutor<'a, T, V> {
+        let mapped_select = self.select.map_to_view::<V>();
         ProjectionSelectExecutor {
             select: mapped_select,
             client: self.client,
@@ -5745,15 +5851,8 @@ impl<'a, T: Model + 'static + Send> std::future::IntoFuture for UpdateExecutor<'
 fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam {
     match value {
         Value::Integer(value) => match rust_type {
-            Some(rust_type) if matches!(rust_type, "i64" | "u64" | "usize" | "isize") => {
-                Box::new(*value)
-            }
-            Some(rust_type)
-                if matches!(
-                    rust_type,
-                    "i8" | "i16" | "i32" | "u8" | "u16" | "u32" | "usize" | "isize"
-                ) =>
-            {
+            Some("i64" | "u64" | "usize" | "isize") => Box::new(*value),
+            Some("i8" | "i16" | "i32" | "u8" | "u16" | "u32") => {
                 Box::new(*value as i32)
             }
             Some(_) => Box::new(value.to_string()),

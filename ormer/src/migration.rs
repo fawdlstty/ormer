@@ -1253,7 +1253,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             // 未触发重建时补发重命名；SQLite 3.25+ 支持 RENAME COLUMN，
             // 且重命名必须先于同列上的其他变更执行
             let mut steps = sqlite_rename_steps;
-            steps.extend(plan.steps.drain(..));
+            steps.append(&mut plan.steps);
             plan.steps = steps;
         }
 
@@ -2262,8 +2262,7 @@ fn sqlite_rebuild_sql<T: WritableModel>(
     statements.extend(
         split_sql_statements(&original_create)
             .into_iter()
-            .skip(1)
-            .map(|statement| statement),
+            .skip(1),
     );
     Ok(statements.join(";\n"))
 }
@@ -2518,10 +2517,8 @@ fn flush_sql_word(word: &mut String, trigger_mode: bool, trigger_depth: &mut usi
     if trigger_mode {
         match word.to_ascii_uppercase().as_str() {
             "BEGIN" => *trigger_depth += 1,
-            "END" => {
-                if *trigger_depth > 0 {
-                    *trigger_depth -= 1;
-                }
+            "END" if *trigger_depth > 0 => {
+                *trigger_depth -= 1;
             }
             _ => {}
         }
@@ -2984,7 +2981,7 @@ impl Database {
         };
         Ok(tables.into_iter().find(|table| {
             table.name == name
-                && schema.map_or(true, |schema| {
+                && schema.is_none_or(|schema| {
                     table.schema.as_deref().is_some_and(|actual| actual == schema)
                 })
         }))

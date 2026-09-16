@@ -44,7 +44,7 @@ impl Migration for AddDryRunUserEmail {
 async fn database() -> ormer::Result<Database> {
     #[cfg(feature = "sqlite")]
     {
-        Ok(Database::connect(DbType::Sqlite, ":memory:").await?)
+        Database::connect(DbType::Sqlite, ":memory:").await
     }
     #[cfg(all(not(feature = "sqlite"), feature = "postgresql"))]
     {

@@ -2912,7 +2912,7 @@ impl<'a> FieldInfo<'a> {
         }
         let relation_default = relation_default_expr(relation.as_ref());
 
-        Ok(Self {
+        Self {
             field,
             field_name,
             field_type,
@@ -2957,7 +2957,7 @@ impl<'a> FieldInfo<'a> {
                 .any(|attr| attr.path().is_ident("ormer_ignore")),
             normal_index: None,
         }
-        .with_json_schema()?)
+        .with_json_schema()
     }
 
     fn with_json_schema(mut self) -> syn::Result<Self> {
@@ -3470,13 +3470,10 @@ fn json_update_struct(
 }
 
 fn extract_compress_attr(field: &syn::Field) -> Option<syn::Ident> {
-    let Some(attr) = field
+    let attr = field
         .attrs
         .iter()
-        .find(|attr| attr.path().is_ident("compress"))
-    else {
-        return None;
-    };
+        .find(|attr| attr.path().is_ident("compress"))?;
 
     let algorithm = match &attr.meta {
         Meta::Path(_) => "pglz".to_string(),
@@ -3679,7 +3676,7 @@ fn through_via_type<'a>(
         .expect("#[through] relation metadata is missing");
     relation_fields
         .iter()
-        .find(|candidate| candidate.field_name.to_string() == through.via_relation)
+        .find(|candidate| candidate.field_name == through.via_relation.as_str())
         .map(|candidate| &candidate.target_type)
         .unwrap_or_else(|| panic!("#[through] via relation must reference a relation field"))
 }

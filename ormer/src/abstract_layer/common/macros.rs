@@ -1121,7 +1121,7 @@ macro_rules! impl_unified_delete_executor {
                 }
             }
 
-            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
+            pub fn to_sql(&self) -> $crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.to_sql(),
@@ -1149,7 +1149,7 @@ macro_rules! impl_unified_delete_executor {
             /// [`Self::execute_models_with_hooks`] 显式提供模型主体，
             /// 并统一受 `hooks_enabled()` 开关与 `without_hooks()` 控制
             /// （嵌套的 insert 钩子同样会被关闭范围抑制）。
-            pub async fn execute(self) -> crate::Result<u64> {
+            pub async fn execute(self) -> $crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -1180,7 +1180,7 @@ macro_rules! impl_unified_delete_executor {
             /// 钩子经隐藏 trait 派发，统一受 `hooks_enabled()` 开关控制：
             /// `without_hooks()`（或上游写入链的关闭范围）会让本方法跳过
             /// 全部 Before/After 钩子。
-            pub async fn execute_with_hooks(self, model: &T) -> crate::Result<u64>
+            pub async fn execute_with_hooks(self, model: &T) -> $crate::Result<u64>
             where
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
@@ -1194,7 +1194,7 @@ macro_rules! impl_unified_delete_executor {
             }
 
             /// Execute the configured delete with per-model hooks.
-            pub async fn execute_models_with_hooks(self, models: &[T]) -> crate::Result<u64>
+            pub async fn execute_models_with_hooks(self, models: &[T]) -> $crate::Result<u64>
             where
                 T: $crate::BeforeDelete + $crate::AfterDelete + Send + Sync,
             {
@@ -1216,7 +1216,7 @@ macro_rules! impl_unified_delete_executor {
                 Ok(affected)
             }
 
-            pub async fn returning(self) -> crate::Result<Vec<T>> {
+            pub async fn returning(self) -> $crate::Result<Vec<T>> {
                 // 能力矩阵优先：dml_returning=false 的后端（MySQL/QuestDB/
                 // ClickHouse/InfluxDB）统一以 "DML RETURNING" 拒绝。
                 $crate::Capabilities::ensure(
@@ -1243,7 +1243,7 @@ macro_rules! impl_unified_delete_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = crate::Result<u64>;
+            type Output = $crate::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -1315,7 +1315,7 @@ macro_rules! impl_unified_block_delete_executor {
                 }
             }
 
-            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
+            pub fn to_sql(&self) -> $crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => exec.to_sql(),
@@ -1351,7 +1351,7 @@ macro_rules! impl_unified_block_delete_executor {
                 }
             }
 
-            pub async fn execute(self) -> crate::Result<$crate::abstract_layer::common::BlockDeleteResult> {
+            pub async fn execute(self) -> $crate::Result<$crate::abstract_layer::common::BlockDeleteResult> {
                 match self {
                     #[cfg(feature = "postgresql")]
                     $executor_name::PostgreSQL(exec) => exec.execute().await,
@@ -1512,7 +1512,7 @@ macro_rules! impl_unified_update_executor {
                 result
             }
 
-            pub fn to_sql(&self) -> crate::Result<$crate::SqlStatement> {
+            pub fn to_sql(&self) -> $crate::Result<$crate::SqlStatement> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.to_sql(),
@@ -1541,7 +1541,7 @@ macro_rules! impl_unified_update_executor {
             /// [`Self::execute_with_hooks`] / [`Self::execute_models_with_hooks`]
             /// 显式提供模型主体，并统一受 `hooks_enabled()` 开关与
             /// `without_hooks()` 控制。
-            pub async fn execute(self) -> crate::Result<u64> {
+            pub async fn execute(self) -> $crate::Result<u64> {
                 match self {
                     #[cfg(feature = "sqlite")]
                     $executor_name::Sqlite(exec, _) => exec.execute().await,
@@ -1573,7 +1573,7 @@ macro_rules! impl_unified_update_executor {
             /// 钩子经隐藏 trait 派发，统一受 `hooks_enabled()` 开关控制：
             /// `without_hooks()`（或上游写入链的关闭范围）会让本方法跳过
             /// 全部 Before/After 钩子。
-            pub async fn execute_with_hooks(self, model: &mut T) -> crate::Result<u64>
+            pub async fn execute_with_hooks(self, model: &mut T) -> $crate::Result<u64>
             where
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
@@ -1587,7 +1587,7 @@ macro_rules! impl_unified_update_executor {
             }
 
             /// Execute the configured update with per-model hooks.
-            pub async fn execute_models_with_hooks(self, models: &mut [T]) -> crate::Result<u64>
+            pub async fn execute_models_with_hooks(self, models: &mut [T]) -> $crate::Result<u64>
             where
                 T: $crate::BeforeUpdate + $crate::AfterUpdate + Send + Sync,
             {
@@ -1627,7 +1627,7 @@ macro_rules! impl_unified_update_executor {
                 }
             }
 
-            pub async fn returning(self) -> crate::Result<Vec<T>> {
+            pub async fn returning(self) -> $crate::Result<Vec<T>> {
                 // 能力矩阵优先：dml_returning=false 的后端（MySQL/QuestDB/
                 // ClickHouse/InfluxDB）统一以 "DML RETURNING" 拒绝。
                 $crate::Capabilities::ensure(
@@ -1655,7 +1655,7 @@ macro_rules! impl_unified_update_executor {
         }
 
         impl<'a, T: $crate::Model + 'static> std::future::IntoFuture for $executor_name<'a, T> {
-            type Output = crate::Result<u64>;
+            type Output = $crate::Result<u64>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + 'a>>;
 
@@ -1676,7 +1676,7 @@ macro_rules! impl_unified_collect_future {
             C: FromIterator<T> + 'static,
         > std::future::IntoFuture for $future_name<'a, T, C>
         {
-            type Output = crate::Result<C>;
+            type Output = $crate::Result<C>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -1715,7 +1715,7 @@ macro_rules! impl_unified_aggregate_future {
             R: $crate::model::FromValue + 'static + std::marker::Send,
         > std::future::IntoFuture for $future_name<'a, T, R>
         {
-            type Output = crate::Result<R>;
+            type Output = $crate::Result<R>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -1935,7 +1935,7 @@ macro_rules! impl_unified_related_collect_future {
         where
             Self: 'a,
         {
-            type Output = crate::Result<Vec<T>>;
+            type Output = $crate::Result<Vec<T>>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
@@ -1979,7 +1979,7 @@ macro_rules! impl_unified_related_count_future {
         where
             Self: 'a,
         {
-            type Output = crate::Result<usize>;
+            type Output = $crate::Result<usize>;
             type IntoFuture =
                 std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 

@@ -197,7 +197,7 @@ async fn reserved_word_columns_roundtrip_on_sqlite() -> ormer::Result<()> {
 
 #[cfg(feature = "questdb")]
 mod questdb_index_gate {
-    use ormer::{Model, OrmerError};
+    use ormer::OrmerError;
 
     #[derive(Debug, Clone, ormer::Model)]
     #[table = "audit_questdb_events"]

@@ -63,7 +63,7 @@ fn sqlite_fulltext_uses_shadow_table_and_bm25() {
         .rank(FullTextRank::Relevance)
         .filter(|a| a.status.eq("open"))
         .to_sql_with_params(DbType::Sqlite);
-    assert!(sql.contains("CREATE VIRTUAL TABLE") == false);
+    assert!(!sql.contains("CREATE VIRTUAL TABLE"));
     assert!(sql.contains("b6_articles_fts MATCH ?"), "{sql}");
     assert!(sql.contains("SELECT t0.title, t0.body FROM"), "{sql}");
     assert!(sql.contains("bm25("), "{sql}");

@@ -93,7 +93,7 @@ impl Migration for FailingMigration {
 }
 
 async fn database() -> ormer::Result<Database> {
-    Ok(Database::connect(DbType::Sqlite, ":memory:").await?)
+    Database::connect(DbType::Sqlite, ":memory:").await
 }
 
 #[tokio::test]

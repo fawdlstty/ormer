@@ -535,7 +535,7 @@ impl<'a, I: crate::model::Insertable> PooledInsertOrIgnoreExecutor<'a, I> {
                 let columns = I::Model::insert_columns();
                 let primary_key = common_helpers::quote_column_list(
                     DbType::PostgreSQL,
-                    &I::Model::primary_key_columns(),
+                    I::Model::primary_key_columns(),
                 );
                 let statements = common_helpers::build_chunked_insert_statements::<I::Model>(
                     DbType::PostgreSQL,
@@ -1755,11 +1755,11 @@ impl<'a> Drop for PooledConnection<'a> {
                 });
                 // 归还任务被取消（运行时关闭等）时连接不会进入空闲队列，
                 // 退役该连接以保证池容量守恒
-                let _ = handle.spawn(async move {
+                drop(handle.spawn(async move {
                     if join.await.is_err() {
                         watcher_inner.close_connection().await;
                     }
-                });
+                }));
             }
             Err(_) => {
                 // 不在 tokio 运行时上下文：无法执行归还前的异步健康检查，
@@ -2349,12 +2349,14 @@ impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
         find_by_id_with_executor(self.select::<T>(), key).await
     }
 
-    pub async fn find_related<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+    pub async fn find_related<T, S>(
         &self,
         owner: &T,
         relation: S,
     ) -> crate::Result<Vec<S::Target>>
     where
+        T: Model + 'static + Send + Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
         S::Target: Send + Sync,
         S::Via: Send + Sync,
@@ -2362,12 +2364,14 @@ impl<'a, 'pool> PooledDatabaseScope<'a, 'pool> {
         find_related_with_executor(&self.select::<T>(), owner, &relation).await
     }
 
-    pub async fn preload<T: Model + 'static + Send + Sync, S: RelationSelection<T>>(
+    pub async fn preload<T, S>(
         &self,
         owners: &mut [T],
         relation: S,
     ) -> crate::Result<()>
     where
+        T: Model + 'static + Send + Sync,
+        S: RelationSelection<T>,
         for<'b> S: RelationNestedLoader<'b, T> + Send + Sync,
         S::Target: Send + Sync,
         S::Via: Send + Sync,

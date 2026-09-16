@@ -13,6 +13,7 @@ fn assert_invalid_pool_range(result: Result<(), OrmerError>, expected: &str) {
 }
 
 #[tokio::test]
+#[allow(clippy::reversed_empty_ranges)]
 async fn pool_builder_rejects_invalid_ranges() {
     for (range, expected) in [(0..0, "max_size"), (2..1, "min_size")] {
         let result = Database::create_pool(DbType::Sqlite, ":memory:")
@@ -25,6 +26,7 @@ async fn pool_builder_rejects_invalid_ranges() {
 }
 
 #[tokio::test]
+#[allow(clippy::reversed_empty_ranges)]
 async fn replicated_pool_builder_rejects_invalid_ranges() {
     for (range, expected) in [(0..0, "max_size"), (2..1, "min_size")] {
         let result = ConnectionPool::replicated(DbType::Sqlite)

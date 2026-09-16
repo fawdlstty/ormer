@@ -210,8 +210,7 @@ async fn clickhouse_grouped_and_mapped_as_model_return_errors_without_panicking(
         .select::<ClickHouseCapabilityUser>()
         .filter(|user| user.id.is_in(mapped_subquery))
         .to_sql()
-        .err()
-        .expect("mapped is_in subqueries must be capability gated");
+        .expect_err("mapped is_in subqueries must be capability gated");
     assert!(matches!(
         subquery_error,
         OrmerError::UnsupportedFeature {
@@ -228,8 +227,7 @@ async fn clickhouse_grouped_and_mapped_as_model_return_errors_without_panicking(
         .filter(|user| user.id.is_in(mapped_subquery))
         .collect::<Vec<ClickHouseCapabilityUser>>()
         .await
-        .err()
-        .expect("mapped is_in execution must be capability gated");
+        .expect_err("mapped is_in execution must be capability gated");
     assert!(matches!(
         execution_error,
         OrmerError::UnsupportedFeature {

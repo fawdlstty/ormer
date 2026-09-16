@@ -1977,7 +1977,7 @@ impl<'a> Transaction<'a> {
         }
 
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
-        models.run_before_insert(hook_ctx.clone()).await?;
+        models.run_before_insert(hook_ctx).await?;
         let statements = common_helpers::build_insert_statements_with_conflict::<I::Model>(
             DbType::MySQL,
             &models.as_refs(),
@@ -2655,6 +2655,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
         let mapped_select = self.select.map_to(f);
         ProjectionSelectExecutor {
             select: mapped_select,
+            pool: self.pool,
+            _marker: PhantomData,
+        }
+    }
+
+    /// 字段投影到 ViewModel（按目标视图列集合投影，典型用于跳过 blob 等大字段）
+    pub fn map_to_view<V: crate::model::ViewModel>(
+        self,
+    ) -> ProjectionSelectExecutor<'a, T, V> {
+        ProjectionSelectExecutor {
+            select: self.select.map_to_view::<V>(),
             pool: self.pool,
             _marker: PhantomData,
         }

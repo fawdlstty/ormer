@@ -298,6 +298,7 @@ fn version_snapshot_value_key(value: &Value) -> String {
 ///    内容一致即可恢复正确版本；
 /// 3. 最终回退到 `VersionInfo::initial`，此时乐观锁 UPDATE 因版本不匹配
 ///    影响 0 行而失败（fail-safe，不会静默用错版本写库）。
+///
 /// 残余风险：TTL 窗口内复用同一地址的新对象仍可能读到旧版本号，表现为
 /// 一次多余的乐观锁冲突错误，而非数据损坏。
 fn version_object_key<T: Model>(model: &T) -> VersionObjectKey {
@@ -371,9 +372,7 @@ pub fn version_snapshot_update<T: Model>(
     model: &T,
     old_version: u64,
 ) -> Option<VersionSnapshotUpdate> {
-    if T::version_info().is_none() {
-        return None;
-    }
+    T::version_info()?;
     let (key, object_key) = version_snapshot_keys(model);
     Some(VersionSnapshotUpdate {
         key,
@@ -3015,8 +3014,9 @@ impl_field_type_provider_for_plain_type!(
     uuid::Uuid,
 );
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ActiveValue<T> {
+    #[default]
     NotSet,
     Set(T),
     Unchanged(T),
@@ -3037,12 +3037,6 @@ impl<T> ActiveValue<T> {
 
     pub fn is_not_set(&self) -> bool {
         matches!(self, Self::NotSet)
-    }
-}
-
-impl<T> Default for ActiveValue<T> {
-    fn default() -> Self {
-        Self::NotSet
     }
 }
 
@@ -3340,7 +3334,8 @@ pub fn intern_concat(a: &'static str, b: &'static str) -> &'static str {
 /// new_with_prefix(prefix)` 的 prefix 参数），缓存键持有前缀副本。
 #[doc(hidden)]
 pub fn intern_prefixed(prefix: &str, suffix: &'static str) -> &'static str {
-    static CACHE: OnceLock<Mutex<HashMap<(Box<str>, &'static str), &'static str>>> = OnceLock::new();
+    type InternPrefixedCache = Mutex<HashMap<(Box<str>, &'static str), &'static str>>;
+    static CACHE: OnceLock<InternPrefixedCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     intern_with(cache, (prefix.into(), suffix), || {
         Box::leak(format!("{prefix}{suffix}").into_boxed_str())
@@ -3661,7 +3656,7 @@ fn generate_questdb_create_table_sql_with_name<T: Model>(
 ) -> crate::Result<String> {
     let db_type = crate::abstract_layer::DbType::QuestDB;
     let table_name = normalize_table_name_for_db(db_type, table_name.unwrap_or(T::TABLE_NAME));
-    let quoted_table_name = quote_qualified_identifier(db_type, &table_name);
+    let quoted_table_name = quote_qualified_identifier(db_type, table_name);
     let mut sql = format!("CREATE TABLE IF NOT EXISTS {quoted_table_name} (");
 
     for (index, column) in T::column_schema().iter().enumerate() {
@@ -4755,7 +4750,7 @@ pub trait FromRowValues: Sized {
     fn from_row_values(values: &[Value]) -> crate::Result<Self>;
 }
 
-fn first_row_value<'a, S>(values: &'a [Value], expected: S) -> crate::Result<&'a Value>
+fn first_row_value<S>(values: &[Value], expected: S) -> crate::Result<&Value>
 where
     S: AsRef<str>,
 {

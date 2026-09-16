@@ -22,7 +22,6 @@ fn assert_comparison_placeholder(sql: &str, expr: &str) {
         .split_once(expr)
         .unwrap_or_else(|| panic!("SQL: {sql}"))
         .1
-        .trim_start()
         .split_whitespace()
         .next()
         .unwrap_or("");

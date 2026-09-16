@@ -463,7 +463,7 @@ fn classify_database_error(message: &str) -> (DatabaseErrorKind, Option<String>)
 /// 等，见 [`OrmerError::with_driver_code`]）；无结构化码时为文本提取值。
 /// 文本兜底包含 MySQL 1062 的 "Duplicate entry" 文案。
 fn classify_for_code(code: Option<&str>, lower: &str) -> DatabaseErrorKind {
-    let kind = if matches!(
+    if matches!(
         code,
         Some("23505") | Some("1062") | Some("2601") | Some("2627")
     ) || lower.contains("unique constraint failed")
@@ -497,8 +497,7 @@ fn classify_for_code(code: Option<&str>, lower: &str) -> DatabaseErrorKind {
         DatabaseErrorKind::Constraint(ConstraintKind::Other)
     } else {
         DatabaseErrorKind::Other
-    };
-    kind
+    }
 }
 
 /// 从错误消息中提取 SQLSTATE 风格的错误码：5 位、首字符为数字的

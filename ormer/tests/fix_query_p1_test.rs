@@ -271,6 +271,7 @@ fn range_inclusive_and_full_bounds() {
 
 #[cfg(feature = "sqlite")]
 #[test]
+#[allow(clippy::reversed_empty_ranges)]
 fn range_start_after_end_clamps_to_limit_zero() {
     // 10..5 → 不再 panic / 回绕，钳制为 LIMIT 0 OFFSET 10
     let sql = Select::<FixP1User>::new()

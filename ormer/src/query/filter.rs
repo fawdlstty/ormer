@@ -166,10 +166,11 @@ pub type Value = crate::model::Value;
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct DynamicSubquery {
-    render: Arc<
-        dyn Fn(crate::abstract_layer::DbType) -> crate::Result<(String, Vec<Value>)> + Send + Sync,
-    >,
+    render: Arc<DynamicSubqueryRender>,
 }
+
+type DynamicSubqueryRender =
+    dyn Fn(crate::abstract_layer::DbType) -> crate::Result<(String, Vec<Value>)> + Send + Sync;
 
 impl fmt::Debug for DynamicSubquery {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
