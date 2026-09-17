@@ -1,4 +1,12 @@
-use ormer::{FieldType, Model};
+// Model 仅在启用 SQL 后端（下方测试模型的 cfg 条件）时被派生宏需要
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql"
+))]
+use ormer::Model;
+use ormer::FieldType;
 
 #[cfg(feature = "postgresql")]
 pub mod _test_common;
@@ -251,6 +259,16 @@ fn test_tuple_struct_field_type() -> ormer::Result<()> {
     Ok(())
 }
 
+// 调用方均为 SQL 后端专属测试，极简组合下无调用方属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql"
+    )),
+    allow(dead_code)
+)]
 fn assert_integer_value(value: &ormer::Value, expected: i64) {
     match value {
         ormer::Value::Integer(value) => assert_eq!(*value, expected),

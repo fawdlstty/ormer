@@ -944,6 +944,23 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             push_foreign_key_diff_steps::<T>(db_type, table_name, db_first_table, &mut plan)?;
         }
 
+        // ---- PostgreSQL 枚举变体追加 ----
+        // 模型为枚举列新增了库内枚举类型尚不存在的变体时，生成 ALTER TYPE ...
+        // ADD VALUE 步骤让增量迁移收敛。没有这一步时，列类型 diff（只比类型名，
+        // 枚举列名不变则视为未变更）与 db_first 校验（比变体列表）之间出现空洞：
+        // 校验报 Enum variants mismatch → 计划为空 → 复验仍失败 → permissive
+        // 路径删表重建，而重建时的 CREATE TYPE 因同名类型已存在被跳过，新表
+        // 仍引用缺变体的旧类型 → 校验永远失败，ensure_table 死循环。
+        // 变体删除/重排是 PostgreSQL 不支持的变更，仍交由重建路径处理。
+        #[cfg(feature = "postgresql")]
+        {
+            if matches!(db_type, DbType::PostgreSQL) {
+                if let Some(db_first_table) = &introspected_table {
+                    push_enum_add_value_steps::<T>(db_first_table, &mut plan)?;
+                }
+            }
+        }
+
         // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
         let effective_primary_keys = crate::model::effective_primary_key_columns::<T>(db_type);
         for expected in T::COLUMN_SCHEMA {
@@ -1929,6 +1946,59 @@ fn push_foreign_key_diff_steps<T: WritableModel>(
     Ok(())
 }
 
+/// PostgreSQL 枚举变体 diff：模型声明了库内枚举类型尚不存在的变体时，为每个
+/// 缺失变体生成一条 `ALTER TYPE ... ADD VALUE IF NOT EXISTS` 步骤（按模型声明
+/// 顺序；ADD VALUE 只能追加到类型末尾，`IF NOT EXISTS` 保证重放幂等）。
+///
+/// 只处理"实际列类型就是同名枚举类型"的列：
+/// - 列在库内不存在 → 由 AddColumn 建列 DDL 处理；
+/// - 列类型本身不一致（如被改成 TEXT）→ 由列类型 diff 的 AlterColumn 处理；
+/// - 库内变体比模型多（删除/重排变体）→ PostgreSQL 不支持，此处无能为力，
+///   交由 ensure_table 的重建路径。
+///
+/// 注意：`ALTER TYPE ... ADD VALUE` 在 PostgreSQL 12+ 才允许在事务块内执行
+/// （且新值须等事务提交后可用——本计划的后续步骤不会用到新值，复验在
+/// 提交后进行），TimescaleDB 2.x 要求的 PostgreSQL 版本均满足。
+#[cfg(feature = "postgresql")]
+fn push_enum_add_value_steps<T: WritableModel>(
+    db_first_table: &DbFirstTable,
+    plan: &mut MigrationPlan,
+) -> crate::Result<()> {
+    for column in T::COLUMN_SCHEMA {
+        let Some(expected_variants) = column.enum_variants else {
+            continue;
+        };
+        let Some(actual_column) = db_first_table
+            .columns
+            .iter()
+            .find(|actual| actual.name == column.name)
+        else {
+            continue;
+        };
+        let enum_name = column_type_definition(DbType::PostgreSQL, column);
+        if !types_equivalent(DbType::PostgreSQL, &actual_column.type_name, &enum_name) {
+            continue;
+        }
+        for variant in expected_variants {
+            if actual_column
+                .enum_variants
+                .iter()
+                .any(|actual| actual == variant)
+            {
+                continue;
+            }
+            plan.push(MigrationStep::AlterType {
+                name: enum_name.clone(),
+                definition: format!(
+                    "ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{}'",
+                    variant.replace('\'', "''")
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 渲染 `ALTER TABLE ... ALTER COLUMN ... SET/DROP DEFAULT` 步骤
 /// （PostgreSQL / MySQL / DuckDB 语法一致）。
 #[allow(dead_code)] // 仅在涉及 ALTER DEFAULT 的后端 feature 组合下被调用
@@ -2900,6 +2970,17 @@ impl Database {
         }
     }
 
+    // 仅启用 clickhouse/influxdb 时所有分支都 diverge，table_name 不被使用属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     async fn schema_columns(
         &self,
         table_name: &str,
@@ -2945,7 +3026,7 @@ impl Database {
             feature = "mssql",
             feature = "duckdb"
         )),
-        allow(unreachable_code)
+        allow(unreachable_code, unused_variables)
     )]
     async fn db_first_table_for(
         &self,
@@ -3208,5 +3289,95 @@ mod mysql_compression_tests {
             step.sql(DbType::MySQL).unwrap(),
             "ALTER TABLE documents COMPRESSION='LZ4'"
         );
+    }
+}
+
+#[cfg(all(test, feature = "postgresql"))]
+mod postgres_enum_add_value_tests {
+    use super::{DbType, MigrationPlan, MigrationStep, push_enum_add_value_steps};
+    use crate::db_first::{DbFirstColumn, DbFirstTable};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ormer::ModelEnum)]
+    enum PlanTaskKind {
+        Charge,
+        #[default]
+        Load,
+        Unload,
+    }
+
+    #[derive(Debug, ormer::Model, Clone)]
+    #[table = "collect.plan_enum_tasks"]
+    struct PlanEnumTask {
+        #[primary]
+        id: i64,
+        kind: PlanTaskKind,
+    }
+
+    fn db_first_table(column: Option<DbFirstColumn>) -> DbFirstTable {
+        DbFirstTable {
+            schema: Some("collect".to_string()),
+            name: "plan_enum_tasks".to_string(),
+            columns: column.into_iter().collect(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    fn actual_column(type_name: &str, variants: &[&str]) -> DbFirstColumn {
+        DbFirstColumn {
+            name: "kind".to_string(),
+            type_name: type_name.to_string(),
+            nullable: false,
+            primary_key: false,
+            auto_increment: false,
+            enum_variants: variants.iter().map(|variant| variant.to_string()).collect(),
+            default: None,
+        }
+    }
+
+    fn alter_type_definitions(table: &DbFirstTable) -> Vec<String> {
+        let mut plan = MigrationPlan::new("collect.plan_enum_tasks", DbType::PostgreSQL);
+        push_enum_add_value_steps::<PlanEnumTask>(table, &mut plan).expect("enum diff steps");
+        plan.steps()
+            .iter()
+            .filter_map(|step| match step {
+                MigrationStep::AlterType { definition, .. } => Some(definition.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn missing_variant_becomes_add_value_step() {
+        let definitions = alter_type_definitions(&db_first_table(Some(actual_column(
+            "plan_task_kind",
+            &["Charge", "Load"],
+        ))));
+        assert_eq!(
+            definitions,
+            vec!["ALTER TYPE plan_task_kind ADD VALUE IF NOT EXISTS 'Unload'"]
+        );
+    }
+
+    #[test]
+    fn matching_variants_produce_no_steps() {
+        let definitions = alter_type_definitions(&db_first_table(Some(actual_column(
+            "plan_task_kind",
+            &["Charge", "Load", "Unload"],
+        ))));
+        assert!(definitions.is_empty());
+    }
+
+    #[test]
+    fn non_enum_column_is_left_to_type_diff() {
+        let definitions =
+            alter_type_definitions(&db_first_table(Some(actual_column("text", &[]))));
+        assert!(definitions.is_empty());
+    }
+
+    #[test]
+    fn absent_column_is_left_to_add_column() {
+        let definitions = alter_type_definitions(&db_first_table(None));
+        assert!(definitions.is_empty());
     }
 }

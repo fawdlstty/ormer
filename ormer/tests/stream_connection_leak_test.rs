@@ -102,6 +102,8 @@ async fn test_stream_early_termination_impl(config: &_test_common::DbConfig) {
 }
 
 /// 测试在事务中流式查询后连接是否正确释放
+// MySQL 事务内流式查询走快速失败契约测试，不消费本实现
+#[cfg(any(feature = "sqlite", feature = "postgresql"))]
 async fn test_stream_in_transaction_release_impl(config: &_test_common::DbConfig) {
     let db = _test_common::create_db_connection(config).await.unwrap();
 

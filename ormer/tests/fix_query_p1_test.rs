@@ -12,12 +12,17 @@
 
 use ormer::query::builder::Select;
 
+// 以下辅助仅被 sqlite 专属测试消费；_test_common 模块自身也以 sqlite 等后端为门控
+#[cfg(feature = "sqlite")]
 pub mod _test_common;
 
+#[cfg(feature = "sqlite")]
 define_test_user_for_join!(FixP1User, "fix_p1_query_users");
+#[cfg(feature = "sqlite")]
 define_test_role_for_join!(FixP1Role, "fix_p1_query_roles");
 
 /// 带软删除过滤器的模型（P1-7 / P1-8）
+#[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, ormer::Model)]
 #[table = "fix_p1_soft_users"]
 #[filter(filter_deleted, |m| m.deleted.eq(0))]

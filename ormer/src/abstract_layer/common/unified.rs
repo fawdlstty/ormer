@@ -1278,6 +1278,17 @@ impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
         }
     }
 
+    // f 仅由本地后端分支消费（ClickHouse/InfluxDB 不支持 partial insert）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn default<F, C>(self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> C,
@@ -2569,6 +2580,18 @@ impl Database {
     /// 注意：db-first 实体生成不受 [`Capabilities::schema_introspection`] 门控
     /// （ClickHouse 的 db-first 可用而该字段为 false），InfluxDB/QuestDB 的
     /// 拒绝由本入口与 `postgresql_backend::db_first_tables` 分别硬编码。
+    // schema 仅由 SQL 后端的 db_first_tables 分支消费（InfluxDB 提前拒绝）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables)
+    )]
     pub async fn generate_entities(&self, schema: Option<&str>) -> crate::Result<String> {
         #[cfg(feature = "influxdb")]
         #[allow(irrefutable_let_patterns)]
@@ -2654,6 +2677,17 @@ impl Database {
         }
     }
 
+    // model 仅由本地后端分支消费（ClickHouse/InfluxDB 返回 Unsupported）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert_model<T>(
         &self,
         model: impl crate::model::InsertModel<T>,
@@ -2703,6 +2737,17 @@ impl Database {
     /// 以 [`Capabilities::insert_conflict`] 为准：矩阵为 false 的后端
     /// （ClickHouse/InfluxDB/QuestDB）统一拒绝；QuestDB 复用 PostgreSQL 连接，
     /// 按运行时 `db_type` 判定，不能按 `Database` 枚举变体判定。
+    // models 仅由本地后端分支消费（矩阵拒绝路径不使用）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert_or_update<I: crate::model::Insertable>(
         &self,
         models: I,
@@ -2749,6 +2794,17 @@ impl Database {
     ///
     /// 以 [`Capabilities::insert_ignore`] 为准：矩阵为 false 的后端
     /// （ClickHouse/InfluxDB/QuestDB）统一拒绝，QuestDB 按运行时 `db_type` 判定。
+    // models 仅由本地后端分支消费（矩阵拒绝路径不使用）
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert_or_ignore<I: crate::model::Insertable>(
         &self,
         models: I,
@@ -3168,6 +3224,8 @@ impl Database {
         // MySQL 的选项必须在 BEGIN 前下发（begin_with_opts），其余后端
         // 走"先 BEGIN 再应用选项、失败回滚"的公共路径。
         #[cfg(feature = "mysql")]
+        // mysql-only 组合下该枚举仅剩一个变体，if let 不可反驳属预期
+        #[allow(irrefutable_let_patterns)]
         if let Database::MySQL(db) = self {
             let txn = db.begin_with_opts(options).await?;
             return Ok(Transaction::MySQL(txn));
@@ -3349,6 +3407,18 @@ impl<'a, R: Model> DerivedTableSelectExecutor<'a, R> {
 
 pub struct DerivedTableCollectFuture<'a, R: Model, C> {
     db: &'a Database,
+    // select 仅由 SQL 后端分支消费；influxdb-only 组合下恒为 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(dead_code)
+    )]
     select: DerivedTableSelect<R>,
     _marker: std::marker::PhantomData<C>,
 }
@@ -3362,6 +3432,18 @@ where
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
+    // db_type/sql/params 仅由 SQL 后端分支消费；influxdb-only 组合下无消费方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables)
+    )]
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let db_type = self.db.db_type();
@@ -3478,6 +3560,18 @@ where
     type IntoFuture =
         std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send + 'a>>;
 
+    // sql/params 仅由 SQL 后端分支消费；influxdb-only 组合下无消费方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables)
+    )]
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let db_type = self.db.db_type();
@@ -4046,6 +4140,18 @@ impl<'a, T: Model> WithoutFilterQuery<T> for SelectExecutor<'a, T> {
     }
 }
 
+// 本块的 join/derived 分派方法参数仅由 SQL 后端分支消费；
+// clickhouse/influxdb-only 组合下落 Unsupported，参数不被使用属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_variables)
+)]
 impl<'a, T: Model> SelectExecutor<'a, T> {
     fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         match self {
@@ -4861,6 +4967,17 @@ impl<'a, T: Model> super::SqlExecutor for DeleteExecutor<'a, T> {
         DeleteExecutor::to_sql(self)
     }
 
+    // sql 仅由 SQL 后端分支消费；influxdb-only 组合下恒走 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -4894,6 +5011,17 @@ pub struct BlockDeleteResult {
 
 impl BlockDeleteResult {
     /// 回退路径结果：仅报告行数。
+    // 仅 PG/OLTP 后端的行删除路径消费；clickhouse/influxdb-only 组合下无调用方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn from_row_count(rows: u64) -> Self {
         Self {
             blocks_dropped: 0,
@@ -4960,6 +5088,18 @@ impl<'a, T: Model> super::SqlExecutor for BlockDeleteExecutor<'a, T> {
         BlockDeleteExecutor::to_sql(self)
     }
 
+    // sql 仅由 SQL 后端分支消费；influxdb-only 组合下恒走 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables)
+    )]
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         match self {
             #[cfg(feature = "postgresql")]
@@ -5019,6 +5159,17 @@ pub enum UpdateExecutor<'a, T: Model> {
 crate::impl_unified_update_executor!(UpdateExecutor);
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
+    // model/fields 仅由 SQL 后端分支消费；clickhouse/influxdb-only 组合下落 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub(crate) fn set_model_columns(self, model: &T, fields: &[String]) -> Self {
         match self {
             #[cfg(feature = "sqlite")]
@@ -5060,6 +5211,17 @@ impl<'a, T: Model> super::SqlExecutor for UpdateExecutor<'a, T> {
         UpdateExecutor::to_sql(self)
     }
 
+    // sql 仅由 SQL 后端分支消费；clickhouse/influxdb-only 组合下恒走 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -6426,6 +6588,17 @@ impl<'a> Transaction<'a> {
 
     /// 插入记录 - 返回执行器（合并后返回 [`InsertExecutor`] 的事务变体，
     /// 旧名 [`TransactionInsertExecutor`] 保留为过渡别名）。
+    // models 仅由本地后端分支消费；influxdb-only 组合下无消费方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert<I: crate::model::Insertable>(&mut self, models: I) -> InsertExecutor<'_, I> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -6446,6 +6619,17 @@ impl<'a> Transaction<'a> {
 
     /// 插入或更新记录 - 返回执行器（合并后返回 [`InsertOrUpdateExecutor`]
     /// 的事务变体，旧名 [`TransactionInsertOrUpdateExecutor`] 保留为过渡别名）。
+    // models 仅由本地后端分支消费；influxdb-only 组合下无消费方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert_or_update<I: crate::model::Insertable>(
         &mut self,
         models: I,
@@ -6484,6 +6668,17 @@ impl<'a> Transaction<'a> {
 
     /// 插入或忽略记录 - 返回执行器（合并后返回 [`InsertOrIgnoreExecutor`]
     /// 的事务变体，旧名 [`TransactionInsertOrIgnoreExecutor`] 保留为过渡别名）。
+    // models 仅由本地后端分支消费；influxdb-only 组合下无消费方属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn insert_or_ignore<I: crate::model::Insertable>(
         &mut self,
         models: I,
@@ -6700,6 +6895,18 @@ pub type MappedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 )]
 pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 
+// 本块的 group_by/having 等分派方法参数仅由 SQL 后端分支消费；
+// clickhouse/influxdb-only 组合下落 Unsupported，参数不被使用属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_variables)
+)]
 impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 添加 GROUP BY 字段
     pub fn group_by<F, G>(self, f: F) -> Self
@@ -7026,6 +7233,17 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     /// 支持：
     /// - 单字段：map_to(|r| r.uid) -> ProjectionSelectExecutor<'a, T, i32>
     /// - 元组：map_to(|r| (r.uid, r.id)) -> ProjectionSelectExecutor<'a, T, (i32, i32)>
+    // f 仅由本地后端分支消费；clickhouse/influxdb-only 组合下落 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn map_to<F, M>(self, f: F) -> ProjectionSelectExecutor<'a, T, M::Output>
     where
         F: FnOnce(<T as Model>::Where) -> M,
@@ -7294,6 +7512,7 @@ where
 /// collect_with 的克隆式后端分支（L27：PostgreSQL/MySQL/MSSQL 三份同构
 /// 代码收敛）：`clone_with_*` → `collect::<Vec<V>>` → 装入对应 Collect 变体。
 /// `V` 由变体构造器的期望类型反向推断，宏内无需引用泛型参数。
+#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
 macro_rules! collect_with_clone_branch {
     ($exec:ident, $f:ident, [$($variant:ident)::+], $clone:ident) => {{
         let future = $exec.$clone().collect::<Vec<_>>();
@@ -7305,6 +7524,17 @@ impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
     /// 执行查询并收集结果，同时应用转换函数
     /// 用于将查询结果转换为其他类型（如Model）
     /// 示例：collect_with(|v| Uids { id: v })
+    // f 仅由本地后端分支消费；clickhouse/influxdb-only 组合下落 Unsupported
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb"
+        )),
+        allow(unused_variables)
+    )]
     pub fn collect_with<C, F, M>(self, f: F) -> ModelCollectWithFuture<'a, T, V, C, M, F>
     where
         T: 'static,
@@ -7421,6 +7651,7 @@ impl<'a, 'b, T: Model, V: crate::query::builder::ColumnValueType>
 /// 克隆式 collect_with（PostgreSQL/MySQL/MSSQL Collect 变体）的公共
 /// 收尾（L27）：等待投影结果后逐项应用转换函数，三份同构循环收敛为一份。
 /// 后端 Collect 变体只实现 `IntoFuture`，调用方需先 `.into_future()`。
+#[cfg(any(feature = "postgresql", feature = "mysql", feature = "mssql"))]
 async fn collect_with_map<V, M, C, F, Fut>(future: Fut, mapper: F) -> crate::Result<C>
 where
     Fut: Future<Output = crate::Result<Vec<V>>>,

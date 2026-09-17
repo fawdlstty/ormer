@@ -98,6 +98,18 @@ impl FilterFormatter {
         sql
     }
 
+    // influxdb-only 组合下无任何全文检索后端分支，闭包与 query_sql 不被使用属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables)
+    )]
     pub(crate) fn full_text_search_sql(
         &self,
         search: &crate::query::filter::FullTextQuery,

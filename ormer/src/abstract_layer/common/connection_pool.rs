@@ -2257,6 +2257,8 @@ impl<'a> PooledConnection<'a> {
         // 走"先 BEGIN 再应用选项、失败回滚"的公共路径（L20：与
         // Database::begin_opts 共用 apply_transaction_options_or_rollback）。
         #[cfg(feature = "mysql")]
+        // mysql-only 组合下该枚举仅剩一个变体，if let 不可反驳属预期
+        #[allow(irrefutable_let_patterns)]
         if let ConnectionWrapper::MySQL(db) = self.get_connection() {
             let txn = crate::utils::FutureTraceExt::trace(db.begin_with_opts(options)).await?;
             return Ok(super::unified::Transaction::MySQL(txn));

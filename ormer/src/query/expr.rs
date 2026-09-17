@@ -135,7 +135,17 @@ pub enum TimePart {
 }
 
 impl TimeUnit {
-    #[cfg_attr(feature = "sqlite", allow(dead_code))]
+    // 仅 sqlite / influxdb 组合下没有调用方（其余后端的日期算术都会用到）
+    #[cfg_attr(
+        not(any(
+            feature = "postgresql",
+            feature = "mssql",
+            feature = "mysql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(dead_code)
+    )]
     fn pg_name(self) -> &'static str {
         match self {
             Self::Second => "second",
@@ -816,6 +826,18 @@ impl SqlExpr {
         SqlExpr::Value(value.into())
     }
 
+    // influxdb-only 组合下所有 SQL 后端分支被裁剪，参数不被使用属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(unused_variables, unused_assignments)
+    )]
     pub(crate) fn to_sql(
         &self,
         db_type: DbType,

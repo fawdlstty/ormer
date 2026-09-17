@@ -1060,6 +1060,9 @@ macro_rules! impl_unified_select_executor_methods {
 #[macro_export]
 macro_rules! impl_unified_delete_executor {
     ($executor_name:ident) => {
+        // 极简 feature 组合（如 influxdb-only）下多数分派臂被裁剪，
+        // 生成方法的参数不被使用属预期
+        #[allow(unused_variables, unused_mut)]
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F, W>(self, f: F) -> Self
             where
@@ -1374,6 +1377,9 @@ macro_rules! impl_unified_block_delete_executor {
 #[macro_export]
 macro_rules! impl_unified_update_executor {
     ($executor_name:ident) => {
+        // 极简 feature 组合（如 influxdb-only）下多数分派臂被裁剪，
+        // 生成方法的参数/局部变量不被使用属预期
+        #[allow(unused_variables, unused_mut)]
         impl<'a, T: $crate::Model> $executor_name<'a, T> {
             pub fn filter<F, W>(self, f: F) -> Self
             where
@@ -1748,6 +1754,9 @@ macro_rules! impl_unified_aggregate_future {
 #[macro_export]
 macro_rules! impl_unified_join_executor {
     ($executor_name:ident) => {
+        // 极简 feature 组合（如 influxdb-only）下多数分派臂被裁剪，
+        // 生成方法的参数不被使用属预期
+        #[allow(unused_variables)]
         impl<'a, T: $crate::Model, J: $crate::Model> $executor_name<'a, T, J> {
             pub fn filter<F, W>(self, f: F) -> Self
             where
@@ -1838,6 +1847,9 @@ macro_rules! impl_unified_join_collect_future {
 #[macro_export]
 macro_rules! impl_unified_related_select_executor {
     ($executor_name:ident) => {
+        // 极简 feature 组合（如 influxdb-only）下多数分派臂被裁剪，
+        // 生成方法的参数不被使用属预期
+        #[allow(unused_variables)]
         impl<'a, T: $crate::Model + 'static, R: $crate::Model + 'static> $executor_name<'a, T, R> {
             pub fn filter<F, W>(self, f: F) -> Self
             where

@@ -2657,7 +2657,7 @@ impl Database {
                         CASE WHEN c.data_type = 'ARRAY' THEN c.udt_name \
                              WHEN c.data_type = 'USER-DEFINED' THEN c.udt_name \
                              ELSE c.data_type END AS type_name, \
-                        c.udt_name, c.is_nullable, c.column_default, c.is_identity, \
+                        c.udt_name, c.udt_schema, c.is_nullable, c.column_default, c.is_identity, \
                         EXISTS (
                             SELECT 1
                             FROM information_schema.table_constraints tc
@@ -2682,13 +2682,16 @@ impl Database {
             let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
             let type_name: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
             let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
-            let nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            // 枚举类型挂在类型自己的 schema（CREATE TYPE 不带限定时落在 search_path
+            // 首位，通常为 public），不一定与表同 schema，必须按 udt_schema 反查。
+            let udt_schema: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let nullable: String = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
             let default: Option<String> =
-                row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
-            let identity: String = row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
-            let primary_key: bool = row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
+                row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
+            let identity: String = row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
+            let primary_key: bool = row.try_get(7).trace_for("tokio_postgres::Row::try_get")?;
             let enum_variants = self
-                .db_first_postgres_enum_variants(schema_name, &udt_name)
+                .db_first_postgres_enum_variants(&udt_schema, &udt_name)
                 .await?;
             let auto_increment = identity == "YES"
                 || default

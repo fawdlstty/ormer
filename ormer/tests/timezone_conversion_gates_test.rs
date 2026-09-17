@@ -15,6 +15,15 @@ struct TimezoneEvent {
     occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
+// 仅 sqlite/duckdb/clickhouse 的负向断言消费；questdb-only 组合下无调用方属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "duckdb",
+        feature = "clickhouse"
+    )),
+    allow(dead_code)
+)]
 fn assert_timezone_conversion_is_rejected(backend: DbType) {
     let error = ormer::Select::<TimezoneEvent>::new()
         .map_to(|event| event.occurred_at.at_time_zone("Asia/Shanghai"))

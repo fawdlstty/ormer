@@ -243,6 +243,18 @@ impl Capabilities {
         }
     }
 
+    // 仅 influxdb-only 组合下所有消费方（SQL 后端矩阵分支）都被裁剪，属预期
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(dead_code)
+    )]
     const fn full_oltp() -> Self {
         Self {
             transactions: true,

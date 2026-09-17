@@ -830,6 +830,8 @@ impl ColumnDefault {
         match self {
             Self::String(value) => quote_sql_literal(value),
             Self::Number(value) => value.to_string(),
+            // influxdb-only 组合下该 match 无可用分支，value 不被使用属预期
+            #[allow(unused_variables)]
             Self::Boolean(value) => match db_type {
                 #[cfg(feature = "sqlite")]
                 crate::abstract_layer::DbType::Sqlite => if value { "1" } else { "0" }.to_string(),
@@ -2527,6 +2529,17 @@ fn through_link_is_column_store(db_type: crate::abstract_layer::DbType) -> bool 
     }
 }
 
+// influxdb-only 组合下走列存储提前报错分支，SQL 拼接变量不被使用属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb"
+    )),
+    allow(unused_variables)
+)]
 pub async fn graph_insert_through_link_values<'tx, Via>(
     tx: &mut crate::abstract_layer::Transaction<'tx>,
     owner_column: &'static str,

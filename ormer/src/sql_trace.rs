@@ -36,6 +36,19 @@ struct SqlTraceState {
     params_redactor: Option<ParamsRedactor>,
 }
 
+// 以下执行期快照/上报结构仅被 SQL 后端执行器消费，
+// influxdb-only 组合下无调用方属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse"
+    )),
+    allow(dead_code)
+)]
 #[derive(Clone)]
 struct SqlTraceSnapshot {
     before: Vec<BeforeCallback>,
@@ -171,6 +184,17 @@ impl SqlTraceBuilder {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse"
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct SqlTraceExecution {
     sql: String,
     event: SqlTraceEvent,
@@ -190,6 +214,17 @@ impl SqlTrace {
         f(&mut state);
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(dead_code)
+    )]
     fn snapshot(&self) -> SqlTraceSnapshot {
         let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
         SqlTraceSnapshot {
@@ -203,6 +238,17 @@ impl SqlTrace {
         }
     }
 
+    #[cfg_attr(
+        not(any(
+            feature = "sqlite",
+            feature = "postgresql",
+            feature = "mysql",
+            feature = "mssql",
+            feature = "duckdb",
+            feature = "clickhouse"
+        )),
+        allow(dead_code)
+    )]
     fn start(&self, sql: &str, params: &[Value]) -> SqlTraceExecution {
         let snapshot = self.snapshot();
         let rewrite_event = SqlTraceEvent {
@@ -237,6 +283,18 @@ impl SqlTrace {
     }
 }
 
+// 方法集仅被 SQL 后端执行器消费，influxdb-only 组合下无调用方属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse"
+    )),
+    allow(dead_code)
+)]
 impl SqlTraceExecution {
     pub(crate) fn sql(&self) -> &str {
         &self.sql
@@ -272,6 +330,17 @@ impl SqlTraceExecution {
     }
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql",
+        feature = "duckdb",
+        feature = "clickhouse"
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn start_sql_trace(sql: &str, params: &[Value]) -> SqlTraceExecution {
     global_sql_trace().start(sql, params)
 }

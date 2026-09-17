@@ -12,7 +12,15 @@
 pub mod _test_common;
 
 use ormer::query::builder::Select;
-use ormer::{DbType, OrderBy};
+use ormer::OrderBy;
+// DbType 仅被 sqlite/postgresql/mssql/questdb 专属断言消费
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mssql",
+    feature = "questdb"
+))]
+use ormer::DbType;
 #[cfg(feature = "postgresql")]
 use ormer::FullTextMode;
 #[cfg(any(feature = "sqlite", feature = "questdb"))]

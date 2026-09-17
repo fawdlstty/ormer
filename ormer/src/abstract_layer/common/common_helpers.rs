@@ -1001,6 +1001,13 @@ fn push_pk_match_sql(
     }
 }
 
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgresql",
+    feature = "mysql",
+    feature = "mssql",
+    feature = "duckdb"
+))]
 fn plan_set_value<'a>(plan: &'a ModelUpdatePlan, column: &str) -> Option<&'a Value> {
     plan.sets
         .iter()
@@ -3267,9 +3274,12 @@ pub fn parse_column_value_strict(
 
 #[cfg(test)]
 mod tests {
+    // 极简组合（如 influxdb-only）下测试体全部被 cfg 裁剪，导入不被使用属预期
+    #[cfg_attr(not(any(feature = "sqlite", feature = "mysql")), allow(unused_imports))]
     use super::*;
 
     #[test]
+    #[cfg_attr(not(any(feature = "sqlite", feature = "mysql")), allow(unused_variables))]
     fn batch_insert_builder_uses_backend_placeholder_rules() {
         let columns = &["id", "name", "age"];
 

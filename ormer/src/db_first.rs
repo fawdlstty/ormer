@@ -605,6 +605,17 @@ fn has_many_relations(entity: &EntityTable<'_>, entities: &[EntityTable<'_>]) ->
     relations
 }
 
+// duckdb/clickhouse 直接消费原始类型名，influxdb 直接报不支持；
+// 仅 sqlite/postgresql/mysql/mssql 使用小写形式，其余组合下 lower 不被使用属预期
+#[cfg_attr(
+    not(any(
+        feature = "sqlite",
+        feature = "postgresql",
+        feature = "mysql",
+        feature = "mssql"
+    )),
+    allow(unused_variables)
+)]
 fn rust_type_for_column(db_type: DbType, column: &DbFirstColumn) -> crate::Result<String> {
     let raw = column.type_name.trim();
     let lower = raw.to_ascii_lowercase();
