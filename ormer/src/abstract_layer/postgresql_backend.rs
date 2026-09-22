@@ -344,6 +344,7 @@ fn pg_upsert_param_rust_types<T: Model>(row_count: usize, columns: &[&str]) -> V
 /// 参数上限分块）：`Database::insert_or_ignore_batch` 与执行器 to_sql 共用
 /// 同一入口，to_sql 展示与实际执行的语句保持一致。
 fn build_pg_insert_or_ignore_statements<T: Model>(
+    table_name: &str,
     models: &[&T],
 ) -> crate::Result<Vec<common_helpers::InsertSqlStatement>> {
     let columns = T::insert_columns();
@@ -353,7 +354,7 @@ fn build_pg_insert_or_ignore_statements<T: Model>(
         let (mut sql, params) = common_helpers::build_batch_insert_statement::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
-            T::table_name_for_db(DbType::PostgreSQL),
+            table_name,
             &columns,
             chunk,
             common_helpers::BatchInsertValuesMode::WithoutAutoIncrement,
@@ -1785,10 +1786,20 @@ async fn ensure_routed_table_on_client<T: Model>(
     if table == T::table_name_for_db(db_type) {
         return Ok(());
     }
+    // 事务专用连接无进程内缓存：先探测子表是否已存在，存在则跳过整套幂等
+    // DDL（枚举 + CREATE TABLE + create_hypertable + 索引），避免事务内对
+    // 同一路由子表的多次写入反复执行 DDL；触达时顺带为旧版本创建的子表
+    // 幂等补挂列存压缩（进程级缓存，每表每进程一次）。
+    if db_type == DbType::PostgreSQL && routed_table_exists(client, table).await? {
+        mark_schema_ensured(db_type, table);
+        ensure_existing_columnstore::<T>(client, db_type, table).await?;
+        return Ok(());
+    }
     let executor: CreateTableExecutor<'_, T> = CreateTableExecutor {
         client,
         db_type,
         table_name: Some(table.to_string()),
+        route_columnstore: true,
         _marker: std::marker::PhantomData,
     };
     let sql = executor.to_sql()?;
@@ -1797,7 +1808,26 @@ async fn ensure_routed_table_on_client<T: Model>(
         traced_pg_execute_empty(client, statement_sql.as_ref()).await?;
     }
     mark_schema_ensured(db_type, table);
+    mark_columnstore_ensured(db_type, table);
     Ok(())
+}
+
+/// 探测路由子表是否已存在（`to_regclass`，缺表返回 NULL）。
+async fn routed_table_exists(
+    client: &tokio_postgres::Client,
+    table: &str,
+) -> crate::Result<bool> {
+    let (schema, table_name) = split_schema_table_name(table, "public");
+    let qualified = format!(
+        "{}.{}",
+        crate::model::quote_identifier(DbType::PostgreSQL, schema),
+        crate::model::quote_identifier(DbType::PostgreSQL, table_name)
+    );
+    let row = client
+        .query_opt("SELECT to_regclass($1::text) IS NOT NULL", &[&qualified])
+        .trace()
+        .await?;
+    Ok(row.map(|row| row.get(0)).unwrap_or(false))
 }
 
 /// 剥出 schema 限定表名（如 `ticket.tickets`）里的 schema 段；无 schema
@@ -1846,16 +1876,137 @@ fn mark_schema_ensured(db_type: DbType, table_name: &str) {
     }
 }
 
+/// SQL 字符串字面量（单引号翻倍转义），用于 DO 块内无法参数化的字面量。
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// 进程级"已补挂列存压缩"缓存：同一路由子表每进程只执行一次自适应 DO 块
+/// （外部取消压缩不感知，需重启进程）。
+static ENSURED_COLUMNSTORE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn ensured_columnstore() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    ENSURED_COLUMNSTORE
+        .get_or_init(std::sync::Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn columnstore_ensured(db_type: DbType, table: &str) -> bool {
+    ensured_columnstore().contains(&format!("{db_type:?}|{table}"))
+}
+
+fn mark_columnstore_ensured(db_type: DbType, table: &str) {
+    ensured_columnstore().insert(format!("{db_type:?}|{table}"));
+}
+
+/// 生成路由子表的 TimescaleDB 列存压缩 DDL（单条幂等 DO 块）。
+///
+/// 拆表子表的路由列值在子表内固定，行存 heap 下逐行写盘；启用 columnstore
+/// 后按批压缩，存量与增量 chunk 由自动压缩策略（policy）滚动压缩。压缩窗口
+/// 取模型声明的 chunk 间隔，与 `create_hypertable` 的 chunk 时间对齐。
+///
+/// `segmentby`：路由列在主键内时取路由列（满足"唯一索引必须包含全部
+/// segmentby 列"的约束，路由列按批键存储零行开销）；否则置空，交由字典
+/// 压缩处理子表内的固定值（此时主键不含路由列，任何含路由列的 segmentby
+/// 都会让 chunk 压缩在运行时报唯一索引错误）。
+///
+/// 仅 PostgreSQL 且模型同时声明 route key 与 `#[hypertable]` 时返回语句；
+/// 无时间列的路由子表是普通表，没有列存能力。DO 块在 TimescaleDB 不支持
+/// 新版参数时降级旧版 `timescaledb.compress*`，仍不支持（如未装扩展）则
+/// 整体静默跳过——列存是纯存储优化，失败不影响功能正确性。
+pub(crate) fn hypertable_columnstore_sql<T: crate::model::Model>(
+    db_type: DbType,
+    table: &str,
+) -> Option<String> {
+    if db_type != DbType::PostgreSQL {
+        return None;
+    }
+    let route_key = T::hypertable_route_key()?;
+    let (time_column, chunk_interval) = T::hypertable_info()?;
+    let route_in_primary = T::column_schema()
+        .iter()
+        .any(|column| column.is_primary && column.name == route_key);
+
+    let (schema, table_name) = split_schema_table_name(table, "public");
+    let qualified = format!(
+        "{}.{}",
+        crate::model::quote_identifier(db_type, schema),
+        crate::model::quote_identifier(db_type, table_name)
+    );
+    let regclass = sql_string_literal(&qualified);
+    let segmentby = if route_in_primary {
+        sql_string_literal(route_key)
+    } else {
+        "''".to_string()
+    };
+    let legacy_segmentby = if route_in_primary {
+        format!("timescaledb.compress_segmentby = {}, ", sql_string_literal(route_key))
+    } else {
+        String::new()
+    };
+    let orderby = sql_string_literal(&format!("{time_column} DESC"));
+    let interval = chunk_interval.to_interval_string();
+
+    Some(format!(
+        "DO $ormer_columnstore$\n\
+         BEGIN\n\
+         \x20   ALTER TABLE {qualified} SET (timescaledb.columnstore = TRUE, timescaledb.segmentby = {segmentby}, timescaledb.orderby = {orderby});\n\
+         \x20   CALL add_columnstore_policy({regclass}, after => INTERVAL '{interval}', if_not_exists => TRUE);\n\
+         EXCEPTION\n\
+         \x20   WHEN OTHERS THEN\n\
+         \x20       BEGIN\n\
+         \x20           ALTER TABLE {qualified} SET (timescaledb.compress = TRUE, {legacy_segmentby}timescaledb.compress_orderby = {orderby});\n\
+         \x20           SELECT add_compression_policy({regclass}, compress_after => INTERVAL '{interval}', if_not_exists => TRUE);\n\
+         \x20       EXCEPTION WHEN OTHERS THEN NULL;\n\
+         \x20       END;\n\
+         END\n\
+         $ormer_columnstore$;"
+    ))
+}
+
+/// 为已存在的路由子表补挂列存压缩（自适应）：旧版本 ormer 或外部创建的
+/// 子表没有压缩属性，首次写入触达时按幂等 DO 块补齐；进程级缓存保证每个
+/// 子表每进程只处理一次。
+async fn ensure_existing_columnstore<T: crate::model::Model>(
+    client: &tokio_postgres::Client,
+    db_type: DbType,
+    table: &str,
+) -> crate::Result<()> {
+    if columnstore_ensured(db_type, table) {
+        return Ok(());
+    }
+    if let Some(columnstore_sql) = hypertable_columnstore_sql::<T>(db_type, table) {
+        // DO 块内部已吞掉"后端不支持"类错误，这里只会传播连接级错误。
+        traced_pg_execute_empty(client, &columnstore_sql).await?;
+    }
+    mark_columnstore_ensured(db_type, table);
+    Ok(())
+}
+
 pub struct CreateTableExecutor<'a, T: crate::model::Model> {
     client: &'a tokio_postgres::Client,
     db_type: DbType,
     table_name: Option<String>,
+    /// 路由子表建表标记：DDL 序列尾部追加 TimescaleDB 列存压缩 DO 块
+    /// （仅 PG 且模型同时声明 route key 与 `#[hypertable]` 时生效，见
+    /// `hypertable_columnstore_sql`）。基础表建表不带该步骤。
+    route_columnstore: bool,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
     pub fn with_table_name(mut self, table_name: &str) -> Self {
         self.table_name = Some(table_name.to_string());
+        self
+    }
+
+    /// 标记为路由子表建表（拆表写入路径与迁移重建路径使用）：DDL 序列尾部
+    /// 追加列存压缩与自动压缩策略，幂等且在后端不支持时静默跳过。
+    pub fn with_route_columnstore(mut self) -> Self {
+        self.route_columnstore = true;
         self
     }
 
@@ -1929,6 +2080,13 @@ impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
             statements.push(SingleSqlStatement::new(hypertable_sql, Vec::new()));
         }
 
+        // 路由子表收尾：追加列存压缩 DO 块（需在 create_hypertable 之后执行）。
+        if self.route_columnstore
+            && let Some(columnstore_sql) = hypertable_columnstore_sql::<T>(self.db_type, table_name)
+        {
+            statements.push(SingleSqlStatement::new(columnstore_sql, Vec::new()));
+        }
+
         Ok(SqlStatement::batch(self.db_type, statements))
     }
 
@@ -1961,16 +2119,34 @@ impl<'a, T: crate::model::Model> SqlExecutor for CreateTableExecutor<'a, T> {
 pub struct DropTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
     db_type: DbType,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             self.db_type,
             format!(
                 "DROP TABLE IF EXISTS {}{}",
-                common_helpers::quote_table_name::<T>(self.db_type),
+                common_helpers::quote_routed_table_name::<T>(self.db_type, &self.table_route)?,
                 if self.db_type.is_questdb() {
                     ""
                 } else {
@@ -2008,16 +2184,34 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for DropTableExecutor<'a, T
 pub struct TruncateTableExecutor<'a, T: crate::model::WritableModel> {
     client: &'a tokio_postgres::Client,
     db_type: DbType,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         Ok(SqlStatement::single(
             self.db_type,
             format!(
                 "TRUNCATE TABLE {}",
-                common_helpers::quote_table_name::<T>(self.db_type)
+                common_helpers::quote_routed_table_name::<T>(self.db_type, &self.table_route)?
             ),
             Vec::new(),
         ))
@@ -2278,10 +2472,28 @@ pub struct InsertPartialExecutor<'a, T: Model> {
     db: &'a Database,
     assignments: Vec<InsertAssignment>,
     source_table: Option<&'static str>,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
         self.assignments.extend(assignments);
         self
@@ -2316,10 +2528,13 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         ensure_auto_increment_supported::<T>(self.db.db_type())?;
         common_helpers::validate_insert_model_table::<T>(DbType::PostgreSQL, self.source_table)?;
+        let table_name =
+            crate::model::routed_model_table_name_for_db::<T>(DbType::PostgreSQL, &self.table_route)?;
         let statement =
-            common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
+            common_helpers::build_partial_insert_statement_with_auto_increment_returning_for_table::<T>(
                 DbType::PostgreSQL,
                 &self.assignments,
+                &table_name,
             )?;
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
@@ -2354,6 +2569,12 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
         if sql.statements.is_empty() {
             return Ok(<T as Model>::AutoIncrementKeyType::default());
         }
+
+        let routed = crate::model::routed_model_table_name_for_db::<T>(
+            DbType::PostgreSQL,
+            &self.table_route,
+        )?;
+        self.db.ensure_routed_table::<T>(&routed).await?;
 
         let statement = &sql.statements[0];
         let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
@@ -2418,12 +2639,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrUpdateExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        // 与事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        // 与事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+        )?;
         let statements =
             common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
                 DbType::PostgreSQL,
                 "INSERT INTO",
-                <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+                &routed,
                 &refs,
                 |sql, columns| common_helpers::append_standard_upsert_clause::<I::Model>(DbType::PostgreSQL, sql, columns),
             )?;
@@ -2459,6 +2685,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrUpda
     async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
+        {
+            let refs = self.models.as_refs();
+            if !refs.is_empty() {
+                let routed = common_helpers::routed_insert_table_name::<I::Model>(
+                    DbType::PostgreSQL,
+                    &refs,
+                )?;
+                self.db.ensure_routed_table::<I::Model>(&routed).await?;
+            }
+        }
         for statement in sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
             pg_execute_with_types(
@@ -2491,8 +2727,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertOrIgnoreExecutor<'a, I
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
 
-        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导
-        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&refs)?;
+        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+        )?;
+        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&routed, &refs)?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
@@ -2525,6 +2766,16 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
     async fn execute_with_sql(mut self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let hook_ctx = HookContext::new(HookOperation::Insert);
         self.models.run_before_insert(hook_ctx).await?;
+        {
+            let refs = self.models.as_refs();
+            if !refs.is_empty() {
+                let routed = common_helpers::routed_insert_table_name::<I::Model>(
+                    DbType::PostgreSQL,
+                    &refs,
+                )?;
+                self.db.ensure_routed_table::<I::Model>(&routed).await?;
+            }
+        }
         for statement in sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
             pg_execute_with_types(
@@ -2849,6 +3100,7 @@ impl Database {
             client: &self.client,
             db_type: self.db_type,
             table_name: None,
+            route_columnstore: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -2871,6 +3123,7 @@ impl Database {
             db: self,
             assignments: Vec::new(),
             source_table: None,
+            table_route: crate::model::TableRoute::new(),
             _marker: PhantomData,
         }
     }
@@ -3498,11 +3751,14 @@ impl Database {
         }
 
         // 构建批量插入或更新的 SQL: INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
-        // 与事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        // 与事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<T>(DbType::PostgreSQL, models)?;
+        self.ensure_routed_table::<T>(&routed).await?;
         let statements = common_helpers::build_auto_increment_aware_upsert_statements::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
-            T::table_name_for_db(DbType::PostgreSQL),
+            &routed,
             models,
             |sql, columns| common_helpers::append_standard_upsert_clause::<T>(DbType::PostgreSQL, sql, columns),
         )?;
@@ -3522,8 +3778,11 @@ impl Database {
         }
 
         // INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_key) DO NOTHING
-        // 与执行器 to_sql 共用同一语句构建入口（分块 + 每块参数类型）
-        let statements = build_pg_insert_or_ignore_statements::<T>(models)?;
+        // 与执行器 to_sql 共用同一语句构建入口（分块 + 每块参数类型）；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<T>(DbType::PostgreSQL, models)?;
+        self.ensure_routed_table::<T>(&routed).await?;
+        let statements = build_pg_insert_or_ignore_statements::<T>(&routed, models)?;
         for statement in statements {
             let rust_types = pg_upsert_param_rust_types::<T>(statement.row_count, &T::insert_columns());
             pg_execute_with_types(&self.client, &statement.sql, &statement.params, &rust_types)
@@ -3555,6 +3814,7 @@ impl Database {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             db_type: self.db_type,
             client: &self.client,
             _marker: PhantomData,
@@ -3571,6 +3831,7 @@ impl Database {
             db_type: self.db_type,
             key: common_helpers::resolve_block_key::<T>(self.db_type).ok(),
             range: None,
+            table_route: crate::model::TableRoute::new(),
             client: &self.client,
             timescaledb: &self.timescaledb,
             _marker: PhantomData,
@@ -3583,6 +3844,7 @@ impl Database {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             client: &self.client,
             db_type: self.db_type,
             _marker: PhantomData,
@@ -3633,6 +3895,7 @@ impl Database {
         DropTableExecutor {
             client: &self.client,
             db_type: self.db_type,
+            table_route: crate::model::TableRoute::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -3642,6 +3905,7 @@ impl Database {
         TruncateTableExecutor {
             client: &self.client,
             db_type: self.db_type,
+            table_route: crate::model::TableRoute::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -4044,12 +4308,17 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
-        // 与非事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        // 与非事务版一致：自增主键已设置的行携带主键冲突更新，未设置的行由序列生成；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+        )?;
         let statements =
             common_helpers::build_auto_increment_aware_upsert_statements::<I::Model>(
                 DbType::PostgreSQL,
                 "INSERT INTO",
-                <I::Model as Model>::table_name_for_db(DbType::PostgreSQL),
+                &routed,
                 &refs,
                 |sql, columns| common_helpers::append_standard_upsert_clause::<I::Model>(DbType::PostgreSQL, sql, columns),
             )?;
@@ -4077,6 +4346,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
+        {
+            let refs = self.models.as_refs();
+            let routed = common_helpers::routed_insert_table_name::<I::Model>(
+                DbType::PostgreSQL,
+                &refs,
+            )?;
+            ensure_routed_table_on_client::<I::Model>(self.client, DbType::PostgreSQL, &routed)
+                .await?;
+        }
         for statement in &sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
             pg_execute_with_types(self.client, &statement.sql, &statement.params, rust_types)
@@ -4100,8 +4378,13 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         if refs.is_empty() {
             return Ok(SqlStatement::batch(DbType::PostgreSQL, Vec::new()));
         }
-        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导
-        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&refs)?;
+        // 按绑定参数上限分块（与 execute 路径同源），参数类型按块内行数推导；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<I::Model>(
+            DbType::PostgreSQL,
+            &refs,
+        )?;
+        let statements = build_pg_insert_or_ignore_statements::<I::Model>(&routed, &refs)?;
 
         Ok(SqlStatement::batch(
             DbType::PostgreSQL,
@@ -4126,6 +4409,15 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
         }
         let hook_ctx = HookContext::new(HookOperation::Insert).transaction();
         self.models.run_before_insert(hook_ctx).await?;
+        {
+            let refs = self.models.as_refs();
+            let routed = common_helpers::routed_insert_table_name::<I::Model>(
+                DbType::PostgreSQL,
+                &refs,
+            )?;
+            ensure_routed_table_on_client::<I::Model>(self.client, DbType::PostgreSQL, &routed)
+                .await?;
+        }
         // 分块语句逐条执行（to_sql 可能产出多块）
         for statement in &sql.statements {
             let rust_types = statement.param_rust_types.as_deref().unwrap_or(&[]);
@@ -4230,6 +4522,7 @@ impl<'a> Transaction<'a> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             // 事务只在 PostgreSQL 连接上存在（QuestDB transactions=false）
             db_type: DbType::PostgreSQL,
             client: self.client(),
@@ -4243,6 +4536,7 @@ impl<'a> Transaction<'a> {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             client: self.client(),
             // 事务不可能建立在 QuestDB 连接上（begin 已拒绝），仅为类型完备
             db_type: DbType::PostgreSQL,
@@ -4295,11 +4589,14 @@ impl<'a> Transaction<'a> {
         }
 
         // INSERT INTO table (cols) VALUES (...), (...) ON CONFLICT (primary_keys) DO UPDATE SET ...
-        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成
+        // 自增主键已设置的行携带主键冲突更新，未设置的行由序列生成；
+        // TimescaleDB/PG 拆表模型写入路由子表
+        let routed = common_helpers::routed_insert_table_name::<T>(DbType::PostgreSQL, models)?;
+        ensure_routed_table_on_client::<T>(self.client(), DbType::PostgreSQL, &routed).await?;
         let statements = common_helpers::build_auto_increment_aware_upsert_statements::<T>(
             DbType::PostgreSQL,
             "INSERT INTO",
-            T::table_name_for_db(DbType::PostgreSQL),
+            &routed,
             models,
             |sql, columns| common_helpers::append_standard_upsert_clause::<T>(DbType::PostgreSQL, sql, columns),
         )?;
@@ -5192,6 +5489,8 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
     versioned: bool,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     /// 运行时后端类型（PostgreSQL 或复用本连接的 QuestDB），驱动能力矩阵判定。
     db_type: DbType,
     client: &'a tokio_postgres::Client,
@@ -5199,6 +5498,22 @@ pub struct DeleteExecutor<'a, T: Model> {
 }
 
 impl<'a, T: Model> DeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     /// 运行时后端类型，供统一层能力门控使用。
     pub(crate) fn db_type(&self) -> DbType {
         self.db_type
@@ -5236,6 +5551,9 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self.filters
             .extend(common_helpers::model_delete_filters(model));
         self.versioned = T::version_info().is_some();
+        if let Ok(route) = model.table_route() {
+            self.table_route.merge_missing(route);
+        }
         self
     }
 
@@ -5274,7 +5592,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        common_helpers::build_delete_sql::<T>(DbType::PostgreSQL, &self.filters)
+        common_helpers::build_delete_sql_for_route::<T>(DbType::PostgreSQL, &self.table_route, &self.filters)
             .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 
@@ -5354,9 +5672,11 @@ pub(crate) fn block_delete_questdb_sql<T: Model>(
 /// 生成 TimescaleDB `drop_chunks` SQL（服务端整块语义，边界不做客户端对齐）。
 pub(crate) fn block_delete_drop_chunks_sql<T: Model>(
     range: &common_helpers::AlignedBlockRange,
+    route: &crate::model::TableRoute,
 ) -> crate::Result<SqlStatement> {
     let db_type = DbType::PostgreSQL;
-    let table_name = T::table_name_for_db(db_type).replace('\'', "''");
+    let routed = crate::model::routed_model_table_name_for_db::<T>(db_type, route)?;
+    let table_name = routed.replace('\'', "''");
     let mut sql = format!(
         "SELECT drop_chunks(relation => '{table_name}'::regclass, older_than => $1::timestamptz"
     );
@@ -5379,9 +5699,10 @@ pub(crate) fn block_delete_fallback_sql<T: Model>(
     db_type: DbType,
     key: &common_helpers::BlockKey,
     range: &common_helpers::AlignedBlockRange,
+    route: &crate::model::TableRoute,
 ) -> crate::Result<SqlStatement> {
     let filters = common_helpers::block_delete_fallback_filters(range, &key.time_column);
-    let (sql, params) = common_helpers::build_delete_sql::<T>(db_type, &filters)?;
+    let (sql, params) = common_helpers::build_delete_sql_for_route::<T>(db_type, route, &filters)?;
     let mut rust_types = Vec::new();
     for filter in &filters {
         pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
@@ -5411,12 +5732,30 @@ pub struct BlockDeleteExecutor<'a, T: Model> {
     db_type: DbType,
     key: Option<common_helpers::BlockKey>,
     range: Option<common_helpers::BlockRange>,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     client: &'a tokio_postgres::Client,
     timescaledb: &'a std::sync::OnceLock<bool>,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn with_range(mut self, range: common_helpers::BlockRange) -> Self {
         self.range = Some(range);
         self
@@ -5432,7 +5771,7 @@ impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
         if self.db_type.is_questdb() {
             self.questdb_sql(&key, &range)
         } else {
-            block_delete_drop_chunks_sql::<T>(&range)
+            block_delete_drop_chunks_sql::<T>(&range, &self.table_route)
         }
     }
 
@@ -5447,7 +5786,7 @@ impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
 
         if !self.detect_timescaledb().await? {
             // 未安装 timescaledb：对齐边界行删除回退，SQL 注释中标注回退路径
-            let sql = block_delete_fallback_sql::<T>(self.db_type, &key, &range)?;
+            let sql = block_delete_fallback_sql::<T>(self.db_type, &key, &range, &self.table_route)?;
             let rows = self.execute_statement(&sql).await?;
             return Ok(super::common::BlockDeleteResult {
                 blocks_dropped: 0,
@@ -5455,7 +5794,7 @@ impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
             });
         }
 
-        let sql = block_delete_drop_chunks_sql::<T>(&range)?;
+        let sql = block_delete_drop_chunks_sql::<T>(&range, &self.table_route)?;
         // 先取删除前的块数，再执行 drop_chunks，最后取删除后的块数，
         // 两者之差才是本次删除掉的块数。
         let before = self.count_chunks().await;
@@ -5598,7 +5937,11 @@ impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
 
     /// 统计目标超表当前块数（尽力而为，失败按 0 处理）。
     async fn count_chunks(&self) -> u64 {
-        let table_name = T::table_name_for_db(self.db_type);
+        let table_name = crate::model::routed_model_table_name_for_db::<T>(
+            self.db_type,
+            &self.table_route,
+        )
+        .unwrap_or_else(|_| T::table_name_for_db(self.db_type).to_string());
         let count: Option<i64> = self
             .client
             .query_opt(
@@ -5629,12 +5972,30 @@ pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
+    /// TimescaleDB/PG 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     client: &'a tokio_postgres::Client,
     db_type: DbType,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     /// 运行时后端类型（PostgreSQL 或复用本连接的 QuestDB），供统一层能力门控使用。
     pub(crate) fn db_type(&self) -> DbType {
         self.db_type
@@ -5759,8 +6120,9 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
             for filter in &self.filters {
                 pg_collect_filter_param_rust_types::<T>(filter, &mut rust_types);
             }
-            let (sql, params) = common_helpers::build_update_sql::<T>(
+            let (sql, params) = common_helpers::build_update_sql_for_route::<T>(
                 DbType::PostgreSQL,
+                &self.table_route,
                 &self.sets,
                 &self.filters,
             )?;
@@ -6741,7 +7103,7 @@ mod block_delete_tests {
     }
 
     // ColumnSchema 无 Default；测试只需 name/rust_type/hypertable 三个字段
-    fn unused_fields(name: &'static str) -> ColumnSchema {
+    pub(super) fn unused_fields(name: &'static str) -> ColumnSchema {
         ColumnSchema {
             rust_name: name,
             name,
@@ -6879,7 +7241,7 @@ mod block_delete_tests {
             start: None,
             end: day("2024-01-17 00:00:00"),
         };
-        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range)
+        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range, &crate::model::TableRoute::new())
             .unwrap()
             .statements
             .remove(0);
@@ -6893,7 +7255,7 @@ mod block_delete_tests {
             start: Some(day("2024-01-15 00:00:00")),
             end: day("2024-01-17 00:00:00"),
         };
-        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range)
+        let sql = block_delete_drop_chunks_sql::<TsEvent>(&range, &crate::model::TableRoute::new())
             .unwrap()
             .statements
             .remove(0);
@@ -6912,7 +7274,7 @@ mod block_delete_tests {
             start: None,
             end: day("2024-01-17 00:00:00"),
         };
-        let sql = block_delete_fallback_sql::<TsEvent>(DbType::PostgreSQL, &key, &range)
+        let sql = block_delete_fallback_sql::<TsEvent>(DbType::PostgreSQL, &key, &range, &crate::model::TableRoute::new())
             .unwrap()
             .statements
             .remove(0);
@@ -6925,5 +7287,159 @@ mod block_delete_tests {
             sql.params[0],
             Value::DateTime(t) if t == day("2024-01-17 00:00:00")
         ));
+    }
+}
+
+/// 路由子表列存压缩 DDL 渲染测试（不依赖真实 PG）。
+#[cfg(test)]
+mod route_columnstore_tests {
+    use super::*;
+    use crate::model::ColumnSchema;
+
+    fn column(
+        name: &'static str,
+        primary: bool,
+        hypertable: Option<std::time::Duration>,
+    ) -> ColumnSchema {
+        ColumnSchema {
+            rust_name: name,
+            name,
+            rust_type: "",
+            is_primary: primary,
+            hypertable,
+            ..block_delete_tests::unused_fields(name)
+        }
+    }
+
+    macro_rules! columnstore_test_model {
+        ($model:ident, $table:literal, $route:expr, [$($col:expr),+ $(,)?]) => {
+            struct $model;
+            impl crate::model::Model for $model {
+                const TABLE_NAME: &'static str = $table;
+                const COLUMNS: &'static [&'static str] = &[];
+                const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+
+                type AutoIncrementKeyType = ();
+                type QueryBuilder = ();
+                type Where = ();
+                type Update = ();
+
+                fn column_schema() -> Vec<ColumnSchema> {
+                    vec![$($col),+]
+                }
+
+                fn hypertable_route_key() -> Option<&'static str> {
+                    $route
+                }
+
+                fn query() -> Self::QueryBuilder {}
+                fn select() -> Self::QueryBuilder {}
+                fn from_row(_row: &Row) -> crate::Result<Self> {
+                    unreachable!()
+                }
+                fn from_row_values(_values: &[Value]) -> crate::Result<Self> {
+                    unreachable!()
+                }
+                fn field_values(&self) -> Vec<Value> {
+                    Vec::new()
+                }
+                fn primary_key_columns() -> &'static [&'static str] {
+                    &[]
+                }
+                fn primary_key_values(&self) -> Vec<Value> {
+                    Vec::new()
+                }
+            }
+        };
+    }
+
+    const DAY: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+    // 路由列在主键内：segmentby 取路由列
+    columnstore_test_model!(
+        RoutedPkModel,
+        "routed_pk_events",
+        Some("station"),
+        [
+            column("time", true, Some(DAY)),
+            column("station", true, None),
+            column("val", false, None),
+        ]
+    );
+
+    // 路由列不在主键内：segmentby 置空（唯一索引约束禁止取路由列）
+    columnstore_test_model!(
+        RoutedNoPkModel,
+        "routed_no_pk_events",
+        Some("station"),
+        [
+            column("id", true, None),
+            column("time", false, Some(DAY)),
+            column("station", false, None),
+        ]
+    );
+
+    // 只有路由键、无 #[hypertable] 时间列：普通表，无列存能力
+    columnstore_test_model!(
+        RouteOnlyModel,
+        "route_only_events",
+        Some("station"),
+        [column("id", true, None), column("station", false, None)]
+    );
+
+    #[test]
+    fn segmentby_uses_route_key_when_route_in_primary() {
+        let sql = hypertable_columnstore_sql::<RoutedPkModel>(DbType::PostgreSQL, "routed_pk_events_val")
+            .expect("routed hypertable child must generate columnstore ddl");
+        assert!(sql.contains("timescaledb.columnstore = TRUE"));
+        assert!(sql.contains("timescaledb.segmentby = 'station'"));
+        assert!(sql.contains("timescaledb.orderby = 'time DESC'"));
+        assert!(sql.contains("CALL add_columnstore_policy('public.routed_pk_events_val', after => INTERVAL '1 day', if_not_exists => TRUE)"));
+        // 旧版 TimescaleDB 降级路径
+        assert!(sql.contains("timescaledb.compress = TRUE"));
+        assert!(sql.contains("timescaledb.compress_segmentby = 'station'"));
+        assert!(sql.contains("SELECT add_compression_policy('public.routed_pk_events_val', compress_after => INTERVAL '1 day', if_not_exists => TRUE)"));
+    }
+
+    #[test]
+    fn segmentby_empty_when_route_not_in_primary() {
+        let sql = hypertable_columnstore_sql::<RoutedNoPkModel>(
+            DbType::PostgreSQL,
+            "routed_no_pk_events_val",
+        )
+        .expect("routed hypertable child must generate columnstore ddl");
+        assert!(sql.contains("timescaledb.segmentby = ''"));
+        assert!(!sql.contains("compress_segmentby"));
+    }
+
+    #[test]
+    fn schema_qualified_table_is_rendered_and_quoted() {
+        let sql = hypertable_columnstore_sql::<RoutedPkModel>(
+            DbType::PostgreSQL,
+            "ticket.routed_pk_events_val",
+        )
+        .expect("routed hypertable child must generate columnstore ddl");
+        // 小写标识符无需引号，quote_identifier 原样输出
+        assert!(sql.contains("ALTER TABLE ticket.routed_pk_events_val SET"));
+        assert!(sql.contains("add_columnstore_policy('ticket.routed_pk_events_val',"));
+    }
+
+    #[test]
+    fn route_only_model_without_hypertable_is_skipped() {
+        assert!(hypertable_columnstore_sql::<RouteOnlyModel>(
+            DbType::PostgreSQL,
+            "route_only_events_val"
+        )
+        .is_none());
+    }
+
+    // DbType 变体随 feature 门控：仅在存在非 PG 类型可引用时验证跳过逻辑
+    #[test]
+    #[cfg(feature = "sqlite")]
+    fn non_postgresql_backend_is_skipped() {
+        assert!(
+            hypertable_columnstore_sql::<RoutedPkModel>(DbType::Sqlite, "routed_pk_events_val")
+                .is_none()
+        );
     }
 }

@@ -156,6 +156,9 @@ pub struct ModelUpdatePlan {
     pub sets: Vec<(String, Value)>,
     pub filters: Vec<FilterExpr>,
     pub version_update: Option<VersionSnapshotUpdate>,
+    /// 实例的拆表路由值（TimescaleDB/PG 字符串拆表 + 表名模板），
+    /// 由 [`model_update_plan`] 从模型实例提取。
+    pub table_route: crate::model::TableRoute,
 }
 
 pub type ModelUpdateBatch = Vec<ModelUpdatePlan>;
@@ -246,6 +249,7 @@ pub fn model_update_plan<T: Model>(
         sets,
         filters,
         version_update,
+        table_route: model.table_route().unwrap_or_default(),
     })
 }
 
@@ -286,7 +290,17 @@ pub fn build_delete_sql<T: Model>(
     db_type: DbType,
     filters: &[FilterExpr],
 ) -> crate::Result<(String, Vec<Value>)> {
-    let mut sql = format!("DELETE FROM {}", quote_table_name::<T>(db_type));
+    build_delete_sql_for_route::<T>(db_type, &crate::model::TableRoute::new(), filters)
+}
+
+/// [`build_delete_sql`] 的拆表路由版本：按 `route` 渲染目标表名
+/// （TimescaleDB/PG 字符串拆表与表名模板）。
+pub fn build_delete_sql_for_route<T: Model>(
+    db_type: DbType,
+    route: &crate::model::TableRoute,
+    filters: &[FilterExpr],
+) -> crate::Result<(String, Vec<Value>)> {
+    let mut sql = format!("DELETE FROM {}", quote_routed_table_name::<T>(db_type, route)?);
     let mut params = Vec::new();
     push_filters_sql(db_type, &mut sql, &mut params, filters)?;
     Ok((sql, params))
@@ -670,7 +684,21 @@ pub fn build_update_sql<T: Model>(
     sets: &[UpdateAssignment],
     filters: &[FilterExpr],
 ) -> crate::Result<(String, Vec<Value>)> {
-    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    build_update_sql_for_route::<T>(db_type, &crate::model::TableRoute::new(), sets, filters)
+}
+
+/// [`build_update_sql`] 的拆表路由版本：按 `route` 渲染目标表名
+/// （TimescaleDB/PG 字符串拆表与表名模板）。
+pub fn build_update_sql_for_route<T: Model>(
+    db_type: DbType,
+    route: &crate::model::TableRoute,
+    sets: &[UpdateAssignment],
+    filters: &[FilterExpr],
+) -> crate::Result<(String, Vec<Value>)> {
+    let mut sql = format!(
+        "UPDATE {} SET ",
+        quote_routed_table_name::<T>(db_type, route)?
+    );
     let mut params = Vec::new();
     for (index, assignment) in sets.iter().enumerate() {
         validate_update_assignment(db_type, assignment)?;
@@ -734,7 +762,23 @@ pub fn build_model_update_sql<T: Model>(
     db_type: DbType,
     plan: &ModelUpdatePlan,
 ) -> crate::Result<ModelSqlStatement> {
-    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    // PG 路由键模型（TimescaleDB 字符串拆表）必须携带实例路由值，避免静默
+    // 更新到基础表；模板风格与其它后端维持空路由 → 基础表名的既有语义。
+    #[cfg(feature = "postgresql")]
+    if db_type == DbType::PostgreSQL
+        && T::hypertable_route_key().is_some()
+        && plan.table_route.is_empty()
+    {
+        return Err(crate::ormer_error!(
+            "Model {} declares a hypertable route key but the instance carries no route value; \
+             set the route column before update",
+            T::TABLE_NAME
+        ));
+    }
+    let mut sql = format!(
+        "UPDATE {} SET ",
+        quote_routed_table_name::<T>(db_type, &plan.table_route)?
+    );
     let mut params = Vec::new();
     for (index, (column, value)) in plan.sets.iter().enumerate() {
         if index > 0 {
@@ -831,7 +875,7 @@ pub fn build_duckdb_graph_update_sql<T: Model>(
     let sql = format!(
         "MERGE INTO {} AS {TARGET} USING (SELECT {}) AS {SOURCE} \
          ON {} WHEN MATCHED THEN UPDATE SET {}",
-        quote_table_name::<T>(db_type),
+        quote_routed_table_name::<T>(db_type, &plan.table_route)?,
         source_columns.join(", "),
         join_conditions.join(" AND "),
         set_assignments.join(", ")
@@ -1022,7 +1066,8 @@ fn build_sqlite_bulk_model_update_sql<T: Model>(
 ) -> crate::Result<ModelSqlStatement> {
     let db_type = DbType::Sqlite;
     let pk_columns = T::primary_key_columns();
-    let mut sql = format!("UPDATE {} SET ", quote_table_name::<T>(db_type));
+    let table = quote_routed_table_name::<T>(db_type, &plans[0].table_route)?;
+    let mut sql = format!("UPDATE {table} SET ");
     let mut params = Vec::new();
     let mut param_columns = Vec::new();
 
@@ -1188,7 +1233,7 @@ fn build_values_source_bulk_model_update_sql<T: Model>(
         )?;
     }
 
-    let table = quote_table_name::<T>(db_type);
+    let table = quote_routed_table_name::<T>(db_type, &plans[0].table_route)?;
     let sql = match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => {
@@ -1325,7 +1370,7 @@ fn build_mysql_bulk_model_update_sql<T: Model>(
     Ok(ModelSqlStatement {
         sql: format!(
             "UPDATE {} AS target JOIN ({source_sql}) AS source ON {predicates} SET {assignments}",
-            quote_table_name::<T>(db_type)
+            quote_routed_table_name::<T>(db_type, &plans[0].table_route)?
         ),
         params,
         versioned: false,
@@ -1392,6 +1437,15 @@ pub fn build_bulk_model_update_statements<T: Model>(
 ) -> crate::Result<Option<Vec<ModelSqlStatement>>> {
     if plans.len() <= 1 {
         return Ok(None);
+    }
+
+    // 批量 UPDATE 只能命中一张物理表：拆表模型的多行更新必须落在同一路由子表
+    let route = &plans[0].table_route;
+    if plans.iter().any(|plan| &plan.table_route != route) {
+        return Err(crate::ormer_error!(
+            "Batch update cannot target multiple routed tables on {}",
+            T::TABLE_NAME
+        ));
     }
 
     let set_columns = match model_update_set_columns(plans) {
@@ -3091,16 +3145,17 @@ pub fn build_mssql_insert_conflict_statement<T: Model>(
 }
 
 #[cfg(feature = "mssql")]
-pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>) {
+pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> crate::Result<(String, Vec<Value>)> {
     // 与 conflict 路径（build_mssql_insert_conflict_statement）及 MySQL/PG/SQLite 的
     // upsert 语义保持一致：MERGE 源列使用 insert_columns() 排除自增列，避免向
     // IDENTITY 列显式插入未赋值的 0/NULL（SQL Server 错误 544）。
     let columns = T::insert_columns();
     let columns_sql = quote_column_list(DbType::MSSQL, &columns);
     let col_count = columns.len();
+    let routed = routed_table_name_for_models(DbType::MSSQL, models)?;
     let mut sql = format!(
         "MERGE INTO {} AS target USING (VALUES ",
-        quote_table_name::<T>(DbType::MSSQL)
+        quote_qualified_identifier(DbType::MSSQL, &routed)
     );
     let mut all_values = Vec::new();
 
@@ -3136,7 +3191,7 @@ pub fn build_mssql_merge_source<T: Model>(models: &[&T]) -> (String, Vec<Value>)
         sql.push_str("1 = 0");
     }
 
-    (sql, all_values)
+    Ok((sql, all_values))
 }
 
 /// 生成批量 MERGE 语句组（insert_or_update / insert_or_ignore，按参数上限
@@ -3151,7 +3206,7 @@ pub fn build_mssql_merge_statements<T: Model>(
     with_update: bool,
 ) -> crate::Result<Vec<InsertSqlStatement>> {
     build_chunked_insert_statements::<T>(DbType::MSSQL, models, |chunk| {
-        let (mut sql, params) = build_mssql_merge_source::<T>(chunk);
+        let (mut sql, params) = build_mssql_merge_source::<T>(chunk)?;
         if with_update {
             append_mssql_merge_update_clause::<T>(&mut sql);
         }

@@ -12,6 +12,7 @@
 struct TsEvent {
     #[primary]
     id: i64,
+    #[primary]
     #[hypertable(std::time::Duration::from_secs(86400))]
     time: chrono::DateTime<chrono::Utc>,
 }

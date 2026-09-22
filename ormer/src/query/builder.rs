@@ -2287,6 +2287,8 @@ macro_rules! impl_multi_table_select {
             range_start: Option<usize>,
             range_end: Option<usize>,
             ignored_columns: Vec<String>,
+            /// 主表拆表路由；仅作用于主表，关联表始终渲染基础表名。
+            table_route: TableRoute,
             _marker: PhantomData<(T, $($r),+)>,
         }
 
@@ -2296,6 +2298,18 @@ macro_rules! impl_multi_table_select {
                     context_filter_exprs_for::<T>(&self.context_filters, &self.disabled_context_filters);
                 filters.extend(self.filters.iter().cloned());
                 filters
+            }
+
+            /// 设置主表拆表路由键值（渲染 `{表名}_{路由值}` 子表名；关联表不路由）。
+            pub fn route_table(mut self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
+                self.table_route.insert(key, value);
+                self
+            }
+
+            /// 合并主表拆表路由（已有同名字段值不被覆盖）。
+            pub fn with_table_route(mut self, route: TableRoute) -> Self {
+                self.table_route.merge_missing(route);
+                self
             }
 
             #[cfg(feature = "postgresql")]
@@ -2382,9 +2396,9 @@ macro_rules! impl_multi_table_select {
                 let mut params = Vec::new();
                 let mut param_idx = 1;
 
-                // SELECT 子句 - 只选择主表的列
+                // SELECT 子句 - 只选择主表的列（主表按拆表路由渲染，关联表不路由）
                 let from_tables = format_from_table_list(&[
-                    table_name_for::<T>(db_type),
+                    table_name_for_route_or_panic::<T>(db_type, &self.table_route),
                     $(table_name_for::<$r>(db_type)),+
                 ]);
                 write!(
@@ -2441,11 +2455,11 @@ impl_multi_table_select!(
 
 /// `Select<T>` 转入"主表 + N 个关联表"构建器（`from` / `from3` / `from4`）
 /// 的公共入口：三者只差目标类型、关联表参数个数与断言消息前缀，
-/// 字段搬运逻辑完全一致。
+/// 字段搬运逻辑完全一致。主表拆表路由随转换携带，不视为丢失状态。
 macro_rules! select_into_multi_table {
     ($select:ident, $label:literal, $ty:ident, ($($r:ident),+)) => {
         {
-            let dropped = $select.lost_state_on_conversion(true);
+            let dropped = $select.lost_state_on_conversion();
             assert!(
                 dropped.is_empty(),
                 concat!(
@@ -2464,6 +2478,7 @@ macro_rules! select_into_multi_table {
                 range_start: $select.range_start,
                 range_end: $select.range_end,
                 ignored_columns: $select.ignored_columns,
+                table_route: $select.table_route,
                 _marker: PhantomData,
             }
         }
@@ -3530,14 +3545,11 @@ impl<T: Model> Select<T> {
     /// 检查转换为目标查询类型（RelatedSelect/MultiTableSelect/FourTableSelect/
     /// AggregateSelect）时会被丢弃的非默认状态。
     ///
-    /// 这些目标类型不携带 route_table/lock/cursor/distinct/cte 等字段；
-    /// 若已设置仍继续转换，会把查询静默打到未拆分的基础表或丢失语义，
-    /// 因此调用方必须显式报错。
-    fn lost_state_on_conversion(&self, include_table_route: bool) -> Vec<&'static str> {
+    /// 主表拆表路由（table_route）由上述全部目标类型携带、随转换传递；
+    /// 其余 lock/cursor/distinct/cte 等字段目标类型不携带，若已设置仍继续
+    /// 转换会把语义静默丢失，因此调用方必须显式报错。
+    fn lost_state_on_conversion(&self) -> Vec<&'static str> {
         let mut dropped = Vec::new();
-        if include_table_route && !self.table_route.is_empty() {
-            dropped.push("route_table");
-        }
         if self.lock.is_some() {
             dropped.push("lock");
         }
@@ -3581,7 +3593,7 @@ impl<T: Model> Select<T> {
 
     /// 创建带类型参数的聚合查询
     fn aggregate_typed<R>(self, func: &str, column: &str) -> AggregateSelect<T, R> {
-        let dropped = self.lost_state_on_conversion(false);
+        let dropped = self.lost_state_on_conversion();
         assert!(
             dropped.is_empty(),
             "Select::{}(): AggregateSelect does not carry the following states: {}; \

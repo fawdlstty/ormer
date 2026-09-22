@@ -378,6 +378,26 @@ macro_rules! __ormer_backend_join_methods {
 #[macro_export]
 macro_rules! __ormer_backend_related_methods {
     ($conn_field:ident) => {
+        pub fn route_table(
+            self,
+            key: impl Into<String>,
+            value: impl $crate::model::TableRouteValue,
+        ) -> Self {
+            Self {
+                select: self.select.route_table(key, value),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
+            Self {
+                select: self.select.with_table_route(route),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn filter<F, W>(self, f: F) -> Self
         where
             F: FnOnce(T::Where, R::Where) -> W,
@@ -404,6 +424,26 @@ macro_rules! __ormer_backend_related_methods {
 #[macro_export]
 macro_rules! __ormer_backend_multi_table_methods {
     ($conn_field:ident) => {
+        pub fn route_table(
+            self,
+            key: impl Into<String>,
+            value: impl $crate::model::TableRouteValue,
+        ) -> Self {
+            Self {
+                select: self.select.route_table(key, value),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
+            Self {
+                select: self.select.with_table_route(route),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn filter<F, W>(self, f: F) -> Self
         where
             F: FnOnce(T::Where, R1::Where, R2::Where) -> W,
@@ -430,6 +470,26 @@ macro_rules! __ormer_backend_multi_table_methods {
 #[macro_export]
 macro_rules! __ormer_backend_four_table_methods {
     ($conn_field:ident) => {
+        pub fn route_table(
+            self,
+            key: impl Into<String>,
+            value: impl $crate::model::TableRouteValue,
+        ) -> Self {
+            Self {
+                select: self.select.route_table(key, value),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
+        pub fn with_table_route(self, route: $crate::model::TableRoute) -> Self {
+            Self {
+                select: self.select.with_table_route(route),
+                $conn_field: self.$conn_field,
+                _marker: std::marker::PhantomData,
+            }
+        }
+
         pub fn filter<F, W>(self, f: F) -> Self
         where
             F: FnOnce(T::Where, R1::Where, R2::Where, R3::Where) -> W,

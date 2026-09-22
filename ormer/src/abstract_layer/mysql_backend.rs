@@ -752,10 +752,28 @@ pub struct InsertPartialExecutor<'a, T: Model> {
     db: &'a Database,
     assignments: Vec<InsertAssignment>,
     source_table: Option<&'static str>,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
         self.assignments.extend(assignments);
         self
@@ -789,8 +807,13 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         common_helpers::validate_insert_model_table::<T>(DbType::MySQL, self.source_table)?;
-        let statement =
-            common_helpers::build_partial_insert_statement::<T>(DbType::MySQL, &self.assignments)?;
+        let table_name =
+            crate::model::routed_model_table_name_for_db::<T>(DbType::MySQL, &self.table_route)?;
+        let statement = common_helpers::build_partial_insert_statement_for_table::<T>(
+            DbType::MySQL,
+            &self.assignments,
+            &table_name,
+        )?;
         Ok(SqlStatement::single(
             DbType::MySQL,
             statement.sql,
@@ -1436,6 +1459,7 @@ impl Database {
             db: self,
             assignments: Vec::new(),
             source_table: None,
+            table_route: crate::model::TableRoute::new(),
             _marker: PhantomData,
         }
     }
@@ -1559,6 +1583,7 @@ impl Database {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             pool: self.executor_conn(),
             _marker: PhantomData,
         }
@@ -1570,6 +1595,7 @@ impl Database {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             pool: self.executor_conn(),
             _marker: PhantomData,
         }
@@ -2204,6 +2230,7 @@ impl<'a> Transaction<'a> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             pool: ExecutorConn::Transaction(&self.conn),
             _marker: PhantomData,
         }
@@ -2215,6 +2242,7 @@ impl<'a> Transaction<'a> {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             pool: ExecutorConn::Transaction(&self.conn),
             _marker: PhantomData,
         }
@@ -2959,11 +2987,29 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<FilterExpr>,
     versioned: bool,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     pool: ExecutorConn<'a>,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> DeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
@@ -2988,6 +3034,9 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self.filters
             .extend(common_helpers::model_delete_filters(model));
         self.versioned = T::version_info().is_some();
+        if let Ok(route) = model.table_route() {
+            self.table_route.merge_missing(route);
+        }
         self
     }
 
@@ -3001,7 +3050,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        common_helpers::build_delete_sql::<T>(DbType::MySQL, &self.filters)
+        common_helpers::build_delete_sql_for_route::<T>(DbType::MySQL, &self.table_route, &self.filters)
             .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 }
@@ -3045,11 +3094,29 @@ pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     pool: ExecutorConn<'a>,
     _marker: PhantomData<T>,
 }
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     /// 添加 WHERE 条件
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
@@ -3122,8 +3189,12 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let (sql, params) =
-                common_helpers::build_update_sql::<T>(DbType::MySQL, &self.sets, &self.filters)?;
+            let (sql, params) = common_helpers::build_update_sql_for_route::<T>(
+                DbType::MySQL,
+                &self.table_route,
+                &self.sets,
+                &self.filters,
+            )?;
             statements.push(common_helpers::ModelSqlStatement {
                 sql,
                 params,

@@ -30,7 +30,8 @@ struct User {
 - `#[embed(prefix = "前缀_")]` - 嵌入值对象，并把字段展开为带前缀的列
 - `#[data_type(i64)]` - 数据库类型覆盖（如 Rust 字段为 i32 但数据库使用 BIGINT）
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB 超表时间分片时长
-- `#[hypertable]` - 标注 `String` 字段作为 PostgreSQL/TimescaleDB 字符串拆表键
+- `#[hypertable]` - TimescaleDB 空间分区列（默认 4 个分区）
+- `#[hypertable(route)]` - 标注 `String` 字段作为 PostgreSQL 拆表路由键（每模型至多一个）
 - `#[compress]` - 列压缩，默认使用 PostgreSQL `pglz`
 - `#[compress(lz4)]` - 指定压缩算法；PostgreSQL 按列生成 `COMPRESSION lz4`，MySQL 按表生成 `COMPRESSION='LZ4'`
 - `#[filter(filter_name, |m, ...| ...)]` - 模型级可复用过滤器，名称必须以 `filter_` 开头
@@ -164,7 +165,7 @@ struct Event {
 | `30d ≤ d < 365d` | 月 | `MONTH` / `toYYYYMM(ts)` |
 | `≥ 365d` | 年 | `YEAR` / `toYYYY(ts)` |
 
-TimescaleDB 可用无参 `#[hypertable]` 标注 `String` 字段，让 PostgreSQL 按字段值拆成不同物理表；SQLite、MySQL、MSSQL 不启用该自动拆表。路由键使用字段的 SQL 列名（未配置 `#[column]` 时就是字段名），写入时自动从模型字段取值，查询和建表时显式传入 route。
+TimescaleDB 支持在时间分片外叠加空间分区：无参 `#[hypertable]` 标注 `String` 字段，`create_hypertable` 按该列分成默认 4 个分区。
 
 ```rust
 #[derive(Debug, Model)]
@@ -173,24 +174,71 @@ struct Event {
     #[primary]
     id: i64,
     payload: String,
-    #[hypertable]
-    #[ormer_ignore]
+    #[hypertable] // 空间分区列，默认 4 个分区
     tenant: String,
     #[hypertable(std::time::Duration::from_secs(86400))]
     created_at: chrono::NaiveDateTime,
 }
+```
 
-db.create_table::<Event>()
-    .route_table("tenant", "acme")
-    .execute()
-    .await?;
+## 拆表路由键
 
-let rows: Vec<Event> = db
-    .select::<Event>()
+`#[hypertable(route)]` 把一个 `String` 字段（每模型至多一个）声明为拆表路由键：PostgreSQL 上物理表名为 `{表名}_{路由字段值}`，如表 `aaa`、路由值 `val` 读写子表 `aaa_val`；其他后端忽略 route key，读写基础表名。它与所有后端生效的表名模板 `#[table = "orders_{tenant_id}"]`（见"动态表路由"）是两种独立的拆表风格。
+
+```rust
+#[derive(Debug, Model)]
+#[table = "aaa"]
+struct Aaa {
+    #[primary]
+    id: i64,
+    #[hypertable(route)]
+    tenant: String, // 子表 aaa_acme、aaa_other……
+}
+```
+
+路由键使用字段的 SQL 列名（未配置 `#[column]` 时就是字段名）；不想建列时叠加 `#[ormer_ignore]`。路由值必须是由字母、数字、下划线组成的非空字符串。
+
+写入（`insert`、upsert、`insert_or_ignore`、`insert_partial`）从模型字段自动取路由值，PostgreSQL 上首次写入新路由值时自动按模型 DDL 创建子表（含超表与索引），无需手工建表：
+
+```rust
+db.insert(&Aaa { id: 1, tenant: "acme".to_string() }).await?;
+// 自动创建并写入 aaa_acme
+```
+
+查询、更新、删除、清表、删表与按块删除通过 `route_table(key, value)` 或 `with_table_route(route)` 显式指定子表：
+
+```rust
+let rows: Vec<Aaa> = db
+    .select::<Aaa>()
     .route_table("tenant", "acme")
     .collect()
     .await?;
+
+let count: usize = db
+    .select::<Aaa>()
+    .route_table("tenant", "acme")
+    .count(|a| a.id)
+    .await?;
+
+db.delete::<Aaa>()
+    .route_table("tenant", "acme")
+    .filter(|a| a.id.eq(1))
+    .execute()
+    .await?;
+
+let route = ormer::model::TableRoute::new().with("tenant", "acme");
+db.truncate_table::<Aaa>().with_table_route(route).execute().await?;
 ```
+
+`delete_blocks`（drop_chunks 按块删除）、`drop_table`、`create_table` 同样支持 `with_table_route`。related/multi/four 表 JOIN 只对主表应用路由，关联表不路由。`ensure_table` / `migrate_table` 在 PostgreSQL 上会自动迁移已存在的 `{表名}_%` 子表。
+
+子表列存压缩：模型同时声明 `#[hypertable]` 与 route key 时，子表是 TimescaleDB 超表，路由列在子表内值固定、行存下逐行写盘。ormer 在自动建子表与 `ensure_table` 迁移时自动启用 columnstore（按 chunk 间隔挂自动压缩策略），存量与过期 chunk 滚动压缩，路由列存储开销近零；`create_table().with_table_name(子表名).with_route_columnstore()` 手动建子表时同样生效。后端不支持（未装 TimescaleDB 或旧版本）时静默跳过，不影响功能。
+
+限制：
+
+- `find_by_id`、`preload`、`select_related` 等便捷 API 没有路由入口，需要路由时改用 `db.select::<T>().with_table_route(...)`。
+- 查询不传路由时使用基础表名。
+- 路由渲染失败（缺少路由值或值非法）会 panic，与既有 Select 行为一致。
 
 ## InfluxDB 模型
 

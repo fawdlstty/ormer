@@ -919,6 +919,20 @@ impl<'a, T: crate::model::WritableModel> CreateTableExecutor<'a, T> {
         }
     }
 
+    /// 标记为路由子表建表：PostgreSQL 的 DDL 序列尾部追加 TimescaleDB 列存
+    /// 压缩与自动压缩策略；表路由本就是 PG 专属能力，其余后端原样返回。
+    pub fn with_route_columnstore(self) -> Self {
+        match self {
+            #[cfg(feature = "postgresql")]
+            CreateTableExecutor::PostgreSQL(exec) => {
+                CreateTableExecutor::PostgreSQL(exec.with_route_columnstore())
+            }
+            // 仅启用 postgresql feature 时其余变体不存在，兜底臂不可达
+            #[allow(unreachable_patterns)]
+            other => other,
+        }
+    }
+
     pub fn route_table(self, key: impl Into<String>, value: impl TableRouteValue) -> Self {
         let mut route = crate::model::TableRoute::new();
         route.insert(key, value);
@@ -1027,6 +1041,51 @@ pub enum DropTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> DropTableExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由 PostgreSQL 变体消费（其余后端落基础表名）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由 PostgreSQL 变体消费（其余后端落基础表名）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "sqlite")]
+            this @ DropTableExecutor::Sqlite(..) => this,
+            #[cfg(feature = "postgresql")]
+            DropTableExecutor::PostgreSQL(exec) => {
+                DropTableExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "mysql")]
+            this @ DropTableExecutor::MySQL(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "mssql")]
+            this @ DropTableExecutor::MSSQL(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "duckdb")]
+            this @ DropTableExecutor::DuckDB(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "clickhouse")]
+            this @ DropTableExecutor::ClickHouse(..) => this,
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            unsupported @ DropTableExecutor::Unsupported { .. } => unsupported,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "influxdb")]
+            this @ DropTableExecutor::InfluxDB(..) => this,
+        }
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -1121,6 +1180,41 @@ pub enum TruncateTableExecutor<'a, T: crate::model::WritableModel> {
 }
 
 impl<'a, T: crate::model::WritableModel> TruncateTableExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由 PostgreSQL 变体消费（其余后端落基础表名）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由 PostgreSQL 变体消费（其余后端落基础表名）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            #[cfg(feature = "postgresql")]
+            TruncateTableExecutor::PostgreSQL(exec) => {
+                TruncateTableExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "mysql")]
+            this @ TruncateTableExecutor::MySQL(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "mssql")]
+            this @ TruncateTableExecutor::MSSQL(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "duckdb")]
+            this @ TruncateTableExecutor::DuckDB(..) => this,
+            unsupported @ TruncateTableExecutor::Unsupported { .. } => unsupported,
+        }
+    }
+
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         match self {
             #[cfg(feature = "postgresql")]
@@ -1239,6 +1333,51 @@ pub enum InsertPartialExecutor<'a, T: Model> {
         feature: &'static str,
         _marker: std::marker::PhantomData<&'a T>,
     },
+}
+
+impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由本地后端分支消费（ClickHouse/InfluxDB 不支持 partial insert）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由本地后端分支消费（ClickHouse/InfluxDB 不支持 partial insert）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            InsertPartialExecutor::Sqlite(exec, phantom) => {
+                InsertPartialExecutor::Sqlite(exec.with_table_route(route), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            InsertPartialExecutor::PostgreSQL(exec) => {
+                InsertPartialExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            #[cfg(feature = "mysql")]
+            InsertPartialExecutor::MySQL(exec) => {
+                InsertPartialExecutor::MySQL(exec.with_table_route(route))
+            }
+            #[cfg(feature = "mssql")]
+            InsertPartialExecutor::MSSQL(exec) => {
+                InsertPartialExecutor::MSSQL(exec.with_table_route(route))
+            }
+            #[cfg(feature = "duckdb")]
+            InsertPartialExecutor::DuckDB(exec) => {
+                InsertPartialExecutor::DuckDB(exec.with_table_route(route))
+            }
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            unsupported @ InsertPartialExecutor::Unsupported { .. } => unsupported,
+        }
+    }
 }
 
 impl<'a, T: Model + Send + Sync> InsertPartialExecutor<'a, T> {
@@ -4954,6 +5093,44 @@ pub enum DeleteExecutor<'a, T: Model> {
 
 crate::impl_unified_delete_executor!(DeleteExecutor);
 
+impl<'a, T: Model> DeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            DeleteExecutor::Sqlite(exec, phantom) => {
+                DeleteExecutor::Sqlite(exec.with_table_route(route), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            DeleteExecutor::PostgreSQL(exec) => {
+                DeleteExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            #[cfg(feature = "mysql")]
+            DeleteExecutor::MySQL(exec) => DeleteExecutor::MySQL(exec.with_table_route(route)),
+            #[cfg(feature = "mssql")]
+            DeleteExecutor::MSSQL(exec) => DeleteExecutor::MSSQL(exec.with_table_route(route)),
+            #[cfg(feature = "duckdb")]
+            DeleteExecutor::DuckDB(exec) => DeleteExecutor::DuckDB(exec.with_table_route(route)),
+            unsupported @ DeleteExecutor::Unsupported { .. } => unsupported,
+        }
+    }
+}
+
 impl<'a, T: Model> NamedFilterQuery<T> for DeleteExecutor<'a, T> {
     fn apply_named_filter(self, _name: &'static str, expr: WhereExpr) -> Self {
         self.filter(|_| expr)
@@ -5060,6 +5237,56 @@ pub enum BlockDeleteExecutor<'a, T: Model> {
 
 crate::impl_unified_block_delete_executor!(BlockDeleteExecutor);
 
+impl<'a, T: Model> BlockDeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由 PostgreSQL/Fallback 分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由 PostgreSQL/Fallback 分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            #[cfg(feature = "postgresql")]
+            BlockDeleteExecutor::PostgreSQL(exec) => {
+                BlockDeleteExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "clickhouse")]
+            this @ BlockDeleteExecutor::ClickHouse(..) => this,
+            // route key 仅 PostgreSQL/表名模板语义，此后端忽略
+            #[cfg(feature = "influxdb")]
+            this @ BlockDeleteExecutor::InfluxDB(..) => this,
+            #[cfg(any(
+                feature = "sqlite",
+                feature = "mysql",
+                feature = "mssql",
+                feature = "duckdb"
+            ))]
+            BlockDeleteExecutor::Fallback {
+                db_type,
+                key,
+                range,
+                delete,
+            } => BlockDeleteExecutor::Fallback {
+                db_type,
+                key,
+                range,
+                delete: delete.with_table_route(route),
+            },
+        }
+    }
+}
+
 #[cfg(any(
     feature = "sqlite",
     feature = "mysql",
@@ -5157,6 +5384,45 @@ pub enum UpdateExecutor<'a, T: Model> {
 }
 
 crate::impl_unified_update_executor!(UpdateExecutor);
+
+impl<'a, T: Model> UpdateExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn route_table(
+        self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        let mut route = crate::model::TableRoute::new();
+        route.insert(key, value);
+        self.with_table_route(route)
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+    #[allow(unused_variables)]
+    pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+        match self {
+            #[cfg(feature = "sqlite")]
+            UpdateExecutor::Sqlite(exec, phantom) => {
+                UpdateExecutor::Sqlite(exec.with_table_route(route), phantom)
+            }
+            #[cfg(feature = "postgresql")]
+            UpdateExecutor::PostgreSQL(exec) => {
+                UpdateExecutor::PostgreSQL(exec.with_table_route(route))
+            }
+            #[cfg(feature = "mysql")]
+            UpdateExecutor::MySQL(exec) => UpdateExecutor::MySQL(exec.with_table_route(route)),
+            #[cfg(feature = "mssql")]
+            UpdateExecutor::MSSQL(exec) => UpdateExecutor::MSSQL(exec.with_table_route(route)),
+            #[cfg(feature = "duckdb")]
+            UpdateExecutor::DuckDB(exec) => UpdateExecutor::DuckDB(exec.with_table_route(route)),
+            #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+            unsupported @ UpdateExecutor::Unsupported { .. } => unsupported,
+        }
+    }
+}
 
 impl<'a, T: Model> UpdateExecutor<'a, T> {
     // model/fields 仅由 SQL 后端分支消费；clickhouse/influxdb-only 组合下落 Unsupported
@@ -5353,6 +5619,22 @@ fn find_toplevel_where(sql: &str) -> Option<usize> {
 }
 
 impl<'a, T: Model> ScopedDeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.inner = self.inner.route_table(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.inner = self.inner.with_table_route(route);
+        self
+    }
+
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> W,
@@ -5420,6 +5702,22 @@ impl<'a, T: Model> super::SqlExecutor for ScopedDeleteExecutor<'a, T> {
 }
 
 impl<'a, T: Model> ScopedUpdateExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.inner = self.inner.route_table(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.inner = self.inner.with_table_route(route);
+        self
+    }
+
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> W,
@@ -5812,6 +6110,62 @@ impl_unified_multi_table_select_family!(
     (R)
 );
 
+/// 统一层"主表 + N 个关联表"执行器的主表拆表路由转发生成宏：
+/// `route_table` / `with_table_route` 仅作用于主表，逐后端转发到内部
+/// 执行器（最终落到 builder 层 `RelatedSelect`/`MultiTableSelect`/
+/// `FourTableSelect` 的 `table_route`）。DuckDB 变体形状差异与
+/// [`impl_unified_multi_table_select_family`] 一致，经 `duckdb_extra` 注入：
+/// 第一个组插值进解构 pattern 尾部（`..`），第二个组插值进重建表达式尾部
+/// （pattern 位置不接受类型化 token，故需要两组分别提供）。
+macro_rules! impl_unified_multi_table_route {
+    (
+        $exec:ident, ($($r:ident),+)
+        $(, duckdb_extra { $($duck_pat:tt)* } { $($duck_expr:tt)* })?
+    ) => {
+        impl<'a, T: Model, $($r: Model),+> $exec<'a, T, $($r),+> {
+            /// 设置主表拆表路由键值（渲染 `{表名}_{路由值}` 子表名；关联表不路由）。
+            // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+            #[allow(unused_variables)]
+            pub fn route_table(
+                self,
+                key: impl Into<String>,
+                value: impl crate::model::TableRouteValue,
+            ) -> Self {
+                let mut route = crate::model::TableRoute::new();
+                route.insert(key, value);
+                self.with_table_route(route)
+            }
+
+            /// 合并主表拆表路由（已有同名字段值不被覆盖）。
+            // route 仅由 SQL 后端分支消费（极简 feature 组合下分派臂被裁剪属预期）
+            #[allow(unused_variables)]
+            pub fn with_table_route(self, route: crate::model::TableRoute) -> Self {
+                match self {
+                    #[cfg(feature = "sqlite")]
+                    $exec::Sqlite(exec, phantom) => {
+                        $exec::Sqlite(exec.with_table_route(route), phantom)
+                    }
+                    #[cfg(feature = "postgresql")]
+                    $exec::PostgreSQL(exec) => $exec::PostgreSQL(exec.with_table_route(route)),
+                    #[cfg(feature = "mysql")]
+                    $exec::MySQL(exec) => $exec::MySQL(exec.with_table_route(route)),
+                    #[cfg(feature = "mssql")]
+                    $exec::MSSQL(exec) => $exec::MSSQL(exec.with_table_route(route)),
+                    #[cfg(feature = "duckdb")]
+                    $exec::DuckDB(exec $(, $($duck_pat)*)?) => $exec::DuckDB(
+                        exec.with_table_route(route)
+                        $(, $($duck_expr)*)?
+                    ),
+                    #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
+                    unsupported @ $exec::Unsupported { .. } => unsupported,
+                }
+            }
+        }
+    };
+}
+
+impl_unified_multi_table_route!(RelatedSelectExecutor, (R));
+
 impl_unified_multi_table_select_family!(
     MultiTableSelectExecutor,
     MultiTableCountFuture,
@@ -5820,6 +6174,12 @@ impl_unified_multi_table_select_family!(
     "统计同谓词总行数（列表分页 total_count 用）。\n\n返回 `usize`（统一层把后端的 `i64` 行数强转），与\n[`SelectExecutor::count`] 的返回类型一致。",
     (R1, R2),
     duckdb_extra { std::marker::PhantomData<&'a ()> }
+);
+
+impl_unified_multi_table_route!(
+    MultiTableSelectExecutor,
+    (R1, R2),
+    duckdb_extra { .. } { std::marker::PhantomData }
 );
 
 impl_unified_multi_table_collect!(
@@ -5838,6 +6198,12 @@ impl_unified_multi_table_select_family!(
     "统计同谓词总行数（列表分页 total_count 用）。\n\n返回 `usize`（统一层把后端的 `i64` 行数强转），与\n[`SelectExecutor::count`] 的返回类型一致。",
     (R1, R2, R3),
     duckdb_extra { std::marker::PhantomData<&'a ()> }
+);
+
+impl_unified_multi_table_route!(
+    FourTableSelectExecutor,
+    (R1, R2, R3),
+    duckdb_extra { .. } { std::marker::PhantomData }
 );
 
 impl_unified_multi_table_collect!(

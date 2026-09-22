@@ -30,7 +30,8 @@ struct User {
 - `#[embed(prefix = "prefix_")]` - Embeds a value object and expands its fields into prefixed columns
 - `#[data_type(i64)]` - Database type override (e.g., Rust i32 field mapped to BIGINT in database)
 - `#[hypertable(Duration::from_secs(86400))]` - TimescaleDB hypertable time chunk interval
-- `#[hypertable]` - Marks a `String` field as a PostgreSQL/TimescaleDB string table route key
+- `#[hypertable]` - TimescaleDB space partition column (4 partitions by default)
+- `#[hypertable(route)]` - Marks a `String` field as a PostgreSQL table route key (at most one per model)
 - `#[compress]` - Column compression using PostgreSQL `pglz` by default
 - `#[compress(lz4)]` - Select a compression algorithm; PostgreSQL emits column-level `COMPRESSION lz4`, while MySQL emits the table option `COMPRESSION='LZ4'`
 - `#[filter(filter_name, |m, ...| ...)]` - Model-level reusable filter; the name must start with `filter_`
@@ -168,7 +169,7 @@ struct Event {
 | `30d ≤ d < 365d` | month | `MONTH` / `toYYYYMM(ts)` |
 | `≥ 365d` | year | `YEAR` / `toYYYY(ts)` |
 
-For TimescaleDB, bare `#[hypertable]` can mark a `String` field so PostgreSQL routes different string values to different physical tables; SQLite, MySQL, and MSSQL do not enable this automatic split. The route key is the field's SQL column name (or the Rust field name when `#[column]` is not set). Inserts read it from the model value; queries and table creation pass it explicitly with `route_table`.
+TimescaleDB supports space partitioning on top of time chunking: bare `#[hypertable]` marks a `String` field, and `create_hypertable` partitions by that column into 4 partitions by default.
 
 ```rust
 #[derive(Debug, Model)]
@@ -177,24 +178,71 @@ struct Event {
     #[primary]
     id: i64,
     payload: String,
-    #[hypertable]
-    #[ormer_ignore]
+    #[hypertable] // space partition column, 4 partitions by default
     tenant: String,
     #[hypertable(std::time::Duration::from_secs(86400))]
     created_at: chrono::NaiveDateTime,
 }
+```
 
-db.create_table::<Event>()
-    .route_table("tenant", "acme")
-    .execute()
-    .await?;
+## Table Route Key
 
-let rows: Vec<Event> = db
-    .select::<Event>()
+`#[hypertable(route)]` declares a `String` field (at most one per model) as a table route key: on PostgreSQL the physical table name becomes `{table}_{route_value}`, so table `aaa` with route value `val` reads and writes the subtable `aaa_val`; other backends ignore the route key and use the base table. This is a split style independent from the all-backend table-name template `#[table = "orders_{tenant_id}"]` (see "Dynamic Table Routing").
+
+```rust
+#[derive(Debug, Model)]
+#[table = "aaa"]
+struct Aaa {
+    #[primary]
+    id: i64,
+    #[hypertable(route)]
+    tenant: String, // subtables aaa_acme, aaa_other...
+}
+```
+
+The route key is the field's SQL column name (the Rust field name when `#[column]` is not set); add `#[ormer_ignore]` when the field should not become a column. A route value must be a non-empty string of letters, digits, and underscores.
+
+Writes (`insert`, upserts, `insert_or_ignore`, `insert_partial`) read the route value from the model field automatically; on PostgreSQL, the first write with a new route value creates the subtable from the model DDL (including the hypertable and indexes), with no manual table creation:
+
+```rust
+db.insert(&Aaa { id: 1, tenant: "acme".to_string() }).await?;
+// creates and writes aaa_acme automatically
+```
+
+Queries, updates, deletes, truncates, table drops, and block deletes pass the subtable explicitly with `route_table(key, value)` or `with_table_route(route)`:
+
+```rust
+let rows: Vec<Aaa> = db
+    .select::<Aaa>()
     .route_table("tenant", "acme")
     .collect()
     .await?;
+
+let count: usize = db
+    .select::<Aaa>()
+    .route_table("tenant", "acme")
+    .count(|a| a.id)
+    .await?;
+
+db.delete::<Aaa>()
+    .route_table("tenant", "acme")
+    .filter(|a| a.id.eq(1))
+    .execute()
+    .await?;
+
+let route = ormer::model::TableRoute::new().with("tenant", "acme");
+db.truncate_table::<Aaa>().with_table_route(route).execute().await?;
 ```
+
+`delete_blocks` (drop_chunks block deletion), `drop_table`, and `create_table` support `with_table_route` as well. related/multi/four table JOINs apply the route to the main table only; joined tables are not routed. `ensure_table` / `migrate_table` automatically migrate existing `{table}_%` subtables on PostgreSQL.
+
+Subtable columnstore: when a model declares both `#[hypertable]` and a route key, each subtable is a TimescaleDB hypertable whose route column holds a fixed value and is written row by row in row storage. ormer automatically enables columnstore when auto-creating subtables and during `ensure_table` migration (attaching an automatic compression policy keyed to the chunk interval), so stale chunks are compressed over time and the route column's storage cost drops to nearly zero. `create_table().with_table_name(subtable).with_route_columnstore()` applies the same when creating subtables manually. Backends without support (TimescaleDB not installed or too old) skip it silently without affecting functionality.
+
+Limitations:
+
+- Convenience APIs such as `find_by_id`, `preload`, and `select_related` have no route entry; use `db.select::<T>().with_table_route(...)` when routing is needed.
+- Without a route, queries use the base table name.
+- Rendering a route fails with a panic (missing route value or invalid value), consistent with the existing Select behavior.
 
 ## InfluxDB Models
 

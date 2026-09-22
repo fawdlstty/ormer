@@ -485,6 +485,7 @@ impl Database {
             pool: self.pool.clone(),
             assignments: Vec::new(),
             source_table: None,
+            table_route: crate::model::TableRoute::new(),
             _marker: PhantomData,
         }
     }
@@ -690,6 +691,7 @@ impl Database {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -700,6 +702,7 @@ impl Database {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1342,10 +1345,28 @@ pub struct InsertPartialExecutor<'a, T: Model> {
     pool: Pool,
     assignments: Vec<InsertAssignment>,
     source_table: Option<&'static str>,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     _marker: PhantomData<&'a T>,
 }
 
 impl<'a, T: Model> InsertPartialExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     fn with_assignments(mut self, assignments: Vec<InsertAssignment>) -> Self {
         self.assignments.extend(assignments);
         self
@@ -1379,10 +1400,13 @@ impl<'a, T: Model> InsertPartialExecutor<'a, T> {
 
     pub fn to_sql(&self) -> crate::Result<SqlStatement> {
         common_helpers::validate_insert_model_table::<T>(DbType::MSSQL, self.source_table)?;
+        let table_name =
+            crate::model::routed_model_table_name_for_db::<T>(DbType::MSSQL, &self.table_route)?;
         let statement =
-            common_helpers::build_partial_insert_statement_with_auto_increment_returning::<T>(
+            common_helpers::build_partial_insert_statement_with_auto_increment_returning_for_table::<T>(
                 DbType::MSSQL,
                 &self.assignments,
+                &table_name,
             )?;
         Ok(SqlStatement::single(
             DbType::MSSQL,
@@ -1621,6 +1645,8 @@ pub type GroupedSelectExecutor<'a, T, V> = ProjectionSelectExecutor<'a, T, V>;
 pub struct DeleteExecutor<'a, T: Model> {
     filters: Vec<crate::query::filter::FilterExpr>,
     versioned: bool,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     pool: Pool,
     _marker: PhantomData<(T, &'a ())>,
 }
@@ -1630,6 +1656,8 @@ pub struct UpdateExecutor<'a, T: Model> {
     sets: Vec<UpdateAssignment>,
     filters: Vec<FilterExpr>,
     model_updates: ModelUpdateBatch,
+    /// 拆表路由值（`route_table` / `with_table_route` 注入）。
+    table_route: crate::model::TableRoute,
     pool: Pool,
     _marker: PhantomData<(T, &'a ())>,
 }
@@ -1736,6 +1764,7 @@ impl<'a> Transaction<'a> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
+            table_route: crate::model::TableRoute::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -1746,6 +1775,7 @@ impl<'a> Transaction<'a> {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
+            table_route: crate::model::TableRoute::new(),
             pool: self.pool.clone(),
             _marker: PhantomData,
         }
@@ -2389,6 +2419,22 @@ impl<'a, T: Model + 'static, V: crate::model::FromRowValues + 'static>
 
 // DeleteExecutor 实现
 impl<'a, T: Model> DeleteExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> W,
@@ -2412,6 +2458,9 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
         self.filters
             .extend(common_helpers::model_delete_filters(model));
         self.versioned = T::version_info().is_some();
+        if let Ok(route) = model.table_route() {
+            self.table_route.merge_missing(route);
+        }
         self
     }
 
@@ -2437,7 +2486,7 @@ impl<'a, T: Model> DeleteExecutor<'a, T> {
     }
 
     fn build_sql_with_params(&self) -> (String, Vec<Value>) {
-        common_helpers::build_delete_sql::<T>(DbType::MSSQL, &self.filters)
+        common_helpers::build_delete_sql_for_route::<T>(DbType::MSSQL, &self.table_route, &self.filters)
             .unwrap_or_else(|err| panic!("Failed to build delete SQL: {}", err))
     }
 }
@@ -2465,6 +2514,22 @@ impl<'a, T: Model> SqlExecutor for DeleteExecutor<'a, T> {
 
 // UpdateExecutor 实现
 impl<'a, T: Model> UpdateExecutor<'a, T> {
+    /// 设置拆表路由键值（渲染 `{表名}_{路由值}` 子表名）。
+    pub fn route_table(
+        mut self,
+        key: impl Into<String>,
+        value: impl crate::model::TableRouteValue,
+    ) -> Self {
+        self.table_route.insert(key, value);
+        self
+    }
+
+    /// 合并拆表路由（已有同名字段值不被覆盖）。
+    pub fn with_table_route(mut self, route: crate::model::TableRoute) -> Self {
+        self.table_route.merge_missing(route);
+        self
+    }
+
     pub fn filter<F, W>(mut self, f: F) -> Self
     where
         F: FnOnce(T::Where) -> W,
@@ -2547,8 +2612,12 @@ impl<'a, T: Model> UpdateExecutor<'a, T> {
 
         // Base UPDATE from sets/filters (manual .set()/.filter() calls)
         if !self.sets.is_empty() || (self.model_updates.is_empty() && !self.filters.is_empty()) {
-            let (sql, params) =
-                common_helpers::build_update_sql::<T>(DbType::MSSQL, &self.sets, &self.filters)?;
+            let (sql, params) = common_helpers::build_update_sql_for_route::<T>(
+                DbType::MSSQL,
+                &self.table_route,
+                &self.sets,
+                &self.filters,
+            )?;
             statements.push(common_helpers::ModelSqlStatement {
                 sql,
                 params,

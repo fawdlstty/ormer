@@ -209,7 +209,7 @@ mod validate_table_tests {
 
         let create_result = db
             .execute_sql(
-                "SELECT create_hypertable('validate_table_hypertable_interval_mismatch_1', 'created_at', chunk_time_interval => INTERVAL '2 hours', if_not_exists => TRUE, migrate_data => TRUE)",
+                "SELECT create_hypertable('validate_table_hypertable_interval_mismatch_1', 'created_at', chunk_time_interval => INTERVAL '2 hours', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
             )
             .await;
         if let Err(error) = create_result {

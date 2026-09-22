@@ -5140,7 +5140,7 @@ fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> syn::Result<pro
     if route_fields.len() > 1 {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "only one String field can use bare #[hypertable] per model",
+            "only one String field can use #[hypertable(route)] per model",
         ));
     }
 
@@ -5172,23 +5172,58 @@ fn validate_hypertable_space_field(field: &syn::Field, field_type: &syn::Type) -
     ))
 }
 
+fn validate_hypertable_route_field(field: &syn::Field, field_type: &syn::Type) -> syn::Result<()> {
+    if is_string_type(field_type) {
+        return Ok(());
+    }
+
+    let field_name = field
+        .ident
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "<unnamed>".to_string());
+    Err(syn::Error::new_spanned(
+        field,
+        format!("#[hypertable(route)] requires field `{field_name}` to be String"),
+    ))
+}
+
 /// 提取 hypertable 属性信息。
 /// 支持语法：
 /// - #[hypertable(Duration::from_hours(1))]：TimescaleDB 时间分片时长
 /// - #[hypertable]：TimescaleDB 空间分区，默认 4 个分区
+/// - #[hypertable(route)]：TimescaleDB 字符串拆表路由键（String 字段）
 fn extract_hypertable(field: &syn::Field, field_type: &syn::Type) -> syn::Result<HypertableAttr> {
     for attr in &field.attrs {
         if attr.path().is_ident("hypertable") {
             return match &attr.meta {
                 Meta::List(list) if !list.tokens.is_empty() => {
-                    let tokens = &list.tokens;
-                    Ok(HypertableAttr {
-                        duration: quote! { Some(#tokens) },
-                        is_time: true,
-                        route: false,
-                        space: quote! { None },
-                        space_count: None,
-                    })
+                    // #[hypertable(route)]：唯一的裸 ident `route` 视为拆表路由声明，
+                    // 其余内容按时间分片时长处理
+                    let mut iter = list.tokens.clone().into_iter();
+                    let is_route = matches!(
+                        iter.next(),
+                        Some(proc_macro2::TokenTree::Ident(ident)) if ident == "route"
+                    ) && iter.next().is_none();
+                    if is_route {
+                        validate_hypertable_route_field(field, field_type)?;
+                        Ok(HypertableAttr {
+                            duration: quote! { None },
+                            is_time: false,
+                            route: true,
+                            space: quote! { None },
+                            space_count: None,
+                        })
+                    } else {
+                        let tokens = &list.tokens;
+                        Ok(HypertableAttr {
+                            duration: quote! { Some(#tokens) },
+                            is_time: true,
+                            route: false,
+                            space: quote! { None },
+                            space_count: None,
+                        })
+                    }
                 }
                 Meta::Path(_) => {
                     validate_hypertable_space_field(field, field_type)?;

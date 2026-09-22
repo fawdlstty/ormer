@@ -32,6 +32,20 @@ pub enum TableEnsureOutcome {
     Recreated,
 }
 
+impl TableEnsureOutcome {
+    /// 聚合两次 ensure 的结果：基础表与路由子表各自 ensure 后合并为整体
+    /// 结果，严重程度取两者较高者（Ready < Migrated < Recreated）。
+    pub(crate) fn merge(self, other: TableEnsureOutcome) -> TableEnsureOutcome {
+        if self == TableEnsureOutcome::Recreated || other == TableEnsureOutcome::Recreated {
+            TableEnsureOutcome::Recreated
+        } else if self == TableEnsureOutcome::Migrated || other == TableEnsureOutcome::Migrated {
+            TableEnsureOutcome::Migrated
+        } else {
+            TableEnsureOutcome::Ready
+        }
+    }
+}
+
 /// 判断错误是否属于"应当删除重建"的结构性差异。
 ///
 /// 包括：ormer 自身报告的不可迁移 schema / 结构不匹配，以及 TimescaleDB
@@ -48,6 +62,62 @@ fn is_schema_rebuild_error(err: &crate::OrmerError) -> bool {
         }
         _ => false,
     }
+}
+
+/// 严格模式（[`Database::ensure_table`]）共用的破坏性差异预检：返回
+/// "数据库有而模型没有"的列。非空时调用方拒绝继续（自动删列丢数据，
+/// 需显式选择 `ensure_table_permissive` 或手写迁移）。基础表与路由子表
+/// 的增量迁移路径使用同一份判定。
+fn rejected_dropped_columns<T: WritableModel>(actual: &[SchemaColumn]) -> Vec<&str> {
+    let expected_names: BTreeSet<&str> =
+        T::COLUMN_SCHEMA.iter().map(|column| column.name).collect();
+    actual
+        .iter()
+        .map(|column| column.name.as_str())
+        .filter(|name| !expected_names.contains(name))
+        .collect()
+}
+
+/// 路由子表的 `LIKE` 前缀匹配模式：`{base}_%`。基础表名中的 `LIKE` 通配符
+/// （`%`、`_`）与转义符本身按 PostgreSQL `LIKE` 默认转义规则（反斜杠）转义，
+/// 保证前缀按字面匹配，不会把 `aaaxval` 之类同前缀表误判为子表。
+#[cfg(feature = "postgresql")]
+fn routed_child_table_like_pattern(base_name: &str) -> String {
+    let mut pattern = String::with_capacity(base_name.len() + 8);
+    for character in base_name.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(character);
+    }
+    pattern.push_str("\\_%");
+    pattern
+}
+
+/// 组装路由子表的 `pg_class` 前缀查询：枚举 `schema` 下形如
+/// `{base}_<路由值>` 的已存在子表，排除基础表名本身。schema 处理与既有
+/// 表存在性校验（`check_table_exists` 等）一致：模型表名可带 schema 前缀，
+/// 无前缀时按 `public` 处理。字面量双写单引号做防御性转义（表名与模式
+/// 均来自模型常量，正常不含引号）。路由值无法枚举，因此只列出已存在的
+/// 子表，不预建。
+#[cfg(feature = "postgresql")]
+fn routed_child_tables_sql(schema: &str, pattern: &str, base_name: &str) -> String {
+    fn quote_literal(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+    format!(
+        "SELECT c.relname \
+         FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} \
+           AND c.relname LIKE {} \
+           AND c.relname <> {} \
+           AND c.relkind IN ('r', 'p') \
+         ORDER BY c.relname",
+        quote_literal(schema),
+        quote_literal(pattern),
+        quote_literal(base_name),
+    )
 }
 
 /// A single migration operation.
@@ -653,6 +723,10 @@ pub struct TableMigration<'a, T: WritableModel> {
     /// 用户显式标注的列重命名（old, new）。diff 阶段命中"删 old 列 + 加 new 列"
     /// 且存在对应标注时，生成 RenameColumn 而非删列加列，避免数据丢失。
     renames: Vec<(String, String)>,
+    /// 目标表名覆盖：迁移 PG 路由子表时按子表名参数化（对齐
+    /// `CreateTableExecutor` 的 `table_name: Some(..)` 先例）。`None` 时
+    /// 使用模型基础表名。
+    table_name: Option<String>,
 }
 
 impl<'a, T: WritableModel> TableMigration<'a, T> {
@@ -715,18 +789,52 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         self.sqlite_rebuild_plan().await?.to_sql()
     }
 
+    /// 迁移计划预览：基础表动作 + PG 路由子表（已存在的）动作。
+    ///
+    /// 模型声明 hypertable route key 时（仅 PostgreSQL），写入路径会把数据
+    /// 落到 `{基础表名}_{路由值}` 子表；本方法在基础表计划之后，用 `pg_class`
+    /// 前缀查询枚举已存在的子表，把每个子表的差异动作并入同一份计划。路由
+    /// 值无法枚举，不存在的子表不预建（首次写入时仍按当时 DDL 自动创建）。
     pub async fn plan(&self) -> crate::Result<MigrationPlan> {
+        #[cfg_attr(not(feature = "postgresql"), allow(unused_mut))]
+        let mut plan = self.plan_base_only().await?;
+        #[cfg(feature = "postgresql")]
+        if self.table_name.is_none() {
+            self.append_routed_child_steps(&mut plan).await?;
+        }
+        Ok(plan)
+    }
+
+    /// 仅目标表的计划（不含路由子表扩散）。[`Database::ensure_table`] 的
+    /// 增量分支使用它：子表动作由专门的子表迁移步骤逐表套用与基础表相同
+    /// 的破坏性预检后再执行，避免严格模式下绕过删列拒绝。
+    async fn plan_base_only(&self) -> crate::Result<MigrationPlan> {
+        let db_type = self.db.db_type();
+        let table_name = self
+            .table_name
+            .as_deref()
+            .unwrap_or(T::table_name_for_db(db_type));
+        self.plan_for_table(table_name).await
+    }
+
+    /// 表名参数化的计划核心：基础表与路由子表共用同一套 schema diff 逻辑
+    /// （对齐 `CreateTableExecutor` 的 `table_name: Some(..)` 参数化先例）。
+    async fn plan_for_table(&self, table_name: &str) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
         // QuestDB 没有主键/NOT NULL 约束，自省结果不参与这两项比较
         #[cfg(feature = "questdb")]
         let questdb = matches!(db_type, DbType::QuestDB);
         #[cfg(not(feature = "questdb"))]
         let questdb = false;
-        let table_name = T::table_name_for_db(db_type);
         let mut plan = MigrationPlan::new(table_name, db_type);
         let actual = self.db.schema_columns(table_name).await?;
 
         let Some(mut actual) = actual else {
+            // 路由子表不预建：不存在时计划为空，由调用方跳过（写入路径会在
+            // 首次写入时按当前 DDL 自动创建子表）。
+            if table_name != T::table_name_for_db(db_type) {
+                return Ok(plan);
+            }
             plan.push(MigrationStep::CreateTable {
                 table: table_name.to_string(),
                 definition: crate::generate_create_table_sql::<T>(db_type)?,
@@ -734,7 +842,11 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             return Ok(plan);
         };
 
-        self.db.validate_hypertable_for_migration::<T>().await?;
+        // TimescaleDB 超表元数据按模型表名校验，仅对基础表执行；子表的超表
+        // 声明与基础表同源（同一份 #[hypertable] 声明随建表 DDL 下发）。
+        if table_name == T::table_name_for_db(db_type) {
+            self.db.validate_hypertable_for_migration::<T>().await?;
+        }
 
         // 先应用用户显式标注的列重命名：把自省结果中的旧列名改写为新列名，
         // 后续 drop/add/type diff 基于改写后的列集合进行，避免"删旧列 + 加
@@ -1304,6 +1416,46 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                 Err(error)
             }
         }
+    }
+
+    /// 把已存在的 PG 路由子表的差异动作并入预览计划。
+    ///
+    /// 仅 PostgreSQL 且模型声明 route key 时生效；每个子表复用
+    /// [`TableMigration::plan_for_table`] 生成子计划，步骤的目标表名即子表
+    /// 名（`AddColumn { table: "aaa_val" }` 等），与基础表动作合并在同一份
+    /// [`MigrationPlan`] 中。子表已不存在（枚举后被并发删除）时跳过，不预建。
+    #[cfg(feature = "postgresql")]
+    async fn append_routed_child_steps(&self, plan: &mut MigrationPlan) -> crate::Result<()> {
+        let db_type = self.db.db_type();
+        if !matches!(db_type, DbType::PostgreSQL) || T::hypertable_route_key().is_none() {
+            return Ok(());
+        }
+        let mut included = Vec::new();
+        for child in self.db.existing_routed_child_tables::<T>().await? {
+            if self.db.schema_columns(&child).await?.is_none() {
+                continue;
+            }
+            let child_plan = self.plan_for_table(&child).await?;
+            if !child_plan.is_empty() {
+                included.push((child, child_plan));
+            }
+        }
+        if included.is_empty() {
+            return Ok(());
+        }
+        plan.warnings.push(format!(
+            "routed child tables included in this plan: {}",
+            included
+                .iter()
+                .map(|(child, _)| child.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        for (_, child_plan) in included {
+            plan.steps.extend(child_plan.steps);
+            plan.warnings.extend(child_plan.warnings);
+        }
+        Ok(())
     }
 }
 
@@ -2636,6 +2788,7 @@ impl Database {
             db: self,
             marker: PhantomData,
             renames: Vec::new(),
+            table_name: None,
         }
     }
 
@@ -2649,6 +2802,12 @@ impl Database {
     ///    `is_unmigratable_schema()` 编程判定）。确需删列或删表重建时，显式
     ///    调用 [`Database::ensure_table_permissive`]，或先通过
     ///    [`Database::migrate_table`] 的 [`MigrationPlan`] 预览再自行处理。
+    ///
+    /// TimescaleDB 拆表路由（仅 PostgreSQL）：模型声明 route key 时，基础表
+    /// 处理完成后还会用 `pg_class` 前缀查询枚举已存在的
+    /// `{基础表名}_{路由值}` 子表，对每个子表套用同样的校验、破坏性预检与
+    /// 增量迁移（不预建不存在的子表）；整体结果为两者中较严重者。
+    /// 非 PG 后端与无 route key 模型行为与开销不变。
     pub async fn ensure_table<T: WritableModel>(
         &self,
     ) -> crate::Result<TableEnsureOutcome> {
@@ -2665,6 +2824,210 @@ impl Database {
     }
 
     async fn ensure_table_inner<T: WritableModel>(
+        &self,
+        allow_destructive: bool,
+    ) -> crate::Result<TableEnsureOutcome> {
+        let base_outcome = self
+            .ensure_base_table_inner::<T>(allow_destructive)
+            .await?;
+        let child_outcome = self
+            .ensure_routed_child_tables::<T>(allow_destructive)
+            .await?;
+        Ok(base_outcome.merge(child_outcome))
+    }
+
+    /// 确保路由子表与当前模型一致（TimescaleDB 拆表迁移感知）。
+    ///
+    /// 模型声明 route key 时，写入路径把数据落到 `{基础表名}_{路由值}` 子表
+    /// 并在首次写入前按当时的 DDL 自动建表；模型演进后子表不会自行跟进。
+    /// 这里用 `pg_class` 前缀查询枚举已存在的子表，对每个子表按表名参数化
+    /// 复用与基础表相同的 schema 校验与增量迁移逻辑（含破坏性预检与
+    /// permissive 重建语义）。路由值无法枚举，不存在的子表不预建。
+    /// 非 PostgreSQL 后端与未声明 route key 的模型直接返回，行为与开销同
+    /// 改造前完全一致。
+    async fn ensure_routed_child_tables<T: WritableModel>(
+        &self,
+        allow_destructive: bool,
+    ) -> crate::Result<TableEnsureOutcome> {
+        #[cfg(feature = "postgresql")]
+        {
+            if !matches!(self.db_type(), DbType::PostgreSQL)
+                || T::hypertable_route_key().is_none()
+            {
+                return Ok(TableEnsureOutcome::Ready);
+            }
+            let mut outcome = TableEnsureOutcome::Ready;
+            for child in self.existing_routed_child_tables::<T>().await? {
+                outcome = outcome
+                    .merge(self.ensure_routed_child_table::<T>(&child, allow_destructive).await?);
+            }
+            Ok(outcome)
+        }
+        #[cfg(not(feature = "postgresql"))]
+        {
+            let _ = allow_destructive;
+            Ok(TableEnsureOutcome::Ready)
+        }
+    }
+
+    /// 迁移单个已存在的路由子表：与基础表相同的破坏性预检 → 增量迁移 →
+    /// 复验收敛；无法增量迁移时按 `ensure_table_permissive` 语义删表重建
+    /// （经 `create_table().with_table_name()` 参数化复用建表 DDL，含
+    /// create_hypertable 与索引）。
+    #[cfg(feature = "postgresql")]
+    async fn ensure_routed_child_table<T: WritableModel>(
+        &self,
+        child: &str,
+        allow_destructive: bool,
+    ) -> crate::Result<TableEnsureOutcome> {
+        // 枚举与执行之间子表可能被并发删除：跳过而非预建（写入路径会在
+        // 首次写入时按当前 DDL 自动创建）。
+        let Some(actual) = self.schema_columns(child).await? else {
+            return Ok(TableEnsureOutcome::Ready);
+        };
+        if !allow_destructive {
+            let dropped_columns = rejected_dropped_columns::<T>(&actual);
+            if !dropped_columns.is_empty() {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    child,
+                    format!(
+                        "columns [{}] exist in the database but not in the model; \
+                         dropping them loses data. Call ensure_table_permissive() to opt in, \
+                         or write an explicit migration",
+                        dropped_columns.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let migration: TableMigration<'_, T> = TableMigration {
+            db: self,
+            marker: PhantomData,
+            renames: Vec::new(),
+            table_name: Some(child.to_string()),
+        };
+        match migration.plan_for_table(child).await {
+            Ok(plan) => {
+                migration.execute_plan(&plan).await?;
+                // 复验与基础表路径一致：计划执行后重算 diff，仍有差异说明
+                // 迁移未收敛，按 allow_destructive 决定报错或重建。
+                match migration.plan_for_table(child).await {
+                    Ok(post_plan) if post_plan.is_empty() => {
+                        // schema 已收敛：为旧版本创建的子表幂等补挂 TimescaleDB
+                        // 列存压缩（重建路径的建表 DDL 已自带该步骤）。
+                        self.apply_routed_columnstore::<T>(child).await?;
+                        Ok(TableEnsureOutcome::Migrated)
+                    }
+                    Ok(_) => {
+                        if !allow_destructive {
+                            return Err(crate::OrmerError::unmigratable_schema(
+                                child,
+                                "incremental migration did not reconcile the schema; \
+                                 fixing it requires dropping and recreating the table. \
+                                 Call ensure_table_permissive() to opt in, \
+                                 or write an explicit migration",
+                            ));
+                        }
+                        self.recreate_routed_child_table::<T>(child).await?;
+                        Ok(TableEnsureOutcome::Recreated)
+                    }
+                    Err(post_error) => {
+                        if !allow_destructive {
+                            return Err(crate::OrmerError::unmigratable_schema(
+                                child,
+                                format!(
+                                    "incremental migration did not reconcile the schema: \
+                                     {post_error}; fixing it requires dropping and recreating \
+                                     the table. Call ensure_table_permissive() to opt in, \
+                                     or write an explicit migration"
+                                ),
+                            ));
+                        }
+                        self.recreate_routed_child_table::<T>(child).await?;
+                        Ok(TableEnsureOutcome::Recreated)
+                    }
+                }
+            }
+            Err(migration_error)
+                if migration_error.is_unmigratable_schema()
+                    || is_schema_rebuild_error(&migration_error) =>
+            {
+                if !allow_destructive {
+                    return Err(crate::OrmerError::unmigratable_schema(
+                        child,
+                        format!(
+                            "schema differences cannot be migrated incrementally: \
+                             {migration_error}; fixing them requires dropping and recreating \
+                             the table. Call ensure_table_permissive() to opt in, \
+                             or write an explicit migration"
+                        ),
+                    ));
+                }
+                self.recreate_routed_child_table::<T>(child).await?;
+                Ok(TableEnsureOutcome::Recreated)
+            }
+            Err(migration_error) => Err(migration_error),
+        }
+    }
+
+    /// 删除并按当前模型重建一个路由子表。表名参数化复用
+    /// `create_table::<T>().with_table_name()` 的完整 DDL 序列（枚举类型 +
+    /// CREATE TABLE + create_hypertable + 索引 + 列存压缩），与写入路径
+    /// 自动建子表一致。
+    #[cfg(feature = "postgresql")]
+    async fn recreate_routed_child_table<T: WritableModel>(
+        &self,
+        child: &str,
+    ) -> crate::Result<()> {
+        let sql = format!(
+            "DROP TABLE IF EXISTS {}",
+            crate::model::quote_qualified_identifier(self.db_type(), child)
+        );
+        self.execute_sql(sql).await?;
+        self.create_table::<T>()
+            .with_table_name(child)
+            .with_route_columnstore()
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// 为已存在的路由子表幂等补挂 TimescaleDB 列存压缩（自适应）：仅 PG 且
+    /// 模型声明 route key + `#[hypertable]` 时生成语句，其余场景为空操作。
+    /// DO 块在后端不支持时静默跳过，纯存储优化不影响功能正确性。
+    #[cfg(feature = "postgresql")]
+    async fn apply_routed_columnstore<T: WritableModel>(&self, child: &str) -> crate::Result<()> {
+        if let Some(sql) =
+            crate::abstract_layer::postgresql_backend::hypertable_columnstore_sql::<T>(
+                self.db_type(),
+                child,
+            )
+        {
+            self.execute_sql(sql).await?;
+        }
+        Ok(())
+    }
+
+    /// 用 `pg_class` 前缀查询枚举 PG 上已存在的路由子表，返回带 schema
+    /// 前缀的完整表名（schema 解析与 `check_table_exists` 等既有逻辑一致：
+    /// 模型表名可带前缀，无前缀按 `public` 处理）。结果按表名排序，保证
+    /// 迁移计划与执行顺序确定性。
+    #[cfg(feature = "postgresql")]
+    async fn existing_routed_child_tables<T: WritableModel>(
+        &self,
+    ) -> crate::Result<Vec<String>> {
+        let base = T::table_name_for_db(self.db_type());
+        let (schema, base_name) = crate::model::split_schema_table_name(base, "public");
+        let pattern = routed_child_table_like_pattern(base_name);
+        let sql = routed_child_tables_sql(schema, &pattern, base_name);
+        let rows = self
+            .select_sql::<String>(sql)
+            .collect::<Vec<String>>()
+            .await?;
+        Ok(rows.into_iter().map(|name| format!("{schema}.{name}")).collect())
+    }
+
+    async fn ensure_base_table_inner<T: WritableModel>(
         &self,
         allow_destructive: bool,
     ) -> crate::Result<TableEnsureOutcome> {
@@ -2686,13 +3049,7 @@ impl Database {
         // 默认策略：计划会删除"数据库有、模型没有"的列（非 SQLite 生成
         // DropColumn，SQLite 触发整表重建），执行前直接拒绝。
         if !allow_destructive {
-            let expected_names: BTreeSet<&str> =
-                T::COLUMN_SCHEMA.iter().map(|column| column.name).collect();
-            let dropped_columns: Vec<&str> = actual
-                .iter()
-                .map(|column| column.name.as_str())
-                .filter(|name| !expected_names.contains(name))
-                .collect();
+            let dropped_columns = rejected_dropped_columns::<T>(&actual);
             if !dropped_columns.is_empty() {
                 return Err(crate::OrmerError::unmigratable_schema(
                     table_name,
@@ -2707,7 +3064,7 @@ impl Database {
         }
 
         let migration = self.migrate_table::<T>();
-        match migration.plan().await {
+        match migration.plan_base_only().await {
             Ok(plan) => {
                 migration.execute_plan(&plan).await?;
                 match self.validate_table::<T>().await {
@@ -3379,5 +3736,126 @@ mod postgres_enum_add_value_tests {
     fn absent_column_is_left_to_add_column() {
         let definitions = alter_type_definitions(&db_first_table(None));
         assert!(definitions.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "postgresql"))]
+mod routed_child_migration_tests {
+    use super::{routed_child_table_like_pattern, routed_child_tables_sql};
+    use crate::abstract_layer::DbType;
+    use crate::model::{routed_model_table_name_for_db, TableRoute};
+
+    #[derive(Debug, ormer::Model, Clone)]
+    #[table = "routed_child_events"]
+    struct RoutedChildEvent {
+        #[primary]
+        id: i64,
+        #[hypertable(std::time::Duration::from_secs(86_400))]
+        recorded_at: chrono::DateTime<chrono::Utc>,
+        #[hypertable(route)]
+        tenant: String,
+    }
+
+    #[derive(Debug, ormer::Model, Clone)]
+    #[table = "collect.routed_child_events"]
+    struct CollectRoutedChildEvent {
+        #[primary]
+        id: i64,
+        #[hypertable(std::time::Duration::from_secs(86_400))]
+        recorded_at: chrono::DateTime<chrono::Utc>,
+        #[hypertable(route)]
+        tenant: String,
+    }
+
+    fn route(tenant: &str) -> TableRoute {
+        TableRoute::new().with("tenant", tenant.to_string())
+    }
+
+    /// 路由子表命名约定与枚举模式的衔接：模型带 route key 时写入路径落到
+    /// `{基础表名}_{路由值}`，迁移侧的 `pg_class` 前缀查询按同一约定匹配。
+    #[test]
+    fn route_key_naming_convention_matches_enumeration_pattern() {
+        assert_eq!(
+            <RoutedChildEvent as ormer::Model>::hypertable_route_key(),
+            Some("tenant")
+        );
+        assert_eq!(
+            routed_model_table_name_for_db::<RoutedChildEvent>(DbType::PostgreSQL, &route("val"))
+                .unwrap(),
+            "routed_child_events_val"
+        );
+        // schema 前缀保留在子表名里；枚举侧按 schema 分段后对表名做前缀匹配
+        assert_eq!(
+            routed_model_table_name_for_db::<CollectRoutedChildEvent>(
+                DbType::PostgreSQL,
+                &route("val")
+            )
+            .unwrap(),
+            "collect.routed_child_events_val"
+        );
+        let (schema, base_name) =
+            crate::model::split_schema_table_name("collect.routed_child_events", "public");
+        assert_eq!((schema, base_name), ("collect", "routed_child_events"));
+    }
+
+    #[derive(Debug, ormer::Model, Clone)]
+    #[table = "plain_no_route_events"]
+    struct PlainNoRouteEvent {
+        #[primary]
+        id: i64,
+        name: String,
+    }
+
+    #[test]
+    fn route_free_models_do_not_opt_into_child_migration() {
+        assert_eq!(
+            <PlainNoRouteEvent as ormer::Model>::hypertable_route_key(),
+            None
+        );
+    }
+
+    /// LIKE 模式转义：基础表名中的 `_`、`%`、`\` 按字面匹配，避免
+    /// `aaaxval` 这类同前缀表被 `{base}_%` 误判为路由子表。
+    #[test]
+    fn child_table_like_pattern_escapes_like_wildcards() {
+        assert_eq!(
+            routed_child_table_like_pattern("routed_child_events"),
+            r"routed\_child\_events\_%"
+        );
+        assert_eq!(routed_child_table_like_pattern("events"), r"events\_%");
+        assert_eq!(
+            routed_child_table_like_pattern("we%ird\\name"),
+            r"we\%ird\\name\_%"
+        );
+    }
+
+    /// 枚举 SQL 锁定：固定目标 schema、`{base}_%` 前缀匹配、排除基础表
+    /// 本身、只取表对象并按表名排序（计划与执行顺序确定）。
+    #[test]
+    fn child_table_enumeration_sql_pins_schema_and_excludes_base() {
+        let pattern = routed_child_table_like_pattern("routed_child_events");
+        let sql = routed_child_tables_sql("public", &pattern, "routed_child_events");
+        assert_eq!(
+            sql,
+            "SELECT c.relname \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' \
+               AND c.relname LIKE 'routed\\_child\\_events\\_%' \
+               AND c.relname <> 'routed_child_events' \
+               AND c.relkind IN ('r', 'p') \
+             ORDER BY c.relname"
+        );
+    }
+
+    /// 模型表名带 schema 前缀时，枚举 SQL 钉住目标 schema 而不是依赖
+    /// search_path，与 `check_table_exists` 等既有 schema 处理一致。
+    #[test]
+    fn child_table_enumeration_sql_uses_schema_qualified_base() {
+        let pattern = routed_child_table_like_pattern("events");
+        let sql = routed_child_tables_sql("collect", &pattern, "events");
+        assert!(sql.contains("nspname = 'collect'"));
+        assert!(sql.contains(r"LIKE 'events\_%'"));
+        assert!(sql.contains("AND c.relname <> 'events'"));
     }
 }
