@@ -49,29 +49,28 @@ async fn test_schema_validation_impl(
         Err(e) => println!("✗ 表结构验证失败: {e}\n"),
     }
 
-    // 测试 3: 尝试用不同的表结构创建（应该失败）
-    println!("测试 3: 尝试用不同的表结构创建");
-    let different_result = db.validate_table::<TestUserDifferent>().await;
+    // 测试 3: 用不同的表结构诊断（应给出迁移计划：补 address 列，
+    // 多余的 age 列在默认 Keep 策略下保留）
+    println!("测试 3: 用不同的表结构诊断");
+    let different_result = db.plan_table::<TestUserDifferent>().await?;
     assert!(
-        different_result.is_err(),
-        "different model schema should be rejected"
+        matches!(
+            different_result,
+            ormer::TableDiagnosis::Migratable(_)
+        ),
+        "different model schema should be Migratable, got {different_result:?}"
     );
-    println!(
-        "✓ 正确检测到表结构不匹配: {:?}\n",
-        different_result.as_ref().err()
-    );
+    println!("✓ 诊断出可迁移的表结构差异\n");
 
-    // 测试 4: 尝试用缺少列的表结构创建（应该失败）
-    println!("测试 4: 尝试用缺少列的表结构创建");
-    let missing_result = db.validate_table::<TestUserMissingColumn>().await;
+    // 测试 4: 缺列的模型诊断（默认 Keep 策略下多余的 age 列保留，无其余
+    // 差异即收敛为 Ready，不再视为错误）
+    println!("测试 4: 用缺列的模型诊断");
+    let missing_result = db.plan_table::<TestUserMissingColumn>().await?;
     assert!(
-        missing_result.is_err(),
-        "missing model columns should be rejected"
+        matches!(missing_result, ormer::TableDiagnosis::Ready),
+        "missing columns should converge under Keep policy, got {missing_result:?}"
     );
-    println!(
-        "✓ 正确检测到表结构不匹配: {:?}\n",
-        missing_result.as_ref().err()
-    );
+    println!("✓ 缺列模型在 Keep 策略下收敛为 Ready\n");
 
     println!("=== 测试完成 ===");
 

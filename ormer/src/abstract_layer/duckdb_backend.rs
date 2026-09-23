@@ -524,9 +524,6 @@ fn replace_or_append_returning(sql: &str, projection: &str) -> String {
     }
 }
 
-fn table_name_for<T: Model>() -> &'static str {
-    T::table_name_for_db(DbType::DuckDB)
-}
 
 fn is_uuid_rust_type(rust_type: &str) -> bool {
     matches!(rust_type, "Uuid" | "uuid::Uuid")
@@ -1270,21 +1267,6 @@ impl Database {
         }
     }
 
-    /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().trace().await?;
-
-        if !table_exists {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {} does not exist",
-                T::TABLE_NAME
-            ));
-        }
-
-        // 表已存在，验证表结构
-        self.validate_table_schema::<T>().await
-    }
 
     pub(crate) async fn db_first_tables(
         &self,
@@ -1454,205 +1436,9 @@ impl Database {
         Ok(ddl_introspection::parse_ddl_foreign_keys(create_sql))
     }
 
-    /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
-        let sql = "SELECT COUNT(*) FROM information_schema.tables \
-                   WHERE table_schema = 'main' \
-                     AND table_type = 'BASE TABLE' \
-                     AND table_name = ?";
 
-        let mut rows = self
-            .conn
-            .query(sql, [table_name_for::<T>()])
-            .trace()
-            .await?;
 
-        if let Some(row) = rows.next().trace().await? {
-            let count = row.get_value(0).trace_for("duckcompat::Row::get_value")?;
 
-            match count {
-                duckcompat::Value::Integer(c) => Ok(c > 0),
-                _ => Ok(false),
-            }
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> crate::Result<()> {
-        // 查询表的列信息
-        let sql = format!("PRAGMA table_info({})", table_name_for::<T>());
-
-        let mut rows = traced_duckdb_query(&self.conn, &sql, (), &[]).await?;
-
-        // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool, bool, Option<String>)> = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
-            let name = row.get_value(1).trace_for("duckcompat::Row::get_value")?;
-            let col_type = row.get_value(2).trace_for("duckcompat::Row::get_value")?;
-            let notnull = row.get_value(3).trace_for("duckcompat::Row::get_value")?;
-            let pk = row.get_value(5).trace_for("duckcompat::Row::get_value")?;
-            let default = row.get_value(4).trace_for("duckcompat::Row::get_value")?;
-
-            if let (
-                duckcompat::Value::Text(name),
-                duckcompat::Value::Text(col_type),
-            ) = (name, col_type)
-            {
-                let default = match default {
-                    duckcompat::Value::Text(value) => Some(value),
-                    duckcompat::Value::Integer(value) => Some(value.to_string()),
-                    duckcompat::Value::Real(value) => Some(value.to_string()),
-                    _ => None,
-                };
-                actual_columns.push((
-                    name,
-                    col_type,
-                    duckdb_truthy_flag(&notnull),
-                    duckdb_truthy_flag(&pk),
-                    default,
-                ));
-            }
-        }
-
-        // 比较列数量
-        let expected_columns = T::columns();
-        let expected_schema = T::column_schema();
-        if actual_columns.len() != expected_columns.len() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
-                T::TABLE_NAME,
-                expected_columns.len(),
-                actual_columns.len()
-            ));
-        }
-
-        // 比较每一列的定义
-        for (i, expected_col) in expected_schema.iter().enumerate() {
-            if i >= actual_columns.len() {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Missing column: {}",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            let (actual_name, actual_type, actual_notnull, actual_pk, actual_default) =
-                &actual_columns[i];
-
-            // 检查列名
-            if actual_name != expected_col.name {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                    T::TABLE_NAME,
-                    i,
-                    expected_col.name,
-                    actual_name
-                ));
-            }
-
-            // 检查主键约束
-            if expected_col.is_primary != *actual_pk {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    if expected_col.is_primary { "" } else { "not " },
-                    if *actual_pk { "" } else { "not " }
-                ));
-            }
-
-            // 检查列类型（只比较基础类型，不包含 NOT NULL 约束）
-            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
-            let expected_type = crate::abstract_layer::DbType::DuckDB.sql_type(
-                effective_rust_type,
-                expected_col.is_primary,
-                expected_col.is_auto_increment,
-                expected_col.is_nullable,
-                expected_col.enum_variants,
-            );
-
-            // 从统一类型映射中提取基础类型，避免把 INTEGER 与 BIGINT 混为一谈。
-            let type_to_compare = expected_type
-                .strip_suffix(" PRIMARY KEY")
-                .or_else(|| expected_type.strip_suffix(" NOT NULL"))
-                .unwrap_or(&expected_type)
-                .to_string();
-
-            if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            // 检查 NOT NULL 约束（主键列自动 NOT NULL，所以不需要额外检查）
-            if !expected_col.is_primary {
-                let expected_notnull = !expected_col.is_nullable;
-                if *actual_notnull != expected_notnull {
-                    return Err(crate::ormer_error!(
-                        "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                        T::TABLE_NAME,
-                        expected_col.name,
-                        if expected_notnull { "NOT " } else { "" },
-                        if *actual_notnull { "NOT " } else { "" }
-                    ));
-                }
-            }
-
-            let expected_default = expected_col
-                .default
-                .map(|default| default.to_sql(crate::abstract_layer::DbType::DuckDB));
-            let duckdb_auto_increment_default = expected_col.is_auto_increment
-                && actual_default
-                    .as_deref()
-                    .is_some_and(|default| default.to_ascii_lowercase().contains("nextval"));
-            if !duckdb_auto_increment_default
-                && actual_default.as_deref() != expected_default.as_deref()
-            {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Default value mismatch for '{}': expected {:?}, but actual is {:?}",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    expected_default,
-                    actual_default
-                ));
-            }
-        }
-
-        self.validate_table_constraints::<T>(table_name_for::<T>())
-            .await?;
-        Ok(())
-    }
-
-    async fn validate_table_constraints<T: Model>(&self, table_name: &str) -> crate::Result<()> {
-        let actual = self.db_first_table(table_name).await?;
-        ddl_introspection::validate_table_constraints::<T>(DbType::DuckDB, &actual)
-    }
-
-    /// 检查 SQL 类型是否兼容
-    fn types_compatible(&self, actual: &str, expected: &str) -> bool {
-        // 标准化类型名称（DuckDB 类型别名）
-        fn normalize(s: &str) -> String {
-            match s.to_uppercase().as_str() {
-                "INT" | "INTEGER" | "MEDIUMINT" | "INT4" => "INTEGER".to_string(),
-                "BIGINT" | "INT8" | "LONG" | "INT64" => "BIGINT".to_string(),
-                "VARCHAR" | "CHARACTER" | "NCHAR" | "NVARCHAR" | "TEXT" | "CLOB" => {
-                    "TEXT".to_string()
-                }
-                "BLOB" => "BLOB".to_string(),
-                "BOOLEAN" | "BOOL" | "LOGICAL" => "BOOLEAN".to_string(),
-                // 单精度别名归一为 REAL；FLOAT 在 DuckDB 中是 DOUBLE 的别名
-                "REAL" | "FLOAT4" => "REAL".to_string(),
-                "DOUBLE" | "FLOAT" | "FLOAT8" | "DECIMAL" | "NUMERIC" => "DOUBLE".to_string(),
-                _ => s.to_string(),
-            }
-        }
-
-        normalize(actual) == normalize(expected)
-    }
 
     /// 插入记录 - 返回执行器
     pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
@@ -1974,6 +1760,12 @@ impl Database {
         traced_duckdb_execute(&self.conn, "SELECT 1", (), &[])
             .await
             .is_ok()
+    }
+
+    /// 连接层探活：不可达/损坏连接返回 Err（`Database::ping` 的后端分派）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        traced_duckdb_execute(&self.conn, "SELECT 1", (), &[]).await?;
+        Ok(())
     }
 }
 

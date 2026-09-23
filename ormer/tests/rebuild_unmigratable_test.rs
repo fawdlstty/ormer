@@ -163,11 +163,18 @@ async fn unmigratable_primary_key_change_rebuild_flow() {
     .unwrap();
     create_audit_objects(&db).await;
 
-    // 1. validate_table 必须报出 schema mismatch（ensure_table 的进入条件）
-    let validate_err = db.validate_table::<RebuildStatV2>().await.unwrap_err();
+    // 1. plan_table（apply_table 的进入条件）在 PG 上支持主键原地变更：
+    //    判定为可迁移且计划含 ChangePrimaryKey 步骤
+    let diagnosis = db.plan_table::<RebuildStatV2>().await.unwrap();
+    let has_pk_change = match &diagnosis {
+        ormer::TableDiagnosis::Migratable(plan) => plan.steps().iter().any(|step| {
+            matches!(step, ormer::MigrationStep::ChangePrimaryKey { .. })
+        }),
+        _ => false,
+    };
     assert!(
-        validate_err.to_string().starts_with("Schema mismatch"),
-        "unexpected validate error: {validate_err}"
+        has_pk_change,
+        "primary key change must plan an in-place ChangePrimaryKey, got {diagnosis:?}"
     );
 
     // 2. 迁移必须失败，且失败类型可编程判定（替代脆弱的字符串匹配）
@@ -203,8 +210,11 @@ async fn unmigratable_primary_key_change_rebuild_flow() {
             .unwrap();
     }
 
-    // 6. 重建后新模型校验通过
-    db.validate_table::<RebuildStatV2>().await.unwrap();
+    // 6. 重建后新模型诊断就绪
+    assert!(matches!(
+        db.plan_table::<RebuildStatV2>().await.unwrap(),
+        ormer::TableDiagnosis::Ready
+    ));
 
     // 7. 还原的触发器仍然生效
     db.insert(&RebuildStatV2 {

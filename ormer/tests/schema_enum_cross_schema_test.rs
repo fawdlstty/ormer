@@ -48,10 +48,14 @@ async fn test_schema_enum_cross_schema_impl(
         .await
         .expect("first create_table on schema-qualified table should succeed");
 
-    // 关键断言：表已存在后再校验，枚举类型虽在 public 也必须校验通过
-    db.validate_table::<SchemaEnumTask>()
-        .await
-        .expect("validate_table must resolve enum type via column udt_schema, not table schema");
+    // 关键断言：表已存在后再诊断，枚举类型虽在 public 也必须解析成功
+    assert!(
+        matches!(
+            db.plan_table::<SchemaEnumTask>().await?,
+            ormer::TableDiagnosis::Ready
+        ),
+        "plan_table must resolve enum type via column udt_schema, not table schema"
+    );
 
     // 现场等价路径：重启后的建表调用对已存在的表走校验分支，也必须通过
     db.create_table::<SchemaEnumTask>()

@@ -2657,7 +2657,11 @@ impl Database {
         }
     }
 
-    /// 创建表 - 返回执行器
+    /// 创建表 - 返回执行器。
+    ///
+    /// 仅建表（表已存在时按各后端 IF NOT EXISTS 语义幂等跳过）。应用启动时
+    /// 的表结构对齐编排请改用 [`Database::apply_table`]：建表、补列、索引
+    /// 语义 diff、CHECK 闭环、主键原地变更与重建收场统一走一个入口。
     pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         match self {
             #[cfg(feature = "sqlite")]
@@ -2680,37 +2684,6 @@ impl Database {
             Database::InfluxDB(db) => {
                 CreateTableExecutor::InfluxDB(db, std::marker::PhantomData)
             }
-        }
-    }
-
-    /// 验证表结构
-    ///
-    /// 以 [`Capabilities::schema_introspection`] 为准：矩阵为 false 的后端
-    /// （ClickHouse/InfluxDB）统一拒绝；QuestDB 为 true，走
-    /// `table_columns()` 专用校验路径。
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        if !Capabilities::of(self.db_type()).schema_introspection {
-            return Err(unsupported_feature(self.db_type(), "validate_table"));
-        }
-        match self {
-            #[cfg(feature = "questdb")]
-            Database::PostgreSQL(db) if db.db_type().is_questdb() => {
-                let _ = db;
-                self.validate_table_questdb::<T>().await
-            }
-            #[cfg(feature = "sqlite")]
-            Database::Sqlite(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "postgresql")]
-            Database::PostgreSQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "mysql")]
-            Database::MySQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "mssql")]
-            Database::MSSQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "duckdb")]
-            Database::DuckDB(db) => db.validate_table::<T>().await,
-            // 矩阵兜底：正常不可达（schema_introspection=false 已在上面拦截）。
-            #[allow(unreachable_patterns)]
-            _ => Err(unsupported_feature(self.db_type(), "validate_table")),
         }
     }
 
@@ -6671,6 +6644,31 @@ impl<'a, 'tx> TransactionScope<'a, 'tx> {
 }
 
 impl<'a> Transaction<'a> {
+    /// 取一把事务级咨询锁（PG `pg_advisory_xact_lock`），事务结束自动释放。
+    ///
+    /// key 由调用方对业务键（如 project/zone/agvid）做哈希得到；同一事务内
+    /// 重复取同一把锁为空操作（PG 语义，可重入）。其他后端返回
+    /// `UnsupportedFeature`（咨询锁是 PostgreSQL 专属能力）。
+    #[cfg_attr(not(feature = "postgresql"), allow(unused_variables))]
+    pub async fn advisory_xact_lock(&self, key: i64) -> crate::Result<()> {
+        match self {
+            #[cfg(feature = "postgresql")]
+            Transaction::PostgreSQL(txn) => {
+                // QuestDB 复用 PG 连接但无咨询锁概念，按运行时 db_type 拒绝
+                if self.db_type().is_questdb() {
+                    return Err(unsupported_feature(
+                        self.db_type(),
+                        "advisory_xact_lock",
+                    ));
+                }
+                txn.advisory_xact_lock(key).await
+            }
+            // 仅启用部分 feature 时兜底臂可能不可达
+            #[allow(unreachable_patterns)]
+            _ => Err(unsupported_feature(self.db_type(), "advisory_xact_lock")),
+        }
+    }
+
     /// 事务内的作用域查询入口（对齐 [`Database::scope`]）。
     pub fn scope<'tx>(&'tx self) -> TransactionScope<'a, 'tx> {
         TransactionScope {

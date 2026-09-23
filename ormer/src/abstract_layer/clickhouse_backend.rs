@@ -393,6 +393,12 @@ impl Database {
         self.select_json("SELECT 1").await.is_ok()
     }
 
+    /// 连接层探活：端点不可达/查询失败返回 Err（`Database::ping` 的后端分派）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        self.select_json("SELECT 1").await?;
+        Ok(())
+    }
+
     /// Generate and execute a ClickHouse CREATE TABLE statement.
     #[allow(dead_code)] // 保留给 db-first / 建表入口待接线
     pub(crate) async fn create_table<T: crate::model::WritableModel>(

@@ -184,9 +184,6 @@ async fn traced_mysql_exec_drop(
     }
 }
 
-fn table_name_for<T: Model>() -> &'static str {
-    T::table_name_for_db(DbType::MySQL)
-}
 
 /// 追加 MySQL `ON DUPLICATE KEY UPDATE` 子句，与公共层标准 upsert 语义一致：
 /// 冲突更新排除主键列，避免冲突落在次级唯一键时把目标行主键覆盖为来源行的占位值。
@@ -1186,263 +1183,9 @@ impl Database {
         }
     }
 
-    /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        let mut lease = self.executor_conn().lease().await?;
 
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>(lease.conn()?).trace().await?;
 
-        if !table_exists {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Table does not exist",
-                T::TABLE_NAME
-            ));
-        }
 
-        // 表已存在，验证表结构
-        self.validate_table_schema::<T>(lease.conn()?).await
-    }
-
-    /// 检查表是否存在
-    async fn check_table_exists<T: Model>(
-        &self,
-        conn: &mut mysql_async::Conn,
-    ) -> crate::Result<bool> {
-        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?";
-
-        let result: Option<u64> = conn
-            .exec_first(sql, (table_name_for::<T>(),))
-            .trace()
-            .await?;
-
-        Ok(result.unwrap_or(0) > 0)
-    }
-
-    /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(
-        &self,
-        conn: &mut mysql_async::Conn,
-    ) -> crate::Result<()> {
-        let table_options: Option<String> = conn
-            .exec_first(
-                "SELECT CREATE_OPTIONS FROM INFORMATION_SCHEMA.TABLES \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
-                (table_name_for::<T>(),),
-            )
-            .trace()
-            .await?;
-        let actual_compression = table_options
-            .as_deref()
-            .and_then(parse_mysql_table_compression);
-
-        // 查询表的列信息
-        let sql = r#"
-            SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, EXTRA
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
-            ORDER BY ORDINAL_POSITION
-        "#;
-
-        let rows: Vec<mysql_async::Row> = conn.exec(sql, (table_name_for::<T>(),)).trace().await?;
-
-        // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool, bool, bool)> = Vec::new();
-        for row in rows {
-            let name: String = row.get(0).unwrap_or_default();
-            let col_type: String = row.get(1).unwrap_or_default();
-            let is_nullable: String = row.get(2).unwrap_or_default();
-            let key: String = row.get(3).unwrap_or_default();
-            let extra: String = row.get(4).unwrap_or_default();
-            actual_columns.push((
-                name,
-                col_type,
-                is_nullable == "YES",
-                key.eq_ignore_ascii_case("PRI"),
-                extra
-                    .split(',')
-                    .any(|value| value.trim().eq_ignore_ascii_case("auto_increment")),
-            ));
-        }
-
-        // 比较列数量
-        if actual_columns.len() != T::COLUMNS.len() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
-                T::TABLE_NAME,
-                T::COLUMNS.len(),
-                actual_columns.len()
-            ));
-        }
-
-        // 比较每一列的定义
-        for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
-            if i >= actual_columns.len() {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Missing column: {}",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            let (actual_name, actual_type, actual_nullable, actual_primary, actual_auto_increment) =
-                &actual_columns[i];
-
-            // 检查列名
-            if actual_name != expected_col.name {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                    T::TABLE_NAME,
-                    i,
-                    expected_col.name,
-                    actual_name
-                ));
-            }
-
-            if expected_col.is_primary != *actual_primary {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    if expected_col.is_primary { "" } else { "not " },
-                    if *actual_primary { "" } else { "not " }
-                ));
-            }
-
-            if expected_col.is_auto_increment != *actual_auto_increment {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    expected_col.is_auto_increment,
-                    actual_auto_increment
-                ));
-            }
-
-            // 检查列类型（只比较基础类型，不包含约束）
-            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
-            let expected_type = crate::abstract_layer::DbType::MySQL.sql_type(
-                effective_rust_type,
-                expected_col.is_primary,
-                expected_col.is_auto_increment,
-                expected_col.is_nullable,
-                expected_col.enum_variants,
-            );
-
-            // 对于类型比较，统一按非主键映射提取基础类型（主键与非主键共用同一
-            // 映射，保证与建表 DDL、迁移自检一致），再去掉约束后缀
-            let full_type = crate::abstract_layer::DbType::MySQL.sql_type(
-                effective_rust_type,
-                false,
-                expected_col.is_auto_increment,
-                expected_col.is_nullable,
-                expected_col.enum_variants,
-            );
-            let type_to_compare = full_type.replace(" NOT NULL", "");
-
-            if !self.types_compatible(actual_type, &type_to_compare) {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            // 检查 NOT NULL 约束（主键列除外，因为主键自动 NOT NULL）
-            if !expected_col.is_primary {
-                let expected_nullable = expected_col.is_nullable;
-                if *actual_nullable != expected_nullable {
-                    return Err(crate::ormer_error!(
-                        "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                        T::TABLE_NAME,
-                        expected_col.name,
-                        if expected_nullable { "" } else { "NOT " },
-                        if *actual_nullable { "" } else { "NOT " }
-                    ));
-                }
-            }
-        }
-
-        let expected_compression = crate::model::table_compression_algorithm::<T>()?;
-        let expected_compression_name = expected_compression.map(|value| value.as_upper_str());
-        if expected_compression_name != actual_compression.as_deref() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Compression mismatch: expected {}, but actual is {}",
-                T::TABLE_NAME,
-                expected_compression_name.unwrap_or("NONE"),
-                actual_compression.as_deref().unwrap_or("NONE")
-            ));
-        }
-
-        let table_name = table_name_for::<T>();
-        let actual_table = self
-            .db_first_tables(None)
-            .await?
-            .into_iter()
-            .find(|table| table.name == table_name)
-            .ok_or_else(|| {
-                crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Table metadata is unavailable",
-                    T::TABLE_NAME
-                )
-            })?;
-        crate::db_first::validate_model_constraints::<T>(
-            crate::abstract_layer::DbType::MySQL,
-            &actual_table,
-        )?;
-        Ok(())
-    }
-
-    /// 检查 SQL 类型是否兼容
-    fn types_compatible(&self, actual: &str, expected: &str) -> bool {
-        // 标准化类型名称
-        fn normalize(s: &str) -> String {
-            let upper = s.to_uppercase();
-            // 提取基础类型名（去掉括号内的参数）
-            let base_type = if let Some(pos) = upper.find('(') {
-                &upper[..pos]
-            } else {
-                &upper[..]
-            };
-
-            match base_type {
-                // 整数类型
-                "TINYINT" => "TINYINT".to_string(),
-                "SMALLINT" => "SMALLINT".to_string(),
-                "MEDIUMINT" => "MEDIUMINT".to_string(),
-                "INT" | "INTEGER" => "INT".to_string(),
-                "BIGINT" => "BIGINT".to_string(),
-                // 无符号整数
-                t if t.ends_with(" UNSIGNED") => {
-                    let unsigned_type = t.replace(" ", "");
-                    match unsigned_type.as_str() {
-                        "TINYINTUNSIGNED" => "TINYINT UNSIGNED".to_string(),
-                        "SMALLINTUNSIGNED" => "SMALLINT UNSIGNED".to_string(),
-                        "MEDIUMINTUNSIGNED" => "MEDIUMINT UNSIGNED".to_string(),
-                        "INTUNSIGNED" | "INTEGERUNSIGNED" => "INT UNSIGNED".to_string(),
-                        "BIGINTUNSIGNED" => "BIGINT UNSIGNED".to_string(),
-                        _ => t.to_string(),
-                    }
-                }
-                // 浮点类型
-                "FLOAT" => "FLOAT".to_string(),
-                "DOUBLE" | "DOUBLEPRECISION" => "DOUBLE".to_string(),
-                // 保留 CHAR/VARCHAR 长度，UUID 的 CHAR(36) 不能与其他文本类型等价
-                "VARCHAR" | "CHAR" => upper,
-                "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => "TEXT".to_string(),
-                // 布尔类型（MySQL 使用 TINYINT(1) 存储布尔值）
-                "BOOL" | "BOOLEAN" => "TINYINT".to_string(),
-                // 字节类型
-                "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "VARBINARY" | "BINARY" => {
-                    "BLOB".to_string()
-                }
-                // 其他
-                _ => base_type.to_string(),
-            }
-        }
-
-        normalize(actual) == normalize(expected)
-    }
 
     /// 插入记录 - 返回执行器
     pub fn insert<I: crate::model::Insertable>(&self, models: I) -> InsertExecutor<'_, I> {
@@ -1796,6 +1539,18 @@ impl Database {
             return false;
         };
         traced_mysql_query_drop(conn, "SELECT 1").await.is_ok()
+    }
+
+    /// 连接层探活：不可达/鉴权失败返回 Err（`Database::ping` 的后端分派）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        let mut lease = self.executor_conn().lease().await.map_err(|error| {
+            crate::ormer_error!("MySQL ping failed to lease connection: {error}")
+        })?;
+        let Ok(conn) = lease.conn() else {
+            return Err(crate::ormer_error!("MySQL ping failed: connection unavailable"));
+        };
+        traced_mysql_query_drop(conn, "SELECT 1").await?;
+        Ok(())
     }
 }
 

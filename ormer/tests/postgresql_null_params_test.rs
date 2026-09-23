@@ -20,7 +20,10 @@ async fn test_insert_or_ignore_null_binary_param() -> Result<(), Box<dyn std::er
     assert!(sql.contains("payload BYTEA"));
 
     db.create_table::<NullableBinary>().execute().await?;
-    db.validate_table::<NullableBinary>().await?;
+    assert!(
+        matches!(db.plan_table::<NullableBinary>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     db.insert_or_ignore(&NullableBinary {
         id: 1,

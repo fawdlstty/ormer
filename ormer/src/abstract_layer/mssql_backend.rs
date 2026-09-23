@@ -441,6 +441,12 @@ impl Database {
         self.exec_sql("SELECT 1").await.is_ok()
     }
 
+    /// 连接层探活：不可达/鉴权失败返回 Err（`Database::ping` 的后端分派）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        self.exec_sql("SELECT 1").await?;
+        Ok(())
+    }
+
     pub async fn exec_sql(&self, sql: &str) -> crate::Result<u64> {
         let mut client = self.pool.lock().await;
         let query = Query::new(sql);
@@ -712,186 +718,6 @@ impl Database {
         self.begin().await
     }
 
-    /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        let mut client = self.pool.lock().await;
-        let table_filter = if let Some((schema_name, table_name)) = T::TABLE_NAME.rsplit_once('.') {
-            format!("TABLE_SCHEMA = '{schema_name}' AND TABLE_NAME = '{table_name}'")
-        } else {
-            format!("TABLE_NAME = '{}'", T::TABLE_NAME)
-        };
-
-        // 检查表是否存在
-        let check_sql =
-            format!("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE {table_filter}");
-        {
-            let query = Query::new(&check_sql);
-            let stream = query.query(&mut *client).trace().await?;
-            let rows = stream.into_first_result().trace().await?;
-            if rows.is_empty() {
-                return Err(crate::ormer_error!(
-                    "Table {} does not exist",
-                    T::TABLE_NAME
-                ));
-            }
-            // 尝试读取 COUNT 结果
-            if let Ok(Some(count)) = rows[0].try_get::<i32, _>(0) {
-                if count == 0 {
-                    return Err(crate::ormer_error!(
-                        "Table {} does not exist",
-                        T::TABLE_NAME
-                    ));
-                }
-            }
-        }
-
-        // 查询表的列信息
-        let col_sql = format!(
-            "SELECT c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
-                    CASE WHEN COLUMNPROPERTY(OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)), c.COLUMN_NAME, 'IsIdentity') = 1 THEN 1 ELSE 0 END, \
-                    CASE WHEN EXISTS ( \
-                        SELECT 1 \
-                        FROM sys.indexes i \
-                        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
-                        JOIN sys.columns sc ON sc.object_id = ic.object_id AND sc.column_id = ic.column_id \
-                        WHERE i.is_primary_key = 1 \
-                          AND i.object_id = OBJECT_ID(QUOTENAME(c.TABLE_SCHEMA) + '.' + QUOTENAME(c.TABLE_NAME)) \
-                          AND sc.name = c.COLUMN_NAME \
-                    ) THEN 1 ELSE 0 END \
-             FROM INFORMATION_SCHEMA.COLUMNS c WHERE {table_filter} ORDER BY c.ORDINAL_POSITION"
-        );
-        let query = Query::new(&col_sql);
-        let stream = query.query(&mut *client).trace().await?;
-        let rows = stream.into_first_result().trace().await?;
-
-        // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool, bool, bool)> = Vec::new();
-        for row in rows {
-            let name: String = row.get::<&str, _>(0).unwrap_or("").to_string();
-            let col_type: String = row.get::<&str, _>(1).unwrap_or("").to_string();
-            let nullable: String = row.get::<&str, _>(2).unwrap_or("").to_string();
-            let auto_increment = row.get::<i32, _>(3).unwrap_or(0) != 0;
-            let primary_key = row.get::<i32, _>(4).unwrap_or(0) != 0;
-            actual_columns.push((
-                name.to_lowercase(),
-                col_type.to_lowercase(),
-                nullable == "YES",
-                primary_key,
-                auto_increment,
-            ));
-        }
-
-        // 比较列数量
-        if actual_columns.len() != T::COLUMNS.len() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
-                T::TABLE_NAME,
-                T::COLUMNS.len(),
-                actual_columns.len()
-            ));
-        }
-
-        // 比较每一列的定义
-        for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
-            if i >= actual_columns.len() {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Missing column: {}",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            let (actual_name, actual_type, actual_nullable, actual_primary, actual_auto_increment) =
-                &actual_columns[i];
-
-            // 检查列名
-            if actual_name != &expected_col.name.to_lowercase() {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                    T::TABLE_NAME,
-                    i,
-                    expected_col.name,
-                    actual_name
-                ));
-            }
-
-            if expected_col.is_primary != *actual_primary {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    if expected_col.is_primary { "" } else { "not " },
-                    if *actual_primary { "" } else { "not " }
-                ));
-            }
-
-            if expected_col.is_auto_increment != *actual_auto_increment {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    expected_col.is_auto_increment,
-                    actual_auto_increment
-                ));
-            }
-
-            // 提取预期的 SQL 类型
-            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
-            let expected_sql_type = MSSQLTypeMapper::sql_type(
-                effective_rust_type,
-                expected_col.is_primary,
-                expected_col.is_auto_increment,
-                false,
-                expected_col.enum_variants,
-            );
-            // 提取基础类型（第一个单词，去除约束和大小）
-            let base_expected = expected_sql_type
-                .split([' ', '('])
-                .next()
-                .unwrap_or("")
-                .to_lowercase();
-
-            // 检查列类型
-            if &base_expected != actual_type {
-                // 处理特殊情况：MSSQL 的 INT/INTEGER
-                let compatible_type = (base_expected == "int" && actual_type == "integer")
-                    || (base_expected == "integer" && actual_type == "int")
-                    || (base_expected == "nvarchar" && actual_type == "varchar")
-                    || (base_expected == "nchar" && actual_type == "char");
-                if !compatible_type {
-                    return Err(crate::ormer_error!(
-                        "Schema mismatch: table {}, reason: Column type mismatch at column '{}': expected '{}', but actual is '{}'",
-                        T::TABLE_NAME,
-                        expected_col.name,
-                        base_expected,
-                        actual_type
-                    ));
-                }
-            }
-
-            let expected_nullable = expected_col.is_nullable;
-            if !expected_col.is_primary && (*actual_nullable != expected_nullable) {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    if expected_nullable { "" } else { "NOT " },
-                    if *actual_nullable { "" } else { "NOT " }
-                ));
-            }
-        }
-
-        drop(client);
-        let (schema_name, table_name) = T::TABLE_NAME
-            .rsplit_once('.')
-            .unwrap_or(("dbo", T::TABLE_NAME));
-        let actual_table = self.db_first_table(schema_name, table_name).await?;
-        crate::db_first::validate_model_constraints::<T>(
-            crate::abstract_layer::DbType::MSSQL,
-            &actual_table,
-        )?;
-        Ok(())
-    }
 
     /// 创建分组聚合查询执行器
     pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {

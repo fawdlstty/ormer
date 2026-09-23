@@ -27,7 +27,10 @@ async fn test_json_value_roundtrip_on_postgres() -> Result<(), Box<dyn std::erro
     assert!(sql.contains("JSONB"), "doc column should be JSONB: {sql}");
 
     db.create_table::<JsonDoc>().execute().await?;
-    db.validate_table::<JsonDoc>().await?;
+    assert!(
+        matches!(db.plan_table::<JsonDoc>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     let doc = serde_json::json!({ "role": "admin", "level": 3 });
     db.insert(&[

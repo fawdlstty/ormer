@@ -1858,7 +1858,7 @@ fn ensured_schemas() -> std::sync::MutexGuard<'static, std::collections::HashSet
 /// 带 schema 限定的表名（如 `#[table = "ticket.tickets"]`）对应的幂等
 /// 建 schema 语句；无 schema 前缀，或 schema 已在全局缓存中确认存在时
 /// 返回 `None`，不再生成重复 DDL。
-fn create_schema_sql_if_qualified(db_type: DbType, table_name: &str) -> Option<String> {
+pub(crate) fn create_schema_sql_if_qualified(db_type: DbType, table_name: &str) -> Option<String> {
     let schema = schema_of_qualified_table(db_type, table_name)?;
     if ensured_schemas().contains(schema) {
         return None;
@@ -2018,6 +2018,15 @@ impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
         // 报错；建表流程最前面补一条幂等的 CREATE SCHEMA IF NOT EXISTS。
         if let Some(create_schema_sql) = create_schema_sql_if_qualified(self.db_type, table_name) {
             statements.push(SingleSqlStatement::new(create_schema_sql, Vec::new()));
+        }
+
+        // 超表模型依赖 TimescaleDB 扩展：建超表前幂等确保扩展存在，避免
+        // 全新实例上 create_hypertable 因扩展缺失直接失败。
+        if !self.db_type.is_questdb() && T::hypertable_info().is_some() {
+            statements.push(SingleSqlStatement::new(
+                "CREATE EXTENSION IF NOT EXISTS timescaledb",
+                Vec::new(),
+            ));
         }
 
         if !self.db_type.is_questdb() {
@@ -2852,7 +2861,7 @@ impl Database {
         schema: Option<&str>,
     ) -> crate::Result<Vec<DbFirstTable>> {
         // 保留硬编码：db-first 实体生成不在 Capabilities::schema_introspection
-        // 覆盖范围内（该字段只门控 validate_table，QuestDB 为 true），
+        // 覆盖范围内（该字段只门控 plan_table/apply_table，QuestDB 为 true），
         // QuestDB 无 information_schema，此处按运行时 db_type 单独拒绝。
         if self.db_type.is_questdb() {
             return Err(crate::OrmerError::UnsupportedFeature {
@@ -3078,6 +3087,235 @@ impl Database {
         Ok(foreign_keys)
     }
 
+    // ===== 表迁移统一入口（table_migrate.rs）的内部自省与运维能力 =====
+    //
+    // 以下方法全部 pub(crate)：内省数据（索引定义/约束定义/触发器定义）
+    // 不出 ormer，不设公开细粒度内省 API（规格书 §4.1 设计原则 ②）。
+
+    /// 增强索引自省：在名称/列/唯一性之外补充定义文本（pg_get_indexdef）、
+    /// 索引方法（pg_am）与 indisvalid，供索引语义 diff 消费：
+    /// - 定义文本让特殊索引（method/expression/谓词）纳入比对；
+    /// - indisvalid=false 的 CONCURRENTLY 失败残留被识别并清除。
+    pub(crate) async fn index_facts(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<crate::table_migrate::ActualIndexFacts>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT i.relname, ix.indisunique, ix.indisvalid, am.amname, \
+                        pg_get_indexdef(i.oid) \
+                 FROM pg_index ix \
+                 JOIN pg_class i ON i.oid = ix.indexrelid \
+                 JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 JOIN pg_am am ON am.oid = i.relam \
+                 WHERE ns.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary \
+                 ORDER BY i.relname",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        let mut facts = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+            let unique: bool = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+            let valid: bool = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
+            let method: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
+            let definition: String = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
+            let parsed = crate::table_migrate::parse_pg_index_definition(&definition);
+            let columns = parsed
+                .as_ref()
+                .map(|parsed| {
+                    crate::table_migrate::parse_plain_index_column_list(&parsed.columns)
+                })
+                .unwrap_or_default();
+            let predicate = parsed.and_then(|parsed| parsed.predicate);
+            facts.push(crate::table_migrate::ActualIndexFacts {
+                name,
+                columns,
+                unique,
+                valid,
+                method: Some(method),
+                definition: Some(definition),
+                predicate,
+            });
+        }
+        Ok(facts)
+    }
+
+    /// 表上存量 CHECK 约束（conname + pg_get_constraintdef），供 CHECK
+    /// 约束闭环比对。
+    pub(crate) async fn check_constraint_facts(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<crate::table_migrate::ActualCheckFacts>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT con.conname, pg_get_constraintdef(con.oid) \
+                 FROM pg_constraint con \
+                 JOIN pg_class t ON t.oid = con.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 WHERE con.contype = 'c' AND ns.nspname = $1 AND t.relname = $2 \
+                 ORDER BY con.conname",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
+                let definition: String =
+                    row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
+                Ok(crate::table_migrate::ActualCheckFacts { name, definition })
+            })
+            .collect()
+    }
+
+    /// 现有主键约束名（ChangePrimaryKey 的 DROP 子动作需要）。
+    pub(crate) async fn primary_key_constraint_name(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Option<String>> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT con.conname \
+                 FROM pg_constraint con \
+                 JOIN pg_class t ON t.oid = con.conrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 WHERE con.contype = 'p' AND ns.nspname = $1 AND t.relname = $2 \
+                 LIMIT 1",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        row.map(|row| row.try_get(0).trace_for("tokio_postgres::Row::try_get")).transpose()
+    }
+
+    /// 表上所有 INVALID（indisvalid=false）残留索引名（CONCURRENTLY 失败
+    /// 产物，不含主键索引），供 apply 执行前/重试前自愈清理。
+    pub(crate) async fn invalid_index_names(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<String>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT i.relname \
+                 FROM pg_index ix \
+                 JOIN pg_class i ON i.oid = ix.indexrelid \
+                 JOIN pg_class t ON t.oid = ix.indrelid \
+                 JOIN pg_namespace ns ON ns.oid = t.relnamespace \
+                 WHERE ns.nspname = $1 AND t.relname = $2 \
+                   AND NOT ix.indisvalid AND NOT ix.indisprimary",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        rows.into_iter()
+            .map(|row| row.try_get(0).trace_for("tokio_postgres::Row::try_get"))
+            .collect()
+    }
+
+    /// 表是否为 TimescaleDB hypertable（_timescaledb_catalog.hypertable 登记）。
+    /// hypertable 不支持 CREATE INDEX CONCURRENTLY（0A000），索引迁移需退回
+    /// 普通建索引（事务化执行、失败即回滚，无 INVALID 残留）。扩展未安装时
+    /// 直接返回 false，不触碰不存在的目录表。
+    pub(crate) async fn is_hypertable_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<bool> {
+        let installed = if let Some(&installed) = self.timescaledb.get() {
+            installed
+        } else {
+            let installed: bool = self
+                .client
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+                    &[],
+                )
+                .trace()
+                .await?
+                .try_get(0)
+                .trace_for("tokio_postgres::Row::try_get")?;
+            let _ = self.timescaledb.set(installed);
+            installed
+        };
+        if !installed {
+            return Ok(false);
+        }
+        let row = self
+            .client
+            .query_opt(
+                "SELECT true FROM _timescaledb_catalog.hypertable \
+                 WHERE schema_name = $1 AND table_name = $2",
+                &[&schema_name, &table_name],
+            )
+            .trace()
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// 表上业务触发器的可重放定义（pg_get_triggerdef，排除 internal），
+    /// 供重建路径删除表前备份。表名以 `schema.table` 字面量传 to_regclass
+    /// （模型常量，单引号转义；绑定参数的 `::regclass` 解析期转换不可靠）。
+    /// TimescaleDB 挂在触发函数上的守卫触发器（如 ts_insert_blocker，非
+    /// tgisinternal）由 create_hypertable 自动重建，备份重放会撞 42710，排除。
+    pub(crate) async fn business_trigger_definitions(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<Vec<String>> {
+        let qualified = format!("{schema_name}.{table_name}");
+        let regclass_literal = sql_string_literal(&qualified);
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT pg_get_triggerdef(trigger_info.oid) \
+                     FROM pg_trigger trigger_info \
+                     WHERE trigger_info.tgrelid = to_regclass({regclass_literal}) \
+                       AND NOT trigger_info.tgisinternal \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM pg_proc proc \
+                         JOIN pg_namespace ns ON ns.oid = proc.pronamespace \
+                         WHERE proc.oid = trigger_info.tgfoid \
+                           AND ns.nspname LIKE '%timescaledb%')"
+                ),
+                &[],
+            )
+            .trace()
+            .await?;
+        rows.into_iter()
+            .map(|row| row.try_get(0).trace_for("tokio_postgres::Row::try_get"))
+            .collect()
+    }
+
+    /// 幂等安装扩展（CREATE EXTENSION IF NOT EXISTS）。名称由统一层校验为
+    /// 纯标识符后拼接（该语句不支持参数绑定）。
+    pub(crate) async fn ensure_extension(&self, name: &str) -> crate::Result<()> {
+        let quoted = crate::model::quote_identifier(self.db_type, name);
+        traced_pg_execute_empty(
+            &self.client,
+            &format!("CREATE EXTENSION IF NOT EXISTS {quoted}"),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 连接层探活：SELECT 1（QuestDB 复用本后端连接，同样支持）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        traced_pg_execute_empty(&self.client, "SELECT 1").await?;
+        Ok(())
+    }
+
     /// 从 bb8 连接池租借一条连接创建 Database
     ///
     /// 租借的连接由 `Database` 直接持有（`Deref` 暴露 `&Client` 视图），
@@ -3164,55 +3402,7 @@ impl Database {
         }
     }
 
-    /// 验证表结构是否与模型定义匹配
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        // 保留 is_questdb 路由（非能力拒绝）：Capabilities::schema_introspection
-        // 对 QuestDB 为 true，统一层放行后在此分流到 table_columns 专用校验；
-        // 矩阵只覆盖“能否校验”的粗粒度门控，不表达校验 SQL 的方言差异。
-        if self.db_type.is_questdb() {
-            // QuestDB 无 information_schema，基于 table_columns 元函数自省比对
-            #[cfg(feature = "questdb")]
-            {
-                return self.validate_table_questdb_schema::<T>().await;
-            }
-            #[cfg(not(feature = "questdb"))]
-            {
-                return Err(crate::OrmerError::UnsupportedFeature {
-                    backend: self.db_type,
-                    feature: "schema introspection",
-                });
-            }
-        }
-        // 检查表是否存在
-        let table_exists = self.check_table_exists::<T>().trace().await?;
 
-        if !table_exists {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Table does not exist",
-                T::TABLE_NAME
-            ));
-        }
-
-        // 表已存在，验证表结构
-        self.validate_table_schema::<T>().await?;
-        self.validate_table_hypertable::<T>().await
-    }
-
-    /// 检查表是否存在
-    async fn check_table_exists<T: Model>(&self) -> crate::Result<bool> {
-        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
-        let sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema=$1 AND table_name=$2";
-
-        let row = self
-            .client
-            .query_one(sql, &[&schema_name, &table_name])
-            .trace()
-            .await?;
-
-        let count: i64 = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
-
-        Ok(count > 0)
-    }
 
     async fn check_table_is_hypertable<T: Model>(&self) -> crate::Result<bool> {
         let sql = "SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL";
@@ -3379,370 +3569,8 @@ impl Database {
         self.validate_table_hypertable::<T>().await
     }
 
-    /// 验证表结构是否与模型定义匹配（内部使用）
-    async fn validate_table_schema<T: Model>(&self) -> crate::Result<()> {
-        // 查询表的列信息
-        let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
-        let sql = r#"
-            SELECT column_name, data_type, udt_name, is_nullable,
-                   EXISTS (
-                       SELECT 1
-                       FROM information_schema.table_constraints tc
-                       JOIN information_schema.key_column_usage kcu
-                         ON tc.constraint_name = kcu.constraint_name
-                        AND tc.table_schema = kcu.table_schema
-                        AND tc.table_name = kcu.table_name
-                       WHERE tc.constraint_type = 'PRIMARY KEY'
-                         AND kcu.table_schema = c.table_schema
-                         AND kcu.table_name = c.table_name
-                         AND kcu.column_name = c.column_name
-                   ) AS is_primary,
-                   COALESCE(column_default LIKE 'nextval(%', FALSE) AS is_auto_increment,
-                   CASE a.attcompression
-                       WHEN 'p' THEN 'pglz'
-                       WHEN 'l' THEN 'lz4'
-                       ELSE NULL
-                   END AS compression
-            FROM information_schema.columns c
-            JOIN pg_namespace ns
-              ON ns.nspname = c.table_schema
-            JOIN pg_class rel
-              ON rel.relnamespace = ns.oid AND rel.relname = c.table_name
-            JOIN pg_attribute a
-              ON a.attrelid = rel.oid
-             AND a.attname = c.column_name
-             AND a.attnum > 0
-             AND NOT a.attisdropped
-            WHERE c.table_schema = $1 AND c.table_name = $2
-            ORDER BY c.ordinal_position
-        "#;
 
-        let rows = self
-            .client
-            .query(sql, &[&schema_name, &table_name])
-            .trace()
-            .await?;
 
-        // 收集实际的表结构
-        let mut actual_columns: Vec<(String, String, bool, bool, bool, Option<String>)> =
-            Vec::new();
-        for row in rows {
-            let name: String = row.try_get(0).trace_for("tokio_postgres::Row::try_get")?;
-            let col_type: String = row.try_get(1).trace_for("tokio_postgres::Row::try_get")?;
-            let udt_name: String = row.try_get(2).trace_for("tokio_postgres::Row::try_get")?;
-            let is_nullable: String = row.try_get(3).trace_for("tokio_postgres::Row::try_get")?;
-            let is_primary: bool = row.try_get(4).trace_for("tokio_postgres::Row::try_get")?;
-            let is_auto_increment: bool =
-                row.try_get(5).trace_for("tokio_postgres::Row::try_get")?;
-            let compression: Option<String> =
-                row.try_get(6).trace_for("tokio_postgres::Row::try_get")?;
-
-            let actual_type = if col_type == "USER-DEFINED" || col_type == "ARRAY" {
-                udt_name
-            } else {
-                col_type
-            };
-            actual_columns.push((
-                name,
-                actual_type,
-                is_nullable == "YES",
-                is_primary,
-                is_auto_increment,
-                compression,
-            ));
-        }
-
-        // 比较列数量
-        if actual_columns.len() != T::COLUMNS.len() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
-                T::TABLE_NAME,
-                T::COLUMNS.len(),
-                actual_columns.len()
-            ));
-        }
-
-        // 比较每一列的定义
-        // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
-        let effective_primary_keys =
-            crate::model::effective_primary_key_columns::<T>(crate::abstract_layer::DbType::PostgreSQL);
-        for (i, expected_col) in T::COLUMN_SCHEMA.iter().enumerate() {
-            if i >= actual_columns.len() {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Missing column: {}",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            let (
-                actual_name,
-                actual_type,
-                actual_nullable,
-                actual_primary,
-                actual_auto_increment,
-                actual_compression,
-            ) = &actual_columns[i];
-
-            // 检查列名
-            if actual_name != expected_col.name {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                    T::TABLE_NAME,
-                    i,
-                    expected_col.name,
-                    actual_name
-                ));
-            }
-
-            let expected_primary = effective_primary_keys.contains(&expected_col.name);
-            if expected_primary != *actual_primary {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Primary key mismatch for '{}': expected {}primary key, but actual is {}primary key",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    if expected_primary { "" } else { "not " },
-                    if *actual_primary { "" } else { "not " }
-                ));
-            }
-
-            if expected_col.is_auto_increment != *actual_auto_increment {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Auto-increment mismatch for '{}': expected {}, but actual is {}",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    expected_col.is_auto_increment,
-                    actual_auto_increment
-                ));
-            }
-
-            let effective_rust_type = expected_col.data_type.unwrap_or(expected_col.rust_type);
-
-            // 检查列类型（只比较基础类型，不包含约束）
-            let expected_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                effective_rust_type,
-                expected_col.is_primary,
-                expected_col.is_auto_increment,
-                expected_col.is_nullable,
-                expected_col.enum_variants,
-            );
-
-            // 对于类型比较，我们需要提取基础类型（不包含 SERIAL, PRIMARY KEY, NOT NULL 等约束）
-            let type_to_compare = if expected_col.is_primary && expected_col.is_auto_increment {
-                // SERIAL类型在PostgreSQL中实际存储为integer/bigint
-                match effective_rust_type {
-                    "i8" | "i16" | "u8" => "SMALLINT".to_string(), // SMALLSERIAL -> SMALLINT
-                    "i32" | "u16" | "u32" => "INTEGER".to_string(), // SERIAL -> INTEGER
-                    "i64" | "u64" => "BIGINT".to_string(),         // BIGSERIAL -> BIGINT
-                    _ => "INTEGER".to_string(),
-                }
-            } else if expected_col.is_primary {
-                // 主键的基础类型
-                match effective_rust_type {
-                    "i8" | "i16" | "u8" => "SMALLINT".to_string(),
-                    "i32" | "u16" | "u32" => "INTEGER".to_string(),
-                    "i64" | "u64" => "BIGINT".to_string(),
-                    // 非整数主键（如 NaiveDateTime）使用 sql_type 获取基础类型
-                    _ => {
-                        let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                            effective_rust_type,
-                            false,
-                            expected_col.is_auto_increment,
-                            expected_col.is_nullable,
-                            expected_col.enum_variants,
-                        );
-                        full_type.replace(" NOT NULL", "")
-                    }
-                }
-            } else {
-                // 非主键列，提取基础类型（去掉 NOT NULL）
-                let full_type = crate::abstract_layer::DbType::PostgreSQL.sql_type(
-                    effective_rust_type,
-                    false,
-                    expected_col.is_auto_increment,
-                    expected_col.is_nullable,
-                    expected_col.enum_variants,
-                );
-                // 去掉 " NOT NULL" 后缀
-                full_type.replace(" NOT NULL", "")
-            };
-
-            if !Self::types_compatible(actual_type, &type_to_compare) {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{expected_type}', but actual is '{actual_type}'",
-                    T::TABLE_NAME,
-                    expected_col.name
-                ));
-            }
-
-            // 检查 NOT NULL 约束（主键列除外，因为主键自动 NOT NULL）
-            if !expected_primary {
-                let expected_nullable = expected_col.is_nullable;
-                if *actual_nullable != expected_nullable {
-                    return Err(crate::ormer_error!(
-                        "Schema mismatch: table {}, reason: Column nullability mismatch for '{}': expected {}NULL, but actual is {}NULL",
-                        T::TABLE_NAME,
-                        expected_col.name,
-                        if expected_nullable { "" } else { "NOT " },
-                        if *actual_nullable { "" } else { "NOT " }
-                    ));
-                }
-            }
-
-            let expected_compression = crate::model::column_compression_algorithm(expected_col)
-                .map(|value| value.as_str());
-            if actual_compression.as_deref() != expected_compression {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Compression mismatch for '{}': expected {}, but actual is {}",
-                    T::TABLE_NAME,
-                    expected_col.name,
-                    expected_compression.unwrap_or("default"),
-                    actual_compression.as_deref().unwrap_or("default")
-                ));
-            }
-        }
-
-        let actual_table = self.db_first_table(schema_name, table_name).await?;
-        crate::db_first::validate_model_constraints::<T>(
-            crate::abstract_layer::DbType::PostgreSQL,
-            &actual_table,
-        )?;
-        Ok(())
-    }
-
-    /// QuestDB 表结构校验：基于 `questdb_schema_columns` 自省结果逐列比对。
-    ///
-    /// 结构比对口径对齐 PG 分支（列数、列名与位置、列类型）；QuestDB 没有
-    /// 主键/NOT NULL 约束，且 designated timestamp 列随建表 `timestamp(...)`
-    /// 子句派生，这两类标记不参与比较（与迁移差异检测口径一致）。类型期望
-    /// 值与 QuestDB 建表口径一致：`#[index]` 的 STRING 列建为 SYMBOL。
-    #[cfg(feature = "questdb")]
-    async fn validate_table_questdb_schema<T: Model>(&self) -> crate::Result<()> {
-        let table_name = T::table_name_for_db(self.db_type);
-        // QuestDB 表至少有一列，自省结果为空即表不存在
-        let Some(actual_columns) = self.questdb_schema_columns(table_name).await? else {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Table does not exist",
-                table_name
-            ));
-        };
-
-        if actual_columns.len() != T::COLUMN_SCHEMA.len() {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {}, reason: Column count mismatch: expected {}, but actual is {}",
-                table_name,
-                T::COLUMN_SCHEMA.len(),
-                actual_columns.len()
-            ));
-        }
-
-        for (index, expected) in T::COLUMN_SCHEMA.iter().enumerate() {
-            let actual = &actual_columns[index];
-            if actual.name != expected.name {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column name mismatch at position {}: expected '{}', but actual is '{}'",
-                    table_name,
-                    index,
-                    expected.name,
-                    actual.name
-                ));
-            }
-            if actual.type_name.is_empty() {
-                return Err(crate::ormer_error!(
-                    "Cannot determine the database type of column {}",
-                    expected.name
-                ));
-            }
-            let mut expected_type = if let Some(db_value_type) = expected.db_value_type {
-                db_value_type(self.db_type).to_string()
-            } else {
-                self.db_type.sql_type(
-                    expected.data_type.unwrap_or(expected.rust_type),
-                    false,
-                    false,
-                    true,
-                    expected.enum_variants,
-                )
-            };
-            expected_type = expected_type.trim_end_matches(" NOT NULL").to_string();
-            if expected.is_indexed && expected_type.eq_ignore_ascii_case("STRING") {
-                expected_type = "SYMBOL".to_string();
-            }
-            if !actual.type_name.trim().eq_ignore_ascii_case(&expected_type) {
-                return Err(crate::ormer_error!(
-                    "Schema mismatch: table {}, reason: Column type mismatch for '{}': expected '{}', but actual is '{}'",
-                    table_name,
-                    expected.name,
-                    expected_type,
-                    actual.type_name
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// 检查 SQL 类型是否兼容
-    fn types_compatible(actual: &str, expected: &str) -> bool {
-        // 标准化类型名称 - 只提取基础类型，去除约束
-        fn normalize(s: &str) -> String {
-            let upper = s.to_uppercase();
-            match upper.as_str() {
-                "_INT4" | "INT4[]" | "INTEGER[]" => return "INTEGER[]".to_string(),
-                "_INT8" | "INT8[]" | "BIGINT[]" => return "BIGINT[]".to_string(),
-                "_TEXT"
-                | "TEXT[]"
-                | "_VARCHAR"
-                | "VARCHAR[]"
-                | "_BPCHAR"
-                | "CHAR[]"
-                | "CHARACTER VARYING[]" => return "TEXT[]".to_string(),
-                _ => {}
-            }
-            if upper.starts_with("TIMESTAMP WITH TIME ZONE") || upper == "TIMESTAMPTZ" {
-                return "TIMESTAMPTZ".to_string();
-            }
-            if upper.starts_with("TIMESTAMP WITHOUT TIME ZONE") || upper == "TIMESTAMP" {
-                return "TIMESTAMP".to_string();
-            }
-            // 提取第一个单词作为基础类型
-            let base_type = upper.split_whitespace().next().unwrap_or(&upper);
-
-            match base_type {
-                // 整数类型
-                "SMALLINT" | "INT2" => "SMALLINT".to_string(),
-                "INTEGER" | "INT" | "INT4" | "SERIAL" => "INTEGER".to_string(),
-                "BIGINT" | "INT8" | "BIGSERIAL" => "BIGINT".to_string(),
-                // 字符串类型
-                "CHARACTER" => {
-                    // CHARACTER VARYING 需要特殊处理
-                    if upper.starts_with("CHARACTER VARYING") || upper.starts_with("CHARACTER(") {
-                        "VARCHAR".to_string()
-                    } else {
-                        "CHAR".to_string()
-                    }
-                }
-                "VARCHAR" | "TEXT" | "CHAR" | "BPCHAR" => "VARCHAR".to_string(),
-                // 布尔类型
-                "BOOLEAN" | "BOOL" => "BOOLEAN".to_string(),
-                // 浮点类型
-                "REAL" | "FLOAT4" => "REAL".to_string(),
-                "DOUBLE" => "DOUBLE PRECISION".to_string(), // DOUBLE PRECISION
-                "FLOAT8" | "FLOAT" => "DOUBLE PRECISION".to_string(),
-                // 字节类型
-                "BYTEA" | "BLOB" => "BYTEA".to_string(),
-                // 其他
-                _ => base_type.to_string(),
-            }
-        }
-
-        let actual = normalize(actual);
-        let expected = normalize(expected);
-        actual == expected
-            || matches!(
-                (actual.as_str(), expected.as_str()),
-                ("TIMESTAMP", "TIMESTAMPTZ") | ("TIMESTAMPTZ", "TIMESTAMP")
-            )
-    }
 
     /// 批量插入或更新记录（遇到重复键时更新）
     pub async fn insert_or_update_batch<T: Model>(&self, models: &[&T]) -> crate::Result<()> {
@@ -4448,6 +4276,21 @@ impl<'a> Transaction<'a> {
         pg_execute_untyped(self.client(), sql, &params).await
     }
 
+    /// 事务级咨询锁（`SELECT pg_advisory_xact_lock($1)`），事务结束自动
+    /// 释放。参数绑定 i64（PG advisory lock 的单键形态）；必须带 i64 类型
+    /// 提示，否则 $1 被推断为 int8 而无提示小整数会绑成 i32，驱动层报
+    /// i32/int8 不兼容。
+    pub(crate) async fn advisory_xact_lock(&self, key: i64) -> crate::Result<()> {
+        pg_execute_with_types(
+            self.client(),
+            "SELECT pg_advisory_xact_lock($1)",
+            &[Value::Integer(key)],
+            &["i64"],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub(crate) async fn select_raw<V, C>(&self, sql: &str, params: Vec<Value>) -> crate::Result<C>
     where
         V: crate::model::FromRowValues,
@@ -5034,18 +4877,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn timestamp_and_timestamptz_schema_types_are_compatible() {
-        assert!(Database::types_compatible(
-            "timestamp without time zone",
-            "TIMESTAMPTZ"
-        ));
-        assert!(Database::types_compatible(
-            "timestamp with time zone",
-            "TIMESTAMP"
-        ));
-        assert!(!Database::types_compatible("DATE", "TIMESTAMPTZ"));
-    }
 }
 
 impl_backend_executor_methods!(SelectExecutor, client, &'a tokio_postgres::Client, Select);

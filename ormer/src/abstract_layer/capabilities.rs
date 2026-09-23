@@ -74,12 +74,12 @@ pub struct Capabilities {
     /// 消费点：`model::generate_create_table_sql_with_engine`。QuestDB 由专用建表
     /// 函数生成无约束 DDL，与此声明一致。
     pub constraints: bool,
-    /// 是否支持通过系统表校验表结构（`validate_table`）。
+    /// 是否支持通过系统表内省表结构（`plan_table`/`apply_table` 的前提）。
     ///
-    /// 消费点：统一层 `Database::validate_table`、连接池 `PooledConnection::validate_table`。
-    /// QuestDB 走 `table_columns()` 专用校验路径，因此为 true。该字段不覆盖 db-first
-    /// 实体生成（`generate_entities`）：ClickHouse 可用、QuestDB/InfluxDB 拒绝，
-    /// 该维度由各自路径单独硬编码。
+    /// 消费点：统一层 `Database::plan_table`、`Database::apply_table`（表迁移
+    /// 统一入口）。QuestDB 走 `table_columns()` 专用路径，因此为 true。该字段不覆盖
+    /// db-first 实体生成（`generate_entities`）：ClickHouse 可用、QuestDB/InfluxDB
+    /// 拒绝，该维度由各自路径单独硬编码。
     pub schema_introspection: bool,
     /// 是否支持高级分组（GROUP BY 聚合投影、HAVING、GROUPING SETS/CUBE/
     /// ROLLUP）。该标志当前仅驱动统一层 ClickHouse/InfluxDB 的
@@ -140,7 +140,7 @@ impl Capabilities {
                 copy: false,
                 row_lock: false,
                 constraints: false,
-                // validate_table 走 table_columns() 专用路径；db-first 实体生成
+                // plan_table/apply_table 走 table_columns() 专用路径；db-first 实体生成
                 // 不在本字段覆盖范围内（postgresql_backend::db_first_tables 单独拒绝）。
                 schema_introspection: true,
                 advanced_grouping: false,

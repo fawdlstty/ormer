@@ -231,6 +231,26 @@ impl Database {
             .is_ok_and(|response| response.status().is_success())
     }
 
+    /// 连接层探活：`/health` 非 2xx 或网络错误返回 Err
+    /// （`Database::ping` 的后端分派）。
+    pub(crate) async fn ping(&self) -> crate::Result<()> {
+        let mut request = self.http.get(self.health_path());
+        if let Some(auth) = self.auth_header() {
+            request = request.header("Authorization", auth);
+        }
+        let response = request.send().await.map_err(|error| {
+            crate::OrmerError::from_external("reqwest::Client::send (InfluxDB ping)", error)
+        })?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(crate::ormer_error!(
+                "InfluxDB ping failed: /health returned {}",
+                response.status()
+            ))
+        }
+    }
+
     /// 执行一条 InfluxQL/SQL 查询，返回所有 series（列名与行值）。
     ///
     /// 读查询不重试业务错误，仅对网络错误重试一次。

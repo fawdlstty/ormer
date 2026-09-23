@@ -1836,34 +1836,6 @@ impl<'a> PooledConnection<'a> {
         }
     }
 
-    /// 验证表结构
-    ///
-    /// 以 [`crate::Capabilities::schema_introspection`] 为准：ClickHouse/InfluxDB
-    /// 统一拒绝；QuestDB 为 true，由 PostgreSQL 后端按运行时 db_type 分流到
-    /// `table_columns()` 专用校验。
-    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
-        let db_type = db_type_for_connection(self.get_connection());
-        crate::Capabilities::ensure(db_type, |caps| caps.schema_introspection, "validate_table")?;
-        match self.get_connection() {
-            #[cfg(feature = "sqlite")]
-            ConnectionWrapper::Sqlite(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "postgresql")]
-            ConnectionWrapper::PostgreSQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "mysql")]
-            ConnectionWrapper::MySQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "mssql")]
-            ConnectionWrapper::MSSQL(db) => db.validate_table::<T>().await,
-            #[cfg(feature = "duckdb")]
-            ConnectionWrapper::DuckDB(db) => db.validate_table::<T>().await,
-            // 矩阵兜底：正常不可达（schema_introspection=false 已在上面拦截）。
-            #[allow(unreachable_patterns)]
-            _ => Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "validate_table",
-            }),
-        }
-    }
-
     /// 插入记录 - 返回执行器
     pub fn insert<I: crate::model::Insertable>(&self, models: I) -> PooledInsertExecutor<'_, I> {
         PooledInsertExecutor {

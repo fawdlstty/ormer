@@ -11,6 +11,7 @@ pub mod model;
 pub mod query;
 pub mod raw_sql;
 pub mod sql_trace;
+mod table_migrate;
 mod time;
 pub mod utils;
 
@@ -37,6 +38,10 @@ pub use migration::{
     MIGRATION_TABLE_NAME, Migration, MigrationDryRun, MigrationDryRunStep,
     MigrationExecutionStatus, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
     TableEnsureOutcome, TableMigration,
+};
+pub use table_migrate::{
+    ApplyOptions, ExtraPolicy, RebuildCause, RebuildPolicy, TableApplyOutcome, TableDiagnosis,
+    TablePlan,
 };
 
 // 数据库相关类型 - 当启用任一数据库 feature 时可用

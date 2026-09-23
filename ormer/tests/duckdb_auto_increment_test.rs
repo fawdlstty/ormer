@@ -61,7 +61,10 @@ async fn duckdb_preserves_primary_key_types() -> Result<(), Box<dyn std::error::
     db.create_table::<DuckDbI64AutoIncrementUser>()
         .execute()
         .await?;
-    db.validate_table::<DuckDbI64AutoIncrementUser>().await?;
+    assert!(
+        matches!(db.plan_table::<DuckDbI64AutoIncrementUser>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
     let entities = db.generate_entities(None).await?;
     assert!(
         entities.contains("#[primary(auto)]\n    pub id: i64"),
@@ -77,7 +80,10 @@ async fn duckdb_preserves_primary_key_types() -> Result<(), Box<dyn std::error::
     assert_eq!(generated_id, 1);
 
     db.create_table::<DuckDbTextPrimaryUser>().execute().await?;
-    db.validate_table::<DuckDbTextPrimaryUser>().await?;
+    assert!(
+        matches!(db.plan_table::<DuckDbTextPrimaryUser>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
     db.insert(&DuckDbTextPrimaryUser {
         id: "alice".to_string(),
         name: "Alice".to_string(),

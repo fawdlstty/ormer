@@ -3974,9 +3974,18 @@ fn generate_create_table_sql_with_engine<T: Model>(
         if supports_constraints {
             if let Some(check) = column.check {
                 sql.push(' ');
-                if let Some(name) = check.name {
-                    sql.push_str(&format!("CONSTRAINT {} ", quote_identifier(db_type, name)));
-                }
+                // 未显式命名时按 ormer 默认命名（ck_{table}_{column}），
+                // 与 plan_table 的 CHECK 诊断期望一致，避免依赖数据库的
+                // 隐式命名规则（PG 会按 {table}_{column}_check 命名）。
+                let check_name = check
+                    .name
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        crate::table_migrate::default_check_name(table_name, column.name)
+                    });
+                sql.push_str("CONSTRAINT ");
+                sql.push_str(&quote_identifier(db_type, &check_name));
+                sql.push(' ');
                 sql.push_str(&format!("CHECK ({})", check.expr));
             }
         }

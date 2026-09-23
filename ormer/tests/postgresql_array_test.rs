@@ -69,7 +69,10 @@ async fn test_postgresql_array_sql_and_roundtrip() -> Result<(), Box<dyn std::er
     let _ = db.drop_table::<PgArrayModel>().execute().await;
 
     db.create_table::<PgArrayModel>().execute().await?;
-    db.validate_table::<PgArrayModel>().await?;
+    assert!(
+        matches!(db.plan_table::<PgArrayModel>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     let model = PgArrayModel {
         id: 1,
@@ -99,7 +102,10 @@ async fn test_postgresql_enum_array_data_type_roundtrip() -> Result<(), Box<dyn 
     let _ = db.drop_table::<PgEnumArrayModel>().execute().await;
 
     db.create_table::<PgEnumArrayModel>().execute().await?;
-    db.validate_table::<PgEnumArrayModel>().await?;
+    assert!(
+        matches!(db.plan_table::<PgEnumArrayModel>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     let model = PgEnumArrayModel {
         id: 1,
@@ -138,7 +144,10 @@ async fn test_postgresql_string_array_uses_text_array_value()
     let _ = db.drop_table::<PgStringArrayModel>().execute().await;
 
     db.create_table::<PgStringArrayModel>().execute().await?;
-    db.validate_table::<PgStringArrayModel>().await?;
+    assert!(
+        matches!(db.plan_table::<PgStringArrayModel>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     db.insert(&model).execute().await?;
 

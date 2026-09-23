@@ -108,14 +108,26 @@ async fn table_plan_creates_and_adds_columns() -> ormer::Result<()> {
     ));
     initial.to_sql()?;
     db.migrate_table::<MigrationUserV1>().execute().await?;
-    db.validate_table::<MigrationUserV1>().await?;
+    assert!(
+        matches!(
+            db.plan_table::<MigrationUserV1>().await?,
+            ormer::TableDiagnosis::Ready
+        ),
+        "migrated schema should be Ready"
+    );
 
     let additive = db.migrate_table::<MigrationUserV2>().plan().await?;
     assert!(additive.steps().iter().any(
         |step| matches!(step, MigrationStep::AddColumn { column, .. } if column == "display_name")
     ));
     db.migrate_table::<MigrationUserV2>().execute().await?;
-    db.validate_table::<MigrationUserV2>().await?;
+    assert!(
+        matches!(
+            db.plan_table::<MigrationUserV2>().await?,
+            ormer::TableDiagnosis::Ready
+        ),
+        "migrated schema should be Ready"
+    );
     assert!(
         db.migrate_table::<MigrationUserV2>()
             .plan()
@@ -202,7 +214,10 @@ async fn sqlite_migrates_text_to_integer_and_preserves_data() -> ormer::Result<(
     db.migrate_table::<MigrationIntegerValue>()
         .execute()
         .await?;
-    db.validate_table::<MigrationIntegerValue>().await?;
+    assert!(matches!(
+        db.plan_table::<MigrationIntegerValue>().await?,
+        ormer::TableDiagnosis::Ready
+    ));
     let values = db
         .select_sql::<(i32, i32)>("SELECT id, value FROM ormer_migration_type_values ORDER BY id")
         .collect::<Vec<_>>()
@@ -230,7 +245,10 @@ async fn sqlite_migrates_nullable_to_not_null_and_enforces_constraint() -> ormer
     db.migrate_table::<MigrationNonNullValue>()
         .execute()
         .await?;
-    db.validate_table::<MigrationNonNullValue>().await?;
+    assert!(matches!(
+        db.plan_table::<MigrationNonNullValue>().await?,
+        ormer::TableDiagnosis::Ready
+    ));
 
     let column_info = db
         .select_sql::<(String, i64)>(
@@ -346,7 +364,10 @@ async fn versioned_migrations_track_pending_and_rollback() -> ormer::Result<()> 
         .await
         .expect_err("migration should fail");
     assert!(!error.to_string().is_empty());
-    assert!(db.validate_table::<MigrationHistoryUser>().await.is_err());
+    assert!(matches!(
+        db.plan_table::<MigrationHistoryUser>().await?,
+        ormer::TableDiagnosis::Migratable(_)
+    ));
     assert_eq!(db.pending_migrations(&migrations).await?.len(), 2);
 
     let create_only: [&dyn Migration; 1] = [&create];

@@ -8,10 +8,11 @@ use crate::abstract_layer::DbType;
 #[cfg(any(feature = "sqlite", feature = "duckdb"))]
 use crate::abstract_layer::common::common_helpers;
 use crate::abstract_layer::common::{Database, Transaction};
-use crate::db_first::{DbFirstForeignKey, DbFirstIndex, DbFirstTable};
+use crate::db_first::{DbFirstForeignKey, DbFirstTable};
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
 use crate::model::CompressionAlgorithm;
 use crate::model::{ColumnSchema, WritableModel};
+use crate::table_migrate::ExpectedCheck;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
@@ -32,27 +33,13 @@ pub enum TableEnsureOutcome {
     Recreated,
 }
 
-impl TableEnsureOutcome {
-    /// 聚合两次 ensure 的结果：基础表与路由子表各自 ensure 后合并为整体
-    /// 结果，严重程度取两者较高者（Ready < Migrated < Recreated）。
-    pub(crate) fn merge(self, other: TableEnsureOutcome) -> TableEnsureOutcome {
-        if self == TableEnsureOutcome::Recreated || other == TableEnsureOutcome::Recreated {
-            TableEnsureOutcome::Recreated
-        } else if self == TableEnsureOutcome::Migrated || other == TableEnsureOutcome::Migrated {
-            TableEnsureOutcome::Migrated
-        } else {
-            TableEnsureOutcome::Ready
-        }
-    }
-}
-
 /// 判断错误是否属于"应当删除重建"的结构性差异。
 ///
 /// 包括：ormer 自身报告的不可迁移 schema / 结构不匹配，以及 TimescaleDB
 /// 在超表分区列与唯一索引（主键）冲突时抛出的建表错误。后者的典型场景是
 /// 旧版本建出的表结构与当前模型的主键定义不一致，导致 create_hypertable
 /// 无法完成，此时删除重建是唯一出路。
-fn is_schema_rebuild_error(err: &crate::OrmerError) -> bool {
+pub(crate) fn is_schema_rebuild_error(err: &crate::OrmerError) -> bool {
     match err {
         crate::OrmerError::UnmigratableSchema { .. } => true,
         crate::OrmerError::Other { message } => message.contains("Schema mismatch"),
@@ -62,20 +49,6 @@ fn is_schema_rebuild_error(err: &crate::OrmerError) -> bool {
         }
         _ => false,
     }
-}
-
-/// 严格模式（[`Database::ensure_table`]）共用的破坏性差异预检：返回
-/// "数据库有而模型没有"的列。非空时调用方拒绝继续（自动删列丢数据，
-/// 需显式选择 `ensure_table_permissive` 或手写迁移）。基础表与路由子表
-/// 的增量迁移路径使用同一份判定。
-fn rejected_dropped_columns<T: WritableModel>(actual: &[SchemaColumn]) -> Vec<&str> {
-    let expected_names: BTreeSet<&str> =
-        T::COLUMN_SCHEMA.iter().map(|column| column.name).collect();
-    actual
-        .iter()
-        .map(|column| column.name.as_str())
-        .filter(|name| !expected_names.contains(name))
-        .collect()
 }
 
 /// 路由子表的 `LIKE` 前缀匹配模式：`{base}_%`。基础表名中的 `LIKE` 通配符
@@ -164,6 +137,15 @@ pub enum MigrationStep {
         table: String,
         definition: String,
     },
+    /// 主键原地变更（仅 PostgreSQL 生成）：`DROP CONSTRAINT` 旧主键约束 +
+    /// `ADD PRIMARY KEY` 新主键列，保数据。其他后端的 sql() 渲染返回错误
+    /// ——不支持的后端在计划阶段即转 `NeedsRebuild`，不会生成该步骤。
+    ChangePrimaryKey {
+        table: String,
+        columns: Vec<String>,
+        /// 现有主键约束名（自省所得）；None 时不生成 DROP 子动作。
+        drop_constraint: Option<String>,
+    },
     CreateIndex {
         name: String,
         table: String,
@@ -193,7 +175,23 @@ impl MigrationStep {
             Self::CreateType { definition, .. } | Self::AlterType { definition, .. } => {
                 Ok(definition.clone())
             }
-            Self::CreateTable { definition, .. } => Ok(definition.clone()),
+            Self::CreateTable { table, definition } => {
+                // schema 限定表的建表步骤与 CreateTableExecutor 同源：
+                // 目标 schema 缺失时由幂等 CREATE SCHEMA 前置语句补齐
+                // （仅 PG 有该语义，函数内部对其余后端返回 None）。
+                #[cfg(feature = "postgresql")]
+                {
+                    if let Some(create_schema_sql) = crate::abstract_layer::postgresql_backend::create_schema_sql_if_qualified(db_type, table)
+                    {
+                        return Ok(format!("{create_schema_sql}; {definition}"));
+                    }
+                }
+                #[cfg(not(feature = "postgresql"))]
+                {
+                    let _ = table;
+                }
+                Ok(definition.clone())
+            }
             Self::AddColumn {
                 column, definition, ..
             } => {
@@ -315,6 +313,55 @@ impl MigrationStep {
             Self::AddConstraint { definition, .. } => {
                 Ok(format!("ALTER TABLE {table} ADD {definition}"))
             }
+            Self::ChangePrimaryKey {
+                columns: pk_columns,
+                drop_constraint,
+                ..
+            } => {
+                #[cfg(feature = "postgresql")]
+                {
+                    let columns_sql = pk_columns
+                        .iter()
+                        .map(|column| crate::model::quote_identifier(db_type, column))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // 仅启用 postgresql 时 DbType 只剩 PG 变体，通配臂不可达
+                    #[allow(unreachable_patterns)]
+                    match db_type {
+                        DbType::PostgreSQL => {
+                            // 单条 ALTER 的多个子动作原子生效，DROP 与 ADD 之间
+                            // 无窗口期；ADD 不带约束名，由 PG 按默认规则命名
+                            // （{table}_pkey），与命名唯一化原则一致。
+                            let drop_action = drop_constraint
+                                .as_deref()
+                                .map(|constraint| {
+                                    format!(
+                                        "DROP CONSTRAINT {}, ",
+                                        crate::model::quote_identifier(db_type, constraint)
+                                    )
+                                })
+                                .unwrap_or_default();
+                            Ok(format!(
+                                "ALTER TABLE {table} {drop_action}ADD PRIMARY KEY ({columns_sql})"
+                            ))
+                        }
+                        _ => Err(crate::OrmerError::UnsupportedFeature {
+                            backend: db_type,
+                            feature: "in-place primary key change (ChangePrimaryKey is \
+                                      PostgreSQL-only; other backends surface NeedsRebuild)",
+                        }),
+                    }
+                }
+                #[cfg(not(feature = "postgresql"))]
+                {
+                    let _ = (pk_columns, drop_constraint);
+                    Err(crate::OrmerError::UnsupportedFeature {
+                        backend: db_type,
+                        feature: "in-place primary key change (ChangePrimaryKey is \
+                                  PostgreSQL-only; other backends surface NeedsRebuild)",
+                    })
+                }
+            }
             Self::CreateIndex {
                 name,
                 columns: index_columns,
@@ -389,7 +436,7 @@ impl MigrationStep {
     }
 }
 
-fn table_name(step: &MigrationStep) -> &str {
+pub(crate) fn table_name(step: &MigrationStep) -> &str {
     match step {
         MigrationStep::AddColumn { table, .. }
         | MigrationStep::DropColumn { table, .. }
@@ -397,6 +444,7 @@ fn table_name(step: &MigrationStep) -> &str {
         | MigrationStep::BackfillColumn { table, .. }
         | MigrationStep::AlterColumn { table, .. }
         | MigrationStep::AddConstraint { table, .. }
+        | MigrationStep::ChangePrimaryKey { table, .. }
         | MigrationStep::CreateIndex { table, .. }
         | MigrationStep::DropIndex { table, .. }
         | MigrationStep::AddForeignKey { table, .. } => table,
@@ -409,8 +457,8 @@ fn table_name(step: &MigrationStep) -> &str {
 pub struct MigrationPlan {
     table_name: String,
     db_type: DbType,
-    steps: Vec<MigrationStep>,
-    warnings: Vec<String>,
+    pub(crate) steps: Vec<MigrationStep>,
+    pub(crate) warnings: Vec<String>,
 }
 
 impl MigrationPlan {
@@ -451,7 +499,7 @@ impl MigrationPlan {
         Ok(sql.join(";\n"))
     }
 
-    fn push(&mut self, step: MigrationStep) {
+    pub(crate) fn push(&mut self, step: MigrationStep) {
         self.steps.push(step);
     }
 }
@@ -716,6 +764,24 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
     }
 }
 
+/// 把 [`crate::table_migrate::TableApplyOutcome`] 映射回
+/// [`TableEnsureOutcome`]（薄糖入口的返回形态）。
+fn ensure_outcome_from_apply(
+    outcome: &crate::table_migrate::TableApplyOutcome,
+) -> TableEnsureOutcome {
+    match &outcome.diagnosis {
+        crate::table_migrate::TableDiagnosis::Ready => TableEnsureOutcome::Ready,
+        crate::table_migrate::TableDiagnosis::Migratable(_) => {
+            if outcome.created_table || outcome.executed.is_empty() {
+                TableEnsureOutcome::Ready
+            } else {
+                TableEnsureOutcome::Migrated
+            }
+        }
+        crate::table_migrate::TableDiagnosis::NeedsRebuild(_) => TableEnsureOutcome::Recreated,
+    }
+}
+
 /// Builder returned by `Database::migrate_table`.
 pub struct TableMigration<'a, T: WritableModel> {
     db: &'a Database,
@@ -727,6 +793,13 @@ pub struct TableMigration<'a, T: WritableModel> {
     /// `CreateTableExecutor` 的 `table_name: Some(..)` 先例）。`None` 时
     /// 使用模型基础表名。
     table_name: Option<String>,
+    /// 主键差异处理模式：false（默认，`migrate_table` 公开面）保持既有语义
+    /// ——主键变更报 `UnmigratableSchema`；true（plan_table/apply_table 内部）
+    /// 在 PostgreSQL 上生成 `ChangePrimaryKey` 原地变更步骤，其余后端转重建。
+    pub(crate) allow_inplace_pk: bool,
+    /// 多余列处理：Drop（默认，`migrate_table` 公开面的既有语义——计划含
+    /// DropColumn，由调用方决定是否执行）或 Keep（保留，不生成 DropColumn）。
+    pub(crate) extra_columns: crate::table_migrate::ExtraPolicy,
 }
 
 impl<'a, T: WritableModel> TableMigration<'a, T> {
@@ -750,6 +823,24 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
     ) -> Self {
         self.renames.push((old_name.into(), new_name.into()));
         self
+    }
+
+    /// 内部构造：plan_table / apply_table 的诊断路径使用（主键原地变更
+    /// 开启、多余列策略由 ApplyOptions 决定）。
+    #[allow(dead_code)]
+    pub(crate) fn for_diagnosis(
+        db: &'a Database,
+        table_name: Option<&str>,
+        extra_columns: crate::table_migrate::ExtraPolicy,
+    ) -> Self {
+        Self {
+            db,
+            marker: PhantomData,
+            renames: Vec::new(),
+            table_name: table_name.map(str::to_string),
+            allow_inplace_pk: true,
+            extra_columns,
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -819,7 +910,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
 
     /// 表名参数化的计划核心：基础表与路由子表共用同一套 schema diff 逻辑
     /// （对齐 `CreateTableExecutor` 的 `table_name: Some(..)` 参数化先例）。
-    async fn plan_for_table(&self, table_name: &str) -> crate::Result<MigrationPlan> {
+    pub(crate) async fn plan_for_table(&self, table_name: &str) -> crate::Result<MigrationPlan> {
         let db_type = self.db.db_type();
         // QuestDB 没有主键/NOT NULL 约束，自省结果不参与这两项比较
         #[cfg(feature = "questdb")]
@@ -924,6 +1015,15 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             if expected_names.contains(column.name.as_str()) {
                 continue;
             }
+            if self.extra_columns == crate::table_migrate::ExtraPolicy::Keep {
+                // Keep（apply_table 默认）：多余列保留在库内，不参与 DDL。
+                // 必须先于 SQLite 重建判定，否则 Keep 语义在 SQLite 上被绕过。
+                plan.warnings.push(format!(
+                    "keeping column {} because it is not present in the model (extra_columns = Keep)",
+                    column.name
+                ));
+                continue;
+            }
             #[cfg(feature = "sqlite")]
             if matches!(db_type, DbType::Sqlite) {
                 sqlite_rebuild_required = true;
@@ -977,10 +1077,12 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
         }
 
-        // ---- 索引集合 diff：期望集合（模型声明）vs 实际集合（库内自省）----
-        // 期望有实际没有 → CreateIndex；期望没有实际有 → DropIndex。
-        // 覆盖"给已有列加 #[index]"与"从模型删除 #[index]"两种变更，
-        // 不再局限于本次新增的列。
+        // ---- 索引语义 diff：期望集合（模型声明）vs 实际集合（库内自省）----
+        // 按 列集合+唯一性+method/expression/where 定义文本 比对而非按名字：
+        // 期望有实际没有 → 建（ormer 自动命名）；语义相等但名字漂移
+        // （旧命名事故 idx_{裸表名}_{列}）或列序/定义漂移 → 删旧按 ormer
+        // 命名重建；INVALID（indisvalid=false）残留 → 清除。
+        // 覆盖"给已有列加 #[index]"与"从模型删除 #[index]"两种变更。
         //
         // QuestDB 例外：索引内联在建表语句（SYMBOL 列 INDEX），建表时已随列
         // 生成，视为已有索引；且无独立 CREATE/DROP INDEX DDL，跳过 diff。
@@ -990,13 +1092,6 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         if !questdb {
             match self.db.db_first_table_for(table_name).await? {
                 Some(db_first_table) => {
-                    push_index_diff_steps::<T>(
-                        db_type,
-                        table_name,
-                        &available_columns,
-                        &db_first_table,
-                        &mut plan,
-                    )?;
                     introspected_table = Some(db_first_table);
                 }
                 None => {
@@ -1004,6 +1099,28 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         "metadata for table {table_name} was unavailable; \
                          index and default differences were not evaluated"
                     ));
+                }
+            }
+            if let Some(db_first_table) = &introspected_table {
+                let actual_facts =
+                    self.db.actual_index_facts(table_name, &db_first_table.indexes).await?;
+                let foreign_key_columns: BTreeSet<&str> = db_first_table
+                    .foreign_keys
+                    .iter()
+                    .map(|foreign_key| foreign_key.column.as_str())
+                    .collect();
+                let (steps, warnings) = crate::table_migrate::plan_index_semantic_diff(
+                    db_type,
+                    table_name,
+                    &expected_index_defs::<T>(),
+                    &actual_facts,
+                    &available_columns,
+                    &foreign_key_columns,
+                    index_names_reliable(db_type),
+                )?;
+                plan.warnings.extend(warnings);
+                for step in steps {
+                    plan.push(step);
                 }
             }
         }
@@ -1075,12 +1192,111 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
 
         // 主键期望值使用有效主键列：TimescaleDB 空间分区超表的主键包含分区列
         let effective_primary_keys = crate::model::effective_primary_key_columns::<T>(db_type);
+
+        // ---- 主键集合 diff：PG 原地变更（ChangePrimaryKey）或转重建 ----
+        // 集合级比较先于逐列循环：主键列成员变化不再逐列报
+        // UnmigratableSchema，而是按 allow_inplace_pk 生成单条
+        // ALTER TABLE .. DROP CONSTRAINT .., ADD PRIMARY KEY ..（保数据），
+        // 或把差异上抛为重建原因。步骤在列循环之后下发（新主键列的
+        // SET NOT NULL 等 AlterColumn 必须先行）。
+        let actual_pk_set: BTreeSet<String> = actual
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| column.name.clone())
+            .collect();
+        let mut pk_change_step: Option<MigrationStep> = None;
+        if !questdb {
+            let expected_pk_set: BTreeSet<&str> =
+                effective_primary_keys.iter().copied().collect();
+            if actual_pk_set.len() != expected_pk_set.len()
+                || actual_pk_set.iter().any(|name| !expected_pk_set.contains(name.as_str()))
+            {
+                let partition_columns: Vec<&str> = {
+                    #[cfg(feature = "postgresql")]
+                    {
+                        let mut columns = Vec::new();
+                        if let Some((time_column, _)) = T::hypertable_info() {
+                            columns.push(time_column);
+                        }
+                        if let Some((space_column, _)) = T::hypertable_space_info() {
+                            columns.push(space_column);
+                        }
+                        columns
+                    }
+                    #[cfg(not(feature = "postgresql"))]
+                    {
+                        Vec::new()
+                    }
+                };
+                let is_hypertable = {
+                    #[cfg(feature = "postgresql")]
+                    {
+                        T::hypertable_info().is_some()
+                            && matches!(db_type, DbType::PostgreSQL)
+                    }
+                    #[cfg(not(feature = "postgresql"))]
+                    {
+                        false
+                    }
+                };
+                let pk_constraint_name = if self.allow_inplace_pk {
+                    self.db.primary_key_constraint_name(table_name).await?
+                } else {
+                    None
+                };
+                match crate::table_migrate::plan_primary_key_change(
+                    db_type,
+                    table_name,
+                    &actual_pk_set,
+                    &effective_primary_keys,
+                    pk_constraint_name,
+                    is_hypertable,
+                    &partition_columns,
+                ) {
+                    Ok(Some(step)) if self.allow_inplace_pk => {
+                        pk_change_step = Some(step);
+                    }
+                    Ok(_) => {
+                        return Err(crate::OrmerError::unmigratable_schema(
+                            table_name,
+                            format!(
+                                "primary key change (actual {{{}}}, expected {{{}}}); \
+                                 write an explicit migration",
+                                actual_pk_set
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                effective_primary_keys.join(", "),
+                            ),
+                        ));
+                    }
+                    Err(reason) => {
+                        return Err(crate::OrmerError::unmigratable_schema(
+                            table_name,
+                            format!(
+                                "primary key change (actual {{{}}}, expected {{{}}}): {}; \
+                                 write an explicit migration",
+                                actual_pk_set
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                effective_primary_keys.join(", "),
+                                reason
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
         for expected in T::COLUMN_SCHEMA {
             let Some(actual) = actual_by_name.get(expected.name) else {
                 continue;
             };
             let expected_primary = effective_primary_keys.contains(&expected.name);
-            if !questdb && actual.primary_key != expected_primary {
+            if !questdb && !pk_change_step.is_some() && actual.primary_key != expected_primary {
                 return Err(crate::OrmerError::unmigratable_schema(
                     table_name,
                     format!(
@@ -1284,14 +1500,34 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
         }
 
-        // ---- #[default] 变更 diff：模型声明 vs 库内默认值 ----
-        // CHECK 约束：自省结构（DbFirstTable）不包含 check 定义，模型表达式
-        // 与库内约束无法可靠比对（PG 会以 `((expr))` 全限定形式存储），
-        // 该项检测缺失，此处记录 warning 说明覆盖范围。
-        if !questdb && T::COLUMN_SCHEMA.iter().any(|column| column.check.is_some()) {
-            plan.warnings.push(
-                "check-constraint differences are not detected by automatic migrations".to_string(),
-            );
+        // 主键原地变更步骤在列对齐（AddColumn/SET NOT NULL）之后下发
+        if let Some(step) = pk_change_step {
+            plan.push(step);
+        }
+
+        // ---- CHECK 约束闭环：模型声明 vs 库内存量（PG）----
+        // 模型声明的 check 进比对集：缺失 → AddConstraint；同名但定义
+        // （归一化表达式）不一致 → Drop + Add；表达式相同但名字不同的
+        // 存量约束视为同一约束不重复加；模型未声明的存量 CHECK 不动。
+        // 非 PG 后端无可靠的 check 定义自省，保守跳过（维持旧行为）。
+        #[cfg(feature = "postgresql")]
+        {
+            if matches!(db_type, DbType::PostgreSQL) {
+                let expected_checks = expected_check_defs::<T>(table_name);
+                if !expected_checks.is_empty() {
+                    let (schema, bare) = split_qualified_table_name(table_name);
+                    let schema = schema.unwrap_or("public");
+                    let actual_checks = self.db.check_constraint_facts(schema, bare).await?;
+                    for step in crate::table_migrate::plan_check_diff(
+                        table_name,
+                        &expected_checks,
+                        &actual_checks,
+                        db_type,
+                    ) {
+                        plan.push(step);
+                    }
+                }
+            }
         }
         if let Some(db_first_table) = &introspected_table {
             for (column, expected_default, actual_had_default) in
@@ -1398,7 +1634,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
     ///
     /// 与 `execute` 共用尾部逻辑，供 `ensure_table` 在执行前审查计划（拒绝
     /// 破坏性步骤）后复用，避免两处各写一份事务/非事务执行分支。
-    async fn execute_plan(&self, plan: &MigrationPlan) -> crate::Result<()> {
+    pub(crate) async fn execute_plan(&self, plan: &MigrationPlan) -> crate::Result<()> {
         if plan.is_empty() {
             return Ok(());
         }
@@ -1641,7 +1877,7 @@ fn parse_compression_algorithm(value: &str) -> Option<CompressionAlgorithm> {
     }
 }
 
-fn index_migration_step(
+pub(crate) fn index_migration_step(
     db_type: DbType,
     name: String,
     table: &str,
@@ -1699,33 +1935,10 @@ fn index_migration_step(
 }
 
 /// 模型声明的一个索引/唯一约束（diff 的"期望集合"元素）。
-struct ExpectedIndexDef<'a> {
-    name: Option<&'a str>,
-    columns: Vec<&'a ColumnSchema>,
-    unique: bool,
-}
-
-impl<'a> ExpectedIndexDef<'a> {
-    /// 声明了 method/expression/列清单覆盖（全文、GIN、函数索引等）时无法
-    /// 按列集合与自省结果可靠比对，标记为 special：跳过比对与创建。
-    fn special(&self) -> bool {
-        self.columns.iter().any(|column| {
-            column.index_method.is_some()
-                || column.index_expression.is_some()
-                || column.index_columns.is_some()
-        })
-    }
-
-    fn special_columns(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.columns
-            .iter()
-            .filter(|column| {
-                column.index_method.is_some()
-                    || column.index_expression.is_some()
-                    || column.index_columns.is_some()
-            })
-            .map(|column| column.name)
-    }
+pub(crate) struct ExpectedIndexDef<'a> {
+    pub(crate) name: Option<&'a str>,
+    pub(crate) columns: Vec<&'a ColumnSchema>,
+    pub(crate) unique: bool,
 }
 
 /// 从模型列声明构建期望索引集合。
@@ -1733,7 +1946,7 @@ impl<'a> ExpectedIndexDef<'a> {
 /// 分组口径与建表路径（`generate_indexes_with_name` + 内联 UNIQUE）及校验
 /// 路径（`db_first::validate_model_constraints`）一致：未分组单列索引按列
 /// 独立成组，`index_group`/`unique_group` 各自聚合。
-fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'static>> {
+pub(crate) fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'static>> {
     let mut defs = Vec::new();
 
     let mut grouped: BTreeMap<i32, Vec<&'static ColumnSchema>> = BTreeMap::new();
@@ -1777,180 +1990,45 @@ fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'static>> {
     defs
 }
 
-/// 自省得到的索引列名规整：取首个空白分隔的 token 并去掉引号包裹
-/// （SQLite/DuckDB 解析建表语句时列名可能带引号或 `DESC` 后缀）。
-fn index_column_name(name: &str) -> &str {
-    name.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches(['"', '`', '[', ']'])
-}
-
-/// 期望索引定义与自省索引是否一致（列集合、顺序、唯一性；名称仅在模型
-/// 显式声明时比对，与 validate_model_constraints 的口径一致）。
-fn index_def_matches(db_type: DbType, expected: &ExpectedIndexDef<'_>, actual: &DbFirstIndex) -> bool {
-    if expected.unique != actual.unique {
+/// 名字比对的可靠性：SQLite 与 DuckDB（同为 turso 引擎）内联 UNIQUE
+/// 解析出的名称由建表语句决定且可能为空串，不可靠，此类组合跳过名字
+/// 归一（其余后端可靠）。
+pub(crate) fn index_names_reliable(db_type: DbType) -> bool {
+    #[cfg(feature = "sqlite")]
+    if matches!(db_type, DbType::Sqlite) {
         return false;
     }
-    if let Some(name) = expected.name {
-        // SQLite 内联 UNIQUE 解析出的名称由建表语句决定，不可靠，跳过名称比对
-        let sqlite_unique = {
-            #[cfg(feature = "sqlite")]
-            {
-                expected.unique && matches!(db_type, DbType::Sqlite)
-            }
-            #[cfg(not(feature = "sqlite"))]
-            {
-                false
-            }
-        };
-        if !sqlite_unique && name != index_column_name(&actual.name) {
-            return false;
-        }
-    }
-    if expected.columns.len() != actual.columns.len() {
+    #[cfg(feature = "duckdb")]
+    if matches!(db_type, DbType::DuckDB) {
         return false;
     }
-    // SQLite/DuckDB 的索引解析器不识别 DESC 标志，降序比较仅对解析器
-    // 能给出方向的后端生效
-    let compares_descending = match db_type {
-        #[cfg(feature = "postgresql")]
-        DbType::PostgreSQL => true,
-        #[cfg(feature = "mysql")]
-        DbType::MySQL => true,
-        #[cfg(feature = "mssql")]
-        DbType::MSSQL => true,
-        #[allow(unreachable_patterns)]
-        _ => false,
-    };
-    expected.columns.iter().zip(&actual.columns).all(|(expected, actual)| {
-        expected.name == index_column_name(&actual.name)
-            && (!compares_descending
-                || (expected.index_order == Some("DESC")) == actual.descending)
-    })
+    let _ = db_type;
+    true
 }
 
-/// 比较期望索引集合与自省索引集合，生成 CreateIndex / DropIndex 步骤。
-///
-/// - 期望有实际没有 → `CreateIndex`（复用 [`index_migration_step`] 渲染，
-///   支持复合、降序与部分索引谓词）；
-/// - 实际有期望没有 → `DropIndex`。外键后备索引（如 MySQL 为 FK 列自动
-///   创建的索引）与特殊索引（全文/函数等）涉及列保留不动，记录 warning。
-fn push_index_diff_steps<T: WritableModel>(
-    db_type: DbType,
-    table_name: &str,
-    available_columns: &BTreeSet<&str>,
-    db_first_table: &DbFirstTable,
-    plan: &mut MigrationPlan,
-) -> crate::Result<()> {
-    let expected = expected_index_defs::<T>();
-    let actual_indexes = &db_first_table.indexes;
-
-    let mut consumed = vec![false; actual_indexes.len()];
-    for expected in &expected {
-        if expected.special() {
-            plan.warnings.push(format!(
-                "index on ({}) declares a method/expression override; \
-                 its presence is not diffed automatically",
-                expected
-                    .columns
-                    .iter()
-                    .map(|column| column.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            continue;
-        }
-        let matched = actual_indexes
-            .iter()
-            .enumerate()
-            .find(|(position, actual)| {
-                !consumed[*position] && index_def_matches(db_type, expected, actual)
-            });
-        if let Some((position, _)) = matched {
-            consumed[position] = true;
-            continue;
-        }
-        // 期望有实际没有 → 创建。索引列必须全部存在于表中（含本次新增列）。
-        if !expected
-            .columns
-            .iter()
-            .all(|column| available_columns.contains(column.name))
-        {
-            plan.warnings.push(format!(
-                "skipping index on ({}) because some columns are missing from table {table_name}",
-                expected
-                    .columns
-                    .iter()
-                    .map(|column| column.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            continue;
-        }
-        let name = expected
-            .name
-            .map(ToString::to_string)
-            .unwrap_or_else(|| default_index_name(table_name, expected));
-        plan.push(index_migration_step(
-            db_type,
-            name,
-            table_name,
-            &expected.columns,
-            expected.unique,
-        )?);
-    }
-
-    // 实际有期望没有 → 删除。以下两类保留不动：
-    // 1. 外键后备索引（MySQL 会为 FK 列自动建索引，删除会破坏约束）；
-    // 2. 涉及特殊索引声明（method/expression/列清单覆盖）列的索引。
-    let foreign_key_columns: BTreeSet<&str> = db_first_table
-        .foreign_keys
+/// 从模型列声明提取期望 CHECK 约束集合（显式名或 ormer 自动名
+/// `ck_{table}_{column}`）。
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
+pub(crate) fn expected_check_defs<T: WritableModel>(table_name: &str) -> Vec<ExpectedCheck> {
+    T::COLUMN_SCHEMA
         .iter()
-        .map(|foreign_key| foreign_key.column.as_str())
-        .collect();
-    let special_columns: BTreeSet<&str> = expected
-        .iter()
-        .flat_map(ExpectedIndexDef::special_columns)
-        .collect();
-    for (position, index) in actual_indexes.iter().enumerate() {
-        if consumed[position] || index.name.is_empty() {
-            continue;
-        }
-        let leading_column = index
-            .columns
-            .first()
-            .map(|column| index_column_name(&column.name))
-            .unwrap_or("");
-        if !leading_column.is_empty() && foreign_key_columns.contains(leading_column) {
-            plan.warnings.push(format!(
-                "keeping index {} because it backs a foreign key on column {leading_column}",
-                index.name
-            ));
-            continue;
-        }
-        if index.columns.iter().any(|column| {
-            special_columns.contains(index_column_name(&column.name))
-        }) {
-            plan.warnings.push(format!(
-                "keeping index {} because it may implement a method/expression index declaration",
-                index.name
-            ));
-            continue;
-        }
-        plan.warnings
-            .push(format!("dropping index {} because it is not declared in the model", index.name));
-        plan.push(MigrationStep::DropIndex {
-            name: index.name.clone(),
-            table: table_name.to_string(),
-        });
-    }
-    Ok(())
+        .filter_map(|column| {
+            column.check.map(|check| ExpectedCheck {
+                name: check
+                    .name
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| {
+                        crate::table_migrate::default_check_name(table_name, column.name)
+                    }),
+                expr: check.expr.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// 未显式命名时的索引命名，与建表路径的默认命名保持一致：
 /// 单列 `idx_{table}_{column}`、复合 `idx_{table}_{group}`、唯一 `uq_{table}_{group}`。
-fn default_index_name(table_name: &str, expected: &ExpectedIndexDef<'_>) -> String {
+pub(crate) fn default_index_name(table_name: &str, expected: &ExpectedIndexDef<'_>) -> String {
     let table = table_name.replace('.', "_");
     if expected.unique {
         format!(
@@ -2234,7 +2312,7 @@ fn column_default_changes<T: WritableModel>(
 }
 
 /// 拆分可能带 schema 前缀的表名（如 PG/MSSQL 的 `public.users`）。
-fn split_qualified_table_name(table_name: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_qualified_table_name(table_name: &str) -> (Option<&str>, &str) {
     match table_name.rsplit_once('.') {
         Some((schema, name)) if !schema.is_empty() && !name.is_empty() => (Some(schema), name),
         _ => (None, table_name),
@@ -2343,7 +2421,19 @@ fn normalize_type(db_type: DbType, type_name: &str) -> String {
                 _ => base.to_string(),
             }
         }
-        #[cfg(any(feature = "duckdb", feature = "clickhouse", feature = "influxdb"))]
+        #[cfg(feature = "duckdb")]
+        DbType::DuckDB => {
+            // DuckDB 兼容层（turso）会把 TEXT 声明回读为 VARCHAR：
+            // 标量字符串类型两侧必须归一到同一形态，否则 diff 永远报 AlterColumn。
+            if upper.ends_with("[]") {
+                upper
+            } else if upper.contains("CHAR") || upper.contains("CLOB") || upper.contains("TEXT") {
+                "TEXT".to_string()
+            } else {
+                upper
+            }
+        }
+        #[cfg(any(feature = "clickhouse", feature = "influxdb"))]
         _ => upper,
     }
 }
@@ -2538,7 +2628,7 @@ fn sqlite_conversion_validation_sql(
     ))
 }
 
-async fn execute_steps(
+pub(crate) async fn execute_steps(
     transaction: &mut Transaction<'_>,
     db_type: DbType,
     steps: &[MigrationStep],
@@ -2552,7 +2642,7 @@ async fn execute_steps(
     Ok(())
 }
 
-async fn execute_steps_nontransactional(
+pub(crate) async fn execute_steps_nontransactional(
     db: &Database,
     db_type: DbType,
     steps: &[MigrationStep],
@@ -2783,190 +2873,17 @@ impl Database {
         }
     }
 
+    /// 版本化迁移的表级 diff 入口（内部能力，服务 `MigrationStep` 生成与
+    /// 版本化迁移编排）。应用启动时的表结构对齐请改用
+    /// [`Database::apply_table`]：诊断与执行同源、幂等、策略可控。
     pub fn migrate_table<T: WritableModel>(&self) -> TableMigration<'_, T> {
         TableMigration {
             db: self,
             marker: PhantomData,
             renames: Vec::new(),
             table_name: None,
-        }
-    }
-
-    /// 确保表结构与模型一致，返回实际执行的动作。
-    ///
-    /// 1. 表不存在时直接创建；
-    /// 2. 存在结构差异时优先尝试增量迁移；
-    /// 3. 默认拒绝破坏性步骤：数据库中存在而模型中没有的列不会被删除，
-    ///    无法增量迁移（主键变更、超表分区约束冲突等）的差异也不会触发
-    ///    删表重建，而是返回 [`crate::OrmerError::UnmigratableSchema`]（可用
-    ///    `is_unmigratable_schema()` 编程判定）。确需删列或删表重建时，显式
-    ///    调用 [`Database::ensure_table_permissive`]，或先通过
-    ///    [`Database::migrate_table`] 的 [`MigrationPlan`] 预览再自行处理。
-    ///
-    /// TimescaleDB 拆表路由（仅 PostgreSQL）：模型声明 route key 时，基础表
-    /// 处理完成后还会用 `pg_class` 前缀查询枚举已存在的
-    /// `{基础表名}_{路由值}` 子表，对每个子表套用同样的校验、破坏性预检与
-    /// 增量迁移（不预建不存在的子表）；整体结果为两者中较严重者。
-    /// 非 PG 后端与无 route key 模型行为与开销不变。
-    pub async fn ensure_table<T: WritableModel>(
-        &self,
-    ) -> crate::Result<TableEnsureOutcome> {
-        self.ensure_table_inner::<T>(false).await
-    }
-
-    /// 与 [`Database::ensure_table`] 相同，但显式允许破坏性步骤：
-    /// 删除数据库中存在而模型中没有的列；差异无法增量迁移时删除整表并按
-    /// 当前模型重建（返回 [`TableEnsureOutcome::Recreated`]）。
-    pub async fn ensure_table_permissive<T: WritableModel>(
-        &self,
-    ) -> crate::Result<TableEnsureOutcome> {
-        self.ensure_table_inner::<T>(true).await
-    }
-
-    async fn ensure_table_inner<T: WritableModel>(
-        &self,
-        allow_destructive: bool,
-    ) -> crate::Result<TableEnsureOutcome> {
-        let base_outcome = self
-            .ensure_base_table_inner::<T>(allow_destructive)
-            .await?;
-        let child_outcome = self
-            .ensure_routed_child_tables::<T>(allow_destructive)
-            .await?;
-        Ok(base_outcome.merge(child_outcome))
-    }
-
-    /// 确保路由子表与当前模型一致（TimescaleDB 拆表迁移感知）。
-    ///
-    /// 模型声明 route key 时，写入路径把数据落到 `{基础表名}_{路由值}` 子表
-    /// 并在首次写入前按当时的 DDL 自动建表；模型演进后子表不会自行跟进。
-    /// 这里用 `pg_class` 前缀查询枚举已存在的子表，对每个子表按表名参数化
-    /// 复用与基础表相同的 schema 校验与增量迁移逻辑（含破坏性预检与
-    /// permissive 重建语义）。路由值无法枚举，不存在的子表不预建。
-    /// 非 PostgreSQL 后端与未声明 route key 的模型直接返回，行为与开销同
-    /// 改造前完全一致。
-    async fn ensure_routed_child_tables<T: WritableModel>(
-        &self,
-        allow_destructive: bool,
-    ) -> crate::Result<TableEnsureOutcome> {
-        #[cfg(feature = "postgresql")]
-        {
-            if !matches!(self.db_type(), DbType::PostgreSQL)
-                || T::hypertable_route_key().is_none()
-            {
-                return Ok(TableEnsureOutcome::Ready);
-            }
-            let mut outcome = TableEnsureOutcome::Ready;
-            for child in self.existing_routed_child_tables::<T>().await? {
-                outcome = outcome
-                    .merge(self.ensure_routed_child_table::<T>(&child, allow_destructive).await?);
-            }
-            Ok(outcome)
-        }
-        #[cfg(not(feature = "postgresql"))]
-        {
-            let _ = allow_destructive;
-            Ok(TableEnsureOutcome::Ready)
-        }
-    }
-
-    /// 迁移单个已存在的路由子表：与基础表相同的破坏性预检 → 增量迁移 →
-    /// 复验收敛；无法增量迁移时按 `ensure_table_permissive` 语义删表重建
-    /// （经 `create_table().with_table_name()` 参数化复用建表 DDL，含
-    /// create_hypertable 与索引）。
-    #[cfg(feature = "postgresql")]
-    async fn ensure_routed_child_table<T: WritableModel>(
-        &self,
-        child: &str,
-        allow_destructive: bool,
-    ) -> crate::Result<TableEnsureOutcome> {
-        // 枚举与执行之间子表可能被并发删除：跳过而非预建（写入路径会在
-        // 首次写入时按当前 DDL 自动创建）。
-        let Some(actual) = self.schema_columns(child).await? else {
-            return Ok(TableEnsureOutcome::Ready);
-        };
-        if !allow_destructive {
-            let dropped_columns = rejected_dropped_columns::<T>(&actual);
-            if !dropped_columns.is_empty() {
-                return Err(crate::OrmerError::unmigratable_schema(
-                    child,
-                    format!(
-                        "columns [{}] exist in the database but not in the model; \
-                         dropping them loses data. Call ensure_table_permissive() to opt in, \
-                         or write an explicit migration",
-                        dropped_columns.join(", ")
-                    ),
-                ));
-            }
-        }
-
-        let migration: TableMigration<'_, T> = TableMigration {
-            db: self,
-            marker: PhantomData,
-            renames: Vec::new(),
-            table_name: Some(child.to_string()),
-        };
-        match migration.plan_for_table(child).await {
-            Ok(plan) => {
-                migration.execute_plan(&plan).await?;
-                // 复验与基础表路径一致：计划执行后重算 diff，仍有差异说明
-                // 迁移未收敛，按 allow_destructive 决定报错或重建。
-                match migration.plan_for_table(child).await {
-                    Ok(post_plan) if post_plan.is_empty() => {
-                        // schema 已收敛：为旧版本创建的子表幂等补挂 TimescaleDB
-                        // 列存压缩（重建路径的建表 DDL 已自带该步骤）。
-                        self.apply_routed_columnstore::<T>(child).await?;
-                        Ok(TableEnsureOutcome::Migrated)
-                    }
-                    Ok(_) => {
-                        if !allow_destructive {
-                            return Err(crate::OrmerError::unmigratable_schema(
-                                child,
-                                "incremental migration did not reconcile the schema; \
-                                 fixing it requires dropping and recreating the table. \
-                                 Call ensure_table_permissive() to opt in, \
-                                 or write an explicit migration",
-                            ));
-                        }
-                        self.recreate_routed_child_table::<T>(child).await?;
-                        Ok(TableEnsureOutcome::Recreated)
-                    }
-                    Err(post_error) => {
-                        if !allow_destructive {
-                            return Err(crate::OrmerError::unmigratable_schema(
-                                child,
-                                format!(
-                                    "incremental migration did not reconcile the schema: \
-                                     {post_error}; fixing it requires dropping and recreating \
-                                     the table. Call ensure_table_permissive() to opt in, \
-                                     or write an explicit migration"
-                                ),
-                            ));
-                        }
-                        self.recreate_routed_child_table::<T>(child).await?;
-                        Ok(TableEnsureOutcome::Recreated)
-                    }
-                }
-            }
-            Err(migration_error)
-                if migration_error.is_unmigratable_schema()
-                    || is_schema_rebuild_error(&migration_error) =>
-            {
-                if !allow_destructive {
-                    return Err(crate::OrmerError::unmigratable_schema(
-                        child,
-                        format!(
-                            "schema differences cannot be migrated incrementally: \
-                             {migration_error}; fixing them requires dropping and recreating \
-                             the table. Call ensure_table_permissive() to opt in, \
-                             or write an explicit migration"
-                        ),
-                    ));
-                }
-                self.recreate_routed_child_table::<T>(child).await?;
-                Ok(TableEnsureOutcome::Recreated)
-            }
-            Err(migration_error) => Err(migration_error),
+            allow_inplace_pk: false,
+            extra_columns: crate::table_migrate::ExtraPolicy::Drop,
         }
     }
 
@@ -2975,7 +2892,7 @@ impl Database {
     /// CREATE TABLE + create_hypertable + 索引 + 列存压缩），与写入路径
     /// 自动建子表一致。
     #[cfg(feature = "postgresql")]
-    async fn recreate_routed_child_table<T: WritableModel>(
+    pub(crate) async fn recreate_routed_child_table<T: WritableModel>(
         &self,
         child: &str,
     ) -> crate::Result<()> {
@@ -2992,28 +2909,12 @@ impl Database {
         Ok(())
     }
 
-    /// 为已存在的路由子表幂等补挂 TimescaleDB 列存压缩（自适应）：仅 PG 且
-    /// 模型声明 route key + `#[hypertable]` 时生成语句，其余场景为空操作。
-    /// DO 块在后端不支持时静默跳过，纯存储优化不影响功能正确性。
-    #[cfg(feature = "postgresql")]
-    async fn apply_routed_columnstore<T: WritableModel>(&self, child: &str) -> crate::Result<()> {
-        if let Some(sql) =
-            crate::abstract_layer::postgresql_backend::hypertable_columnstore_sql::<T>(
-                self.db_type(),
-                child,
-            )
-        {
-            self.execute_sql(sql).await?;
-        }
-        Ok(())
-    }
-
     /// 用 `pg_class` 前缀查询枚举 PG 上已存在的路由子表，返回带 schema
     /// 前缀的完整表名（schema 解析与 `check_table_exists` 等既有逻辑一致：
     /// 模型表名可带前缀，无前缀按 `public` 处理）。结果按表名排序，保证
     /// 迁移计划与执行顺序确定性。
     #[cfg(feature = "postgresql")]
-    async fn existing_routed_child_tables<T: WritableModel>(
+    pub(crate) async fn existing_routed_child_tables<T: WritableModel>(
         &self,
     ) -> crate::Result<Vec<String>> {
         let base = T::table_name_for_db(self.db_type());
@@ -3027,91 +2928,30 @@ impl Database {
         Ok(rows.into_iter().map(|name| format!("{schema}.{name}")).collect())
     }
 
-    async fn ensure_base_table_inner<T: WritableModel>(
+    /// [`Database::apply_table`] 的策略预设薄糖：Keep 多余列 + Refuse 重建 +
+    /// 非并发建索引（与改造前 ensure_table 的执行形态一致）。
+    ///
+    /// 语义差异说明：改造前遇到"库中有而模型没有"的列时整体报错拒绝；
+    /// 现按 Keep 策略保留多余列并继续迁移其余差异（规格书 §4.1 拍板：
+    /// Keep = 保留，最保守）。
+    pub async fn ensure_table<T: WritableModel>(
         &self,
-        allow_destructive: bool,
     ) -> crate::Result<TableEnsureOutcome> {
-        let table_name = T::table_name_for_db(self.db_type());
-        let actual = self.schema_columns(table_name).await?;
-        let Some(actual) = actual else {
-            self.create_table::<T>().execute().await?;
-            return Ok(TableEnsureOutcome::Ready);
-        };
-
-        let validation_error = match self.validate_table::<T>().await {
-            Ok(()) => return Ok(TableEnsureOutcome::Ready),
-            Err(err) => err,
-        };
-        if !is_schema_rebuild_error(&validation_error) {
-            return Err(validation_error);
-        }
-
-        // 默认策略：计划会删除"数据库有、模型没有"的列（非 SQLite 生成
-        // DropColumn，SQLite 触发整表重建），执行前直接拒绝。
-        if !allow_destructive {
-            let dropped_columns = rejected_dropped_columns::<T>(&actual);
-            if !dropped_columns.is_empty() {
-                return Err(crate::OrmerError::unmigratable_schema(
-                    table_name,
-                    format!(
-                        "columns [{}] exist in the database but not in the model; \
-                         dropping them loses data. Call ensure_table_permissive() to opt in, \
-                         or write an explicit migration",
-                        dropped_columns.join(", ")
-                    ),
-                ));
-            }
-        }
-
-        let migration = self.migrate_table::<T>();
-        match migration.plan_base_only().await {
-            Ok(plan) => {
-                migration.execute_plan(&plan).await?;
-                match self.validate_table::<T>().await {
-                    Ok(()) => Ok(TableEnsureOutcome::Migrated),
-                    Err(post_error) => {
-                        if !allow_destructive {
-                            return Err(crate::OrmerError::unmigratable_schema(
-                                table_name,
-                                format!(
-                                    "incremental migration did not reconcile the schema: \
-                                     {post_error}; fixing it requires dropping and recreating \
-                                     the table. Call ensure_table_permissive() to opt in, \
-                                     or write an explicit migration"
-                                ),
-                            ));
-                        }
-                        self.recreate_table_internal::<T>().await?;
-                        Ok(TableEnsureOutcome::Recreated)
-                    }
-                }
-            }
-            Err(migration_error)
-                if migration_error.is_unmigratable_schema()
-                    || is_schema_rebuild_error(&migration_error) =>
-            {
-                if !allow_destructive {
-                    return Err(crate::OrmerError::unmigratable_schema(
-                        table_name,
-                        format!(
-                            "schema differences cannot be migrated incrementally: \
-                             {migration_error}; fixing them requires dropping and recreating \
-                             the table. Call ensure_table_permissive() to opt in, \
-                             or write an explicit migration"
-                        ),
-                    ));
-                }
-                self.recreate_table_internal::<T>().await?;
-                Ok(TableEnsureOutcome::Recreated)
-            }
-            Err(migration_error) => Err(migration_error),
-        }
+        let outcome = self
+            .apply_table::<T>(&crate::table_migrate::ApplyOptions::strict())
+            .await?;
+        Ok(ensure_outcome_from_apply(&outcome))
     }
 
-    async fn recreate_table_internal<T: WritableModel>(&self) -> crate::Result<()> {
-        self.drop_table::<T>().execute().await?;
-        self.create_table::<T>().execute().await?;
-        self.validate_table::<T>().await
+    /// [`Database::apply_table`] 的策略预设薄糖：Drop 多余列 + Allow 重建
+    /// （对齐改造前 ensure_table_permissive 语义）。
+    pub async fn ensure_table_permissive<T: WritableModel>(
+        &self,
+    ) -> crate::Result<TableEnsureOutcome> {
+        let outcome = self
+            .apply_table::<T>(&crate::table_migrate::ApplyOptions::permissive())
+            .await?;
+        Ok(ensure_outcome_from_apply(&outcome))
     }
 
     pub fn migrations<'a, M: Migration>(&'a self, migrations: &'a [M]) -> MigrationRunner<'a, M> {
@@ -3338,7 +3178,7 @@ impl Database {
         )),
         allow(unused_variables)
     )]
-    async fn schema_columns(
+    pub(crate) async fn schema_columns(
         &self,
         table_name: &str,
     ) -> crate::Result<Option<Vec<crate::migration::SchemaColumn>>> {
@@ -3385,7 +3225,7 @@ impl Database {
         )),
         allow(unreachable_code, unused_variables)
     )]
-    async fn db_first_table_for(
+    pub(crate) async fn db_first_table_for(
         &self,
         table_name: &str,
     ) -> crate::Result<Option<DbFirstTable>> {
@@ -3442,50 +3282,6 @@ impl Database {
             .collect::<Vec<i64>>()
             .await?;
         Ok(rows.into_iter().next().unwrap_or(0).max(0) as u64)
-    }
-
-    /// QuestDB 表结构校验：基于 `table_columns` 自省结果逐列比对。
-    ///
-    /// QuestDB 没有主键/NOT NULL 约束，这两项不参与比较；类型不一致按
-    /// UnmigratableSchema 报告，由 `ensure_table` 引导到增量迁移路径。
-    #[cfg(feature = "questdb")]
-    pub(crate) async fn validate_table_questdb<T: WritableModel>(&self) -> crate::Result<()> {
-        let db_type = self.db_type();
-        let table_name = T::table_name_for_db(db_type);
-        let Some(actual) = self.schema_columns(table_name).await? else {
-            return Err(crate::ormer_error!(
-                "Schema mismatch: table {table_name}, reason: Table does not exist"
-            ));
-        };
-        let actual_by_name: BTreeMap<&str, &SchemaColumn> = actual
-            .iter()
-            .map(|column| (column.name.as_str(), column))
-            .collect();
-        for expected in T::COLUMN_SCHEMA {
-            let Some(actual) = actual_by_name.get(expected.name) else {
-                return Err(crate::OrmerError::unmigratable_schema(
-                    table_name,
-                    format!("Column {} is missing", expected.name),
-                ));
-            };
-            if actual.type_name.is_empty() {
-                return Err(crate::ormer_error!(
-                    "Cannot determine the database type of column {}",
-                    expected.name
-                ));
-            }
-            let expected_type = column_type_definition(db_type, expected);
-            if !types_equivalent(db_type, &actual.type_name, &expected_type) {
-                return Err(crate::OrmerError::unmigratable_schema(
-                    table_name,
-                    format!(
-                        "Column {} has type {}, expected {}",
-                        expected.name, actual.type_name, expected_type
-                    ),
-                ));
-            }
-        }
-        Ok(())
     }
 
     async fn validate_hypertable_for_migration<T: WritableModel>(&self) -> crate::Result<()> {

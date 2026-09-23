@@ -294,7 +294,10 @@ async fn duckdb_supports_conflicts_bulk_updates_and_arrays()
 -> Result<(), Box<dyn std::error::Error>> {
     let db = ormer::Database::connect(DbType::DuckDB, ":memory:").await?;
     db.create_table::<DuckDbExtendedUser>().execute().await?;
-    db.validate_table::<DuckDbExtendedUser>().await?;
+    assert!(
+        matches!(db.plan_table::<DuckDbExtendedUser>().await?, ormer::TableDiagnosis::Ready),
+        "table should match model after create"
+    );
 
     db.insert(&DuckDbExtendedUser {
         id: 1,
