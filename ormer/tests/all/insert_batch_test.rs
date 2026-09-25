@@ -1,0 +1,196 @@
+#![cfg(any(feature = "sqlite", feature = "postgresql", feature = "mysql"))]
+
+// 使用宏定义测试专用模型（唯一表名）
+define_test_user_simple!(TestUser1, "test_insert_batch_users_1");
+define_test_user_simple!(TestUser2, "test_insert_batch_users_2");
+define_test_user_simple!(TestUser3, "test_insert_batch_users_3");
+
+async fn test_insert_single_and_batch_impl(
+    config: &crate::_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 连接数据库
+    let db = crate::_test_common::create_db_connection(config).await?;
+
+    // 先删除表（如果存在）
+    let _ = db.drop_table::<TestUser1>().execute().await;
+
+    db.create_table::<TestUser1>().execute().await?;
+
+    // 测试插入单个对象
+    db.insert(&TestUser1 {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 20,
+    })
+    .execute()
+    .await?;
+    println!("插入单个对象成功");
+
+    // 查询验证
+    let users = db.select::<TestUser1>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].name, "Alice");
+    println!("第一次查询: {:?}", users);
+
+    // 测试插入 Vec（使用 &vec![...]）
+    db.insert(&vec![
+        TestUser1 {
+            id: 2,
+            name: "Bob".to_string(),
+            age: 25,
+        },
+        TestUser1 {
+            id: 3,
+            name: "Charlie".to_string(),
+            age: 30,
+        },
+    ])
+    .execute()
+    .await?;
+    println!("插入 Vec 成功");
+
+    // 查询验证
+    let users = db.select::<TestUser1>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 3);
+    println!("第二次查询: {:?}", users);
+
+    // 测试插入数组切片
+    let users_array = vec![
+        TestUser1 {
+            id: 4,
+            name: "David".to_string(),
+            age: 35,
+        },
+        TestUser1 {
+            id: 5,
+            name: "Eve".to_string(),
+            age: 28,
+        },
+    ];
+    db.insert(&users_array).execute().await?;
+    println!("插入数组切片成功");
+
+    // 查询验证
+    let users = db.select::<TestUser1>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 5);
+    println!("第三次查询: {:?}", users);
+
+    println!("\n测试通过！insert 方法支持单个对象和数组");
+
+    // 清理测试表
+    db.drop_table::<TestUser1>().execute().await?;
+
+    Ok(())
+}
+
+async fn test_insert_or_update_single_and_batch_impl(
+    config: &crate::_test_common::DbConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // 连接数据库
+    let db = crate::_test_common::create_db_connection(config).await?;
+
+    // 先删除表（如果存在）
+    let _ = db.drop_table::<TestUser2>().execute().await;
+
+    db.create_table::<TestUser2>().execute().await?;
+
+    // 测试插入或更新单个对象
+    db.insert_or_update(&TestUser2 {
+        id: 1,
+        name: "Alice".to_string(),
+        age: 20,
+    })
+    .execute()
+    .await?;
+    println!("第一次 insert_or_update 单个对象成功");
+
+    // 查询验证
+    let users = db.select::<TestUser2>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].name, "Alice");
+    println!("第一次查询: {:?}", users);
+
+    // 使用 insert_or_update 更新同一条记录
+    db.insert_or_update(&TestUser2 {
+        id: 1,
+        name: "Alice Updated".to_string(),
+        age: 21,
+    })
+    .execute()
+    .await?;
+    println!("第二次 insert_or_update 单个对象成功（更新操作）");
+
+    // 查询验证
+    let users = db.select::<TestUser2>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].name, "Alice Updated");
+    assert_eq!(users[0].age, 21);
+    println!("第二次查询: {:?}", users);
+
+    // 测试批量 insert_or_update
+    db.insert_or_update(&vec![
+        TestUser2 {
+            id: 1,
+            name: "Alice Again".to_string(),
+            age: 22,
+        },
+        TestUser2 {
+            id: 2,
+            name: "Bob".to_string(),
+            age: 25,
+        },
+        TestUser2 {
+            id: 3,
+            name: "Charlie".to_string(),
+            age: 30,
+        },
+    ])
+    .execute()
+    .await?;
+    println!("批量 insert_or_update 成功");
+
+    // 查询验证
+    let users = db.select::<TestUser2>().collect::<Vec<_>>().await?;
+    assert_eq!(users.len(), 3);
+    assert_eq!(users[0].name, "Alice Again"); // id=1 被更新
+    assert_eq!(users[1].name, "Bob"); // id=2 新插入
+    assert_eq!(users[2].name, "Charlie"); // id=3 新插入
+    println!("第三次查询: {:?}", users);
+
+    println!("\n测试通过！insert_or_update 方法支持单个对象和数组");
+
+    // 清理测试表
+    db.drop_table::<TestUser2>().execute().await?;
+
+    Ok(())
+}
+
+test_on_all_dbs_result!(test_insert_single_and_batch_impl);
+test_on_all_dbs_result!(test_insert_or_update_single_and_batch_impl);
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn test_insert_batch_auto_chunks_sqlite() -> Result<(), Box<dyn std::error::Error>> {
+    let config = crate::_test_common::sqlite_config();
+    let db = crate::_test_common::create_db_connection(&config).await?;
+    let _ = db.drop_table::<TestUser3>().execute().await;
+    db.create_table::<TestUser3>().execute().await?;
+
+    let users = (1..=350)
+        .map(|id| TestUser3 {
+            id,
+            name: format!("User {id}"),
+            age: 20 + id % 30,
+        })
+        .collect::<Vec<_>>();
+
+    let sql = db.insert(&users).to_sql()?;
+    assert!(sql.statements.len() > 1);
+
+    db.insert(&users).execute().await?;
+    let inserted = db.select::<TestUser3>().collect::<Vec<_>>().await?;
+    assert_eq!(inserted.len(), users.len());
+
+    db.drop_table::<TestUser3>().execute().await?;
+    Ok(())
+}

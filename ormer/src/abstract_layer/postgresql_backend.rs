@@ -1661,7 +1661,7 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
 }
 
 /// 将驼峰命名转换为蛇形命名
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
         if c.is_uppercase() {

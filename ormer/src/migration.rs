@@ -11,6 +11,8 @@ use crate::abstract_layer::common::{Database, Transaction};
 use crate::db_first::{DbFirstForeignKey, DbFirstTable};
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
 use crate::model::CompressionAlgorithm;
+#[cfg(feature = "postgresql")]
+use crate::model::DurationToInterval;
 use crate::model::{ColumnSchema, WritableModel};
 use crate::table_migrate::ExpectedCheck;
 use std::collections::{BTreeMap, BTreeSet};
@@ -407,9 +409,22 @@ impl MigrationStep {
                     DbType::MySQL => Ok(format!("DROP INDEX {name} ON {table}")),
                     #[cfg(feature = "mssql")]
                     DbType::MSSQL => Ok(format!("DROP INDEX {name} ON {table}")),
-                    // SQLite / PostgreSQL / DuckDB：索引名在库内唯一，支持 IF EXISTS
+                    // SQLite / PostgreSQL / DuckDB：索引名在库内唯一，支持 IF EXISTS。
+                    // PG 的索引名只在 schema 内唯一，必须以表所在 schema 限定：
+                    // 业务表多落在非默认 schema（search_path 不含它），裸索引名
+                    // 会被 IF EXISTS 静默吞掉——删除没生效而计划视为已执行，
+                    // 复验不收敛就会误触发删表重建。
                     #[allow(unreachable_patterns)]
-                    _ => Ok(format!("DROP INDEX IF EXISTS {name}")),
+                    _ => {
+                        let index_name = match split_qualified_table_name(&table) {
+                            (Some(schema), _) => format!(
+                                "{}.{name}",
+                                crate::model::quote_identifier(db_type, schema)
+                            ),
+                            (None, _) => name,
+                        };
+                        Ok(format!("DROP INDEX IF EXISTS {index_name}"))
+                    }
                 }
             }
             Self::AddForeignKey {
@@ -926,10 +941,20 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             if table_name != T::table_name_for_db(db_type) {
                 return Ok(plan);
             }
+            // 建表配套步骤对齐 CreateTableExecutor 的 DDL 序列：
+            // 枚举/EXTENSION 前置，create_hypertable 后置（缺了前者建表
+            // 直接报缺类型，缺了后者表永远不是超表、复验必不收敛）。
+            let (pre, post) = create_table_bootstrap_steps::<T>(db_type, table_name);
+            for step in pre {
+                plan.push(step);
+            }
             plan.push(MigrationStep::CreateTable {
                 table: table_name.to_string(),
                 definition: crate::generate_create_table_sql::<T>(db_type)?,
             });
+            for step in post {
+                plan.push(step);
+            }
             return Ok(plan);
         };
 
@@ -1946,6 +1971,72 @@ pub(crate) struct ExpectedIndexDef<'a> {
 /// 分组口径与建表路径（`generate_indexes_with_name` + 内联 UNIQUE）及校验
 /// 路径（`db_first::validate_model_constraints`）一致：未分组单列索引按列
 /// 独立成组，`index_group`/`unique_group` 各自聚合。
+/// 建表配套步骤：与 `CreateTableExecutor` 的 DDL 序列对齐，把建表 DDL
+/// 不覆盖的部分拆成前置（EXTENSION、枚举类型）与后置（create_hypertable）
+/// 两组。`MigrationStep::CreateTable` 的渲染只含 CREATE TABLE/索引 DDL；
+/// 建表计划若不带这些步骤，增量路径（含 ensure 对缺失表的自动建表）建出
+/// 的表要么缺枚举类型直接报错，要么永远是普通表、复验必报 Hypertable
+/// mismatch 而卡死或触发删表重建。
+/// 返回 `(前置步骤, 后置步骤)`：前置须在 CreateTable 之前执行，后置在其后。
+#[allow(unused_variables)]
+pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
+    db_type: DbType,
+    table_name: &str,
+) -> (Vec<MigrationStep>, Vec<MigrationStep>) {
+    #[cfg(feature = "postgresql")]
+    {
+        if matches!(db_type, DbType::PostgreSQL) {
+            // 枚举类型前置：DO 块幂等创建（与 CreateTableExecutor 的模板一致）。
+            let mut pre: Vec<MigrationStep> = T::column_schema()
+                .iter()
+                .filter_map(|column| {
+                    column.enum_variants.map(|variants| {
+                        let enum_name =
+                            crate::abstract_layer::postgresql_backend::to_snake_case(
+                                column.rust_type,
+                            );
+                        let variants_str = variants
+                            .iter()
+                            .map(|v| format!("'{v}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        MigrationStep::Sql {
+                            sql: format!(
+                                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{enum_name}') THEN CREATE TYPE {enum_name} AS ENUM ({variants_str}); END IF; END $$"
+                            ),
+                        }
+                    })
+                })
+                .collect();
+            if let Some((time_column, chunk_interval)) = T::hypertable_info() {
+                // 超表模型：EXTENSION 前置、create_hypertable 后置。
+                // create_default_indexes => FALSE：与 CreateTableExecutor 一致，
+                // 避免 TimescaleDB 默认索引使实际索引集合偏离模型声明。
+                pre.push(MigrationStep::Sql {
+                    sql: "CREATE EXTENSION IF NOT EXISTS timescaledb".to_string(),
+                });
+                let interval_str = chunk_interval.to_interval_string();
+                let hypertable_sql =
+                    if let Some((space_column, partitions)) = T::hypertable_space_info() {
+                        format!(
+                            "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', partitioning_column => '{space_column}', number_partitions => {partitions}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
+                        )
+                    } else {
+                        format!(
+                            "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
+                        )
+                    };
+                let post = vec![MigrationStep::Sql {
+                    sql: hypertable_sql,
+                }];
+                return (pre, post);
+            }
+            return (pre, Vec::new());
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
 pub(crate) fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'static>> {
     let mut defs = Vec::new();
 
@@ -2668,9 +2759,34 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut in_block_comment = false;
     let mut trigger_mode = false;
     let mut trigger_depth = 0usize;
+    // PG dollar-quote（$$...$$ / $tag$...$tag$）：体内分号/引号一律不参与
+    // 拆分。DO $$ ... END $$ 块（枚举类型创建等）依赖此状态才能整条送达。
+    let mut in_dollar = false;
+    let mut dollar_tag = String::new();
     let mut chars = sql.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if in_dollar {
+            current.push(c);
+            if c == '$' {
+                // 匹配定界符剩余部分（dollar_tag 首字符 '$' 已消费）。
+                let rest = &dollar_tag[1..];
+                let mut matched = String::new();
+                for expected in rest.chars() {
+                    if chars.peek() == Some(&expected) {
+                        matched.push(chars.next().expect("peeked char"));
+                    } else {
+                        break;
+                    }
+                }
+                current.push_str(&matched);
+                if matched == rest {
+                    in_dollar = false;
+                }
+            }
+            continue;
+        }
+
         if in_line_comment {
             current.push(c);
             if c == '\n' {
@@ -2731,6 +2847,38 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
                     current.push(chars.next().expect("peeked bracket"));
                 } else {
                     in_bracket = false;
+                }
+            }
+            continue;
+        }
+
+        if c == '$' {
+            // 尝试解析 dollar-quote 开定界符：$$ 或 $ident$；其余（如 PG
+            // 参数占位符 $1）按普通字符处理。
+            let mut probe = chars.clone();
+            let mut ident = String::new();
+            loop {
+                match probe.next() {
+                    Some('$') => {
+                        dollar_tag = format!("${ident}$");
+                        let rest = dollar_tag[1..].to_string();
+                        for _ in 0..rest.chars().count() {
+                            chars.next();
+                        }
+                        flush_sql_word(&mut word, trigger_mode, &mut trigger_depth);
+                        current.push(c);
+                        current.push_str(&rest);
+                        in_dollar = true;
+                        break;
+                    }
+                    Some(ch) if ch.is_ascii_alphanumeric() || ch == '_' => {
+                        ident.push(ch);
+                    }
+                    _ => {
+                        flush_sql_word(&mut word, trigger_mode, &mut trigger_depth);
+                        current.push(c);
+                        break;
+                    }
                 }
             }
             continue;
@@ -3653,5 +3801,281 @@ mod routed_child_migration_tests {
         assert!(sql.contains("nspname = 'collect'"));
         assert!(sql.contains(r"LIKE 'events\_%'"));
         assert!(sql.contains("AND c.relname <> 'events'"));
+    }
+}
+
+/// DropIndex 渲染必须以表所在 schema 限定索引名：业务表多在非默认 schema，
+/// 裸索引名叠加 IF EXISTS 会在 search_path 不含该 schema 时静默空转——
+/// 删除未生效而计划视为已执行，复验不收敛就会误触发删表重建。
+#[cfg(all(test, feature = "postgresql"))]
+mod drop_index_render_tests {
+    use super::{DbType, MigrationStep};
+
+    #[test]
+    fn drop_index_renders_schema_qualified_name() {
+        let step = MigrationStep::DropIndex {
+            table: "collect.collect_exception_logs".to_string(),
+            name: "collect_exception_logs_event_time_idx".to_string(),
+        };
+        let sql = step.sql(DbType::PostgreSQL).expect("render drop index");
+        assert_eq!(
+            sql,
+            "DROP INDEX IF EXISTS collect.collect_exception_logs_event_time_idx"
+        );
+    }
+
+    #[test]
+    fn drop_index_without_schema_keeps_bare_name() {
+        let step = MigrationStep::DropIndex {
+            table: "plain_events".to_string(),
+            name: "plain_events_time_idx".to_string(),
+        };
+        let sql = step.sql(DbType::PostgreSQL).expect("render drop index");
+        assert_eq!(sql, "DROP INDEX IF EXISTS plain_events_time_idx");
+    }
+}
+
+/// 建表计划必须随带配套步骤：`CreateTable` 渲染只含 CREATE TABLE/索引 DDL，
+/// 计划缺前置枚举类型会直接报缺类型，缺后置 create_hypertable 则表永远不是
+/// 超表、复验必报 Hypertable mismatch。
+#[cfg(all(test, feature = "postgresql"))]
+mod create_table_bootstrap_tests {
+    use super::{DbType, MigrationStep, create_table_bootstrap_steps};
+    use crate::model::{ColumnSchema, WritableModel};
+
+    /// 手写列元数据：时间列（7 天分片）+ 空间分区列 + 一个枚举列（task_kind）。
+    fn mock_columns() -> Vec<ColumnSchema> {
+        vec![
+            ColumnSchema {
+                rust_name: "event_time",
+                name: "event_time",
+                rust_type: "DateTimeUtc",
+                is_primary: true,
+                is_auto_increment: false,
+                is_nullable: false,
+                unique_group: None,
+                unique_name: None,
+                is_indexed: false,
+                index_group: None,
+                index_name: None,
+                index_order: None,
+                index_where: None,
+                foreign_key: None,
+                enum_variants: None,
+                data_type: None,
+                db_value_type: None,
+                default: None,
+                check: None,
+                hypertable: Some(std::time::Duration::from_secs(7 * 86_400)),
+                hypertable_space: None,
+                compress: false,
+                compression: None,
+                index_method: None,
+                index_expression: None,
+                index_columns: None,
+            },
+            ColumnSchema {
+                rust_name: "project_id",
+                name: "project_id",
+                rust_type: "String",
+                is_primary: true,
+                is_auto_increment: false,
+                is_nullable: false,
+                unique_group: None,
+                unique_name: None,
+                is_indexed: false,
+                index_group: None,
+                index_name: None,
+                index_order: None,
+                index_where: None,
+                foreign_key: None,
+                enum_variants: None,
+                data_type: None,
+                db_value_type: None,
+                default: None,
+                check: None,
+                hypertable: None,
+                hypertable_space: Some(4),
+                compress: false,
+                compression: None,
+                index_method: None,
+                index_expression: None,
+                index_columns: None,
+            },
+            ColumnSchema {
+                rust_name: "task_kind",
+                name: "task_kind",
+                rust_type: "TaskKind",
+                is_primary: false,
+                is_auto_increment: false,
+                is_nullable: false,
+                unique_group: None,
+                unique_name: None,
+                is_indexed: false,
+                index_group: None,
+                index_name: None,
+                index_order: None,
+                index_where: None,
+                foreign_key: None,
+                enum_variants: Some(&["loading", "unloading"]),
+                data_type: None,
+                db_value_type: None,
+                default: None,
+                check: None,
+                hypertable: None,
+                hypertable_space: None,
+                compress: false,
+                compression: None,
+                index_method: None,
+                index_expression: None,
+                index_columns: None,
+            },
+        ]
+    }
+
+    struct MockHypertableEnumModel;
+
+    impl crate::Model for MockHypertableEnumModel {
+        const TABLE_NAME: &'static str = "mock_hypertable_enum_models";
+        const COLUMNS: &'static [&'static str] = &["event_time", "project_id", "task_kind"];
+        const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+
+        type AutoIncrementKeyType = ();
+        type QueryBuilder = ();
+        type Where = ();
+        type Update = ();
+
+        fn query() -> Self::QueryBuilder {}
+
+        fn select() -> Self::QueryBuilder {}
+
+        fn from_row(_row: &crate::Row) -> crate::Result<Self> {
+            unreachable!()
+        }
+
+        fn from_row_values(_values: &[crate::Value]) -> crate::Result<Self> {
+            unreachable!()
+        }
+
+        fn field_values(&self) -> Vec<crate::Value> {
+            Vec::new()
+        }
+
+        fn primary_key_values(&self) -> Vec<crate::Value> {
+            Vec::new()
+        }
+
+        fn column_schema() -> Vec<ColumnSchema> {
+            mock_columns()
+        }
+    }
+
+    impl WritableModel for MockHypertableEnumModel {}
+
+    #[test]
+    fn bootstrap_steps_cover_enum_extension_and_hypertable() {
+        let (pre, post) = create_table_bootstrap_steps::<MockHypertableEnumModel>(
+            DbType::PostgreSQL,
+            "collect.mock_hypertable_enum_models",
+        );
+        // 前置：枚举类型 DO 块 + timescaledb 扩展
+        assert_eq!(pre.len(), 2);
+        let MigrationStep::Sql { sql: enum_sql } = &pre[0] else {
+            panic!("expected Sql step");
+        };
+        assert_eq!(
+            enum_sql,
+            "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'task_kind') THEN CREATE TYPE task_kind AS ENUM ('loading', 'unloading'); END IF; END $$"
+        );
+        let MigrationStep::Sql { sql: extension } = &pre[1] else {
+            panic!("expected Sql step");
+        };
+        assert_eq!(extension, "CREATE EXTENSION IF NOT EXISTS timescaledb");
+        // 后置：create_hypertable 转换
+        assert_eq!(post.len(), 1);
+        let MigrationStep::Sql { sql: hypertable } = &post[0] else {
+            panic!("expected Sql step");
+        };
+        assert_eq!(
+            hypertable,
+            "SELECT create_hypertable('collect.mock_hypertable_enum_models', 'event_time', \
+             chunk_time_interval => INTERVAL '7 days', partitioning_column => 'project_id', \
+             number_partitions => 4, if_not_exists => TRUE, migrate_data => TRUE, \
+             create_default_indexes => FALSE)"
+        );
+    }
+
+    #[test]
+    fn plain_model_gets_no_bootstrap_steps() {
+        struct MockPlainModel;
+
+        impl crate::Model for MockPlainModel {
+            const TABLE_NAME: &'static str = "mock_plain_models";
+            const COLUMNS: &'static [&'static str] = &["id", "name"];
+            const COLUMN_SCHEMA: &'static [ColumnSchema] = &[];
+
+            type AutoIncrementKeyType = ();
+            type QueryBuilder = ();
+            type Where = ();
+            type Update = ();
+
+            fn query() -> Self::QueryBuilder {}
+
+            fn select() -> Self::QueryBuilder {}
+
+            fn from_row(_row: &crate::Row) -> crate::Result<Self> {
+                unreachable!()
+            }
+
+            fn from_row_values(_values: &[crate::Value]) -> crate::Result<Self> {
+                unreachable!()
+            }
+
+            fn field_values(&self) -> Vec<crate::Value> {
+                Vec::new()
+            }
+
+            fn primary_key_values(&self) -> Vec<crate::Value> {
+                Vec::new()
+            }
+        }
+
+        impl WritableModel for MockPlainModel {}
+
+        let (pre, post) =
+            create_table_bootstrap_steps::<MockPlainModel>(DbType::PostgreSQL, "mock_plain_models");
+        assert!(pre.is_empty());
+        assert!(post.is_empty());
+    }
+}
+
+/// 拆分器必须把 PG dollar-quote 体（DO 块等）当单条语句：体内分号、引号
+/// 不参与拆分，否则枚举类型创建会被切断成不完整 SQL。
+#[cfg(all(test, feature = "postgresql"))]
+mod split_sql_dollar_tests {
+    use super::split_sql_statements;
+
+    #[test]
+    fn dollar_quoted_do_block_stays_intact() {
+        let sql = "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'task_kind') \
+                   THEN CREATE TYPE task_kind AS ENUM ('a', 'b'); END IF; END $$; SELECT 1; SELECT 2";
+        let statements = split_sql_statements(sql);
+        assert_eq!(statements.len(), 3);
+        assert!(statements[0].starts_with("DO $$"));
+        assert!(statements[0].ends_with("END $$"));
+        assert!(statements[0].contains("AS ENUM ('a', 'b');"));
+        assert_eq!(statements[1], "SELECT 1");
+        assert_eq!(statements[2], "SELECT 2");
+    }
+
+    #[test]
+    fn tagged_dollar_quote_and_placeholders() {
+        // $fn$ 定界的体内分号不拆分；$1 是参数占位符不是 dollar quote。
+        let sql = "$fn$ body; with $1 maybe $fn$; SELECT $1::int";
+        let statements = split_sql_statements(sql);
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("$fn$"));
+        assert!(statements[0].ends_with("$fn$"));
+        assert_eq!(statements[1], "SELECT $1::int");
     }
 }

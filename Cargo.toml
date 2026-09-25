@@ -4,3 +4,7 @@ members = ["ormer", "ormer-derive"]
 
 [profile.test]
 debug = 0
+# 全部测试合并为单一二进制（ormer/tests/all/），-Os 可将其从 236MB 压到 152MB：
+# 显著缩短链接与进程加载时间（本机杀软对新的大型未签名 exe 启动扫描极慢，
+# 过大的二进制甚至会被隔离），同时测试执行也更快
+opt-level = "s"

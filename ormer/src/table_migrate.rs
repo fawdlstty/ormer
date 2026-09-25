@@ -892,10 +892,22 @@ impl Database {
                 // 路由子表不预建：不存在时视为就绪（写入路径按当前 DDL 自动建）。
                 return Ok(TableDiagnosis::Ready);
             }
+            // 建表配套步骤对齐 CreateTableExecutor 的 DDL 序列：
+            // 枚举/EXTENSION 前置，create_hypertable 后置（缺了前者建表
+            // 直接报缺类型，缺了后者表永远不是超表、下一轮诊断必报
+            // Hypertable mismatch）。
+            let (pre, post) =
+                crate::migration::create_table_bootstrap_steps::<T>(db_type, target);
+            for step in pre {
+                plan.push(step);
+            }
             plan.push(MigrationStep::CreateTable {
                 table: target.to_string(),
                 definition: crate::generate_create_table_sql::<T>(db_type)?,
             });
+            for step in post {
+                plan.push(step);
+            }
             return Ok(TableDiagnosis::Migratable(plan));
         }
 

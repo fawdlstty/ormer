@@ -1,6 +1,6 @@
 [package]
 name = "ormer"
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -59,10 +59,6 @@ tokio-util = { version = "0.7.19", features = ["compat"], optional = true }
 
 [dev-dependencies]
 paste = "1.0"
-
-[[test]]
-name = "aggregate_test"
-harness = true
 
 [package.metadata.docs.rs]
 all-features = true
