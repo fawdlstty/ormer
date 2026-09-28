@@ -1,11 +1,12 @@
-//! 表迁移统一入口：`plan_table` / `apply_table`。
+//! 表迁移统一入口：`migrate_table`（内部诊断路径 `plan_table`）。
 //!
 //! 设计原则（规格书 auto.md 第四章）：
-//! ① 判断与执行各只有一个入口：`plan_table` 诊断、`apply_table` 执行；
+//! ① 判断与执行各只有一个入口：`plan_table` 诊断（内部）、`migrate_table` 执行；
 //! ② 内省数据不出 ormer：所有 pg_* 自省由本模块内部消费，不设细粒度公开 API；
-//! ③ 项目只声明"模型 + 策略"（[`ApplyOptions`]）；
-//! ④ 全部幂等：apply 可被启动重试循环反复调用，CONCURRENTLY 残留在 apply 内自愈；
-//! ⑤ plan 与 apply 同源：apply 内部就是重新诊断（`diagnose_table`）后按计划执行。
+//! ③ 项目只声明模型：迁移策略全部内化为固定语义（多余列删除、推不动即报错、
+//!    索引并发建、扩展从模型推导）；
+//! ④ 全部幂等：migrate 可被启动重试循环反复调用，CONCURRENTLY 残留在 migrate 内自愈；
+//! ⑤ plan 与 migrate 同源：migrate 内部就是重新诊断（`diagnose_table`）后按计划执行。
 
 use crate::abstract_layer::DbType;
 use crate::abstract_layer::common::{Database, Transaction};
@@ -18,8 +19,8 @@ use crate::migration::{
 use crate::model::WritableModel;
 use std::collections::BTreeSet;
 
-/// [`Database::plan_table`] 产出的执行计划。与版本化迁移的 [`MigrationPlan`]
-/// 同一载体（同源设计）：`steps()` / `to_sql()` 可在执行前审查。
+/// [`Database::plan_table`] 产出的执行计划（内部诊断路径）。与版本化迁移的
+/// [`MigrationPlan`] 同一载体（同源设计）：`steps()` / `to_sql()` 可在执行前审查。
 pub type TablePlan = MigrationPlan;
 
 /// 表迁移诊断结论。
@@ -53,81 +54,13 @@ impl RebuildCause {
     }
 }
 
-/// 多余列处理策略：模型已删、库里还在的列。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtraPolicy {
-    /// 保留（默认，最保守）：多余列留在库内，不参与任何 DDL。
-    Keep,
-    /// 删除（对齐旧 ensure_table_permissive 语义）：生成 DropColumn 步骤。
-    Drop,
-}
-
-/// 诊断为 [`TableDiagnosis::NeedsRebuild`] 时的处置策略。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RebuildPolicy {
-    /// 报错返回（默认，丢数据不可接受场景）。
-    Refuse,
-    /// 删表重建——重建由 ormer 全程托管：自动备份表上业务触发器（PG）→
-    /// 重建 → 自动原样恢复，项目无感。
-    Allow,
-}
-
-/// [`Database::apply_table`] 的执行策略。
-#[derive(Debug, Clone)]
-pub struct ApplyOptions {
-    /// 多余列处理：Keep 保留（默认，最保守）/ Drop 删除（对齐旧
-    /// ensure_table_permissive 语义）。
-    pub extra_columns: ExtraPolicy,
-    /// 推不动时：Refuse 报错返回（默认）/ Allow 删表重建（触发器托管）。
-    pub rebuild: RebuildPolicy,
-    /// 索引操作走 CREATE INDEX CONCURRENTLY（PG，默认 true，不阻塞业务读写）；
-    /// 失败残留的 INVALID 索引由 ormer 自动清理重试。非 PG 后端与 QuestDB
-    /// 忽略该选项（事务内普通建索引）。
-    pub index_concurrently: bool,
-    /// 启动期需确保安装的库级扩展（幂等），如 `&["timescaledb"]`。
-    /// 仅 PostgreSQL 支持扩展；其他后端传入非空列表返回 UnsupportedFeature。
-    pub extensions: Vec<String>,
-}
-
-impl Default for ApplyOptions {
-    fn default() -> Self {
-        Self {
-            extra_columns: ExtraPolicy::Keep,
-            rebuild: RebuildPolicy::Refuse,
-            index_concurrently: true,
-            extensions: Vec::new(),
-        }
-    }
-}
-
-impl ApplyOptions {
-    /// [`crate::Database::ensure_table`] 预设：Keep + Refuse，非并发建索引
-    /// （与改造前 ensure_table 的执行形态一致）。
-    pub(crate) fn strict() -> Self {
-        Self {
-            index_concurrently: false,
-            ..Self::default()
-        }
-    }
-
-    /// [`crate::Database::ensure_table_permissive`] 预设：Drop + Allow。
-    pub(crate) fn permissive() -> Self {
-        Self {
-            extra_columns: ExtraPolicy::Drop,
-            rebuild: RebuildPolicy::Allow,
-            index_concurrently: false,
-            extensions: Vec::new(),
-        }
-    }
-}
-
-/// [`Database::apply_table`] 的执行结果。
+/// [`Database::migrate_table`] 的执行结果。
 #[derive(Debug)]
-pub struct TableApplyOutcome {
-    /// 执行前的诊断结论。
+pub struct TableMigrateOutcome {
+    /// 执行前的诊断结论。成功返回时只可能是 Ready / Migratable（推不动
+    /// 或复验不收敛在执行前就直接返回 Err）。
     pub diagnosis: TableDiagnosis,
-    /// 本次调用是否执行了基础表的 CREATE TABLE（表原本不存在的新建，或
-    /// `rebuild=Allow` 触发的删表重建）。
+    /// 本次调用是否执行了基础表的 CREATE TABLE（仅源于表原本不存在的新建）。
     pub created_table: bool,
     /// 实际执行的步骤（含建索引/清漂移索引/ChangePrimaryKey）。
     pub executed: Vec<MigrationStep>,
@@ -669,7 +602,7 @@ pub(crate) fn default_check_name(table_name: &str, column: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Database API：plan_table / apply_table 与内部编排
+// Database API：migrate_table 与内部编排（plan_table 为内部诊断路径）
 // ---------------------------------------------------------------------------
 
 /// 把 ormer 渲染的 CREATE [UNIQUE] INDEX 语句改写为 CONCURRENTLY 形态
@@ -701,8 +634,9 @@ fn is_index_creation_step(step: &MigrationStep) -> bool {
     }
 }
 
-/// 校验扩展名是合法标识符（CREATE EXTENSION 不支持参数绑定，直接拼接前防御）。
-fn is_safe_extension_name(name: &str) -> bool {
+/// 校验标识符是合法"纯标识符"（扩展名/库名等不支持参数绑定的拼接前防御）。
+/// 供 ensure_extensions 与数据库级管理 API（database_exists 等）共用。
+pub(crate) fn is_safe_identifier(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()
@@ -713,45 +647,109 @@ fn is_safe_extension_name(name: &str) -> bool {
             .is_some_and(|first| first.is_ascii_digit())
 }
 
+/// 从模型自动推导迁移所需的库级扩展，与建表路径（
+/// [`crate::migration::create_table_bootstrap_steps`] 的 EXTENSION 前置步骤）
+/// 同源：PG 且声明了 hypertable 的模型需要 timescaledb；非 PG 或无超表
+/// 声明返回空。
+#[allow(unused_variables)]
+fn model_required_extensions<T: WritableModel>(db_type: DbType) -> Vec<String> {
+    #[cfg(feature = "postgresql")]
+    {
+        if matches!(db_type, DbType::PostgreSQL) && T::hypertable_info().is_some() {
+            return vec!["timescaledb".to_string()];
+        }
+    }
+    #[cfg(not(feature = "postgresql"))]
+    let _ = db_type;
+    Vec::new()
+}
+
 impl Database {
-    /// 诊断：一次性内省这张表（含 PG 路由子表）的全部现状
+    /// 诊断（内部路径）：一次性内省这张表（含 PG 路由子表）的全部现状
     /// （schema/列/主键/索引/约束/触发器），与模型比对。
     ///
-    /// 项目侧了解"表现在什么状态"的唯一入口——ormer 不提供任何细粒度
-    /// 内省 API。诊断与执行同源：[`Database::apply_table`] 内部就是重新
-    /// 调用本方法后按计划执行。
-    pub async fn plan_table<T: WritableModel>(&self) -> crate::Result<TableDiagnosis> {
-        self.diagnose_family_merged::<T>(&ApplyOptions::default()).await
+    /// 内部诊断说明：ormer 不提供任何细粒度内省 API，本方法是诊断与执行
+    /// 同源的内部载体——[`Database::migrate_table`] 内部就是重新调用同一套
+    /// 诊断（`diagnose_family_merged`）后按计划执行（含执行后的复验）。
+    /// 保留为 crate 内诊断入口供内部排查复用。
+    #[allow(dead_code)]
+    pub(crate) async fn plan_table<T: WritableModel>(&self) -> crate::Result<TableDiagnosis> {
+        self.diagnose_family_merged::<T>().await
+    }
+
+    /// 校验：表结构与模型是否完全一致（只读，不执行任何 DDL）。
+    ///
+    /// 一致返回 `Ok(())`；有任何差异（表不存在、列/索引/约束/默认值漂移、
+    /// 多余列、主键演进等）返回 `Err`，错误信息说明差异性质（表缺失 /
+    /// 结构漂移 / 保数据推不动）。供"表存在即校验，不一致再
+    /// [`Database::migrate_table`]，迁移失败再删表重建"的调用方决策链使用；
+    /// 一步到位的建表/迁移请直接调 [`Database::migrate_table`]。
+    ///
+    /// 口径与执行同源：内部走与 migrate_table 相同的内省与期望集构造
+    /// （严格视图——模型已删、库里还在的多余列也算差异）。
+    pub async fn validate_table<T: WritableModel>(&self) -> crate::Result<()> {
+        let db_type = self.db_type();
+        if !crate::abstract_layer::capabilities::Capabilities::of(db_type).schema_introspection {
+            return Err(crate::OrmerError::UnsupportedFeature {
+                backend: db_type,
+                feature: "validate_table",
+            });
+        }
+        let diagnosis = self.diagnose_family_merged::<T>().await?;
+        let table_name = T::table_name_for_db(db_type);
+        match diagnosis {
+            TableDiagnosis::Ready => Ok(()),
+            TableDiagnosis::Migratable(plan) => {
+                let missing = plan.steps().iter().any(|step| {
+                    matches!(step, MigrationStep::CreateTable { table, .. } if table == table_name)
+                });
+                if missing {
+                    Err(crate::ormer_error!(
+                        "validate_table: table {table_name} does not exist \
+                         (create it with migrate_table)"
+                    ))
+                } else {
+                    Err(crate::ormer_error!(
+                        "validate_table: schema mismatch on table {table_name}: {} pending \
+                         step(s) to reconcile with the model (run migrate_table)",
+                        plan.steps().len()
+                    ))
+                }
+            }
+            TableDiagnosis::NeedsRebuild(cause) => Err(crate::OrmerError::unmigratable_schema(
+                cause.table, cause.reason,
+            )),
+        }
     }
 
     /// 执行：把库弄到与模型一致。内部重新诊断后按计划执行（天然幂等，
     /// 适配启动重试循环）。
     ///
-    /// 覆盖：扩展确保 → schema 隐式创建 → 建表 → 补列 → 主键原地变更（PG）→
-    /// 列类型/默认值对齐 → 索引语义 diff（补缺/清漂移/特殊索引纳入）→
-    /// CHECK 约束闭环（PG）→ 外键对齐；诊断为重建且 `rebuild=Allow` 时
-    /// 自动备份/恢复业务触发器（PG）后删表重建。PG 路由子表与基础表走
-    /// 同一套诊断与执行（子表推不动时按策略重建子表自身）。
-    pub async fn apply_table<T: WritableModel>(
-        &self,
-        opts: &ApplyOptions,
-    ) -> crate::Result<TableApplyOutcome> {
+    /// 覆盖：扩展确保（从模型推导，如超表声明的 timescaledb）→ schema
+    /// 隐式创建 → 建表（表不存在直接建全）→ 补列 → 主键原地变更（PG）→
+    /// 列类型/默认值对齐 → 多余列删除 → 索引语义 diff（补缺/清漂移/特殊
+    /// 索引纳入，PG 非 QuestDB 并发建索引+INVALID 自愈）→ CHECK 约束闭环
+    /// （PG）→ 外键对齐。键、列及配置与模型完全一致：保数据推不动
+    /// （NeedsRebuild）或复验不收敛一律直接返回
+    /// [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建。
+    /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
+    pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
         let db_type = self.db_type();
         if !crate::abstract_layer::capabilities::Capabilities::of(db_type).schema_introspection {
             return Err(crate::OrmerError::UnsupportedFeature {
                 backend: db_type,
-                feature: "apply_table",
+                feature: "migrate_table",
             });
         }
-        self.ensure_extensions(&opts.extensions).await?;
+        self.ensure_extensions(&model_required_extensions::<T>(db_type))
+            .await?;
 
-        let diagnosis = self.diagnose_family_merged::<T>(opts).await?;
-        let family = self.diagnose_family::<T>(opts).await?;
+        let diagnosis = self.diagnose_family_merged::<T>().await?;
+        let family = self.diagnose_family::<T>().await?;
         let table_name = T::table_name_for_db(db_type);
 
         let mut executed: Vec<MigrationStep> = Vec::new();
         let mut created_table = false;
-        let mut base_rebuild: Option<RebuildCause> = None;
 
         // 基础表
         match family.base {
@@ -760,78 +758,63 @@ impl Database {
                 created_table |= plan.steps().iter().any(|step| {
                     matches!(step, MigrationStep::CreateTable { table, .. } if table == table_name)
                 });
-                executed.extend(self.execute_plan_steps(&plan, opts).await?);
+                executed.extend(self.execute_plan_steps(&plan).await?);
             }
-            TableDiagnosis::NeedsRebuild(cause) => base_rebuild = Some(cause),
+            // 保数据推不动：直接报错，不托管删表重建
+            TableDiagnosis::NeedsRebuild(cause) => {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    cause.table,
+                    cause.reason,
+                ));
+            }
         }
 
-        // 路由子表：与基础表同一套 diff 逻辑；推不动时按策略重建子表自身
-        let mut child_rebuilt = false;
-        if base_rebuild.is_none() {
-            for (child, child_diagnosis) in family.children {
-                match child_diagnosis {
-                    TableDiagnosis::Ready => {}
-                    TableDiagnosis::Migratable(plan) => {
-                        executed.extend(self.execute_plan_steps(&plan, opts).await?);
-                    }
-                    TableDiagnosis::NeedsRebuild(cause) => match opts.rebuild {
-                        RebuildPolicy::Refuse => {
-                            return Err(crate::OrmerError::unmigratable_schema(
-                                cause.table,
-                                cause.reason,
-                            ));
-                        }
-                        RebuildPolicy::Allow => {
-                            #[cfg(feature = "postgresql")]
-                            {
-                                self.recreate_routed_child_table::<T>(&child).await?;
-                                child_rebuilt = true;
-                            }
-                            #[cfg(not(feature = "postgresql"))]
-                            {
-                                let _ = &child;
-                                let _ = &mut child_rebuilt;
-                            }
-                        }
-                    },
+        // 路由子表：与基础表同一套 diff 逻辑；推不动同样直接报错
+        for (_child, child_diagnosis) in family.children {
+            match child_diagnosis {
+                TableDiagnosis::Ready => {}
+                TableDiagnosis::Migratable(plan) => {
+                    executed.extend(self.execute_plan_steps(&plan).await?);
+                }
+                TableDiagnosis::NeedsRebuild(cause) => {
+                    return Err(crate::OrmerError::unmigratable_schema(
+                        cause.table,
+                        cause.reason,
+                    ));
                 }
             }
         }
 
-        // 基础表推不动 → 按重建策略收场
-        if let Some(cause) = base_rebuild {
-            return self.rebuild_or_refuse::<T>(opts, cause).await;
-        }
-
         // 复验（同源：整体重新诊断）。仍有差异说明增量迁移未收敛，
-        // 转入重建路径按策略收场。
-        match self.diagnose_family_merged::<T>(opts).await? {
-            TableDiagnosis::Ready => Ok(TableApplyOutcome {
+        // 保数据路径已无计可施，直接报错。
+        match self.diagnose_family_merged::<T>().await? {
+            TableDiagnosis::Ready => Ok(TableMigrateOutcome {
                 diagnosis,
-                created_table: created_table || child_rebuilt,
+                created_table,
                 executed,
             }),
-            TableDiagnosis::Migratable(_) => {
-                let cause = RebuildCause::new(
-                    table_name,
-                    "incremental migration did not reconcile the schema; \
-                     fixing it requires dropping and recreating the table",
-                );
-                self.rebuild_or_refuse::<T>(opts, cause).await
+            TableDiagnosis::Migratable(_) => Err(crate::OrmerError::unmigratable_schema(
+                table_name,
+                "incremental migration did not reconcile the schema; \
+                 fixing it requires dropping and recreating the table",
+            )),
+            TableDiagnosis::NeedsRebuild(cause) => {
+                Err(crate::OrmerError::unmigratable_schema(cause.table, cause.reason))
             }
-            TableDiagnosis::NeedsRebuild(cause) => self.rebuild_or_refuse::<T>(opts, cause).await,
         }
     }
 
     /// 扩展确保：逐个幂等 `CREATE EXTENSION IF NOT EXISTS`。仅 PostgreSQL
-    /// 支持扩展；其他后端传入非空列表返回 UnsupportedFeature。
+    /// 支持扩展；其他后端传入非空列表返回 UnsupportedFeature（迁移路径的
+    /// 列表由 [`model_required_extensions`] 从模型推导，非 PG 后端恒为空，
+    /// 不会触达该错误）。
     pub(crate) async fn ensure_extensions(&self, extensions: &[String]) -> crate::Result<()> {
         if extensions.is_empty() {
             return Ok(());
         }
         let db_type = self.db_type();
         for name in extensions {
-            if !is_safe_extension_name(name) {
+            if !is_safe_identifier(name) {
                 return Err(crate::ormer_error!(
                     "invalid extension name {name:?}: must be a plain identifier"
                 ));
@@ -849,7 +832,7 @@ impl Database {
         let _ = db_type;
         Err(crate::OrmerError::UnsupportedFeature {
             backend: db_type,
-            feature: "ApplyOptions.extensions (CREATE EXTENSION is PostgreSQL-only)",
+            feature: "model-required extensions (CREATE EXTENSION is PostgreSQL-only)",
         })
     }
 
@@ -873,12 +856,100 @@ impl Database {
         }
     }
 
+    /// 数据库级管理 API 的标识符前置校验（与 ensure_extensions 同规则：
+    /// 这些 DDL 不支持参数绑定，拼接前防御）。
+    fn validate_admin_identifier(name: &str, what: &str) -> crate::Result<()> {
+        if !is_safe_identifier(name) {
+            return Err(crate::ormer_error!(
+                "invalid {what} {name:?}: must be a plain identifier"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 查询库是否存在（内部查 pg_database，绑定参数防注入）。非 PG 后端返回
+    /// [`crate::OrmerError::UnsupportedFeature`]。
+    pub async fn database_exists(&self, name: &str) -> crate::Result<bool> {
+        Self::validate_admin_identifier(name, "database name")?;
+        #[cfg(feature = "postgresql")]
+        {
+            if let Some(db) = self.as_postgresql() {
+                return db.database_exists(name).await;
+            }
+        }
+        #[cfg(not(feature = "postgresql"))]
+        let _ = name;
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type(),
+            feature: "database_exists (database-level administration is PostgreSQL-only)",
+        })
+    }
+
+    /// 建库（只要不存在即新建；结束时目标库存在即返回 Ok(())，已存在时同样
+    /// 成功）。标识符由 ormer 内部校验并加引号。PG 的 CREATE DATABASE 不能
+    /// 进事务块，本 API 只挂 Database（Transaction 不提供）。
+    pub async fn create_database(&self, name: &str) -> crate::Result<()> {
+        Self::validate_admin_identifier(name, "database name")?;
+        #[cfg(feature = "postgresql")]
+        {
+            if let Some(db) = self.as_postgresql() {
+                return db.create_database(name).await;
+            }
+        }
+        #[cfg(not(feature = "postgresql"))]
+        let _ = name;
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type(),
+            feature: "create_database (database-level administration is PostgreSQL-only)",
+        })
+    }
+
+    /// 删库。始终 WITH (FORCE) 先终止该库全部连接；库不存在视为已删（幂等）。
+    /// 非 PG 后端返回 [`crate::OrmerError::UnsupportedFeature`]。
+    pub async fn drop_database(&self, name: &str) -> crate::Result<()> {
+        Self::validate_admin_identifier(name, "database name")?;
+        #[cfg(feature = "postgresql")]
+        {
+            if let Some(db) = self.as_postgresql() {
+                return db.drop_database(name).await;
+            }
+        }
+        #[cfg(not(feature = "postgresql"))]
+        let _ = name;
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type(),
+            feature: "drop_database (database-level administration is PostgreSQL-only)",
+        })
+    }
+
+    /// 在指定库上应用扩展（幂等，已应用则跳过）。目标库由参数点名，与连接串
+    /// 挂的库分离。PG 的 CREATE EXTENSION 只作用于连接所在库，内部以自身
+    /// 端点/凭据另开一条到 `database` 的连接执行、用完即关；目标库不存在按
+    /// 连接失败报错。仅直连（`Database::connect`）支持：池化连接（bb8）取不到
+    /// 连接配置，返回错误。非 PG 后端返回
+    /// [`crate::OrmerError::UnsupportedFeature`]。
+    pub async fn apply_extension(&self, database: &str, name: &str) -> crate::Result<()> {
+        Self::validate_admin_identifier(database, "database name")?;
+        Self::validate_admin_identifier(name, "extension name")?;
+        #[cfg(feature = "postgresql")]
+        {
+            if let Some(db) = self.as_postgresql() {
+                return db.apply_extension(database, name).await;
+            }
+        }
+        #[cfg(not(feature = "postgresql"))]
+        let _ = (database, name);
+        Err(crate::OrmerError::UnsupportedFeature {
+            backend: self.db_type(),
+            feature: "apply_extension (database-level administration is PostgreSQL-only)",
+        })
+    }
+
     /// 诊断单张表（基础表或某个路由子表）。`table_name` 为 None 时取模型
     /// 基础表名（含超表元数据校验）；Some 时为子表名（不重复做超表校验）。
     pub(crate) async fn diagnose_single_table<T: WritableModel>(
         &self,
         table_name: Option<&str>,
-        opts: &ApplyOptions,
     ) -> crate::Result<TableDiagnosis> {
         let db_type = self.db_type();
         let base_name = T::table_name_for_db(db_type);
@@ -911,8 +982,7 @@ impl Database {
             return Ok(TableDiagnosis::Migratable(plan));
         }
 
-        let migration =
-            TableMigration::<T>::for_diagnosis(self, table_name, opts.extra_columns);
+        let migration = TableMigration::<T>::for_diagnosis(self);
         match migration.plan_for_table(target).await {
             Ok(diff) => {
                 if diff.is_empty() {
@@ -941,11 +1011,8 @@ impl Database {
         }
     }
 
-    /// 诊断（内部）：基础表 + 路由子表的结构化结论（apply 按表分派执行）。
-    async fn diagnose_family<T: WritableModel>(
-        &self,
-        opts: &ApplyOptions,
-    ) -> crate::Result<FamilyDiagnosis> {
+    /// 诊断（内部）：基础表 + 路由子表的结构化结论（migrate 按表分派执行）。
+    async fn diagnose_family<T: WritableModel>(&self) -> crate::Result<FamilyDiagnosis> {
         let db_type = self.db_type();
         if !crate::abstract_layer::capabilities::Capabilities::of(db_type).schema_introspection {
             return Err(crate::OrmerError::UnsupportedFeature {
@@ -953,7 +1020,7 @@ impl Database {
                 feature: "plan_table",
             });
         }
-        let base = self.diagnose_single_table::<T>(None, opts).await?;
+        let base = self.diagnose_single_table::<T>(None).await?;
         #[cfg(feature = "postgresql")]
         let mut children = Vec::new();
         #[cfg(not(feature = "postgresql"))]
@@ -967,7 +1034,7 @@ impl Database {
                         continue;
                     }
                     let child_diagnosis = self
-                        .diagnose_single_table::<T>(Some(&child), opts)
+                        .diagnose_single_table::<T>(Some(&child))
                         .await?;
                     children.push((child, child_diagnosis));
                 }
@@ -976,12 +1043,12 @@ impl Database {
         Ok(FamilyDiagnosis { base, children })
     }
 
-    /// 诊断（内部）：基础表 + 路由子表合并为整体结论（plan_table 与复验用）。
+    /// 诊断（内部）：基础表 + 路由子表合并为整体结论（plan_table 内部路径
+    /// 与复验用）。
     pub(crate) async fn diagnose_family_merged<T: WritableModel>(
         &self,
-        opts: &ApplyOptions,
     ) -> crate::Result<TableDiagnosis> {
-        let family = self.diagnose_family::<T>(opts).await?;
+        let family = self.diagnose_family::<T>().await?;
         let mut merged = family.base;
         for (_, child) in family.children {
             merged = merge_diagnoses(merged, child);
@@ -989,72 +1056,17 @@ impl Database {
         Ok(merged)
     }
 
-    /// 按诊断结论执行：Migratable → 分段执行计划（PG 并发索引在事务外）；
-    /// NeedsRebuild → 按 rebuild 策略收场。
-    async fn rebuild_or_refuse<T: WritableModel>(
-        &self,
-        opts: &ApplyOptions,
-        cause: RebuildCause,
-    ) -> crate::Result<TableApplyOutcome> {
-        let table_name = T::table_name_for_db(self.db_type());
-        match opts.rebuild {
-            RebuildPolicy::Refuse => Err(crate::OrmerError::unmigratable_schema(
-                cause.table,
-                cause.reason,
-            )),
-            RebuildPolicy::Allow => {
-                // 重建全程托管：备份业务触发器（PG）→ 删表 → 重建 → 恢复
-                let triggers = self.backup_business_triggers(table_name).await?;
-                self.drop_table::<T>().execute().await?;
-                self.create_table::<T>().execute().await?;
-                self.restore_business_triggers(&triggers).await?;
-
-                match self.diagnose_family_merged::<T>(opts).await? {
-                    TableDiagnosis::Ready => {
-                        let db_type = self.db_type();
-                        let mut executed = vec![
-                            MigrationStep::Sql {
-                                sql: format!(
-                                    "DROP TABLE {}",
-                                    crate::model::quote_qualified_identifier(db_type, table_name)
-                                ),
-                            },
-                            MigrationStep::CreateTable {
-                                table: table_name.to_string(),
-                                definition: crate::generate_create_table_sql::<T>(db_type)?,
-                            },
-                        ];
-                        for definition in &triggers {
-                            executed.push(MigrationStep::Sql {
-                                sql: definition.clone(),
-                            });
-                        }
-                        Ok(TableApplyOutcome {
-                            diagnosis: TableDiagnosis::NeedsRebuild(cause),
-                            created_table: true,
-                            executed,
-                        })
-                    }
-                    other => Err(crate::ormer_error!(
-                        "apply_table rebuild of {table_name} did not reconcile the schema: {other:?}"
-                    )),
-                }
-            }
-        }
-    }
-
     /// 执行一份迁移计划并返回实际执行的步骤。
     ///
     /// - 非事务后端：逐条执行（现状语义）；
-    /// - `index_concurrently=false`：单事务整体执行；
-    /// - `index_concurrently=true`（PG）：建索引步骤拆到事务外
-    ///   CONCURRENTLY 执行，执行前与失败重试前自动清理同表 INVALID
-    ///   残留索引（自愈），其余步骤保持单事务。
+    /// - PG（非 QuestDB）：建索引步骤拆到事务外 CONCURRENTLY 执行，
+    ///   执行前与失败重试前自动清理同表 INVALID 残留索引（自愈），
+    ///   其余步骤保持单事务；
+    /// - 其余后端：单事务整体执行。
     #[cfg_attr(not(feature = "postgresql"), allow(unused_variables))]
     pub(crate) async fn execute_plan_steps(
         &self,
         plan: &MigrationPlan,
-        opts: &ApplyOptions,
     ) -> crate::Result<Vec<MigrationStep>> {
         if plan.is_empty() {
             return Ok(Vec::new());
@@ -1064,9 +1076,7 @@ impl Database {
         let concurrent = {
             #[cfg(feature = "postgresql")]
             {
-                opts.index_concurrently
-                    && matches!(db_type, DbType::PostgreSQL)
-                    && !db_type.is_questdb()
+                matches!(db_type, DbType::PostgreSQL) && !db_type.is_questdb()
             }
             #[cfg(not(feature = "postgresql"))]
             {
@@ -1199,35 +1209,6 @@ impl Database {
         Ok(())
     }
 
-    /// 备份表上的业务触发器定义（PG `pg_get_triggerdef`，排除 internal）。
-    /// 其他后端无对应概念，返回空列表（重建路径自然跳过恢复）。
-    pub(crate) async fn backup_business_triggers(
-        &self,
-        qualified_table: &str,
-    ) -> crate::Result<Vec<String>> {
-        #[cfg(feature = "postgresql")]
-        {
-            if let Some(db) = self.as_postgresql() {
-                let (schema, bare) = split_qualified_table_name(qualified_table);
-                let schema = schema.unwrap_or("public");
-                return db.business_trigger_definitions(schema, bare).await;
-            }
-        }
-        let _ = qualified_table;
-        Ok(Vec::new())
-    }
-
-    /// 重建后原样恢复业务触发器。
-    pub(crate) async fn restore_business_triggers(
-        &self,
-        definitions: &[String],
-    ) -> crate::Result<()> {
-        for definition in definitions {
-            self.execute_sql(definition.as_str()).await?;
-        }
-        Ok(())
-    }
-
     /// PG 专用视图（QuestDB 连接排除）：供内部自省/运维能力分派。
     #[cfg(feature = "postgresql")]
     pub(crate) fn as_postgresql(&self) -> Option<&crate::abstract_layer::postgresql_backend::Database> {
@@ -1306,8 +1287,8 @@ impl Database {
     }
 }
 
-/// 一次诊断的结构化结论：基础表与各路由子表各自独立（apply 按表分派
-/// 执行与重建；plan_table 对外合并为单一 [`TableDiagnosis`]）。
+/// 一次诊断的结构化结论：基础表与各路由子表各自独立（migrate 按表分派
+/// 执行；plan_table 内部路径合并为单一 [`TableDiagnosis`]）。
 struct FamilyDiagnosis {
     base: TableDiagnosis,
     children: Vec<(String, TableDiagnosis)>,

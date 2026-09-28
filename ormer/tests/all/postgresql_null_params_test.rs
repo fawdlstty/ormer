@@ -19,7 +19,10 @@ async fn test_insert_or_ignore_null_binary_param() -> Result<(), Box<dyn std::er
 
     db.create_table::<NullableBinary>().execute().await?;
     assert!(
-        matches!(db.plan_table::<NullableBinary>().await?, ormer::TableDiagnosis::Ready),
+        matches!(
+            db.migrate_table::<NullableBinary>().await?.diagnosis,
+            ormer::TableDiagnosis::Ready
+        ),
         "table should match model after create"
     );
 

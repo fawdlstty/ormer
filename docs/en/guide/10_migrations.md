@@ -2,24 +2,33 @@
 
 Ormer supports two migration styles: inspectable schema plans derived from a model, and versioned migrations implemented with the `Migration` trait.
 
-## Plan From A Model
+## One-Shot Migration From A Model
 
-`migrate_table::<T>()` builds an executable schema migration plan. A missing table produces a create-table step, and a missing non-primary-key column produces `ADD COLUMN`; existing-column type or nullability drift is converted into real migration steps where Ormer can do so safely. SQLite uses a table rebuild when needed. Conversions that cannot be inferred safely return an error.
+`migrate_table::<T>()` is the unified entry point for aligning table schemas at application startup: a single call runs diagnose -> execute -> re-verify, and is idempotent so startup retry loops can call it repeatedly. A missing table is created in full (including enum/extension/hypertable companion steps), and a missing non-primary-key column produces `ADD COLUMN`; existing-column type or nullability drift is converted into real migration steps where Ormer can do so safely. SQLite uses a table rebuild when needed. Conversions that cannot be inferred safely return an error.
 
 ```rust
-let plan = db.migrate_table::<User>().plan().await?;
+use ormer::{TableDiagnosis};
 
-println!("{}", plan.to_sql()?);
-for warning in plan.warnings() {
-    eprintln!("{warning}");
+let outcome = db.migrate_table::<User>().await?;
+
+// outcome.diagnosis is the pre-execution diagnosis and can be reviewed
+// afterwards. On success it is always Ready / Migratable(plan).
+// outcome.created_table tells whether this call created the table
+// (only from a fresh create when the table did not exist).
+// outcome.executed lists the steps run.
+match &outcome.diagnosis {
+    TableDiagnosis::Ready => {}
+    TableDiagnosis::Migratable(plan) => {
+        for warning in plan.warnings() {
+            eprintln!("{warning}");
+        }
+    }
 }
-
-db.migrate_table::<User>().execute().await?;
 ```
 
-If a target conversion cannot be proven safe, `plan()` or `execute()` returns an error. SQLite complex changes are applied by rebuilding the table, and invalid legacy values fail the migration and roll back.
+If a target conversion cannot be proven safe, the migration returns an error. SQLite complex changes are applied by rebuilding the table, and invalid legacy values fail the migration and roll back.
 
-Schema evolution that cannot be inferred in place (primary-key changes, NOT NULL columns added to populated tables, and so on) returns `OrmerError::UnmigratableSchema`; check it with `err.is_unmigratable_schema()` so callers can choose a drop-and-recreate strategy instead of treating it like any other migration failure.
+Schema evolution that cannot be pushed in place (type narrowing, hypertable partition conflicts, and so on) never drops and recreates the table: `migrate_table` returns `OrmerError::UnmigratableSchema` directly (check it with `err.is_unmigratable_schema()` to distinguish it from other migration failures), leaving existing data and table objects untouched for the caller to decide what to do next.
 
 ## Versioned Migrations
 
@@ -91,9 +100,8 @@ for migration in history {
 }
 ```
 
-SQLite cannot add a foreign key after table creation. `migrate_table` returns an
-error; call `migrate_table::<T>().sqlite_rebuild_plan().await?` to explicitly
-generate and review the rebuild SQL before executing it.
+SQLite cannot add a foreign key after table creation. `migrate_table` fails with
+`UnmigratableSchema`; rebuild the table by hand if adding the key is required.
 
 ClickHouse also uses the unified `Database` migration entry point:
 
@@ -124,14 +132,12 @@ measurement.
 
 `migrate_table` includes column defaults for new columns and infers new regular, composite, and unique indexes when possible. A non-null column added to a populated table still requires an explicit backfill when it has no default.
 
-`ensure_table` rejects destructive changes (column drops and table rebuilds) by default
-with an `UnmigratableSchema` error instead of silently deleting data; opt in explicitly
-with `ensure_table_permissive`. `migrate_table::<T>()` supports chained
-`rename_column("old", "new")` annotations (rendered as `ALTER TABLE ... RENAME COLUMN`)
-so renames no longer degrade to drop + add. Indexes are diffed as expected-vs-actual
-sets: adding `#[index]` to an existing column creates the index, removing it emits
-`DropIndex`. Tightening a nullable column to `NOT NULL` fails first when existing rows
-contain NULLs; backfill before migrating.
+Extra columns (present in the database but absent from the model) are dropped
+outright, so keys, columns, and configuration always match the model exactly.
+Indexes are diffed as expected-vs-actual sets: adding
+`#[index]` to an existing column creates the index, removing it emits `DropIndex`.
+Tightening a nullable column to `NOT NULL` fails first when existing rows contain
+NULLs; backfill before migrating.
 
 Model `#[compress(...)]` attributes are included in schema validation and migration. PostgreSQL uses column-level `SET COMPRESSION`; MySQL uses the table-level `COMPRESSION` option, so all compressed columns in one MySQL table must use the same algorithm.
 

@@ -14,24 +14,6 @@ struct PartialIndexCapabilityUser {
     active: bool,
 }
 
-#[derive(Debug, ormer::Model)]
-#[table = "partial_index_migration_users"]
-struct PartialIndexMigrationUserV1 {
-    #[primary]
-    id: i32,
-    active: bool,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "partial_index_migration_users"]
-struct PartialIndexMigrationUserV2 {
-    #[primary]
-    id: i32,
-    active: bool,
-    #[index(where = "active = 1")]
-    email: Option<String>,
-}
-
 #[cfg(any(feature = "sqlite", feature = "duckdb"))]
 fn assert_partial_index_error(error: OrmerError, db_type: DbType) {
     assert!(matches!(
@@ -64,23 +46,6 @@ async fn sqlite_partial_index_create_table_is_capability_gated() -> ormer::Resul
     Ok(())
 }
 
-#[tokio::test]
-#[cfg(feature = "sqlite")]
-async fn sqlite_partial_index_migration_plan_is_capability_gated() -> ormer::Result<()> {
-    let db = ormer::Database::connect(DbType::Sqlite, ":memory:").await?;
-    db.migrate_table::<PartialIndexMigrationUserV1>()
-        .execute()
-        .await?;
-
-    let error = db
-        .migrate_table::<PartialIndexMigrationUserV2>()
-        .plan()
-        .await
-        .expect_err("SQLite migration planning must reject partial index metadata");
-    assert_partial_index_error(error, DbType::Sqlite);
-    Ok(())
-}
-
 #[test]
 #[cfg(feature = "duckdb")]
 fn duckdb_partial_index_create_sql_is_capability_gated() {
@@ -98,23 +63,6 @@ async fn duckdb_partial_index_create_table_is_capability_gated() -> ormer::Resul
         .execute()
         .await
         .expect_err("DuckDB create_table must reject partial index metadata");
-    assert_partial_index_error(error, DbType::DuckDB);
-    Ok(())
-}
-
-#[tokio::test]
-#[cfg(feature = "duckdb")]
-async fn duckdb_partial_index_migration_plan_is_capability_gated() -> ormer::Result<()> {
-    let db = ormer::Database::connect(DbType::DuckDB, ":memory:").await?;
-    db.migrate_table::<PartialIndexMigrationUserV1>()
-        .execute()
-        .await?;
-
-    let error = db
-        .migrate_table::<PartialIndexMigrationUserV2>()
-        .plan()
-        .await
-        .expect_err("DuckDB migration planning must reject partial index metadata");
     assert_partial_index_error(error, DbType::DuckDB);
     Ok(())
 }

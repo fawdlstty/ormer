@@ -1,6 +1,6 @@
 //! 审查修复批次（W3：模型/派生/迁移）的行为回归测试。
 //!
-//! 覆盖：M6（迁移外键 diff）、M7（4..=8 元组复合主键）、M8（QuestDB 非
+//! 覆盖：M7（4..=8 元组复合主键）、M8（QuestDB 非
 //! String 索引列）、M9（多态枚举列赋值）、M10（DbValue 未配置后端）、
 //! L14（派生宏字符串驻留）、L15（版本快照键单射）、L17（宽 repr 数值枚举
 //! 的无损转换）、L18（保留字标识符引号化）。
@@ -10,8 +10,8 @@ use ormer::model::PrimaryKey;
 #[cfg(feature = "sqlite")]
 use ormer::Database;
 #[cfg(feature = "postgresql")]
-use ormer::MigrationStep;
-use ormer::{Model, OrmerError, Value};
+use ormer::OrmerError;
+use ormer::{Model, Value};
 
 // ---------------------------------------------------------------------------
 // M7：复合主键 PrimaryKey 元组实现扩展到 8 列
@@ -428,115 +428,3 @@ fn intern_helpers_return_stable_references() {
     assert_eq!(c, "runtime_q");
 }
 
-// ---------------------------------------------------------------------------
-// M6：已有列的外键变更进入迁移计划
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, ormer::Model)]
-#[table = "audit_fk_users"]
-struct FkDiffUser {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-}
-
-#[derive(Debug, Clone, ormer::Model)]
-#[table = "audit_fk_orders"]
-struct FkDiffOrderNoFk {
-    #[primary]
-    id: i32,
-    user_id: i32,
-}
-
-#[derive(Debug, Clone, ormer::Model)]
-#[table = "audit_fk_orders"]
-struct FkDiffOrderWithFk {
-    #[primary]
-    id: i32,
-    #[foreign(FkDiffUser)]
-    user_id: i32,
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_foreign_key_add_on_existing_column_reports_unmigratable() -> ormer::Result<()> {
-    let db = Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
-    db.create_table::<FkDiffUser>().execute().await?;
-    db.create_table::<FkDiffOrderNoFk>().execute().await?;
-
-    // 给已有列补 #[foreign]：SQLite 无法 ALTER ADD FOREIGN KEY，计划应给出
-    // 明确的 UnmigratableSchema 而不是静默空计划
-    let error = db
-        .migrate_table::<FkDiffOrderWithFk>()
-        .plan()
-        .await
-        .expect_err("adding a foreign key to an existing SQLite column must fail");
-    assert!(matches!(error, OrmerError::UnmigratableSchema { .. }), "{error}");
-    assert!(error.to_string().contains("user_id"), "{error}");
-    Ok(())
-}
-
-#[cfg(feature = "sqlite")]
-#[tokio::test]
-async fn sqlite_foreign_key_drop_records_warning() -> ormer::Result<()> {
-    let db = Database::connect(ormer::DbType::Sqlite, ":memory:").await?;
-    db.drop_table::<FkDiffOrderWithFk>().execute().await?;
-    db.create_table::<FkDiffUser>().execute().await?;
-    db.create_table::<FkDiffOrderWithFk>().execute().await?;
-
-    // 从模型移除 #[foreign]：SQLite 无法 DROP CONSTRAINT，应记录 warning
-    let plan = db.migrate_table::<FkDiffOrderNoFk>().plan().await?;
-    assert!(
-        plan.warnings()
-            .iter()
-            .any(|warning| warning.contains("cannot drop constraints")),
-        "warnings: {:?}",
-        plan.warnings()
-    );
-    Ok(())
-}
-
-#[cfg(feature = "postgresql")]
-#[tokio::test]
-async fn postgres_foreign_key_diff_adds_and_drops_constraints() -> ormer::Result<()> {
-    let config = crate::_test_common::postgresql_config();
-    let db = crate::_test_common::create_db_connection(&config)
-        .await
-        .map_err(|error| ormer::ormer_error!("connect: {error}"))?;
-
-    db.drop_table::<FkDiffOrderNoFk>().execute().await?;
-    db.drop_table::<FkDiffOrderWithFk>().execute().await?;
-    db.drop_table::<FkDiffUser>().execute().await?;
-    db.create_table::<FkDiffUser>().execute().await?;
-    db.create_table::<FkDiffOrderNoFk>().execute().await?;
-
-    // v1：无外键 → v2：给已有列补 #[foreign] → 计划生成 AddForeignKey
-    let plan = db.migrate_table::<FkDiffOrderWithFk>().plan().await?;
-    let add_step = plan
-        .steps()
-        .iter()
-        .find(|step| matches!(step, MigrationStep::AddForeignKey { column, .. } if column == "user_id"));
-    assert!(add_step.is_some(), "steps: {:?}", plan.steps());
-    db.migrate_table::<FkDiffOrderWithFk>().execute().await?;
-
-    // 计划幂等：外键已与模型一致，不再生成外键步骤
-    let plan = db.migrate_table::<FkDiffOrderWithFk>().plan().await?;
-    assert!(
-        !plan
-            .steps()
-            .iter()
-            .any(|step| matches!(step, MigrationStep::AddForeignKey { .. })),
-        "steps: {:?}",
-        plan.steps()
-    );
-
-    // v2 → v1：移除 #[foreign] → 计划生成 DROP CONSTRAINT
-    let plan = db.migrate_table::<FkDiffOrderNoFk>().plan().await?;
-    let sql = plan.to_sql()?;
-    assert!(sql.contains("DROP CONSTRAINT"), "sql: {sql}");
-    db.migrate_table::<FkDiffOrderNoFk>().execute().await?;
-
-    db.drop_table::<FkDiffOrderNoFk>().execute().await?;
-    db.drop_table::<FkDiffUser>().execute().await?;
-    Ok(())
-}

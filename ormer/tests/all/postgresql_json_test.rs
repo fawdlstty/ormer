@@ -26,7 +26,10 @@ async fn test_json_value_roundtrip_on_postgres() -> Result<(), Box<dyn std::erro
 
     db.create_table::<JsonDoc>().execute().await?;
     assert!(
-        matches!(db.plan_table::<JsonDoc>().await?, ormer::TableDiagnosis::Ready),
+        matches!(
+            db.migrate_table::<JsonDoc>().await?.diagnosis,
+            ormer::TableDiagnosis::Ready
+        ),
         "table should match model after create"
     );
 

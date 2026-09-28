@@ -1,13 +1,12 @@
 #![cfg(any(feature = "sqlite", feature = "postgresql"))]
 
-//! 表迁移统一入口 `plan_table` / `apply_table` 的 SQL 形状与幂等行为测试。
+//! 表迁移统一入口 `migrate_table` 的 SQL 形状与幂等行为测试。
 //!
 //! 覆盖（对应规格书 §4 各能力域）：
-//! - apply_table 建表/补列/收敛/幂等（sqlite e2e）
-//! - ensure_table / ensure_table_permissive 薄糖映射（sqlite e2e）
-//! - 索引语义 diff：删除后 apply 补建（sqlite e2e）
+//! - migrate_table 建表/补列/收敛/幂等（sqlite e2e）
+//! - 索引语义 diff：删除后 migrate 补建（sqlite e2e）
 //! - CHECK 约束闭环（PG e2e）
-//! - rebuild=Allow 的触发器托管（PG e2e）
+//! - 推不动直接报 unmigratable_schema、不破坏存量表（PG e2e）
 //! - advisory_xact_lock（PG e2e roundtrip + 非 PG Unsupported）
 //! - ping
 
@@ -35,7 +34,7 @@ mod shared {
         pub note: Option<String>,
     }
 
-    /// V2 - note 列（Keep 策略下库里的 note 应保留）
+    /// V2 - note 列（模型删列后库里多余的 note 应被删除）
     #[derive(Debug, ormer::Model)]
     #[table = "ormer_apply_items"]
     pub struct ApplyItemV3 {
@@ -47,22 +46,22 @@ mod shared {
 }
 
 #[cfg(feature = "sqlite")]
-mod sqlite_apply {
+mod sqlite_migrate {
     use super::shared::*;
-    use ormer::{Database, DbType, MigrationStep, TableDiagnosis, TableEnsureOutcome};
+    use ormer::{Database, DbType, MigrationStep, TableDiagnosis};
 
     async fn database() -> ormer::Result<Database> {
         Database::connect(DbType::Sqlite, ":memory:").await
     }
 
-    /// apply_table：首建 → 补列 → 收敛 → 幂等（零步骤）。
+    /// migrate_table：首建 → 补列 → 收敛 → 幂等（零步骤）。
     #[tokio::test]
-    async fn apply_creates_adds_and_converges() -> ormer::Result<()> {
+    async fn migrate_creates_adds_and_converges() -> ormer::Result<()> {
         let db = database().await?;
 
-        // 首次 apply：建表
-        let first = db.apply_table::<ApplyItemV1>(&Default::default()).await?;
-        assert!(first.created_table, "first apply should create the table");
+        // 首次 migrate：建表
+        let first = db.migrate_table::<ApplyItemV1>().await?;
+        assert!(first.created_table, "first migrate should create the table");
         assert!(
             first.executed.iter().any(
                 |step| matches!(step, MigrationStep::CreateTable { table, .. } if table == "ormer_apply_items")
@@ -71,12 +70,12 @@ mod sqlite_apply {
             first.executed
         );
         assert!(matches!(
-            db.plan_table::<ApplyItemV1>().await?,
+            db.migrate_table::<ApplyItemV1>().await?.diagnosis,
             TableDiagnosis::Ready
         ));
 
-        // 模型加列：apply 补列
-        let second = db.apply_table::<ApplyItemV2>(&Default::default()).await?;
+        // 模型加列：migrate 补列
+        let second = db.migrate_table::<ApplyItemV2>().await?;
         assert!(!second.created_table);
         assert!(
             second.executed.iter().any(
@@ -86,53 +85,48 @@ mod sqlite_apply {
             second.executed
         );
         assert!(matches!(
-            db.plan_table::<ApplyItemV2>().await?,
+            db.migrate_table::<ApplyItemV2>().await?.diagnosis,
             TableDiagnosis::Ready
         ));
 
-        // 幂等：再次 apply 零动作
-        let third = db.apply_table::<ApplyItemV2>(&Default::default()).await?;
+        // 幂等：再次 migrate 零动作
+        let third = db.migrate_table::<ApplyItemV2>().await?;
         assert!(!third.created_table);
-        assert!(third.executed.is_empty(), "re-apply must be a no-op");
+        assert!(third.executed.is_empty(), "re-migrate must be a no-op");
         assert!(matches!(third.diagnosis, TableDiagnosis::Ready));
 
-        // Keep 策略：模型删列后库里列保留，收敛为 Ready
-        db.apply_table::<ApplyItemV3>(&Default::default()).await?;
+        // 多余列删除（固定语义）：模型删列后库里的 note 列被直接删除
+        // （SQLite 通过整表重建实现，步骤为 Sql 形态而非 DropColumn 变体）
+        let fourth = db.migrate_table::<ApplyItemV3>().await?;
+        assert!(!fourth.created_table);
+        assert!(
+            !fourth.executed.is_empty(),
+            "dropping an extra column must execute steps, got {:?}",
+            fourth.executed
+        );
+        let table_sql = db
+            .select_sql::<String>(ormer::sql!(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'ormer_apply_items'"
+            ))
+            .collect::<Vec<String>>()
+            .await?;
+        assert!(
+            table_sql.iter().all(|sql| !sql.contains("note")),
+            "extra column note must be dropped from the table, got {table_sql:?}"
+        );
         assert!(matches!(
-            db.plan_table::<ApplyItemV3>().await?,
+            db.migrate_table::<ApplyItemV3>().await?.diagnosis,
             TableDiagnosis::Ready
         ));
         Ok(())
     }
 
-    /// ensure_table / ensure_table_permissive 是 apply_table 的策略预设薄糖。
+    /// 索引语义 diff：索引被删后 migrate 按语义签名补建（ormer 自动命名）。
     #[tokio::test]
-    async fn ensure_table_maps_to_apply_outcome() -> ormer::Result<()> {
+    async fn migrate_rebuilds_dropped_index() -> ormer::Result<()> {
         let db = database().await?;
-
-        let outcome = db.ensure_table::<ApplyItemV1>().await?;
-        assert_eq!(outcome, TableEnsureOutcome::Ready);
-        assert!(matches!(
-            db.ensure_table::<ApplyItemV1>().await?,
-            TableEnsureOutcome::Ready
-        ));
-
-        // permissive：模型缺列触发 SQLite 重建（Drop 多余列），保数据换表
-        db.apply_table::<ApplyItemV2>(&Default::default()).await?;
-        let outcome = db.ensure_table_permissive::<ApplyItemV3>().await?;
-        assert_eq!(outcome, TableEnsureOutcome::Migrated);
-        assert!(matches!(
-            db.plan_table::<ApplyItemV3>().await?,
-            TableDiagnosis::Ready
-        ));
-        Ok(())
-    }
-
-    /// 索引语义 diff：索引被删后 apply 按语义签名补建（ormer 自动命名）。
-    #[tokio::test]
-    async fn apply_rebuilds_dropped_index() -> ormer::Result<()> {
-        let db = database().await?;
-        db.apply_table::<ApplyItemV1>(&Default::default()).await?;
+        db.migrate_table::<ApplyItemV1>().await?;
 
         let index_name = "idx_ormer_apply_items_name";
         db.execute_sql(ormer::sql!(format!("DROP INDEX {index_name}")))
@@ -140,14 +134,14 @@ mod sqlite_apply {
         let before = index_names(&db).await?;
         assert!(
             !before.iter().any(|name| name == index_name),
-            "index should be gone before apply: {before:?}"
+            "index should be gone before migrate: {before:?}"
         );
 
-        db.apply_table::<ApplyItemV1>(&Default::default()).await?;
+        db.migrate_table::<ApplyItemV1>().await?;
         let after = index_names(&db).await?;
         assert!(
             after.iter().any(|name| name == index_name),
-            "apply must rebuild the missing index, got {after:?}"
+            "migrate must rebuild the missing index, got {after:?}"
         );
         Ok(())
     }
@@ -159,6 +153,44 @@ mod sqlite_apply {
         ))
         .collect::<Vec<String>>()
         .await
+    }
+
+    /// validate_table：只读校验——表缺失/结构漂移/多余列（严格口径）均报错，
+    /// 与模型一致才通过；全程不执行任何 DDL。
+    #[tokio::test]
+    async fn validate_reports_missing_drift_and_ready() -> ormer::Result<()> {
+        let db = database().await?;
+
+        // 表不存在：报错并说明缺失
+        let err = db.validate_table::<ApplyItemV1>().await.unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "missing table must be reported: {err}"
+        );
+
+        // 建齐后：通过
+        db.migrate_table::<ApplyItemV1>().await?;
+        db.validate_table::<ApplyItemV1>().await?;
+
+        // 结构漂移（索引被删）：报错
+        db.execute_sql(ormer::sql!("DROP INDEX idx_ormer_apply_items_name"))
+            .await?;
+        let err = db.validate_table::<ApplyItemV1>().await.unwrap_err();
+        assert!(
+            err.to_string().contains("schema mismatch"),
+            "drift must be reported: {err}"
+        );
+        db.migrate_table::<ApplyItemV1>().await?;
+        db.validate_table::<ApplyItemV1>().await?;
+
+        // 多余列（严格口径）：模型删列后库里还在的列也算差异
+        db.migrate_table::<ApplyItemV2>().await?;
+        let err = db.validate_table::<ApplyItemV3>().await.unwrap_err();
+        assert!(
+            err.to_string().contains("schema mismatch"),
+            "extra column must be reported in strict view: {err}"
+        );
+        Ok(())
     }
 
     /// ping：库健康检查。
@@ -186,12 +218,12 @@ mod sqlite_apply {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn table_apply_outcome_reports_steps() -> ormer::Result<()> {
+async fn table_migrate_outcome_reports_steps() -> ormer::Result<()> {
     use shared::ApplyItemV1;
-    use ormer::{TableApplyOutcome, TableDiagnosis};
+    use ormer::{TableDiagnosis, TableMigrateOutcome};
     let db = Database::connect(DbType::Sqlite, ":memory:").await?;
-    let outcome = db.apply_table::<ApplyItemV1>(&Default::default()).await?;
-    let TableApplyOutcome {
+    let outcome = db.migrate_table::<ApplyItemV1>().await?;
+    let TableMigrateOutcome {
         diagnosis,
         created_table,
         executed,
@@ -202,7 +234,7 @@ async fn table_apply_outcome_reports_steps() -> ormer::Result<()> {
     Ok(())
 }
 
-/// PostgreSQL 专属能力域：CHECK 闭环、触发器托管、咨询锁。
+/// PostgreSQL 专属能力域：CHECK 闭环、推不动报错、咨询锁。
 #[cfg(feature = "postgresql")]
 mod postgresql_only {
     use ormer::{Database, DbType, TableDiagnosis};
@@ -296,12 +328,12 @@ mod postgresql_only {
         .unwrap();
     }
 
-    /// CHECK 闭环：约束被外力删除后 apply 自动补建（ormer 自动命名）。
+    /// CHECK 闭环：约束被外力删除后 migrate 自动补建（ormer 自动命名）。
     #[tokio::test]
-    async fn apply_restores_dropped_check_constraint() -> ormer::Result<()> {
+    async fn migrate_restores_dropped_check_constraint() -> ormer::Result<()> {
         let db = pg_database().await;
         let _ = db.drop_table::<CheckTask>().execute().await;
-        db.apply_table::<CheckTask>(&Default::default()).await?;
+        db.migrate_table::<CheckTask>().await?;
 
         let constraint_name = "ck_ormer_apply_check_tasks_name";
         db.execute_sql(ormer::sql!(format!(
@@ -309,7 +341,9 @@ mod postgresql_only {
         )))
         .await?;
 
-        let plan = match db.plan_table::<CheckTask>().await? {
+        // 诊断与执行同源：outcome.diagnosis 是执行前结论，可审查补建计划
+        let outcome = db.migrate_table::<CheckTask>().await?;
+        let plan = match outcome.diagnosis {
             TableDiagnosis::Migratable(plan) => plan,
             other => panic!("expected Migratable, got {other:?}"),
         };
@@ -318,10 +352,8 @@ mod postgresql_only {
             sql.contains("ADD CONSTRAINT") && sql.contains(constraint_name),
             "plan should add the missing check constraint, got: {sql}"
         );
-
-        db.apply_table::<CheckTask>(&Default::default()).await?;
         assert!(matches!(
-            db.plan_table::<CheckTask>().await?,
+            db.migrate_table::<CheckTask>().await?.diagnosis,
             TableDiagnosis::Ready
         ));
 
@@ -346,7 +378,7 @@ mod postgresql_only {
     async fn primary_key_change_is_inplace_on_postgresql() -> ormer::Result<()> {
         let db = pg_database().await;
         let _ = db.drop_table::<PkItemV1>().execute().await;
-        db.apply_table::<PkItemV1>(&Default::default()).await?;
+        db.migrate_table::<PkItemV1>().await?;
         db.insert(&PkItemV1 {
             bucket_start: "2026-09-08 10:00:00".to_string(),
             project_id: "p1".to_string(),
@@ -355,7 +387,8 @@ mod postgresql_only {
         .execute()
         .await?;
 
-        let plan = match db.plan_table::<PkItemV2>().await? {
+        let outcome = db.migrate_table::<PkItemV2>().await?;
+        let plan = match outcome.diagnosis {
             TableDiagnosis::Migratable(plan) => plan,
             other => panic!("pk change should be migratable in place, got {other:?}"),
         };
@@ -364,9 +397,8 @@ mod postgresql_only {
             "plan should change the primary key in place"
         );
 
-        db.apply_table::<PkItemV2>(&Default::default()).await?;
         assert!(matches!(
-            db.plan_table::<PkItemV2>().await?,
+            db.migrate_table::<PkItemV2>().await?.diagnosis,
             TableDiagnosis::Ready
         ));
 
@@ -383,9 +415,10 @@ mod postgresql_only {
         Ok(())
     }
 
-    /// rebuild=Allow：不可迁移差异 → 删表重建，业务触发器由 apply 托管备份/恢复。
+    /// 推不动（无法回填的 NOT NULL 新列）：直接返回 unmigratable_schema 错误，
+    /// 不删表重建，存量数据与业务触发器原样保留。
     #[tokio::test]
-    async fn rebuild_allow_restores_business_triggers() -> ormer::Result<()> {
+    async fn unmigratable_difference_reports_error_and_keeps_table() -> ormer::Result<()> {
         let db = pg_database().await;
         let _ = db.drop_table::<TriggerStatV1>().execute().await;
         let _ = db.execute_sql("DROP TABLE IF EXISTS ormer_apply_audit").await;
@@ -393,7 +426,7 @@ mod postgresql_only {
             .execute_sql("DROP FUNCTION IF EXISTS ormer_apply_audit_fn()")
             .await;
 
-        db.apply_table::<TriggerStatV1>(&Default::default()).await?;
+        db.migrate_table::<TriggerStatV1>().await?;
         db.insert(&TriggerStatV1 {
             bucket_start: "2026-09-08 10:00:00".to_string(),
             project_id: "p1".to_string(),
@@ -404,25 +437,22 @@ mod postgresql_only {
         .unwrap();
         create_business_trigger(&db).await;
 
-        let before = match db.plan_table::<TriggerStatV2>().await.unwrap() {
-            TableDiagnosis::NeedsRebuild(cause) => cause,
-            other => panic!("unbackfillable not-null column must require rebuild, got {other:?}"),
-        };
-        assert_eq!(before.table, TRIGGER_TABLE);
+        // 无法回填的 NOT NULL 新列：推不动 → 直接报 unmigratable_schema
+        let err = db.migrate_table::<TriggerStatV2>().await.unwrap_err();
+        assert!(
+            err.is_unmigratable_schema(),
+            "unbackfillable not-null column must report unmigratable_schema, got {err}"
+        );
 
-        let opts = ormer::ApplyOptions {
-            rebuild: ormer::RebuildPolicy::Allow,
-            ..Default::default()
-        };
-        let outcome = db.apply_table::<TriggerStatV2>(&opts).await.unwrap();
-        assert!(outcome.created_table, "rebuild should recreate the table");
-        assert!(matches!(
-            db.plan_table::<TriggerStatV2>().await.unwrap(),
-            TableDiagnosis::Ready
-        ));
-
-        // 触发器恢复且定义一致
-        let restored = db
+        // 不删表重建：存量数据与业务触发器原样保留
+        let rows = db
+            .select_sql::<i64>(ormer::sql!(format!(
+                "SELECT count(*) FROM {TRIGGER_TABLE}"
+            )))
+            .collect::<Vec<i64>>()
+            .await?;
+        assert_eq!(rows.first().copied(), Some(1), "data must survive");
+        let triggers = db
             .select_sql::<String>(ormer::sql!(format!(
                 "SELECT pg_get_triggerdef(t.oid) FROM pg_trigger t \
                  WHERE t.tgrelid = to_regclass('{TRIGGER_TABLE}') AND NOT t.tgisinternal"
@@ -430,8 +460,8 @@ mod postgresql_only {
             .collect::<Vec<String>>()
             .await
             .unwrap();
-        assert_eq!(restored.len(), 1, "trigger must be restored: {restored:?}");
-        assert!(restored[0].contains(TRIGGER_NAME));
+        assert_eq!(triggers.len(), 1, "trigger must be kept: {triggers:?}");
+        assert!(triggers[0].contains(TRIGGER_NAME));
 
         let _ = db.drop_table::<TriggerStatV2>().execute().await;
         let _ = db

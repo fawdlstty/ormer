@@ -1,7 +1,7 @@
 //! 路由子表列存压缩端到端测试（PostgreSQL + TimescaleDB）。
 //!
 //! 拆表子表的路由列在子表内值固定，行存 heap 下逐行写盘；ormer 在建子表
-//! 与 ensure_table 迁移时自动追加 TimescaleDB columnstore 与自动压缩策略。
+//! 与 migrate_table 迁移时自动追加 TimescaleDB columnstore 与自动压缩策略。
 //! 服务器未装 TimescaleDB 时跳过。
 //!
 //! 连接地址通过 `ORMER_TEST_POSTGRES` 配置，未配置时使用默认本地地址。
@@ -121,7 +121,7 @@ async fn routed_child_columnstore_end_to_end() -> ormer::Result<()> {
     .await?;
     assert!(child_compression_enabled(&db).await);
 
-    // 阶段二：模拟旧版本 ormer 创建的子表（无压缩属性），ensure_table 自适应补挂
+    // 阶段二：模拟旧版本 ormer 创建的子表（无压缩属性），migrate_table 自适应补挂
     drop_child_and_base(&db).await?;
     db.execute_sql(format!(
         "CREATE TABLE {CHILD} (time TIMESTAMPTZ NOT NULL, station TEXT NOT NULL, \
@@ -135,10 +135,10 @@ async fn routed_child_columnstore_end_to_end() -> ormer::Result<()> {
     .await?;
     assert!(!child_compression_enabled(&db).await);
 
-    db.ensure_table::<RoutedCsEvent>().await?;
+    db.migrate_table::<RoutedCsEvent>().await?;
     assert!(
         child_compression_enabled(&db).await,
-        "ensure_table must retrofit columnstore on legacy routed child tables"
+        "migrate_table must retrofit columnstore on legacy routed child tables"
     );
     assert!(child_has_compression_policy(&db).await);
 

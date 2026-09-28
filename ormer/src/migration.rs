@@ -20,21 +20,6 @@ use std::marker::PhantomData;
 
 pub const MIGRATION_TABLE_NAME: &str = "__ormer_migrations";
 
-/// [`Database::ensure_table`] 的执行结果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TableEnsureOutcome {
-    /// 表原本不存在并已创建，或已存在且结构校验通过。
-    Ready,
-    /// 存在结构差异，已通过增量迁移对齐。
-    Migrated,
-    /// 存在无法增量迁移的结构差异（如主键变更、超表分区约束冲突），
-    /// 已按约定删除表并按当前模型重建。
-    ///
-    /// 仅由 [`Database::ensure_table_permissive`] 返回：默认的
-    /// [`Database::ensure_table`] 会拒绝删表重建并直接返回错误。
-    Recreated,
-}
-
 /// 判断错误是否属于"应当删除重建"的结构性差异。
 ///
 /// 包括：ormer 自身报告的不可迁移 schema / 结构不匹配，以及 TimescaleDB
@@ -779,148 +764,29 @@ impl<'a, M: Migration> MigrationRunner<'a, M> {
     }
 }
 
-/// 把 [`crate::table_migrate::TableApplyOutcome`] 映射回
-/// [`TableEnsureOutcome`]（薄糖入口的返回形态）。
-fn ensure_outcome_from_apply(
-    outcome: &crate::table_migrate::TableApplyOutcome,
-) -> TableEnsureOutcome {
-    match &outcome.diagnosis {
-        crate::table_migrate::TableDiagnosis::Ready => TableEnsureOutcome::Ready,
-        crate::table_migrate::TableDiagnosis::Migratable(_) => {
-            if outcome.created_table || outcome.executed.is_empty() {
-                TableEnsureOutcome::Ready
-            } else {
-                TableEnsureOutcome::Migrated
-            }
-        }
-        crate::table_migrate::TableDiagnosis::NeedsRebuild(_) => TableEnsureOutcome::Recreated,
-    }
-}
-
-/// Builder returned by `Database::migrate_table`.
-pub struct TableMigration<'a, T: WritableModel> {
+/// 表级 diff 引擎载体：内部供 `table_migrate` 模块的诊断路径
+/// （`for_diagnosis` + `plan_for_table`）构造与消费，不对外暴露。
+pub(crate) struct TableMigration<'a, T: WritableModel> {
     db: &'a Database,
     marker: PhantomData<T>,
     /// 用户显式标注的列重命名（old, new）。diff 阶段命中"删 old 列 + 加 new 列"
     /// 且存在对应标注时，生成 RenameColumn 而非删列加列，避免数据丢失。
     renames: Vec<(String, String)>,
-    /// 目标表名覆盖：迁移 PG 路由子表时按子表名参数化（对齐
-    /// `CreateTableExecutor` 的 `table_name: Some(..)` 先例）。`None` 时
-    /// 使用模型基础表名。
-    table_name: Option<String>,
-    /// 主键差异处理模式：false（默认，`migrate_table` 公开面）保持既有语义
-    /// ——主键变更报 `UnmigratableSchema`；true（plan_table/apply_table 内部）
-    /// 在 PostgreSQL 上生成 `ChangePrimaryKey` 原地变更步骤，其余后端转重建。
+    /// 主键差异处理模式：诊断路径固定 true——在 PostgreSQL 上生成
+    /// `ChangePrimaryKey` 原地变更步骤，其余后端转重建。
     pub(crate) allow_inplace_pk: bool,
-    /// 多余列处理：Drop（默认，`migrate_table` 公开面的既有语义——计划含
-    /// DropColumn，由调用方决定是否执行）或 Keep（保留，不生成 DropColumn）。
-    pub(crate) extra_columns: crate::table_migrate::ExtraPolicy,
 }
 
 impl<'a, T: WritableModel> TableMigration<'a, T> {
-    /// 标注一次列重命名：数据库中的 `old_name` 列对应模型中的 `new_name` 字段。
-    ///
-    /// 未标注时，列重命名会被 diff 识别为"删旧列 + 加新列"，默认的
-    /// [`Database::ensure_table`] 会拒绝（数据丢失）；标注后迁移计划生成
-    /// `ALTER TABLE ... RENAME COLUMN`（MSSQL 为 `sp_rename`），数据原地保留。
-    /// 可链式标注多次，随后调用 [`TableMigration::plan`] / `execute`：
-    ///
-    /// ```ignore
-    /// db.migrate_table::<User>()
-    ///     .rename_column("name", "full_name")
-    ///     .execute()
-    ///     .await?;
-    /// ```
-    pub fn rename_column(
-        mut self,
-        old_name: impl Into<String>,
-        new_name: impl Into<String>,
-    ) -> Self {
-        self.renames.push((old_name.into(), new_name.into()));
-        self
-    }
-
-    /// 内部构造：plan_table / apply_table 的诊断路径使用（主键原地变更
-    /// 开启、多余列策略由 ApplyOptions 决定）。
-    #[allow(dead_code)]
-    pub(crate) fn for_diagnosis(
-        db: &'a Database,
-        table_name: Option<&str>,
-        extra_columns: crate::table_migrate::ExtraPolicy,
-    ) -> Self {
+    /// 内部构造：migrate_table 诊断路径使用（主键原地变更开启、多余列固定
+    /// 生成 DropColumn——键、列及配置与模型完全一致）。
+    pub(crate) fn for_diagnosis(db: &'a Database) -> Self {
         Self {
             db,
             marker: PhantomData,
             renames: Vec::new(),
-            table_name: table_name.map(str::to_string),
             allow_inplace_pk: true,
-            extra_columns,
         }
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub async fn sqlite_rebuild_plan(&self) -> crate::Result<MigrationPlan> {
-        let db_type = self.db.db_type();
-        if !matches!(db_type, DbType::Sqlite) {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "SQLite table rebuild",
-            });
-        }
-
-        let table_name = T::table_name_for_db(db_type);
-        let actual = self.db.schema_columns(table_name).await?.ok_or_else(|| {
-            crate::ormer_error!(
-                "SQLite table {} does not exist; use create_table instead of a rebuild",
-                table_name
-            )
-        })?;
-        let actual_by_name = actual
-            .iter()
-            .map(|column| (column.name.as_str(), column))
-            .collect::<BTreeMap<_, _>>();
-        let mut plan = MigrationPlan::new(table_name, db_type);
-        plan.warnings.push(
-            "SQLite rebuild replaces the table in one transaction; review copy rules before execution"
-                .to_string(),
-        );
-        plan.push(MigrationStep::Sql {
-            sql: sqlite_rebuild_sql::<T>(table_name, &actual_by_name)?,
-        });
-        Ok(plan)
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub async fn sqlite_rebuild_sql(&self) -> crate::Result<String> {
-        self.sqlite_rebuild_plan().await?.to_sql()
-    }
-
-    /// 迁移计划预览：基础表动作 + PG 路由子表（已存在的）动作。
-    ///
-    /// 模型声明 hypertable route key 时（仅 PostgreSQL），写入路径会把数据
-    /// 落到 `{基础表名}_{路由值}` 子表；本方法在基础表计划之后，用 `pg_class`
-    /// 前缀查询枚举已存在的子表，把每个子表的差异动作并入同一份计划。路由
-    /// 值无法枚举，不存在的子表不预建（首次写入时仍按当时 DDL 自动创建）。
-    pub async fn plan(&self) -> crate::Result<MigrationPlan> {
-        #[cfg_attr(not(feature = "postgresql"), allow(unused_mut))]
-        let mut plan = self.plan_base_only().await?;
-        #[cfg(feature = "postgresql")]
-        if self.table_name.is_none() {
-            self.append_routed_child_steps(&mut plan).await?;
-        }
-        Ok(plan)
-    }
-
-    /// 仅目标表的计划（不含路由子表扩散）。[`Database::ensure_table`] 的
-    /// 增量分支使用它：子表动作由专门的子表迁移步骤逐表套用与基础表相同
-    /// 的破坏性预检后再执行，避免严格模式下绕过删列拒绝。
-    async fn plan_base_only(&self) -> crate::Result<MigrationPlan> {
-        let db_type = self.db.db_type();
-        let table_name = self
-            .table_name
-            .as_deref()
-            .unwrap_or(T::table_name_for_db(db_type));
-        self.plan_for_table(table_name).await
     }
 
     /// 表名参数化的计划核心：基础表与路由子表共用同一套 schema diff 逻辑
@@ -1040,20 +906,12 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             if expected_names.contains(column.name.as_str()) {
                 continue;
             }
-            if self.extra_columns == crate::table_migrate::ExtraPolicy::Keep {
-                // Keep（apply_table 默认）：多余列保留在库内，不参与 DDL。
-                // 必须先于 SQLite 重建判定，否则 Keep 语义在 SQLite 上被绕过。
-                plan.warnings.push(format!(
-                    "keeping column {} because it is not present in the model (extra_columns = Keep)",
-                    column.name
-                ));
-                continue;
-            }
             #[cfg(feature = "sqlite")]
             if matches!(db_type, DbType::Sqlite) {
                 sqlite_rebuild_required = true;
                 continue;
             }
+            // 多余列（库里有、模型没有）固定删除：键、列及配置与模型完全一致
             plan.warnings.push(format!(
                 "dropping column {} because it is not present in the model",
                 column.name
@@ -1204,7 +1062,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         // 枚举列名不变则视为未变更）与 db_first 校验（比变体列表）之间出现空洞：
         // 校验报 Enum variants mismatch → 计划为空 → 复验仍失败 → permissive
         // 路径删表重建，而重建时的 CREATE TYPE 因同名类型已存在被跳过，新表
-        // 仍引用缺变体的旧类型 → 校验永远失败，ensure_table 死循环。
+        // 仍引用缺变体的旧类型 → 校验永远失败，migrate_table 死循环。
         // 变体删除/重排是 PostgreSQL 不支持的变更，仍交由重建路径处理。
         #[cfg(feature = "postgresql")]
         {
@@ -1648,75 +1506,6 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
         }
 
         Ok(plan)
-    }
-
-    pub async fn execute(&self) -> crate::Result<()> {
-        let plan = self.plan().await?;
-        self.execute_plan(&plan).await
-    }
-
-    /// 执行一个已生成的迁移计划。
-    ///
-    /// 与 `execute` 共用尾部逻辑，供 `ensure_table` 在执行前审查计划（拒绝
-    /// 破坏性步骤）后复用，避免两处各写一份事务/非事务执行分支。
-    pub(crate) async fn execute_plan(&self, plan: &MigrationPlan) -> crate::Result<()> {
-        if plan.is_empty() {
-            return Ok(());
-        }
-
-        if !plan.db_type().is_transactional() {
-            return execute_steps_nontransactional(self.db, plan.db_type(), plan.steps()).await;
-        }
-
-        let mut transaction = self.db.begin().await?;
-        let result = execute_steps(&mut transaction, plan.db_type(), plan.steps()).await;
-        match result {
-            Ok(()) => transaction.commit().await,
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                Err(error)
-            }
-        }
-    }
-
-    /// 把已存在的 PG 路由子表的差异动作并入预览计划。
-    ///
-    /// 仅 PostgreSQL 且模型声明 route key 时生效；每个子表复用
-    /// [`TableMigration::plan_for_table`] 生成子计划，步骤的目标表名即子表
-    /// 名（`AddColumn { table: "aaa_val" }` 等），与基础表动作合并在同一份
-    /// [`MigrationPlan`] 中。子表已不存在（枚举后被并发删除）时跳过，不预建。
-    #[cfg(feature = "postgresql")]
-    async fn append_routed_child_steps(&self, plan: &mut MigrationPlan) -> crate::Result<()> {
-        let db_type = self.db.db_type();
-        if !matches!(db_type, DbType::PostgreSQL) || T::hypertable_route_key().is_none() {
-            return Ok(());
-        }
-        let mut included = Vec::new();
-        for child in self.db.existing_routed_child_tables::<T>().await? {
-            if self.db.schema_columns(&child).await?.is_none() {
-                continue;
-            }
-            let child_plan = self.plan_for_table(&child).await?;
-            if !child_plan.is_empty() {
-                included.push((child, child_plan));
-            }
-        }
-        if included.is_empty() {
-            return Ok(());
-        }
-        plan.warnings.push(format!(
-            "routed child tables included in this plan: {}",
-            included
-                .iter()
-                .map(|(child, _)| child.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        for (_, child_plan) in included {
-            plan.steps.extend(child_plan.steps);
-            plan.warnings.extend(child_plan.warnings);
-        }
-        Ok(())
     }
 }
 
@@ -2275,7 +2064,7 @@ fn push_foreign_key_diff_steps<T: WritableModel>(
 /// - 列在库内不存在 → 由 AddColumn 建列 DDL 处理；
 /// - 列类型本身不一致（如被改成 TEXT）→ 由列类型 diff 的 AlterColumn 处理；
 /// - 库内变体比模型多（删除/重排变体）→ PostgreSQL 不支持，此处无能为力，
-///   交由 ensure_table 的重建路径。
+///   由 migrate_table 复验不收敛时统一报 unmigratable_schema。
 ///
 /// 注意：`ALTER TYPE ... ADD VALUE` 在 PostgreSQL 12+ 才允许在事务块内执行
 /// （且新值须等事务提交后可用——本计划的后续步骤不会用到新值，复验在
@@ -3021,42 +2810,6 @@ impl Database {
         }
     }
 
-    /// 版本化迁移的表级 diff 入口（内部能力，服务 `MigrationStep` 生成与
-    /// 版本化迁移编排）。应用启动时的表结构对齐请改用
-    /// [`Database::apply_table`]：诊断与执行同源、幂等、策略可控。
-    pub fn migrate_table<T: WritableModel>(&self) -> TableMigration<'_, T> {
-        TableMigration {
-            db: self,
-            marker: PhantomData,
-            renames: Vec::new(),
-            table_name: None,
-            allow_inplace_pk: false,
-            extra_columns: crate::table_migrate::ExtraPolicy::Drop,
-        }
-    }
-
-    /// 删除并按当前模型重建一个路由子表。表名参数化复用
-    /// `create_table::<T>().with_table_name()` 的完整 DDL 序列（枚举类型 +
-    /// CREATE TABLE + create_hypertable + 索引 + 列存压缩），与写入路径
-    /// 自动建子表一致。
-    #[cfg(feature = "postgresql")]
-    pub(crate) async fn recreate_routed_child_table<T: WritableModel>(
-        &self,
-        child: &str,
-    ) -> crate::Result<()> {
-        let sql = format!(
-            "DROP TABLE IF EXISTS {}",
-            crate::model::quote_qualified_identifier(self.db_type(), child)
-        );
-        self.execute_sql(sql).await?;
-        self.create_table::<T>()
-            .with_table_name(child)
-            .with_route_columnstore()
-            .execute()
-            .await?;
-        Ok(())
-    }
-
     /// 用 `pg_class` 前缀查询枚举 PG 上已存在的路由子表，返回带 schema
     /// 前缀的完整表名（schema 解析与 `check_table_exists` 等既有逻辑一致：
     /// 模型表名可带前缀，无前缀按 `public` 处理）。结果按表名排序，保证
@@ -3074,32 +2827,6 @@ impl Database {
             .collect::<Vec<String>>()
             .await?;
         Ok(rows.into_iter().map(|name| format!("{schema}.{name}")).collect())
-    }
-
-    /// [`Database::apply_table`] 的策略预设薄糖：Keep 多余列 + Refuse 重建 +
-    /// 非并发建索引（与改造前 ensure_table 的执行形态一致）。
-    ///
-    /// 语义差异说明：改造前遇到"库中有而模型没有"的列时整体报错拒绝；
-    /// 现按 Keep 策略保留多余列并继续迁移其余差异（规格书 §4.1 拍板：
-    /// Keep = 保留，最保守）。
-    pub async fn ensure_table<T: WritableModel>(
-        &self,
-    ) -> crate::Result<TableEnsureOutcome> {
-        let outcome = self
-            .apply_table::<T>(&crate::table_migrate::ApplyOptions::strict())
-            .await?;
-        Ok(ensure_outcome_from_apply(&outcome))
-    }
-
-    /// [`Database::apply_table`] 的策略预设薄糖：Drop 多余列 + Allow 重建
-    /// （对齐改造前 ensure_table_permissive 语义）。
-    pub async fn ensure_table_permissive<T: WritableModel>(
-        &self,
-    ) -> crate::Result<TableEnsureOutcome> {
-        let outcome = self
-            .apply_table::<T>(&crate::table_migrate::ApplyOptions::permissive())
-            .await?;
-        Ok(ensure_outcome_from_apply(&outcome))
     }
 
     pub fn migrations<'a, M: Migration>(&'a self, migrations: &'a [M]) -> MigrationRunner<'a, M> {

@@ -62,7 +62,10 @@ async fn duckdb_preserves_primary_key_types() -> Result<(), Box<dyn std::error::
         .execute()
         .await?;
     assert!(
-        matches!(db.plan_table::<DuckDbI64AutoIncrementUser>().await?, ormer::TableDiagnosis::Ready),
+        matches!(
+            db.migrate_table::<DuckDbI64AutoIncrementUser>().await?.diagnosis,
+            ormer::TableDiagnosis::Ready
+        ),
         "table should match model after create"
     );
     let entities = db.generate_entities(None).await?;
@@ -81,7 +84,10 @@ async fn duckdb_preserves_primary_key_types() -> Result<(), Box<dyn std::error::
 
     db.create_table::<DuckDbTextPrimaryUser>().execute().await?;
     assert!(
-        matches!(db.plan_table::<DuckDbTextPrimaryUser>().await?, ormer::TableDiagnosis::Ready),
+        matches!(
+            db.migrate_table::<DuckDbTextPrimaryUser>().await?.diagnosis,
+            ormer::TableDiagnosis::Ready
+        ),
         "table should match model after create"
     );
     db.insert(&DuckDbTextPrimaryUser {

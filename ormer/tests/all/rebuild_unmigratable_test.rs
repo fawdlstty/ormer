@@ -131,8 +131,9 @@ async fn audit_rows(db: &Database) -> i64 {
     .unwrap()
 }
 
-/// 复现 ticket_hourly_stats 事故：主键变更 → 迁移拒绝 → 触发器快照 → 删表重建 →
-/// 触发器还原且仍然生效。老写法 `绑定参数::regclass` 在驱动层必败，必须用 to_regclass。
+/// 复现 ticket_hourly_stats 事故：主键变更 → 原地迁移 → 触发器快照 → 手工删表
+/// 重建 → 触发器还原且仍然生效。老写法 `绑定参数::regclass` 在驱动层必败，
+/// 必须用 to_regclass。
 #[tokio::test]
 async fn unmigratable_primary_key_change_rebuild_flow() {
     let db = Database::connect(
@@ -161,10 +162,14 @@ async fn unmigratable_primary_key_change_rebuild_flow() {
     .unwrap();
     create_audit_objects(&db).await;
 
-    // 1. plan_table（apply_table 的进入条件）在 PG 上支持主键原地变更：
-    //    判定为可迁移且计划含 ChangePrimaryKey 步骤
-    let diagnosis = db.plan_table::<RebuildStatV2>().await.unwrap();
-    let has_pk_change = match &diagnosis {
+    // 1. migrate_table 在 PG 上支持主键原地变更：执行前诊断（outcome.diagnosis）
+    //    判定为可迁移且计划含 ChangePrimaryKey 步骤，本次调用即完成原地变更
+    //    （旧句柄式入口在此语义下必失败报 UnmigratableSchema，该入口已移除）
+    let outcome = db
+        .migrate_table::<RebuildStatV2>()
+        .await
+        .unwrap();
+    let has_pk_change = match &outcome.diagnosis {
         ormer::TableDiagnosis::Migratable(plan) => plan.steps().iter().any(|step| {
             matches!(step, ormer::MigrationStep::ChangePrimaryKey { .. })
         }),
@@ -172,18 +177,8 @@ async fn unmigratable_primary_key_change_rebuild_flow() {
     };
     assert!(
         has_pk_change,
-        "primary key change must plan an in-place ChangePrimaryKey, got {diagnosis:?}"
-    );
-
-    // 2. 迁移必须失败，且失败类型可编程判定（替代脆弱的字符串匹配）
-    let migrate_err = db
-        .migrate_table::<RebuildStatV2>()
-        .execute()
-        .await
-        .unwrap_err();
-    assert!(
-        migrate_err.is_unmigratable_schema(),
-        "expected unmigratable schema error, got: {migrate_err}"
+        "primary key change must plan an in-place ChangePrimaryKey, got {:?}",
+        outcome.diagnosis
     );
 
     // 3. 老的快照写法把表名绑成 String 参数再 ::regclass，驱动层必败（事故根因）
@@ -210,7 +205,10 @@ async fn unmigratable_primary_key_change_rebuild_flow() {
 
     // 6. 重建后新模型诊断就绪
     assert!(matches!(
-        db.plan_table::<RebuildStatV2>().await.unwrap(),
+        db.migrate_table::<RebuildStatV2>()
+            .await
+            .unwrap()
+            .diagnosis,
         ormer::TableDiagnosis::Ready
     ));
 
@@ -249,9 +247,10 @@ async fn new_primary_key_column_is_unmigratable() {
         .await
         .unwrap();
 
+    // "只诊断不执行"等价断言：NeedsRebuild 在 Refuse 策略下报
+    // UnmigratableSchema（可编程判定，不 drop）
     let err = db
         .migrate_table::<RebuildStatNewPk>()
-        .plan()
         .await
         .unwrap_err();
     assert!(
@@ -285,9 +284,10 @@ async fn not_null_column_without_backfill_is_unmigratable() {
     .await
     .unwrap();
 
+    // "只诊断不执行"等价断言：NeedsRebuild 在 Refuse 策略下报
+    // UnmigratableSchema（不 drop、不重建）
     let err = db
         .migrate_table::<RebuildStatNotNull>()
-        .plan()
         .await
         .unwrap_err();
     assert!(

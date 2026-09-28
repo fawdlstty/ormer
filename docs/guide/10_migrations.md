@@ -2,24 +2,32 @@
 
 Ormer 提供两种迁移方式：根据模型生成可检查的增量计划，以及通过 `Migration` trait 编写带版本和校验和的迁移。
 
-## 根据模型生成计划
+## 根据模型一次性迁移
 
-`migrate_table::<T>()` 会生成可执行的 schema 迁移计划。不存在的表会生成建表步骤，不存在的非主键列会生成 `ADD COLUMN`；已存在列的类型或可空性变化会尽量生成真实迁移，SQLite 需要时会通过重建表完成回填。无法安全推断的数据转换会直接返回错误。
+`migrate_table::<T>()` 是应用启动时的表结构对齐统一入口：一次调用完成"诊断 → 执行 → 复验"，天然幂等、可被启动重试循环反复调用。不存在的表会直接建全（含枚举/扩展/hypertable 配套步骤），不存在的非主键列会生成 `ADD COLUMN`；已存在列的类型或可空性变化会尽量生成真实迁移，SQLite 需要时会通过重建表完成回填。无法安全推断的数据转换会直接返回错误。
 
 ```rust
-let plan = db.migrate_table::<User>().plan().await?;
+use ormer::{TableDiagnosis};
 
-println!("{}", plan.to_sql()?);
-for warning in plan.warnings() {
-    eprintln!("{warning}");
+let outcome = db.migrate_table::<User>().await?;
+
+// outcome.diagnosis 是执行前的诊断结论，可在执行后审查原计划。
+// 成功返回时只可能是 Ready / Migratable(plan)：
+// outcome.created_table 标记本次是否建了表（仅源于表原本不存在的新建）
+// outcome.executed 是实际执行的步骤清单
+match &outcome.diagnosis {
+    TableDiagnosis::Ready => {}
+    TableDiagnosis::Migratable(plan) => {
+        for warning in plan.warnings() {
+            eprintln!("{warning}");
+        }
+    }
 }
-
-db.migrate_table::<User>().execute().await?;
 ```
 
-如果目标转换无法安全证明，`plan()` 或 `execute()` 会返回错误。SQLite 的复杂变更通过重建表完成，非法旧数据会在迁移阶段失败并回滚。
+如果目标转换无法安全证明，迁移会直接返回错误。SQLite 的复杂变更通过重建表完成，非法旧数据会在迁移阶段失败并回滚。
 
-无法就地推断的 schema 演进（主键变更、有数据时的非空新增列等）返回 `OrmerError::UnmigratableSchema`，可用 `err.is_unmigratable_schema()` 判定，以便调用方选择删表重建等策略，与其他迁移失败区分。
+无法就地推断的 schema 演进（类型收窄、超表分区约束冲突等）不做任何删表重建：`migrate_table` 直接返回 `OrmerError::UnmigratableSchema`（可用 `err.is_unmigratable_schema()` 判定，与其他迁移失败区分），存量数据与表上对象原样保留，由调用方决策后续处理。
 
 ## 版本化迁移
 
@@ -91,8 +99,8 @@ for migration in history {
 }
 ```
 
-SQLite 不支持在建表后追加外键。`migrate_table` 会返回错误；需要时先调用
-`migrate_table::<T>().sqlite_rebuild_plan().await?` 显式生成并审查重建 SQL，再执行。
+SQLite 不支持在建表后追加外键。`migrate_table` 按 `UnmigratableSchema`
+报错；确需追加时由调用方手工重建表。
 
 ClickHouse 也使用统一的 `Database` 迁移入口：
 
@@ -119,10 +127,7 @@ InfluxDB 使用同一迁移入口：没有建表 DDL（measurement 由首条写�
 
 `migrate_table` 会为新增列生成默认值定义，并尽量生成新增的普通索引、联合索引和唯一索引；已有数据上的非空新增列没有默认值时仍需显式回填。
 
-`ensure_table` 遇到需要删列或删表重建的破坏性变更时默认报错（返回
-`UnmigratableSchema`），不再静默删数据；显式允许时改用
-`ensure_table_permissive`。`migrate_table::<T>()` 支持链式 `rename_column("old", "new")`
-标注列重命名（生成 `ALTER TABLE ... RENAME COLUMN`），避免"删列 + 加空列"。
+多余列（库里有、模型没有）会被直接删除，保证键、列及配置与模型完全一致。
 索引按"期望集合 vs 实际集合"自动对比：给已有列新增 `#[index]` 会生成建索引步骤，
 删除 `#[index]` 会生成 `DropIndex`。把可空列收紧为 `NOT NULL` 前，若存量行含 NULL
 会先报错，需先回填。

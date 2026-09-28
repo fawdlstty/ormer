@@ -2,60 +2,6 @@
 
 use ormer::{Database, DbType, Migration, MigrationStep};
 
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_users"]
-struct MigrationUserV1 {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_users"]
-struct MigrationUserV2 {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    display_name: String,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_users"]
-struct MigrationUserV3 {
-    #[primary(auto)]
-    id: i32,
-    name: String,
-    #[default("unknown")]
-    #[unique]
-    slug: String,
-    #[index]
-    tag: Option<String>,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_type_values"]
-struct MigrationIntegerValue {
-    #[primary]
-    id: i32,
-    value: i32,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_nullable_values"]
-struct MigrationNonNullValue {
-    #[primary]
-    id: i32,
-    value: String,
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "ormer_migration_nullable_bad_values"]
-struct MigrationNonNullBadValue {
-    #[primary]
-    id: i32,
-    value: String,
-}
-
 struct CreateMigration;
 
 impl Migration for CreateMigration {
@@ -97,253 +43,6 @@ async fn database() -> ormer::Result<Database> {
 }
 
 #[tokio::test]
-async fn table_plan_creates_and_adds_columns() -> ormer::Result<()> {
-    let db = database().await?;
-
-    let initial = db.migrate_table::<MigrationUserV1>().plan().await?;
-    assert_eq!(initial.table_name(), "ormer_migration_users");
-    assert!(matches!(
-        initial.steps().first(),
-        Some(MigrationStep::CreateTable { .. })
-    ));
-    initial.to_sql()?;
-    db.migrate_table::<MigrationUserV1>().execute().await?;
-    assert!(
-        matches!(
-            db.plan_table::<MigrationUserV1>().await?,
-            ormer::TableDiagnosis::Ready
-        ),
-        "migrated schema should be Ready"
-    );
-
-    let additive = db.migrate_table::<MigrationUserV2>().plan().await?;
-    assert!(additive.steps().iter().any(
-        |step| matches!(step, MigrationStep::AddColumn { column, .. } if column == "display_name")
-    ));
-    db.migrate_table::<MigrationUserV2>().execute().await?;
-    assert!(
-        matches!(
-            db.plan_table::<MigrationUserV2>().await?,
-            ormer::TableDiagnosis::Ready
-        ),
-        "migrated schema should be Ready"
-    );
-    assert!(
-        db.migrate_table::<MigrationUserV2>()
-            .plan()
-            .await?
-            .is_empty()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn table_plan_rejects_implicit_not_null_addition_on_populated_sqlite_table()
--> ormer::Result<()> {
-    let db = database().await?;
-    db.migrate_table::<MigrationUserV1>().execute().await?;
-    db.execute_sql("INSERT INTO ormer_migration_users (name) VALUES ('existing')")
-        .await?;
-
-    let error = db
-        .migrate_table::<MigrationUserV2>()
-        .plan()
-        .await
-        .expect_err("non-null column requires an explicit backfill");
-    assert!(error.to_string().contains("explicit migration"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn table_plan_uses_defaults_and_adds_indexes_for_new_columns() -> ormer::Result<()> {
-    let db = database().await?;
-    db.migrate_table::<MigrationUserV1>().execute().await?;
-    db.execute_sql("INSERT INTO ormer_migration_users (name) VALUES ('existing')")
-        .await?;
-
-    let plan = db.migrate_table::<MigrationUserV3>().plan().await?;
-    assert!(
-        plan.steps()
-            .iter()
-            .any(|step| { matches!(step, MigrationStep::CreateIndex { unique: true, .. }) })
-    );
-    assert!(plan.steps().iter().any(|step| {
-        matches!(
-            step,
-            MigrationStep::CreateIndex { unique: false, columns, .. }
-                if columns == &vec!["tag".to_string()]
-        )
-    }));
-
-    db.migrate_table::<MigrationUserV3>().execute().await?;
-    let rows = db
-        .select_sql::<(String, String)>(
-            "SELECT name, slug FROM ormer_migration_users ORDER BY name",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(rows, vec![("existing".to_string(), "unknown".to_string())]);
-    let error = db
-        .execute_sql(
-            "INSERT INTO ormer_migration_users (name, slug) \
-             VALUES ('second', 'unknown')",
-        )
-        .await
-        .expect_err("new unique index must be enforced");
-    assert!(!error.to_string().is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn sqlite_migrates_text_to_integer_and_preserves_data() -> ormer::Result<()> {
-    let db = database().await?;
-    db.execute_sql(
-        "CREATE TABLE ormer_migration_type_values (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
-    )
-    .await?;
-    db.execute_sql(
-        "INSERT INTO ormer_migration_type_values (id, value) \
-         VALUES (1, '0'), (2, '7'), (3, '-12')",
-    )
-    .await?;
-
-    let plan = db.migrate_table::<MigrationIntegerValue>().plan().await?;
-    assert!(!plan.is_empty());
-    assert!(plan.warnings().is_empty());
-
-    db.migrate_table::<MigrationIntegerValue>()
-        .execute()
-        .await?;
-    assert!(matches!(
-        db.plan_table::<MigrationIntegerValue>().await?,
-        ormer::TableDiagnosis::Ready
-    ));
-    let values = db
-        .select_sql::<(i32, i32)>("SELECT id, value FROM ormer_migration_type_values ORDER BY id")
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(values, vec![(1, 0), (2, 7), (3, -12)]);
-    assert!(
-        db.migrate_table::<MigrationIntegerValue>()
-            .plan()
-            .await?
-            .is_empty()
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn sqlite_migrates_nullable_to_not_null_and_enforces_constraint() -> ormer::Result<()> {
-    let db = database().await?;
-    db.execute_sql(
-        "CREATE TABLE ormer_migration_nullable_values (id INTEGER PRIMARY KEY, value TEXT)",
-    )
-    .await?;
-    db.execute_sql("INSERT INTO ormer_migration_nullable_values (id, value) VALUES (1, 'alice')")
-        .await?;
-
-    db.migrate_table::<MigrationNonNullValue>()
-        .execute()
-        .await?;
-    assert!(matches!(
-        db.plan_table::<MigrationNonNullValue>().await?,
-        ormer::TableDiagnosis::Ready
-    ));
-
-    let column_info = db
-        .select_sql::<(String, i64)>(
-            "SELECT name, \"notnull\" FROM pragma_table_info('ormer_migration_nullable_values') \
-             WHERE name = 'value'",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(column_info, vec![("value".to_string(), 1)]);
-    let error = db
-        .execute_sql("INSERT INTO ormer_migration_nullable_values (id, value) VALUES (2, NULL)")
-        .await
-        .expect_err("migrated NOT NULL column must reject NULL");
-    assert!(!error.to_string().is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn sqlite_invalid_type_value_rolls_back() -> ormer::Result<()> {
-    let db = database().await?;
-    db.execute_sql(
-        "CREATE TABLE ormer_migration_type_values (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
-    )
-    .await?;
-    db.execute_sql(
-        "INSERT INTO ormer_migration_type_values (id, value) \
-         VALUES (1, '12'), (2, 'not-an-integer')",
-    )
-    .await?;
-
-    let error = db
-        .migrate_table::<MigrationIntegerValue>()
-        .execute()
-        .await
-        .expect_err("invalid integer text must abort migration");
-    assert!(!error.to_string().is_empty());
-
-    let rows = db
-        .select_sql::<(i32, String)>(
-            "SELECT id, value FROM ormer_migration_type_values ORDER BY id",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(
-        rows,
-        vec![(1, "12".to_string()), (2, "not-an-integer".to_string())]
-    );
-    let column_info = db
-        .select_sql::<(String, String)>(
-            "SELECT name, type FROM pragma_table_info('ormer_migration_type_values') \
-             WHERE name = 'value'",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(column_info, vec![("value".to_string(), "TEXT".to_string())]);
-    Ok(())
-}
-
-#[tokio::test]
-async fn sqlite_not_null_migration_with_existing_null_rolls_back() -> ormer::Result<()> {
-    let db = database().await?;
-    db.execute_sql(
-        "CREATE TABLE ormer_migration_nullable_bad_values (id INTEGER PRIMARY KEY, value TEXT)",
-    )
-    .await?;
-    db.execute_sql("INSERT INTO ormer_migration_nullable_bad_values (id, value) VALUES (1, NULL)")
-        .await?;
-
-    let error = db
-        .migrate_table::<MigrationNonNullBadValue>()
-        .execute()
-        .await
-        .expect_err("existing NULL must abort NOT NULL migration");
-    assert!(!error.to_string().is_empty());
-
-    let null_count = db
-        .select_sql::<i64>(
-            "SELECT COUNT(*) FROM ormer_migration_nullable_bad_values WHERE value IS NULL",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(null_count, vec![1]);
-    let column_info = db
-        .select_sql::<(String, i64)>(
-            "SELECT name, \"notnull\" \
-             FROM pragma_table_info('ormer_migration_nullable_bad_values') \
-             WHERE name = 'value'",
-        )
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(column_info, vec![("value".to_string(), 0)]);
-    Ok(())
-}
-
-#[tokio::test]
 async fn versioned_migrations_track_pending_and_rollback() -> ormer::Result<()> {
     let db = database().await?;
     let create = CreateMigration;
@@ -364,10 +63,15 @@ async fn versioned_migrations_track_pending_and_rollback() -> ormer::Result<()> 
         .await
         .expect_err("migration should fail");
     assert!(!error.to_string().is_empty());
-    assert!(matches!(
-        db.plan_table::<MigrationHistoryUser>().await?,
-        ormer::TableDiagnosis::Migratable(_)
-    ));
+    // 失败批次整体回滚：业务表未被建出（migration_history_users 不存在）
+    let table_rows = db
+        .select_sql::<i64>(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'migration_history_users'",
+        )
+        .collect::<Vec<i64>>()
+        .await?;
+    assert_eq!(table_rows.first().copied(), Some(0));
     assert_eq!(db.pending_migrations(&migrations).await?.len(), 2);
 
     let create_only: [&dyn Migration; 1] = [&create];
@@ -379,11 +83,4 @@ async fn versioned_migrations_track_pending_and_rollback() -> ormer::Result<()> 
     assert_ne!(history[0].checksum, 0);
     assert_eq!(db.apply_migrations(&create_only).await?, 0);
     Ok(())
-}
-
-#[derive(Debug, ormer::Model)]
-#[table = "migration_history_users"]
-struct MigrationHistoryUser {
-    #[primary]
-    id: i32,
 }

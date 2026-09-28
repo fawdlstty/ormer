@@ -57,7 +57,12 @@ async fn test_data_type_crud_impl(
     #[cfg(feature = "postgresql")]
     if matches!(config.0, ormer::DbType::PostgreSQL) {
         assert!(
-            matches!(db.plan_table::<SpecialFieldModel>().await?, ormer::TableDiagnosis::Ready),
+            matches!(
+                db.migrate_table::<SpecialFieldModel>()
+                    .await?
+                    .diagnosis,
+                ormer::TableDiagnosis::Ready
+            ),
             "table should match model after create"
         );
     }

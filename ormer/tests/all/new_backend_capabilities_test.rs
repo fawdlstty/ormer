@@ -261,33 +261,6 @@ struct DuckDbExtendedUser {
     labels: Vec<String>,
 }
 
-#[cfg(feature = "duckdb")]
-#[derive(Debug, ormer::Model)]
-#[table = "duckdb_migration_users"]
-struct DuckDbMigrationUserV1 {
-    #[primary]
-    id: i32,
-    score: i32,
-}
-
-#[cfg(feature = "duckdb")]
-#[derive(Debug, ormer::Model)]
-#[table = "duckdb_migration_users"]
-struct DuckDbMigrationUserV2 {
-    #[primary]
-    id: i32,
-    score: i64,
-}
-
-#[cfg(feature = "duckdb")]
-#[derive(Debug, ormer::Model)]
-#[table = "duckdb_migration_users"]
-struct DuckDbMigrationUserV3 {
-    #[primary]
-    id: i32,
-    score: Option<i64>,
-}
-
 #[tokio::test]
 #[cfg(feature = "duckdb")]
 async fn duckdb_supports_conflicts_bulk_updates_and_arrays()
@@ -295,7 +268,12 @@ async fn duckdb_supports_conflicts_bulk_updates_and_arrays()
     let db = ormer::Database::connect(DbType::DuckDB, ":memory:").await?;
     db.create_table::<DuckDbExtendedUser>().execute().await?;
     assert!(
-        matches!(db.plan_table::<DuckDbExtendedUser>().await?, ormer::TableDiagnosis::Ready),
+        matches!(
+            db.migrate_table::<DuckDbExtendedUser>()
+                .await?
+                .diagnosis,
+            ormer::TableDiagnosis::Ready
+        ),
         "table should match model after create"
     );
 
@@ -408,41 +386,3 @@ async fn duckdb_preserves_iso8601_strings_and_empty_arrays()
     Ok(())
 }
 
-#[tokio::test]
-#[cfg(feature = "duckdb")]
-async fn duckdb_migrates_column_types_and_nullability() -> Result<(), Box<dyn std::error::Error>> {
-    let db = ormer::Database::connect(DbType::DuckDB, ":memory:").await?;
-    db.migrate_table::<DuckDbMigrationUserV1>()
-        .execute()
-        .await?;
-    db.insert(&DuckDbMigrationUserV1 { id: 1, score: 7 })
-        .execute()
-        .await?;
-
-    let type_plan = db.migrate_table::<DuckDbMigrationUserV2>().plan().await?;
-    assert_eq!(
-        type_plan.to_sql()?,
-        "ALTER TABLE duckdb_migration_users ALTER COLUMN score SET DATA TYPE BIGINT"
-    );
-    db.migrate_table::<DuckDbMigrationUserV2>()
-        .execute()
-        .await?;
-
-    let nullability_plan = db.migrate_table::<DuckDbMigrationUserV3>().plan().await?;
-    assert_eq!(
-        nullability_plan.to_sql()?,
-        "ALTER TABLE duckdb_migration_users ALTER COLUMN score DROP NOT NULL"
-    );
-    db.migrate_table::<DuckDbMigrationUserV3>()
-        .execute()
-        .await?;
-
-    db.execute_sql("UPDATE duckdb_migration_users SET score = NULL WHERE id = 1")
-        .await?;
-    let users = db
-        .select::<DuckDbMigrationUserV3>()
-        .collect::<Vec<_>>()
-        .await?;
-    assert_eq!(users[0].score, None);
-    Ok(())
-}

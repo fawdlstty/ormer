@@ -1768,6 +1768,9 @@ pub struct Database {
     /// 事务专用连接的来源池（`begin` 时从这里另取独占连接）；直连模式为 `None`。
     pool: Option<PgPool>,
     db_type: DbType,
+    /// 直连模式保存的连接配置（`apply_extension` 克隆改写目标库后另开连接）；
+    /// `from_pool` 池化模式为 `None`（bb8-postgres 不暴露连接配置）。
+    connect_config: Option<tokio_postgres::Config>,
     /// timescaledb 扩展是否可用（首次按块删除时探测，随连接缓存）。
     timescaledb: std::sync::OnceLock<bool>,
     /// 已确认存在的路由子表（TimescaleDB text 拆表），进程内缓存避免重复 DDL。
@@ -1810,6 +1813,52 @@ async fn ensure_routed_table_on_client<T: Model>(
     mark_schema_ensured(db_type, table);
     mark_columnstore_ensured(db_type, table);
     Ok(())
+}
+
+/// 数据库级管理 DDL 的标识符校验（CREATE/DROP DATABASE、CREATE EXTENSION
+/// 均不支持参数绑定，拼接前防御；规则与统一层 ensure_extensions 共用）。
+fn validate_admin_identifier(name: &str, what: &str) -> crate::Result<()> {
+    if !crate::table_migrate::is_safe_identifier(name) {
+        return Err(crate::ormer_error!(
+            "invalid {what} {name:?}: must be a plain identifier"
+        ));
+    }
+    Ok(())
+}
+
+/// 生成建库语句：`CREATE DATABASE "name"`（纯函数，供
+/// [`Database::create_database`] 与形状测试使用）。
+#[doc(hidden)]
+pub fn create_database_sql(name: &str) -> crate::Result<String> {
+    validate_admin_identifier(name, "database name")?;
+    Ok(format!(
+        "CREATE DATABASE {}",
+        crate::model::quote_identifier(DbType::PostgreSQL, name)
+    ))
+}
+
+/// 生成删库语句：`DROP DATABASE IF EXISTS "name" WITH (FORCE)`（恒带
+/// FORCE：先终止该库全部连接；不存在视为已删，幂等）。
+#[doc(hidden)]
+pub fn drop_database_sql(name: &str) -> crate::Result<String> {
+    validate_admin_identifier(name, "database name")?;
+    Ok(format!(
+        "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+        crate::model::quote_identifier(DbType::PostgreSQL, name)
+    ))
+}
+
+/// 生成应用扩展语句：`CREATE EXTENSION IF NOT EXISTS "name" CASCADE`
+/// （幂等 + CASCADE；CASCADE 用于等价替代现场 timescaledb 引导脚本，
+/// 与 migrate_table 路径的 [`Database::ensure_extension`]（无 CASCADE）
+/// 行为有意不同）。
+#[doc(hidden)]
+pub fn create_extension_sql(name: &str) -> crate::Result<String> {
+    validate_admin_identifier(name, "extension name")?;
+    Ok(format!(
+        "CREATE EXTENSION IF NOT EXISTS {} CASCADE",
+        crate::model::quote_identifier(DbType::PostgreSQL, name)
+    ))
 }
 
 /// 探测路由子表是否已存在（`to_regclass`，缺表返回 NULL）。
@@ -2801,15 +2850,22 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertOrIgno
 }
 
 impl Database {
+    /// drop_database 遇 55006（库仍被占用）的退避重试窗口：TimescaleDB
+    /// 后台 worker 的退出滞后于 WITH (FORCE) 的等待时需留足余量。窗口须
+    /// 小于消费方的操作超时（robot db.rs 的 30s）。
+    const DROP_DATABASE_55006_RETRY_WINDOW_SECS: u64 = 25;
+
     /// Connect through the PostgreSQL wire protocol.
     pub(crate) fn db_type(&self) -> DbType {
         self.db_type
     }
 
     pub async fn connect(db_type: super::DbType, connection_string: &str) -> crate::Result<Self> {
-        let (client, connection) = tokio_postgres::connect(connection_string, NoTls)
-            .trace()
-            .await?;
+        // 先解析为 Config 再连接：Database 保存该配置，`apply_extension`
+        // 需要克隆改写目标库后另开连接（等效于 tokio_postgres::connect 的
+        // 内部路径，连接行为不变）。
+        let connect_config: tokio_postgres::Config = connection_string.parse()?;
+        let (client, connection) = connect_config.connect(NoTls).trace().await?;
 
         // 在后台运行连接
         tokio::spawn(async move {
@@ -2830,6 +2886,7 @@ impl Database {
             client: PgClientHandle::Owned(std::sync::Arc::new(client)),
             pool: None,
             db_type,
+            connect_config: Some(connect_config),
             timescaledb: std::sync::OnceLock::new(),
             routed_tables: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         })
@@ -2861,7 +2918,7 @@ impl Database {
         schema: Option<&str>,
     ) -> crate::Result<Vec<DbFirstTable>> {
         // 保留硬编码：db-first 实体生成不在 Capabilities::schema_introspection
-        // 覆盖范围内（该字段只门控 plan_table/apply_table，QuestDB 为 true），
+        // 覆盖范围内（该字段只门控 plan_table/migrate_table，QuestDB 为 true），
         // QuestDB 无 information_schema，此处按运行时 db_type 单独拒绝。
         if self.db_type.is_questdb() {
             return Err(crate::OrmerError::UnsupportedFeature {
@@ -3263,41 +3320,6 @@ impl Database {
         Ok(row.is_some())
     }
 
-    /// 表上业务触发器的可重放定义（pg_get_triggerdef，排除 internal），
-    /// 供重建路径删除表前备份。表名以 `schema.table` 字面量传 to_regclass
-    /// （模型常量，单引号转义；绑定参数的 `::regclass` 解析期转换不可靠）。
-    /// TimescaleDB 挂在触发函数上的守卫触发器（如 ts_insert_blocker，非
-    /// tgisinternal）由 create_hypertable 自动重建，备份重放会撞 42710，排除。
-    pub(crate) async fn business_trigger_definitions(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-    ) -> crate::Result<Vec<String>> {
-        let qualified = format!("{schema_name}.{table_name}");
-        let regclass_literal = sql_string_literal(&qualified);
-        let rows = self
-            .client
-            .query(
-                &format!(
-                    "SELECT pg_get_triggerdef(trigger_info.oid) \
-                     FROM pg_trigger trigger_info \
-                     WHERE trigger_info.tgrelid = to_regclass({regclass_literal}) \
-                       AND NOT trigger_info.tgisinternal \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM pg_proc proc \
-                         JOIN pg_namespace ns ON ns.oid = proc.pronamespace \
-                         WHERE proc.oid = trigger_info.tgfoid \
-                           AND ns.nspname LIKE '%timescaledb%')"
-                ),
-                &[],
-            )
-            .trace()
-            .await?;
-        rows.into_iter()
-            .map(|row| row.try_get(0).trace_for("tokio_postgres::Row::try_get"))
-            .collect()
-    }
-
     /// 幂等安装扩展（CREATE EXTENSION IF NOT EXISTS）。名称由统一层校验为
     /// 纯标识符后拼接（该语句不支持参数绑定）。
     pub(crate) async fn ensure_extension(&self, name: &str) -> crate::Result<()> {
@@ -3308,6 +3330,91 @@ impl Database {
         )
         .await?;
         Ok(())
+    }
+
+    /// 查询库是否存在（pg_database + 绑定参数，无注入面）。
+    pub(crate) async fn database_exists(&self, name: &str) -> crate::Result<bool> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
+                &[&name],
+            )
+            .trace()
+            .await?;
+        Ok(row.map(|row| row.get(0)).unwrap_or(false))
+    }
+
+    /// 建库（只要不存在即新建；结束时目标库存在即成功，已存在时同样返回
+    /// Ok(())）。SQL 由 [`create_database_sql`] 校验并生成后在自身连接上执行
+    /// （CREATE DATABASE 不能进事务块）。
+    pub(crate) async fn create_database(&self, name: &str) -> crate::Result<()> {
+        if self.database_exists(name).await? {
+            return Ok(());
+        }
+        let sql = create_database_sql(name)?;
+        traced_pg_execute_empty(&self.client, &sql).await?;
+        if !self.database_exists(name).await? {
+            return Err(crate::ormer_error!(
+                "create_database {name:?} reported success but the database is missing"
+            ));
+        }
+        Ok(())
+    }
+
+    /// 删库（恒 WITH (FORCE)，先终止该库全部连接；库不存在视为已删，幂等）。
+    pub(crate) async fn drop_database(&self, name: &str) -> crate::Result<()> {
+        let sql = drop_database_sql(name)?;
+        // WITH (FORCE) 已 terminate 该库全部会话，但 TimescaleDB 后台 worker
+        // （Scheduler / Telemetry Reporter 等）的退出可能滞后于 FORCE 的
+        // 等待窗口（实测可到 ~20s），55006 时退避重试直到窗口耗尽。
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(Self::DROP_DATABASE_55006_RETRY_WINDOW_SECS);
+        loop {
+            match traced_pg_execute_empty(&self.client, &sql).await {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    let code_matches = matches!(
+                        &err,
+                        crate::OrmerError::Database { code: Some(code), .. } if code == "55006"
+                    );
+                    if code_matches && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// 在指定库上幂等应用扩展（CREATE EXTENSION IF NOT EXISTS ... CASCADE）。
+    /// PG 的 CREATE EXTENSION 只作用于连接所在库：克隆自身连接配置、改写
+    /// 目标库后另开一条连接执行、用完即关（连接对象 drop 时关闭）。目标库
+    /// 不存在按连接失败报错。池化连接（`from_pool`）取不到连接配置，返回错误。
+    pub(crate) async fn apply_extension(&self, database: &str, name: &str) -> crate::Result<()> {
+        let mut config = self.connect_config.clone().ok_or_else(|| {
+            crate::ormer_error!(
+                "apply_extension is unavailable on pooled connections \
+                 (bb8-postgres does not expose its connection config); \
+                 connect via Database::connect instead"
+            )
+        })?;
+        config.dbname(database);
+        let (client, connection) = config.connect(NoTls).trace().await?;
+        let driver = tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                eprintln!("[ormer] {err}");
+            }
+        });
+        let sql = create_extension_sql(name)?;
+        let result = traced_pg_execute_empty(&client, &sql).await.map(|_| ());
+        // 显式关闭并等 driver 退出：client drop 只触发关闭，PG 侧 backend
+        // 的终结要等连接任务结束。不等就返回的话，紧随其后的
+        // drop_database 会撞 55006（库仍被本扩展连接占用）。
+        drop(client);
+        let _ = driver.await;
+        result
     }
 
     /// 连接层探活：SELECT 1（QuestDB 复用本后端连接，同样支持）。
@@ -3327,6 +3434,10 @@ impl Database {
             client: PgClientHandle::Pooled(pooled),
             pool: Some(pool),
             db_type,
+            // bb8-postgres 0.9 的 PostgresConnectionManager 不暴露连接配置
+            //（config 字段私有、无 getter），池化模式无法重构到其他库的连接；
+            // `apply_extension` 在此模式下返回明确错误。
+            connect_config: None,
             timescaledb: std::sync::OnceLock::new(),
             routed_tables: tokio::sync::RwLock::new(std::collections::HashSet::new()),
         })

@@ -733,6 +733,7 @@ use super::super::influxdb_backend;
 /// （R3：raw select 三路径合一，池连接经 [`super::unified::ConnRef::Pooled`]
 /// 参与统一分派，故提升为 crate 可见）
 #[allow(clippy::upper_case_acronyms)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ConnectionWrapper {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::Database),

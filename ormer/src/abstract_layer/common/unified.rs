@@ -530,6 +530,7 @@ where
 }
 
 /// 统一的 Database 枚举
+#[allow(clippy::large_enum_variant)]
 pub enum Database {
     #[cfg(feature = "sqlite")]
     Sqlite(sqlite_backend::Database),
@@ -2660,7 +2661,7 @@ impl Database {
     /// 创建表 - 返回执行器。
     ///
     /// 仅建表（表已存在时按各后端 IF NOT EXISTS 语义幂等跳过）。应用启动时
-    /// 的表结构对齐编排请改用 [`Database::apply_table`]：建表、补列、索引
+    /// 的表结构对齐编排请改用 [`Database::migrate_table`]：建表、补列、索引
     /// 语义 diff、CHECK 闭环、主键原地变更与重建收场统一走一个入口。
     pub fn create_table<T: WritableModel>(&self) -> CreateTableExecutor<'_, T> {
         match self {

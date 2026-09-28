@@ -37,11 +37,9 @@ pub use db_first::{
 pub use migration::{
     MIGRATION_TABLE_NAME, Migration, MigrationDryRun, MigrationDryRunStep,
     MigrationExecutionStatus, MigrationInfo, MigrationPlan, MigrationRunner, MigrationStep,
-    TableEnsureOutcome, TableMigration,
 };
 pub use table_migrate::{
-    ApplyOptions, ExtraPolicy, RebuildCause, RebuildPolicy, TableApplyOutcome, TableDiagnosis,
-    TablePlan,
+    RebuildCause, TableDiagnosis, TableMigrateOutcome, TablePlan,
 };
 
 // 数据库相关类型 - 当启用任一数据库 feature 时可用
