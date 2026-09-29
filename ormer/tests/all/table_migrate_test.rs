@@ -415,6 +415,121 @@ mod postgresql_only {
         Ok(())
     }
 
+    /// 旧版建出的普通表形态（无超表声明，主键也不含分区列）。
+    #[derive(Debug, ormer::Model)]
+    #[table = "ormer_apply_hyp_events"]
+    struct HypEventPlain {
+        project_id: String,
+        #[primary]
+        agvid: i32,
+        #[primary]
+        event_time: chrono::NaiveDateTime,
+        payload: String,
+    }
+
+    /// 现行超表模型（ynyz 的 collect.collect_exception_logs 同构：
+    /// project_id 空间分区 + event_time 时间分区，主键不含分区列、
+    /// 由 effective PK 机制补入）。
+    #[derive(Debug, ormer::Model)]
+    #[table = "ormer_apply_hyp_events"]
+    struct HypEvent {
+        #[hypertable]
+        project_id: String,
+        #[primary]
+        agvid: i32,
+        #[primary]
+        #[hypertable(std::time::Duration::from_secs(86_400))]
+        event_time: chrono::NaiveDateTime,
+        payload: String,
+    }
+
+    /// 存量普通表 → 超表原地转换自愈（ynyz 形态）：旧版建出的普通表，
+    /// migrate_table 先把主键对齐到含分区列，再 create_hypertable 原地
+    /// 转换（migrate_data => TRUE，存量数据随迁），复验收敛、再跑幂等。
+    #[tokio::test]
+    async fn plain_table_converts_to_hypertable_in_place() -> ormer::Result<()> {
+        const TABLE: &str = "ormer_apply_hyp_events";
+        let db = pg_database().await;
+        let _ = db.drop_table::<HypEvent>().execute().await;
+
+        // 无 TimescaleDB 时跳过：原地转换依赖 create_hypertable，
+        // 与 routed_columnstore_test 的守卫约定一致
+        let timescale = db
+            .select_sql::<bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+            )
+            .collect::<Vec<bool>>()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(false);
+        if !timescale {
+            eprintln!(
+                "TimescaleDB not installed; skipping plain->hypertable in-place conversion test"
+            );
+            return Ok(());
+        }
+
+        // 造出 ynyz 形态：按旧版模型建普通表并写入一行存量数据
+        db.migrate_table::<HypEventPlain>().await?;
+        db.insert(&HypEventPlain {
+            project_id: "demo-project-001".to_string(),
+            agvid: 1,
+            event_time: chrono::NaiveDateTime::parse_from_str(
+                "2026-09-24 20:00:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap(),
+            payload: "kept".to_string(),
+        })
+        .execute()
+        .await?;
+
+        // 修复前：Err(unmigratable_schema .. Hypertable mismatch) 死循环
+        let outcome = db.migrate_table::<HypEvent>().await?;
+        let plan = match outcome.diagnosis {
+            TableDiagnosis::Migratable(plan) => plan,
+            other => panic!("plain->hypertable should be migratable in place, got {other:?}"),
+        };
+        let sql = plan.to_sql()?;
+        assert!(
+            sql.contains("ADD PRIMARY KEY"),
+            "plan should align the primary key with partition columns first: {sql}"
+        );
+        assert!(
+            sql.contains("create_hypertable"),
+            "plan should convert the regular table in place: {sql}"
+        );
+
+        let hypertables = db
+            .select_sql::<i64>(ormer::sql!(format!(
+                "SELECT count(*) FROM timescaledb_information.hypertables \
+                 WHERE hypertable_name = '{TABLE}'"
+            )))
+            .collect::<Vec<i64>>()
+            .await?;
+        assert_eq!(
+            hypertables.first().copied(),
+            Some(1),
+            "table must be a hypertable after migrate"
+        );
+
+        // migrate_data => TRUE：存量行随迁保留
+        let rows = db
+            .select_sql::<i64>(ormer::sql!(format!("SELECT count(*) FROM {TABLE}")))
+            .collect::<Vec<i64>>()
+            .await?;
+        assert_eq!(rows.first().copied(), Some(1), "data must survive");
+
+        assert!(matches!(
+            db.migrate_table::<HypEvent>().await?.diagnosis,
+            TableDiagnosis::Ready
+        ));
+
+        let _ = db.drop_table::<HypEvent>().execute().await;
+        Ok(())
+    }
+
     /// 推不动（无法回填的 NOT NULL 新列）：直接返回 unmigratable_schema 错误，
     /// 不删表重建，存量数据与业务触发器原样保留。
     #[tokio::test]

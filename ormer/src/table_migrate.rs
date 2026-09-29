@@ -729,9 +729,10 @@ impl Database {
     /// 隐式创建 → 建表（表不存在直接建全）→ 补列 → 主键原地变更（PG）→
     /// 列类型/默认值对齐 → 多余列删除 → 索引语义 diff（补缺/清漂移/特殊
     /// 索引纳入，PG 非 QuestDB 并发建索引+INVALID 自愈）→ CHECK 约束闭环
-    /// （PG）→ 外键对齐。键、列及配置与模型完全一致：保数据推不动
-    /// （NeedsRebuild）或复验不收敛一律直接返回
-    /// [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建。
+    /// （PG）→ 外键对齐 → 普通表→超表原地转换（create_hypertable
+    /// migrate_data，存量数据随迁、原表触发器不随迁）。键、列及配置与
+    /// 模型完全一致：保数据推不动（NeedsRebuild）或复验不收敛一律直接
+    /// 返回 [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建。
     /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
     pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
         let db_type = self.db_type();
@@ -965,8 +966,8 @@ impl Database {
             }
             // 建表配套步骤对齐 CreateTableExecutor 的 DDL 序列：
             // 枚举/EXTENSION 前置，create_hypertable 后置（缺了前者建表
-            // 直接报缺类型，缺了后者表永远不是超表、下一轮诊断必报
-            // Hypertable mismatch）。
+            // 直接报缺类型，缺了后者建出的是普通表，下一轮诊断会生成
+            // 原地转换步骤补救而非一次建到位）。
             let (pre, post) =
                 crate::migration::create_table_bootstrap_steps::<T>(db_type, target);
             for step in pre {

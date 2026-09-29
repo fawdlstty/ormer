@@ -809,7 +809,8 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             }
             // 建表配套步骤对齐 CreateTableExecutor 的 DDL 序列：
             // 枚举/EXTENSION 前置，create_hypertable 后置（缺了前者建表
-            // 直接报缺类型，缺了后者表永远不是超表、复验必不收敛）。
+            // 直接报缺类型，缺了后者建出的是普通表，得靠后续诊断的
+            // 原地转换步骤补救，凭空多一轮迁移）。
             let (pre, post) = create_table_bootstrap_steps::<T>(db_type, table_name);
             for step in pre {
                 plan.push(step);
@@ -826,8 +827,36 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
 
         // TimescaleDB 超表元数据按模型表名校验，仅对基础表执行；子表的超表
         // 声明与基础表同源（同一份 #[hypertable] 声明随建表 DDL 下发）。
+        // "表存在但只是普通表"不再判死：create_hypertable 支持把既有普通表
+        // 原地转换为超表（migrate_data => TRUE，空表无感转换、有数据的表
+        // 随迁数据，原表触发器不随迁）。转换步骤记入 hypertable_convert_steps
+        // 在计划末尾下发：必须晚于补列与主键原地变更（分区列须存在且纳入
+        // 主键/唯一索引，否则 create_hypertable 拒绝）。反向差异（模型普通
+        // 表、库内超表）与已是超表但维度漂移仍走原校验报错：TimescaleDB
+        // 无法把超表退回普通表，维度也无法原地改。
+        let mut hypertable_convert_steps: Vec<MigrationStep> = Vec::new();
         if table_name == T::table_name_for_db(db_type) {
-            self.db.validate_hypertable_for_migration::<T>().await?;
+            let needs_hypertable_conversion = {
+                #[cfg(feature = "postgresql")]
+                {
+                    matches!(db_type, DbType::PostgreSQL)
+                        && T::hypertable_info().is_some()
+                        && !self.db.table_is_hypertable::<T>().await?
+                }
+                #[cfg(not(feature = "postgresql"))]
+                {
+                    false
+                }
+            };
+            if needs_hypertable_conversion {
+                let (_, post) = create_table_bootstrap_steps::<T>(db_type, table_name);
+                hypertable_convert_steps = post;
+                plan.warnings.push(format!(
+                    "converting existing regular table {table_name} to hypertable in place"
+                ));
+            } else {
+                self.db.validate_hypertable_for_migration::<T>().await?;
+            }
         }
 
         // 先应用用户显式标注的列重命名：把自省结果中的旧列名改写为新列名，
@@ -1505,6 +1534,13 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
             plan.steps = steps;
         }
 
+        // 普通表 → 超表原地转换收尾：晚于列/主键/索引/CHECK/默认值对齐下发
+        // （create_hypertable 要求分区列存在且主键/唯一索引包含分区列），
+        // 与建表路径的后置步骤（create_table_bootstrap_steps 的 post）同源。
+        for step in hypertable_convert_steps {
+            plan.push(step);
+        }
+
         Ok(plan)
     }
 }
@@ -1764,8 +1800,9 @@ pub(crate) struct ExpectedIndexDef<'a> {
 /// 不覆盖的部分拆成前置（EXTENSION、枚举类型）与后置（create_hypertable）
 /// 两组。`MigrationStep::CreateTable` 的渲染只含 CREATE TABLE/索引 DDL；
 /// 建表计划若不带这些步骤，增量路径（含 ensure 对缺失表的自动建表）建出
-/// 的表要么缺枚举类型直接报错，要么永远是普通表、复验必报 Hypertable
-/// mismatch 而卡死或触发删表重建。
+/// 的表要么缺枚举类型直接报错，要么是普通表、复验转入原地转换补救
+/// （历史版本此处直接报 Hypertable mismatch 卡死）。后置步骤同时服务
+/// 存量普通表的原地转换（migrate_data => TRUE）。
 /// 返回 `(前置步骤, 后置步骤)`：前置须在 CreateTable 之前执行，后置在其后。
 #[allow(unused_variables)]
 pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
@@ -3182,6 +3219,25 @@ impl Database {
             #[cfg(feature = "influxdb")]
             Database::InfluxDB(_) => Ok(()),
         }
+    }
+
+    /// 表在库内是否已是 TimescaleDB 超表。仅 PG 有意义（QuestDB 的
+    /// designated timestamp 不构成超表，非 PG 后端恒 false，与
+    /// [`Self::validate_hypertable_for_migration`] 的非 PG 直通行为对齐）。
+    /// 迁移计划据此区分"待原地转换的普通表"与"待维度校验的超表"。
+    #[cfg(feature = "postgresql")]
+    async fn table_is_hypertable<T: WritableModel>(&self) -> crate::Result<bool> {
+        #[cfg(feature = "questdb")]
+        if let Database::PostgreSQL(db) = self {
+            if db.db_type().is_questdb() {
+                return Ok(false);
+            }
+        }
+        #[cfg(feature = "postgresql")]
+        if let Database::PostgreSQL(db) = self {
+            return db.check_table_is_hypertable::<T>().await;
+        }
+        Ok(false)
     }
 }
 

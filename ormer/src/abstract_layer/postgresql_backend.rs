@@ -3515,7 +3515,7 @@ impl Database {
 
 
 
-    async fn check_table_is_hypertable<T: Model>(&self) -> crate::Result<bool> {
+    pub(crate) async fn check_table_is_hypertable<T: Model>(&self) -> crate::Result<bool> {
         let sql = "SELECT to_regclass('timescaledb_information.hypertables') IS NOT NULL";
         let row = self.client.query_one(sql, &[]).trace().await?;
         let has_hypertables_view: bool =
