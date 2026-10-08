@@ -5,6 +5,7 @@ use ormer::generate_create_table_sql;
 // 使用宏定义测试专用模型（唯一表名）
 define_test_user!(TestUser, "test_new_features_users_1");
 define_test_role_with_unique_group!(TestRole, "test_new_features_roles_1");
+define_test_user_multi_unique!(TestMultiUnique, "test_multi_unique_users_1");
 
 async fn test_generate_sql_with_new_features_impl(
     config: &crate::_test_common::DbConfig,
@@ -52,6 +53,22 @@ async fn test_generate_sql_with_new_features_impl(
     assert!(
         role_sql.contains("UNIQUE (uid, name)"),
         "Should have UNIQUE (uid, name)"
+    );
+
+    // 多个裸 #[unique]：各列独立内联 UNIQUE（列级唯一），不得合并为组合
+    // 唯一约束（MySQL utf8mb4 下多 VARCHAR(255) 组合键超 3072 字节上限，
+    // 建表即败；联合唯一请显式 #[unique(group = N)]）。
+    let multi_sql = generate_create_table_sql::<TestMultiUnique>(config.0)?;
+    println!("MultiUnique SQL: {}", multi_sql);
+    let name_unique = multi_sql.contains("name TEXT NOT NULL UNIQUE")
+        || multi_sql.contains("name VARCHAR(255) NOT NULL UNIQUE");
+    let email_unique = multi_sql.contains("email TEXT NOT NULL UNIQUE")
+        || multi_sql.contains("email VARCHAR(255) NOT NULL UNIQUE");
+    assert!(name_unique, "name should be column-level UNIQUE");
+    assert!(email_unique, "email should be column-level UNIQUE");
+    assert!(
+        !multi_sql.contains("UNIQUE (name, email)") && !multi_sql.contains("UNIQUE(name, email)"),
+        "bare #[unique] must NOT merge into a composite unique constraint"
     );
     Ok(())
 }

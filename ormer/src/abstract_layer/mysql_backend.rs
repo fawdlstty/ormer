@@ -28,7 +28,7 @@ use crate::{
 use chrono::{Datelike, Timelike};
 use mysql_async::Pool;
 use mysql_async::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::marker::PhantomData;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
@@ -508,10 +508,87 @@ impl<'a, T: crate::model::WritableModel> SqlExecutor for CreateTableExecutor<'a,
 
     async fn execute_with_sql(self, sql: SqlStatement) -> crate::Result<Self::Output> {
         let mut lease = self.pool.lease().await?;
+        let conn = lease.conn()?;
+        // MySQL（5.x）无 CREATE INDEX IF NOT EXISTS：表已存在时重复 bootstrap
+        // 会撞 ERROR 1061（Duplicate key name）。执行前查 information_schema
+        // 跳过已存在的二级索引，与 CREATE TABLE IF NOT EXISTS 语义对齐。
+        let table_name = self
+            .table_name
+            .clone()
+            .unwrap_or_else(|| T::TABLE_NAME.to_string());
+        let existing = existing_secondary_index_names(conn, &table_name).await?;
         for statement in sql.statements {
-            traced_mysql_query_drop(lease.conn()?, &statement.sql).await?;
+            if let Some(text) = filter_existing_create_index(&statement.sql, &existing) {
+                traced_mysql_query_drop(conn, &text).await?;
+            }
         }
         Ok(())
+    }
+}
+
+/// 已存在的二级索引名集合（不含 PRIMARY；表不存在返回空集）。
+async fn existing_secondary_index_names(
+    conn: &mut mysql_async::Conn,
+    table_name: &str,
+) -> crate::Result<HashSet<String>> {
+    let rows: Vec<mysql_async::Row> = conn
+        .exec(
+            "SELECT DISTINCT INDEX_NAME FROM information_schema.statistics \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? \
+               AND INDEX_NAME != 'PRIMARY'",
+            (table_name,),
+        )
+        .trace()
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get::<Option<String>, _>(0).flatten())
+        .collect())
+}
+
+/// 按分号拆段剔除「索引已存在」的 CREATE INDEX 段，返回待执行文本；
+/// 无需剔除时原样返回，整条全被剔除时返回 None。
+/// 建表 SQL 是 `CREATE TABLE ...;CREATE INDEX ...` 复合串（`SqlStatement::
+/// single` 不拆分，整串交给 multi-statement 执行），MySQL（5.x）又无
+/// CREATE INDEX IF NOT EXISTS——重复 bootstrap 时必须按段幂等剔除。
+/// 拆分仅面向本 crate 生成的 DDL（语句分号只在句尾出现）。
+fn filter_existing_create_index(sql: &str, existing: &HashSet<String>) -> Option<String> {
+    if existing.is_empty() {
+        return Some(sql.to_string());
+    }
+    let parts: Vec<&str> = sql.split(';').collect();
+    let kept: Vec<&str> = parts
+        .iter()
+        .filter(|part| match create_index_statement_name(part) {
+            Some(name) => !existing.contains(&name),
+            None => true,
+        })
+        .copied()
+        .collect();
+    match kept.len() {
+        n if n == parts.len() => Some(sql.to_string()),
+        0 => None,
+        _ => Some(kept.join(";")),
+    }
+}
+
+/// 解析 `CREATE [UNIQUE | FULLTEXT | SPATIAL] INDEX <name> ...` 语句中的
+/// 索引名；非 CREATE INDEX 语句返回 None。仅处理本 crate 生成的全大写
+/// DDL，名字剥 MySQL 反引号引用。
+fn create_index_statement_name(sql: &str) -> Option<String> {
+    let mut rest = sql.trim().strip_prefix("CREATE")?.trim_start();
+    for keyword in ["UNIQUE ", "FULLTEXT ", "SPATIAL "] {
+        if let Some(stripped) = rest.strip_prefix(keyword) {
+            rest = stripped;
+        }
+    }
+    let name_part = rest.strip_prefix("INDEX ")?.trim_start();
+    let end = name_part.find(|c: char| c.is_whitespace() || c == '(')?;
+    let name = name_part[..end].trim_matches('`');
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
     }
 }
 
@@ -2305,7 +2382,10 @@ impl<
 
 #[cfg(test)]
 mod tests {
-    use super::{mysql_value_from_ormer_value, parse_mysql_table_compression};
+    use super::{
+        create_index_statement_name, filter_existing_create_index, mysql_value_from_ormer_value,
+        parse_mysql_table_compression,
+    };
     use crate::abstract_layer::DbType;
     use crate::{OrmerError, Value};
 
@@ -2321,6 +2401,51 @@ mod tests {
         );
         assert_eq!(parse_mysql_table_compression("COMPRESSION=none"), None);
         assert_eq!(parse_mysql_table_compression("ROW_FORMAT=DYNAMIC"), None);
+    }
+
+    #[test]
+    fn detects_create_index_statement_names() {
+        assert_eq!(
+            create_index_statement_name(
+                "CREATE INDEX idx_sms_codes_phone ON sms_codes (phone)"
+            ),
+            Some("idx_sms_codes_phone".to_string())
+        );
+        assert_eq!(
+            create_index_statement_name(
+                "CREATE UNIQUE INDEX idx_orders_no ON orders (trade_no)"
+            ),
+            Some("idx_orders_no".to_string())
+        );
+        assert_eq!(
+            create_index_statement_name("CREATE FULLTEXT INDEX idx_ft ON t (body)"),
+            Some("idx_ft".to_string())
+        );
+        assert_eq!(
+            create_index_statement_name("CREATE TABLE t (id INT)"),
+            None
+        );
+    }
+
+    #[test]
+    fn filters_existing_create_index_segments() {
+        let existing: std::collections::HashSet<String> = ["idx_sms_codes_phone".to_string()]
+            .into_iter()
+            .collect();
+        // 复合串：CREATE TABLE 段保留、已存在索引段剔除。
+        let composite = "CREATE TABLE IF NOT EXISTS sms_codes (id BIGINT PRIMARY KEY AUTO_INCREMENT, phone VARCHAR(255) NOT NULL);CREATE INDEX idx_sms_codes_phone ON sms_codes (phone)";
+        let filtered = filter_existing_create_index(composite, &existing)
+            .expect("table segment must survive");
+        assert!(filtered.contains("CREATE TABLE IF NOT EXISTS sms_codes"));
+        assert!(!filtered.contains("CREATE INDEX"), "filtered: {filtered}");
+        assert!(filtered.ends_with(")"));
+
+        // 索引不存在：原样保留（含 CREATE INDEX 段）。
+        let untouched =
+            filter_existing_create_index(composite, &std::collections::HashSet::new())
+                .expect("no filtering expected");
+        assert!(untouched.contains("CREATE INDEX idx_sms_codes_phone"));
+        assert_eq!(untouched, composite);
     }
 
     #[test]

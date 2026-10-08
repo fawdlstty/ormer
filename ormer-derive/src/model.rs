@@ -215,7 +215,8 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let column_schema_entries = normal_fields
         .iter()
         .filter(|info| info.embed.is_none())
-        .map(|info| {
+        .enumerate()
+        .map(|(field_idx, info)| {
             let field_name = info.field_name;
             let rust_field_name = field_name.to_string();
             let column_name = info.column_name.as_str();
@@ -227,9 +228,14 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             let is_nullable = info.is_nullable;
             let rust_type = &info.rust_type;
 
-            // 检查 unique 属性
+            // 检查 unique 属性；裸 `#[unique]`（哨兵 -1）按字段序分配独立负数
+            // 组号 → 每列单列组走内联 UNIQUE（各列独立唯一）。负数不会与用户
+            // 显式 `#[unique(group = N)]`（N ≥ 0）冲突。
             let unique_attr = &info.unique_attr;
-            let unique_group = option_i32_tokens(unique_attr.group);
+            let unique_group = option_i32_tokens(match unique_attr.group {
+                Some(-1) => Some(-(field_idx as i32 + 2)),
+                other => other,
+            });
             let unique_name = option_string_tokens(unique_attr.name.as_deref());
 
             // 检查 index 属性
@@ -4471,11 +4477,17 @@ struct UniqueAttr {
 }
 
 /// 提取 unique 属性。
+///
+/// 裸 `#[unique]` = 列级唯一：哨兵组号 -1，生成期按字段序替换为独立组号
+/// （每列各自唯一）。同表多个裸 `#[unique]` 曾默认合并为 group 0 的组合
+/// 唯一约束——既是语义反直觉（unique=True 在主流 ORM 均为列级唯一），
+/// 也在 MySQL utf8mb4 下因组合键超 3072 字节上限直接建表失败；联合唯一
+/// 请显式 `#[unique(group = N)]`。
 fn extract_unique_attr(field: &syn::Field) -> syn::Result<UniqueAttr> {
     for attr in &field.attrs {
         if attr.path().is_ident("unique") {
             let mut unique = UniqueAttr {
-                group: Some(0),
+                group: Some(-1),
                 name: None,
             };
             match &attr.meta {

@@ -257,6 +257,24 @@ macro_rules! define_test_user {
     };
 }
 
+/// 定义多裸 `#[unique]` 字段模型（验证列级独立唯一语义：各列各自内联
+/// UNIQUE，不得合并为组合唯一约束）
+#[macro_export]
+macro_rules! define_test_user_multi_unique {
+    ($struct_name:ident, $table_name:literal) => {
+        #[derive(Debug, ormer::Model, Clone)]
+        #[table = $table_name]
+        struct $struct_name {
+            #[primary(auto)]
+            id: i32,
+            #[unique]
+            name: String,
+            #[unique]
+            email: String,
+        }
+    };
+}
+
 /// 定义基础Role模型
 #[macro_export]
 macro_rules! define_test_role {
