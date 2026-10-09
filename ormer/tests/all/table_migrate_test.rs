@@ -237,7 +237,7 @@ async fn table_migrate_outcome_reports_steps() -> ormer::Result<()> {
 /// PostgreSQL 专属能力域：CHECK 闭环、推不动报错、咨询锁。
 #[cfg(feature = "postgresql")]
 mod postgresql_only {
-    use ormer::{Database, DbType, TableDiagnosis};
+    use ormer::{Database, DbType, MigrationStep, TableDiagnosis};
 
     #[derive(Debug, ormer::Model)]
     #[table = "ormer_apply_check_tasks"]
@@ -326,6 +326,90 @@ mod postgresql_only {
         )))
         .await
         .unwrap();
+    }
+
+    #[derive(Debug, ormer::Model)]
+    #[table = "ormer_apply_include_items"]
+    struct IncludeItem {
+        #[primary]
+        id: i32,
+        #[index]
+        name: String,
+        note: Option<String>,
+    }
+
+    /// INCLUDE（存储覆盖）索引：外部初始化脚本（如 project_service
+    /// bootstrap）在 ormer 管理的表上建的 INCLUDE 索引，键列之外的覆盖列
+    /// 让 indnatts > indnkeyatts、indoption 下标越界为 NULL——索引自省
+    /// 不得崩溃；且 INCLUDE 不属于模型声明的键语义，migrate_table 必须
+    /// 将其撤销（删除或按模型重建为纯索引），确保库结构与模型严格一致。
+    /// 回归背景：2026-10-09 gzzs 项目服务器因自省崩溃 collect 数据链全断。
+    #[tokio::test]
+    async fn migrate_tolerates_and_removes_include_index() -> ormer::Result<()> {
+        let db = pg_database().await;
+        let _ = db.drop_table::<IncludeItem>().execute().await;
+        db.migrate_table::<IncludeItem>().await?;
+
+        const MODEL_INDEX: &str = "idx_ormer_apply_include_items_name";
+        const EXT_INDEX: &str = "ormer_ext_cover_idx";
+
+        async fn index_shape(db: &Database, name: &str) -> ormer::Result<Option<(i64, i64)>> {
+            // (indnatts, indnkeyatts)：键列数 < 总列数即带 INCLUDE 覆盖列
+            let rows = db
+                .select_sql::<(i64, i64)>(
+                    ormer::sql!(format!(
+                        "SELECT ix.indnatts, ix.indnkeyatts FROM pg_index ix \
+                         JOIN pg_class i ON i.oid = ix.indexrelid \
+                         WHERE i.relname = '{name}'"
+                    )),
+                )
+                .collect::<Vec<(i64, i64)>>()
+                .await?;
+            Ok(rows.into_iter().next())
+        }
+
+        // 场景一：模型外独立命名的 INCLUDE 索引 → migrate 不崩溃（自省键列
+        // 截断回归点），且被当作模型外多余索引撤销
+        db.execute_sql(ormer::sql!(format!(
+            "CREATE INDEX {EXT_INDEX} \
+             ON ormer_apply_include_items (name) INCLUDE (note)"
+        )))
+        .await?;
+        db.migrate_table::<IncludeItem>().await?;
+        assert_eq!(
+            index_shape(&db, EXT_INDEX).await?,
+            None,
+            "undeclared INCLUDE index must be dropped"
+        );
+        let model_shape = index_shape(&db, MODEL_INDEX).await?;
+        assert_eq!(
+            model_shape,
+            Some((1, 1)),
+            "model-declared index must stay a plain btree"
+        );
+
+        // 场景二：模型声明的索引被外部替换为同名 INCLUDE 版 → 撤销 INCLUDE，
+        // 按模型重建纯 btree（键列语义不变，覆盖列清除）
+        db.execute_sql(ormer::sql!(format!("DROP INDEX {MODEL_INDEX}")))
+            .await?;
+        db.execute_sql(ormer::sql!(format!(
+            "CREATE INDEX {MODEL_INDEX} \
+             ON ormer_apply_include_items (name) INCLUDE (note)"
+        )))
+        .await?;
+        db.migrate_table::<IncludeItem>().await?;
+        assert_eq!(
+            index_shape(&db, MODEL_INDEX).await?,
+            Some((1, 1)),
+            "INCLUDE variant of a declared index must be rebuilt as plain btree"
+        );
+
+        // 幂等：再次迁移收敛（Ready），无 INCLUDE 残留
+        let outcome = db.migrate_table::<IncludeItem>().await?;
+        assert!(matches!(outcome.diagnosis, TableDiagnosis::Ready));
+        assert_eq!(index_shape(&db, EXT_INDEX).await?, None);
+        assert_eq!(index_shape(&db, MODEL_INDEX).await?, Some((1, 1)));
+        Ok(())
     }
 
     /// CHECK 闭环：约束被外力删除后 migrate 自动补建（ormer 自动命名）。
@@ -441,6 +525,134 @@ mod postgresql_only {
         #[hypertable(std::time::Duration::from_secs(86_400))]
         event_time: chrono::NaiveDateTime,
         payload: String,
+    }
+
+    /// gzzs 形态：超表已存在但时间维声明在 update_time（旧版模型建出），
+    /// 时间维列与现行模型（event_time）不一致——TimescaleDB 无法原地改
+    /// 时间维列，此前只能 unmigratable 死循环。独立表名避免与并行测试
+    /// 操作 ormer_apply_hyp_events 互相污染。
+    #[derive(Debug, ormer::Model)]
+    #[table = "ormer_apply_hyp_events_wd"]
+    struct HypEventWrongDim {
+        #[hypertable]
+        project_id: String,
+        #[primary]
+        agvid: i32,
+        #[primary]
+        event_time: chrono::NaiveDateTime,
+        payload: String,
+        #[primary]
+        #[hypertable(std::time::Duration::from_secs(86_400))]
+        update_time: chrono::NaiveDateTime,
+    }
+
+    /// 与 [`HypEventWrongDim`] 同表名的现行模型（时间维 = event_time），
+    /// 供同一张表上做形态迁移。
+    #[derive(Debug, ormer::Model)]
+    #[table = "ormer_apply_hyp_events_wd"]
+    struct HypEventFixed {
+        #[hypertable]
+        project_id: String,
+        #[primary]
+        agvid: i32,
+        #[primary]
+        #[hypertable(std::time::Duration::from_secs(86_400))]
+        event_time: chrono::NaiveDateTime,
+        payload: String,
+    }
+
+    /// 空表自愈（gzzs 形态）：超表时间维列与模型不一致时，空表自动删表
+    /// 重建收敛（created_table 标记重建轮的 CreateTable）；有数据时仍拒绝
+    /// 重建且存量行原样保留。
+    #[tokio::test]
+    async fn wrong_time_dimension_empty_table_rebuilds_data_table_refuses() -> ormer::Result<()> {
+        let db = pg_database().await;
+        let _ = db.drop_table::<HypEventFixed>().execute().await;
+
+        // 无 TimescaleDB 时跳过：超表维度不匹配只发生在 TimescaleDB
+        let timescale = db
+            .select_sql::<bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')",
+            )
+            .collect::<Vec<bool>>()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(false);
+        if !timescale {
+            eprintln!("TimescaleDB not installed; skipping wrong-time-dimension rebuild test");
+            return Ok(());
+        }
+
+        // 造 gzzs 形态：旧模型（时间维 = update_time）建出的空超表
+        db.migrate_table::<HypEventWrongDim>().await?;
+
+        // 新模型（时间维 = event_time）：空表 → 自动删表重建并收敛
+        let outcome = db.migrate_table::<HypEventFixed>().await?;
+        match &outcome.diagnosis {
+            TableDiagnosis::Migratable(plan) => {
+                let sql = plan.to_sql()?;
+                assert!(
+                    plan.steps().iter().any(|step| matches!(
+                        step,
+                        MigrationStep::CreateTable { table, .. }
+                            if table == "ormer_apply_hyp_events_wd"
+                    )),
+                    "rebuild path must create the table anew: {sql}"
+                );
+                assert!(
+                    sql.contains("create_hypertable"),
+                    "rebuilt table must be converted to the model hypertable: {sql}"
+                );
+            }
+            other => panic!(
+                "empty wrong-dimension hypertable must auto-rebuild via CreateTable, got {other:?}"
+            ),
+        }
+        assert!(
+            outcome.created_table,
+            "rebuild path must execute CreateTable"
+        );
+        assert!(matches!(
+            db.migrate_table::<HypEventFixed>().await?.diagnosis,
+            TableDiagnosis::Ready
+        ));
+
+        // 同形态但有数据：仍拒绝重建，存量行原样保留
+        let _ = db.drop_table::<HypEventFixed>().execute().await;
+        db.migrate_table::<HypEventWrongDim>().await?;
+        db.insert(&HypEventWrongDim {
+            project_id: "p1".to_string(),
+            agvid: 1,
+            event_time: chrono::NaiveDateTime::parse_from_str(
+                "2026-10-09 12:00:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap(),
+            payload: "kept".to_string(),
+            update_time: chrono::NaiveDateTime::parse_from_str(
+                "2026-10-09 12:00:00",
+                "%Y-%m-%d %H:%M:%S",
+            )
+            .unwrap(),
+        })
+        .execute()
+        .await?;
+        let err = db.migrate_table::<HypEventFixed>().await.unwrap_err();
+        assert!(
+            err.is_unmigratable_schema(),
+            "non-empty wrong-dimension hypertable must stay refused, got {err}"
+        );
+        let rows = db
+            .select_sql::<i64>(ormer::sql!(
+                "SELECT count(*) FROM ormer_apply_hyp_events_wd"
+            ))
+            .collect::<Vec<i64>>()
+            .await?;
+        assert_eq!(rows.first().copied(), Some(1), "data must survive");
+
+        let _ = db.drop_table::<HypEventFixed>().execute().await;
+        Ok(())
     }
 
     /// 存量普通表 → 超表原地转换自愈（ynyz 形态）：旧版建出的普通表，

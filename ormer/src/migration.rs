@@ -3226,6 +3226,7 @@ impl Database {
     /// [`Self::validate_hypertable_for_migration`] 的非 PG 直通行为对齐）。
     /// 迁移计划据此区分"待原地转换的普通表"与"待维度校验的超表"。
     #[cfg(feature = "postgresql")]
+    #[allow(irrefutable_let_patterns)]
     async fn table_is_hypertable<T: WritableModel>(&self) -> crate::Result<bool> {
         #[cfg(feature = "questdb")]
         if let Database::PostgreSQL(db) = self {

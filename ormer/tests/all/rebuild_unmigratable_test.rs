@@ -246,6 +246,16 @@ async fn new_primary_key_column_is_unmigratable() {
         .execute()
         .await
         .unwrap();
+    // 带上存量行：空表推不动会被 migrate_table 的空表兜底自动重建
+    // （零数据损失），非空表才固化"推不动必须报错"的本测试意图
+    db.insert(&RebuildStatNewPkBase {
+        bucket_start: "2026-10-09 12:00:00".to_string(),
+        project_id: "p1".to_string(),
+        count: 1,
+    })
+    .execute()
+    .await
+    .unwrap();
 
     // "只诊断不执行"等价断言：NeedsRebuild 在 Refuse 策略下报
     // UnmigratableSchema（可编程判定，不 drop）
@@ -258,7 +268,15 @@ async fn new_primary_key_column_is_unmigratable() {
         "expected unmigratable schema error, got: {err}"
     );
 
-    let _ = db.drop_table::<RebuildStatNewPkBase>().execute().await;
+    // 存量行原样保留（拒绝重建语义）
+    let rows = db
+        .select_sql::<i64>(ormer::sql!("SELECT count(*) FROM ormer_rebuild_new_pk"))
+        .collect::<Vec<i64>>()
+        .await
+        .unwrap();
+    assert_eq!(rows.first().copied(), Some(1), "data must survive");
+
+    let _ = db.drop_table::<RebuildStatNewPk>().execute().await;
 }
 
 #[tokio::test]

@@ -3058,8 +3058,11 @@ impl Database {
         let rows = self
             .client
             .query(
+                // indkey 含 INCLUDE（存储覆盖）列而 indoption 只覆盖键列
+                // （indnkeyatts），不按键列截断时 INCLUDE 列下标越界得到 NULL，
+                // descending 的位运算结果为 NULL，try_get::<bool> 直接报错。
                 "SELECT i.relname, ix.indisunique, a.attname, \
-                        (ix.indoption[ord.ordinality - 1] & 1) = 1 AS descending
+                        (COALESCE(ix.indoption[ord.ordinality - 1], 0) & 1) = 1 AS descending
                  FROM pg_index ix
                  JOIN pg_class i ON i.oid = ix.indexrelid
                  JOIN pg_class t ON t.oid = ix.indrelid
@@ -3067,6 +3070,7 @@ impl Database {
                  JOIN unnest(ix.indkey) WITH ORDINALITY AS ord(attnum, ordinality) ON TRUE
                  JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ord.attnum
                  WHERE ns.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary
+                   AND ord.ordinality <= ix.indnkeyatts
                  ORDER BY i.relname, ord.ordinality",
                 &[&schema_name, &table_name],
             )

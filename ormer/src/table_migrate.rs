@@ -370,6 +370,16 @@ pub(crate) fn match_index_semantics(
     if !actual.valid {
         return false;
     }
+    // INCLUDE（存储覆盖）列不属于模型声明的键语义：带 INCLUDE 的实际索引
+    // 一律不视为任何模型声明的实现，交由删除侧清理、按模型重建纯索引，
+    // 确保库结构与模型严格一致（2026-10-09 拍板：外部建的结构一律撤销）。
+    if actual
+        .definition
+        .as_deref()
+        .is_some_and(|definition| definition.to_ascii_uppercase().contains(") INCLUDE ("))
+    {
+        return false;
+    }
     if expected_unique != actual.unique {
         return false;
     }
@@ -732,9 +742,29 @@ impl Database {
     /// （PG）→ 外键对齐 → 普通表→超表原地转换（create_hypertable
     /// migrate_data，存量数据随迁、原表触发器不随迁）。键、列及配置与
     /// 模型完全一致：保数据推不动（NeedsRebuild）或复验不收敛一律直接
-    /// 返回 [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建。
+    /// 返回 [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建；
+    /// 唯一例外是空表兜底——表存在但（连同路由子表）没有任何行时，删表
+    /// 重建是零数据损失的自愈（如超表时间维列与模型不一致的空壳表），
+    /// 自动重建后重跑一轮迁移（见 [`Database::rebuild_empty_table`]）。
     /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
     pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
+        match self.migrate_table_once::<T>().await {
+            Err(err) if err.is_unmigratable_schema() => {
+                if self.rebuild_empty_table::<T>().await {
+                    self.migrate_table_once::<T>().await
+                } else {
+                    Err(err)
+                }
+            }
+            result => result,
+        }
+    }
+
+    /// [`Database::migrate_table`] 的单轮执行（诊断 → 增量执行 → 复验），
+    /// 由外层空表重建兜底包裹。
+    async fn migrate_table_once<T: WritableModel>(
+        &self,
+    ) -> crate::Result<TableMigrateOutcome> {
         let db_type = self.db_type();
         if !crate::abstract_layer::capabilities::Capabilities::of(db_type).schema_introspection {
             return Err(crate::OrmerError::UnsupportedFeature {
@@ -802,6 +832,54 @@ impl Database {
             TableDiagnosis::NeedsRebuild(cause) => {
                 Err(crate::OrmerError::unmigratable_schema(cause.table, cause.reason))
             }
+        }
+    }
+
+    /// 空表自动重建判定与执行（`migrate_table` 的 unmigratable 兜底）：
+    /// 仅当**基础表自身**诊断为推不动（NeedsRebuild，如超表时间维列与
+    /// 模型不一致）且基础表没有任何行时，DROP 基础表并返回 true 交由
+    /// 调用方重跑一轮迁移重建；其余情形一律返回 false 维持原错误路径：
+    /// - 基础表非空（保数据拒绝重建的既有语义不变）；
+    /// - 推不动的是路由子表或复验不收敛（半迁移态，均不适用空表重建，
+    ///   且子表不存在视为就绪，删掉会跳过自适应补挂等执行路径）；
+/// - 基础表带路由子表时 DROP 父表失败，同样返回 false。
+///
+/// 判空用 `SELECT 1 .. LIMIT 1` 探测，不做全表计数；表名来自模型
+/// 声明与库内自省，非用户输入，无注入面。
+    async fn rebuild_empty_table<T: WritableModel>(&self) -> bool {
+        #[cfg(feature = "postgresql")]
+        {
+            let Some(pg) = self.as_postgresql() else {
+                return false;
+            };
+            let Ok(family) = self.diagnose_family::<T>().await else {
+                return false;
+            };
+            if !matches!(family.base, TableDiagnosis::NeedsRebuild(_)) {
+                return false;
+            }
+            let table = T::table_name_for_db(self.db_type());
+            let empty = pg
+                .select_raw::<i64, Vec<i64>>(
+                    &format!("SELECT 1 FROM {table} LIMIT 1"),
+                    Vec::new(),
+                )
+                .await
+                .map(|rows| rows.is_empty())
+                .unwrap_or(false);
+            if !empty {
+                return false;
+            }
+            pg.execute_sql(crate::raw_sql::RawSql::plain(format!(
+                "DROP TABLE IF EXISTS {table}"
+            )))
+            .await
+            .is_ok()
+        }
+        #[cfg(not(feature = "postgresql"))]
+        {
+            let _ = self;
+            false
         }
     }
 
@@ -1747,6 +1825,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[test]
     fn check_diff_renders_on_sqlite() {
         let expected = vec![ExpectedCheck {
@@ -1960,6 +2039,7 @@ mod tests {
         .unwrap()
         .is_none());
         // 非 PG → rebuild 原因
+        #[cfg(feature = "sqlite")]
         assert!(plan_primary_key_change(
             DbType::Sqlite,
             "t",
