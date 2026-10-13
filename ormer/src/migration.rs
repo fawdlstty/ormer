@@ -1130,7 +1130,7 @@ impl<'a, T: WritableModel> TableMigration<'a, T> {
                         if let Some((time_column, _)) = T::hypertable_info() {
                             columns.push(time_column);
                         }
-                        if let Some((space_column, _)) = T::hypertable_space_info() {
+                        for (space_column, _) in T::hypertable_space_infos() {
                             columns.push(space_column);
                         }
                         columns
@@ -1842,19 +1842,30 @@ pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
                     sql: "CREATE EXTENSION IF NOT EXISTS timescaledb".to_string(),
                 });
                 let interval_str = chunk_interval.to_interval_string();
-                let hypertable_sql =
-                    if let Some((space_column, partitions)) = T::hypertable_space_info() {
-                        format!(
-                            "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', partitioning_column => '{space_column}', number_partitions => {partitions}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
-                        )
-                    } else {
-                        format!(
-                            "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
-                        )
-                    };
-                let post = vec![MigrationStep::Sql {
-                    sql: hypertable_sql,
-                }];
+                let mut post = Vec::new();
+                let space_infos = T::hypertable_space_infos();
+                let hypertable_sql = if let Some((first_space, partitions)) =
+                    space_infos.first()
+                {
+                    format!(
+                        "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', partitioning_column => '{first_space}', number_partitions => {partitions}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
+                    )
+                } else {
+                    format!(
+                        "SELECT create_hypertable('{table_name}', '{time_column}', chunk_time_interval => INTERVAL '{interval_str}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)"
+                    )
+                };
+                post.push(MigrationStep::Sql { sql: hypertable_sql });
+                // 首个空间分区列走 create_hypertable 的 partitioning_column，其余列
+                // 按声明顺序用 add_dimension 追加（TimescaleDB 要求 add_dimension 在
+                // 空表上执行，刚建好的表天然满足）。
+                for (space_column, partitions) in space_infos.iter().skip(1) {
+                    post.push(MigrationStep::Sql {
+                        sql: format!(
+                            "SELECT add_dimension('{table_name}', '{space_column}', number_partitions => {partitions}, if_not_exists => TRUE)"
+                        ),
+                    });
+                }
                 return (pre, post);
             }
             return (pre, Vec::new());
@@ -2228,6 +2239,87 @@ fn column_default_changes<T: WritableModel>(
     changes
 }
 
+/// 保数据重建的单列回灌映射。
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
+pub(crate) struct RebuildColumnEntry {
+    /// 新表列名。
+    pub(crate) column: String,
+    /// 回灌 SELECT 表达式（标识符已引用，可直接拼接 SQL）。
+    pub(crate) expression: String,
+    /// 表达式是否取自老表真实列（false = NULL/默认值合成；回灌分批水位只认真实列）。
+    pub(crate) from_old_table: bool,
+}
+
+/// 保数据重建的列回灌映射整体结论（[`build_rebuild_column_mapping`] 产出）。
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
+pub(crate) struct RebuildColumnMapping {
+    /// 每个新列的映射（模型声明顺序，INSERT 列清单与 SELECT 表达式一一对应）。
+    pub(crate) entries: Vec<RebuildColumnEntry>,
+    /// 非空、无 DEFAULT 且老表无来源的列（前置检查 c 拒绝，等人工介入）。
+    pub(crate) unsourced_required: Vec<String>,
+}
+
+/// 保数据重建的列回灌映射生成器（方案 §3.3，纯函数）。
+///
+/// 输入模型列定义与老表 pg 自省列集合，输出新表 INSERT 列清单与 SELECT
+/// 表达式的映射。规则：
+/// - 老表有同名列 → 直接取该列；列声明 `#[column(old_name = "...")]` 时
+///   显式取老表对应列（改名保数据，优先于同名匹配）；
+/// - 老表无此列且模型列可空 → `NULL::<类型>`；
+/// - 老表无此列且有 DEFAULT 子句 → 取默认值表达式；
+/// - 老表无此列、非空且无 DEFAULT → 进 `unsourced_required`，由调用方拒绝；
+/// - 老表有、新模型已删的列不出现在任何映射中（随备份表一并删除）。
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
+pub(crate) fn build_rebuild_column_mapping<T: WritableModel>(
+    db_type: DbType,
+    old_columns: &[SchemaColumn],
+) -> RebuildColumnMapping {
+    let old_by_name: BTreeMap<&str, &SchemaColumn> = old_columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect();
+    let mut entries = Vec::with_capacity(T::COLUMN_SCHEMA.len());
+    let mut unsourced_required = Vec::new();
+    for column in T::COLUMN_SCHEMA {
+        // 改名映射优先：old_name 指向的老列存在时按其取值；未命中（含未
+        // 标注）退回同名列匹配；两处皆无视为"老表无此列"。
+        let source = column
+            .old_name
+            .and_then(|old| old_by_name.get(old).map(|entry| entry.name.as_str()))
+            .or_else(|| old_by_name.get(column.name).map(|entry| entry.name.as_str()));
+        let entry = match source {
+            Some(old_name) => RebuildColumnEntry {
+                column: column.name.to_string(),
+                expression: crate::model::quote_identifier(db_type, old_name),
+                from_old_table: true,
+            },
+            None if column.is_nullable => RebuildColumnEntry {
+                column: column.name.to_string(),
+                expression: format!("NULL::{}", column_type_definition(db_type, column)),
+                from_old_table: false,
+            },
+            None => match column.default {
+                Some(default) => RebuildColumnEntry {
+                    column: column.name.to_string(),
+                    expression: default.to_sql(db_type),
+                    from_old_table: false,
+                },
+                None => {
+                    unsourced_required.push(column.name.to_string());
+                    continue;
+                }
+            },
+        };
+        entries.push(entry);
+    }
+    RebuildColumnMapping {
+        entries,
+        unsourced_required,
+    }
+}
+
 /// 拆分可能带 schema 前缀的表名（如 PG/MSSQL 的 `public.users`）。
 pub(crate) fn split_qualified_table_name(table_name: &str) -> (Option<&str>, &str) {
     match table_name.rsplit_once('.') {
@@ -2573,7 +2665,7 @@ pub(crate) async fn execute_steps_nontransactional(
     Ok(())
 }
 
-fn split_sql_statements(sql: &str) -> Vec<String> {
+pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut word = String::new();
@@ -3657,6 +3749,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                old_name: None,
             },
             ColumnSchema {
                 rust_name: "project_id",
@@ -3685,6 +3778,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                old_name: None,
             },
             ColumnSchema {
                 rust_name: "task_kind",
@@ -3713,6 +3807,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                old_name: None,
             },
         ]
     }

@@ -143,22 +143,23 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     };
 
     // 生成主键列名列表（支持复合主键）
-    // TimescaleDB 空间分区超表要求所有唯一索引（含主键）都包含分区列，
-    // 因此同时声明了时间分片与空间分区的模型，主键自动补齐空间分区列，
+    // TimescaleDB 空间分区超表要求所有唯一索引（含主键）都包含全部分区列，
+    // 因此同时声明了时间分片与空间分区的模型，主键自动补齐全部空间分区列，
     // 使 ON CONFLICT、按主键更新/删除等行身份操作与数据库实际约束保持一致。
     let mut effective_primary_keys: Vec<_> = primary_keys.clone();
-    if let Some(space_field) = normal_fields
-        .iter()
-        .copied()
-        .find(|info| info.hypertable_space_count.is_some())
-        && normal_fields
+    if normal_fields.iter().any(|info| info.has_hypertable_time) {
+        for space_field in normal_fields
             .iter()
-            .any(|info| info.has_hypertable_time)
-        && !primary_keys
-            .iter()
-            .any(|info| info.column_name == space_field.column_name)
-    {
-        effective_primary_keys.push(space_field);
+            .copied()
+            .filter(|info| info.hypertable_space_count.is_some())
+            .filter(|info| {
+                !primary_keys
+                    .iter()
+                    .any(|pk| pk.column_name == info.column_name)
+            })
+        {
+            effective_primary_keys.push(space_field);
+        }
     }
     let primary_key_field_names: Vec<_> = effective_primary_keys
         .iter()
@@ -292,6 +293,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 .db_value_type_expr
                 .clone()
                 .unwrap_or_else(|| quote! { None });
+            let old_name = option_string_tokens(info.column_old_name.as_deref());
 
             quote! {
                 ::ormer::model::ColumnSchema {
@@ -321,6 +323,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     hypertable_space: #hypertable_space,
                     compress: #compress,
                     compression: #compression,
+                    old_name: #old_name,
                 }
             }
         })
@@ -356,6 +359,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 hypertable_space: None,
                 compress: false,
                 compression: None,
+                old_name: None,
             }
         }
     });
@@ -1545,6 +1549,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                             hypertable_space: None,
                             compress: schema.compress,
                             compression: schema.compression,
+                            old_name: None,
                         });
                     }
                 }
@@ -2452,6 +2457,7 @@ fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 .db_value_type_expr
                 .clone()
                 .unwrap_or_else(|| quote! { None });
+            let old_name = option_string_tokens(info.column_old_name.as_deref());
 
             quote! {
                 ::ormer::model::ColumnSchema {
@@ -2481,6 +2487,7 @@ fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     hypertable_space: None,
                     compress: false,
                     compression: None,
+                    old_name: #old_name,
                 }
             }
         })
@@ -2738,7 +2745,8 @@ fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
 // model.rs 与 model_enum.rs 共用的属性解析/类型工具统一放在 shared 模块
 use crate::shared::{
-    extract_column_name, is_string_type, normalize_type_string, option_inner_type, to_snake_case,
+    extract_column_name, extract_column_old_name, is_string_type, normalize_type_string,
+    option_inner_type, to_snake_case,
 };
 
 #[derive(Clone)]
@@ -2802,6 +2810,7 @@ struct FieldInfo<'a> {
     field_name: &'a syn::Ident,
     field_type: &'a syn::Type,
     column_name: String,
+    column_old_name: Option<String>,
     rust_type: String,
     is_nullable: bool,
     is_primary: bool,
@@ -2853,6 +2862,7 @@ impl<'a> FieldInfo<'a> {
         let field_name = field.ident.as_ref().unwrap();
         let field_type = &field.ty;
         let column_name = extract_column_name(field)?;
+        let column_old_name = extract_column_old_name(field)?;
         let type_str = normalize_type_string(quote! { #field_type }.to_string());
         let is_nullable = type_str.starts_with("Option<");
         let rust_type = if is_nullable {
@@ -2923,6 +2933,7 @@ impl<'a> FieldInfo<'a> {
             field_name,
             field_type,
             column_name,
+            column_old_name,
             rust_type,
             is_nullable,
             is_primary,
@@ -5121,27 +5132,27 @@ fn hypertable_space_info_method(field_infos: &[FieldInfo<'_>]) -> syn::Result<pr
         .iter()
         .filter(|info| info.hypertable_space_count.is_some())
         .collect::<Vec<_>>();
-    if space_fields.len() > 1 {
-        return Err(syn::Error::new(
-            proc_macro2::Span::call_site(),
-            "only one field can use #[hypertable_space] per model",
-        ));
+    // TimescaleDB 允许在时间维度外通过 add_dimension 挂任意数量的附加分区维度，
+    // 因此不限制 #[hypertable] 空间分区字段的个数，全部按声明顺序生成。
+    if space_fields.is_empty() {
+        return Ok(quote! {});
     }
 
-    if let Some(info) = space_fields.first() {
-        let key = info.column_name.as_str();
-        // 过滤条件保证 space_count 必然存在
-        let partitions = info
-            .hypertable_space_count
-            .expect("space partition count");
-        Ok(quote! {
-            fn hypertable_space_info() -> Option<(&'static str, u16)> {
-                Some((#key, #partitions))
-            }
+    let entries = space_fields
+        .iter()
+        .map(|info| {
+            let key = info.column_name.as_str();
+            let partitions = info
+                .hypertable_space_count
+                .expect("space partition count");
+            quote! { (#key, #partitions) }
         })
-    } else {
-        Ok(quote! {})
-    }
+        .collect::<Vec<_>>();
+    Ok(quote! {
+        fn hypertable_space_infos() -> Vec<(&'static str, u16)> {
+            vec![#(#entries),*]
+        }
+    })
 }
 
 fn hypertable_route_key_method(field_infos: &[FieldInfo<'_>]) -> syn::Result<proc_macro2::TokenStream> {

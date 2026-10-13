@@ -484,6 +484,7 @@ fn derive_data_enum_field_type(
                     hypertable_space: None,
                     compress: false,
                     compression: None,
+                    old_name: None,
                 });
             }
         });

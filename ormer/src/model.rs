@@ -451,6 +451,9 @@ pub struct ColumnSchema {
     pub index_method: Option<&'static str>,      // fulltext、gin 等索引方法
     pub index_expression: Option<&'static str>,  // 函数索引或全文向量表达式
     pub index_columns: Option<&'static str>,     // 复合索引列清单
+    /// 老表列名映射（`#[column(old_name = "...")]`）：保数据重建路径把新列的
+    /// 值显式取自老表的该列（等价改名保数据）。None 时按同名列取值。
+    pub old_name: Option<&'static str>,
 }
 
 /// 数据库专用表级 DDL 选项。
@@ -1666,6 +1669,16 @@ fn hypertable_space_info_of_schema(schema: &[ColumnSchema]) -> Option<(&'static 
         .find_map(|col| col.hypertable_space.map(|partitions| (col.name, partitions)))
 }
 
+/// 从列 schema 中提取全部 TimescaleDB 空间分区列（按声明顺序），
+/// `ViewModel` 与 `Model` 默认实现共用。
+/// TimescaleDB 允许时间维度外挂任意数量的附加分区维度（`add_dimension`）。
+fn hypertable_space_infos_of_schema(schema: &[ColumnSchema]) -> Vec<(&'static str, u16)> {
+    schema
+        .iter()
+        .filter_map(|col| col.hypertable_space.map(|partitions| (col.name, partitions)))
+        .collect()
+}
+
 /// 从列 schema 中提取主键 Rust 字段名列表，`ViewModel` 与 `Model` 默认实现共用。
 fn primary_field_names_of_schema(schema: &[ColumnSchema]) -> Vec<&'static str> {
     schema
@@ -1706,6 +1719,11 @@ pub trait ViewModel: Sized {
     /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
     fn hypertable_space_info() -> Option<(&'static str, u16)> {
         hypertable_space_info_of_schema(&Self::column_schema())
+    }
+
+    /// 获取 TimescaleDB 全部空间分区列（按声明顺序，可多个）。
+    fn hypertable_space_infos() -> Vec<(&'static str, u16)> {
+        hypertable_space_infos_of_schema(&Self::column_schema())
     }
 
     type QueryBuilder;
@@ -1787,6 +1805,11 @@ pub trait Model: Sized {
     /// 获取 TimescaleDB 空间分区字段名和分区数量（如果有）。
     fn hypertable_space_info() -> Option<(&'static str, u16)> {
         hypertable_space_info_of_schema(&Self::column_schema())
+    }
+
+    /// 获取 TimescaleDB 全部空间分区列（按声明顺序，可多个）。
+    fn hypertable_space_infos() -> Vec<(&'static str, u16)> {
+        hypertable_space_infos_of_schema(&Self::column_schema())
     }
 
     /// 获取 TimescaleDB 字符串拆表路由键（如果有）。
@@ -4487,10 +4510,13 @@ pub fn effective_primary_key_columns<T: Model>(
     #[cfg(feature = "postgresql")]
     if matches!(db_type, crate::abstract_layer::DbType::PostgreSQL)
         && T::hypertable_info().is_some()
-        && let Some((space_column, _)) = T::hypertable_space_info()
-        && !columns.contains(&space_column)
     {
-        columns.push(space_column);
+        // TimescaleDB 要求唯一约束（含主键）包含全部分区列，逐列补齐。
+        for (space_column, _) in T::hypertable_space_infos() {
+            if !columns.contains(&space_column) {
+                columns.push(space_column);
+            }
+        }
     }
     columns
 }

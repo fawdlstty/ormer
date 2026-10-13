@@ -32,6 +32,12 @@ pub(crate) fn extract_column_name(field: &syn::Field) -> syn::Result<String> {
                         let lit: syn::LitStr = value.parse()?;
                         name = Some(lit.value());
                         Ok(())
+                    } else if meta.path.is_ident("old_name") {
+                        // 改名映射归 extract_column_old_name 解析，此处消费放行
+                        //（meta.value() 只消费 `=`，值部分必须 parse 掉）
+                        let value = meta.value()?;
+                        let _lit: syn::Lit = value.parse()?;
+                        Ok(())
                     } else {
                         Err(meta.error("unsupported #[column] argument"))
                     }
@@ -45,6 +51,39 @@ pub(crate) fn extract_column_name(field: &syn::Field) -> syn::Result<String> {
     }
 
     Ok(default_name)
+}
+
+/// 提取 `#[column(old_name = "老列名")]` 的改名映射（保数据重建路径用：
+/// 新列的值显式取自老表的该列，等价改名保数据）。
+///
+/// 与 [`extract_column_name`] 共用 `#[column(...)]` 属性：本函数只认
+/// `old_name`，其余参数（`name` 等）原样放行；未标注返回 `None`。
+pub(crate) fn extract_column_old_name(field: &syn::Field) -> syn::Result<Option<String>> {
+    let mut old_name = None;
+    for attr in &field.attrs {
+        if attr.path().is_ident("column")
+            && let Meta::List(_) = &attr.meta
+        {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("old_name") {
+                    let value = meta.value()?;
+                    let lit: syn::LitStr = value.parse()?;
+                    old_name = Some(lit.value());
+                    Ok(())
+                } else {
+                    // name 等其他参数由 extract_column_name 负责。parse_nested_meta
+                    // 要求每项的输入被消费干净：meta.value() 只消费 `=`，值部分
+                    // 必须真正 parse 掉，否则残留输入报 "expected `,`"。
+                    if meta.input.peek(syn::Token![=]) {
+                        let value = meta.value()?;
+                        let _lit: syn::Lit = value.parse()?;
+                    }
+                    Ok(())
+                }
+            })?;
+        }
+    }
+    Ok(old_name)
 }
 
 /// raw identifier（`r#type` 等）的裸名字；普通标识符原样返回。

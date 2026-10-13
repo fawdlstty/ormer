@@ -2035,6 +2035,18 @@ async fn ensure_existing_columnstore<T: crate::model::Model>(
     Ok(())
 }
 
+impl Database {
+    /// migrate_table 用的路由子表列存补挂入口：旧版本 ormer 或外部创建的
+    /// 子表没有压缩属性，迁移作为全量对账入口也必须补齐（与写入触达
+    /// `ensure_routed_table_on_client` 同一幂等 DO 块与进程级缓存）。
+    pub(crate) async fn ensure_existing_columnstore_for_model<T: crate::model::Model>(
+        &self,
+        table: &str,
+    ) -> crate::Result<()> {
+        ensure_existing_columnstore::<T>(&self.client, self.db_type, table).await
+    }
+}
+
 pub struct CreateTableExecutor<'a, T: crate::model::Model> {
     client: &'a tokio_postgres::Client,
     db_type: DbType,
@@ -2122,20 +2134,32 @@ impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
             // create_default_indexes => FALSE：TimescaleDB 默认会额外创建
             // 时间列/分区列组合的默认索引，导致实际索引集合与模型声明不一致；
             // 关闭后表结构完全由模型声明决定（主键 + #[index]）。
-            let hypertable_sql = if let Some((space_column, partitions)) =
-                T::hypertable_space_info()
-            {
-                format!(
-                    "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', partitioning_column => '{}', number_partitions => {}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
-                    table_name, time_column, interval_str, space_column, partitions
-                )
-            } else {
-                format!(
-                    "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
-                    table_name, time_column, interval_str
-                )
-            };
+            let space_infos = T::hypertable_space_infos();
+            let hypertable_sql =
+                if let Some((first_space, partitions)) = space_infos.first() {
+                    format!(
+                        "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', partitioning_column => '{}', number_partitions => {}, if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
+                        table_name, time_column, interval_str, first_space, partitions
+                    )
+                } else {
+                    format!(
+                        "SELECT create_hypertable('{}', '{}', chunk_time_interval => INTERVAL '{}', if_not_exists => TRUE, migrate_data => TRUE, create_default_indexes => FALSE)",
+                        table_name, time_column, interval_str
+                    )
+                };
             statements.push(SingleSqlStatement::new(hypertable_sql, Vec::new()));
+            // 首个空间分区列走 create_hypertable 的 partitioning_column，其余列按
+            // 声明顺序用 add_dimension 追加（TimescaleDB 要求 add_dimension 在空表
+            // 上执行，刚建好的表天然满足）。
+            for (space_column, partitions) in space_infos.iter().skip(1) {
+                statements.push(SingleSqlStatement::new(
+                    format!(
+                        "SELECT add_dimension('{}', '{}', number_partitions => {}, if_not_exists => TRUE)",
+                        table_name, space_column, partitions
+                    ),
+                    Vec::new(),
+                ));
+            }
         }
 
         // 路由子表收尾：追加列存压缩 DO 块（需在 create_hypertable 之后执行）。
@@ -3563,69 +3587,43 @@ impl Database {
 
         let (schema_name, table_name) = split_schema_table_name(T::TABLE_NAME, "public");
         let expected_interval = to_postgres_interval(chunk_interval);
-        let expected_space = T::hypertable_space_info();
-        if let Some((space_column, partitions)) = expected_space {
-            let expected_partitions = partitions as i16;
-            let sql = r#"
-                SELECT
-                    COUNT(*)::BIGINT,
-                    COUNT(*) FILTER (
-                        WHERE column_name = $3
-                          AND time_interval = $4::interval
-                    )::BIGINT,
-                    COUNT(*) FILTER (
-                        WHERE column_name = $5
-                          AND dimension_type = 'Space'
-                          AND num_partitions = $6
-                    )::BIGINT
-                FROM timescaledb_information.dimensions
-                WHERE hypertable_schema = $1 AND hypertable_name = $2
-            "#;
-            let row = self
-                .client
-                .query_one(
-                    sql,
-                    &[
-                        &schema_name,
-                        &table_name,
-                        &time_column,
-                        &expected_interval,
-                        &space_column,
-                        &expected_partitions,
-                    ],
-                )
-                .trace()
-                .await?;
-            Ok((
-                row.try_get(0).trace_for("tokio_postgres::Row::try_get")?,
-                row.try_get(1).trace_for("tokio_postgres::Row::try_get")?,
-                row.try_get(2).trace_for("tokio_postgres::Row::try_get")?,
-            ))
-        } else {
-            let sql = r#"
-                SELECT
-                    COUNT(*)::BIGINT,
-                    COUNT(*) FILTER (
-                        WHERE column_name = $3
-                          AND time_interval = $4::interval
-                    )::BIGINT
-                FROM timescaledb_information.dimensions
-                WHERE hypertable_schema = $1 AND hypertable_name = $2
-            "#;
-            let row = self
-                .client
-                .query_one(
-                    sql,
-                    &[&schema_name, &table_name, &time_column, &expected_interval],
-                )
-                .trace()
-                .await?;
-            Ok((
-                row.try_get(0).trace_for("tokio_postgres::Row::try_get")?,
-                row.try_get(1).trace_for("tokio_postgres::Row::try_get")?,
-                0,
-            ))
-        }
+        let expected_spaces = T::hypertable_space_infos();
+        // 拉取全部维度行：时间维度由 SQL 参数化比对 interval，空间维度在
+        // Rust 侧逐列匹配，支持多个空间分区维度。
+        let sql = r#"
+            SELECT column_name, dimension_type, num_partitions,
+                   (column_name = $3 AND time_interval = $4::interval) AS matches_time
+            FROM timescaledb_information.dimensions
+            WHERE hypertable_schema = $1 AND hypertable_name = $2
+        "#;
+        let rows = self
+            .client
+            .query(sql, &[&schema_name, &table_name, &time_column, &expected_interval])
+            .trace()
+            .await?;
+        let dimension_count = rows.len() as i64;
+        let time_dimension_count = rows
+            .iter()
+            .filter(|row| {
+                row.try_get::<_, bool>(3)
+                    .trace_for("tokio_postgres::Row::try_get")
+                    .unwrap_or(false)
+            })
+            .count() as i64;
+        let space_dimension_count = expected_spaces
+            .iter()
+            .filter(|(space_column, partitions)| {
+                rows.iter().any(|row| {
+                    let column_name: String = row.try_get(0).unwrap_or_default();
+                    let dimension_type: String = row.try_get(1).unwrap_or_default();
+                    let num_partitions: Option<i16> = row.try_get(2).ok().flatten();
+                    column_name == *space_column
+                        && dimension_type == "Space"
+                        && num_partitions == Some(*partitions as i16)
+                })
+            })
+            .count() as i64;
+        Ok((dimension_count, time_dimension_count, space_dimension_count))
     }
 
     async fn validate_table_hypertable<T: Model>(&self) -> crate::Result<()> {
@@ -3653,12 +3651,21 @@ impl Database {
             let (dimension_count, time_dimension_count, space_dimension_count) = self
                 .check_hypertable_dimensions::<T>(time_column, chunk_interval)
                 .await?;
-            let expected_space = T::hypertable_space_info();
-            let expected_dimension_count = if expected_space.is_some() { 2 } else { 1 };
+            let expected_spaces = T::hypertable_space_infos();
+            let expected_dimension_count = 1 + expected_spaces.len() as i64;
+            let expected_space_text = expected_spaces
+                .iter()
+                .map(|(column, partitions)| {
+                    format!(
+                        ", one space dimension on column '{}' with {} partitions",
+                        column, partitions
+                    )
+                })
+                .collect::<String>();
 
             if dimension_count != expected_dimension_count
                 || time_dimension_count != 1
-                || space_dimension_count != if expected_space.is_some() { 1 } else { 0 }
+                || space_dimension_count != expected_spaces.len() as i64
             {
                 return Err(crate::ormer_error!(
                     "Schema mismatch: table {}, reason: Hypertable dimension mismatch: expected {} dimensions (one time dimension on column '{}' with chunk interval '{}'{}), but actual dimensions={} matching_time_dimensions={} matching_space_dimensions={}",
@@ -3666,10 +3673,7 @@ impl Database {
                     expected_dimension_count,
                     time_column,
                     chunk_interval.to_interval_string(),
-                    expected_space.map_or_else(String::new, |(column, partitions)| format!(
-                        ", one space dimension on column '{}' with {} partitions",
-                        column, partitions
-                    )),
+                    expected_space_text,
                     dimension_count,
                     time_dimension_count,
                     space_dimension_count
@@ -4043,6 +4047,78 @@ impl Database {
             ));
         }
         Ok(Some(columns))
+    }
+
+    /// 表行数（SELECT count(*)）。保数据重建路径的前置检查与回灌对账用。
+    pub(crate) async fn table_row_count(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> crate::Result<i64> {
+        let qualified =
+            crate::model::quote_qualified_identifier(self.db_type, &format!("{schema_name}.{table_name}"));
+        let row = self
+            .client
+            .query_one(&format!("SELECT count(*) FROM {qualified}"), &[])
+            .trace()
+            .await?;
+        Ok(row
+            .try_get::<_, i64>(0)
+            .trace_for("tokio_postgres::Row::try_get")?)
+    }
+
+    /// 主键冲突预检执行器（保数据重建前置检查 b，拍板 A：可精确预检 →
+    /// 迁移前报错）：按给定分组表达式 GROUP BY，取 HAVING count(*) > 1 的
+    /// 冲突组样例。每行返回各分组表达式的 `::text` 形值（NULL → None），
+    /// 末列为组内行数文本，供错误信息直接引用。
+    pub(crate) async fn duplicate_key_samples(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        group_expressions: &[String],
+        sample_limit: usize,
+    ) -> crate::Result<Vec<Vec<Option<String>>>> {
+        let qualified =
+            crate::model::quote_qualified_identifier(self.db_type, &format!("{schema_name}.{table_name}"));
+        let group_list = group_expressions.join(", ");
+        let select_list = group_expressions
+            .iter()
+            .map(|expression| format!("{expression}::text"))
+            .chain(std::iter::once("count(*)::text".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {select_list} FROM {qualified} \
+             GROUP BY {group_list} HAVING count(*) > 1 LIMIT {sample_limit}"
+        );
+        let rows = self.client.query(&sql, &[]).trace().await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (0..row.len())
+                    .map(|index| row.try_get::<_, Option<String>>(index).ok().flatten())
+                    .collect()
+            })
+            .collect())
+    }
+
+    /// 表达式（老表列引用）是否存在 NULL 行（LIMIT 1 探测，保数据重建
+    /// 前置检查 b：新主键列含 NULL 时回灌 INSERT 会因 NOT NULL 失败）。
+    pub(crate) async fn expression_has_null(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        expression: &str,
+    ) -> crate::Result<bool> {
+        let qualified =
+            crate::model::quote_qualified_identifier(self.db_type, &format!("{schema_name}.{table_name}"));
+        let sql = format!("SELECT 1 FROM {qualified} WHERE {expression} IS NULL LIMIT 1");
+        Ok(self
+            .client
+            .query_opt(&sql, &[])
+            .trace()
+            .await?
+            .is_some())
     }
 
     /// 检查连接是否有效
@@ -7077,6 +7153,7 @@ mod block_delete_tests {
             index_method: None,
             index_expression: None,
             index_columns: None,
+            old_name: None,
         }
     }
 

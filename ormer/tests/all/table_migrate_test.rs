@@ -219,18 +219,23 @@ mod sqlite_migrate {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn table_migrate_outcome_reports_steps() -> ormer::Result<()> {
-    use shared::ApplyItemV1;
     use ormer::{TableDiagnosis, TableMigrateOutcome};
+    use shared::ApplyItemV1;
     let db = Database::connect(DbType::Sqlite, ":memory:").await?;
     let outcome = db.migrate_table::<ApplyItemV1>().await?;
     let TableMigrateOutcome {
         diagnosis,
         created_table,
         executed,
+        migrated_rows,
+        backup_table,
     } = outcome;
     assert!(matches!(diagnosis, TableDiagnosis::Migratable(_)));
     assert!(created_table);
     assert_eq!(executed.len(), 1);
+    // 新建表不走保数据重建：无回灌行数、无遗留备份清理记录
+    assert_eq!(migrated_rows, None);
+    assert_eq!(backup_table, None);
     Ok(())
 }
 
@@ -562,10 +567,12 @@ mod postgresql_only {
     }
 
     /// 空表自愈（gzzs 形态）：超表时间维列与模型不一致时，空表自动删表
-    /// 重建收敛（created_table 标记重建轮的 CreateTable）；有数据时仍拒绝
-    /// 重建且存量行原样保留。
+    /// 重建收敛（created_table 标记重建轮的 CreateTable）；有数据时走
+    /// 保数据重建（老表改名→建新表→回灌），存量行保留、新时间维生效、
+    /// outcome.migrated_rows 上报回灌行数。
     #[tokio::test]
-    async fn wrong_time_dimension_empty_table_rebuilds_data_table_refuses() -> ormer::Result<()> {
+    async fn wrong_time_dimension_empty_rebuilds_nonempty_rebuilds_preserving_data(
+    ) -> ormer::Result<()> {
         let db = pg_database().await;
         let _ = db.drop_table::<HypEventFixed>().execute().await;
 
@@ -618,7 +625,8 @@ mod postgresql_only {
             TableDiagnosis::Ready
         ));
 
-        // 同形态但有数据：仍拒绝重建，存量行原样保留
+        // 同形态但有数据：按保数据重建新语义迁移成功，存量行保留、
+        // 新时间维生效（拒绝语义仅剩冲突/NULL/无来源/复验不收敛）
         let _ = db.drop_table::<HypEventFixed>().execute().await;
         db.migrate_table::<HypEventWrongDim>().await?;
         db.insert(&HypEventWrongDim {
@@ -638,10 +646,11 @@ mod postgresql_only {
         })
         .execute()
         .await?;
-        let err = db.migrate_table::<HypEventFixed>().await.unwrap_err();
-        assert!(
-            err.is_unmigratable_schema(),
-            "non-empty wrong-dimension hypertable must stay refused, got {err}"
+        let outcome = db.migrate_table::<HypEventFixed>().await?;
+        assert_eq!(
+            outcome.migrated_rows,
+            Some(1),
+            "preserving rebuild must report the backfilled row count, got {outcome:?}"
         );
         let rows = db
             .select_sql::<i64>(ormer::sql!(
@@ -650,6 +659,23 @@ mod postgresql_only {
             .collect::<Vec<i64>>()
             .await?;
         assert_eq!(rows.first().copied(), Some(1), "data must survive");
+        let dims = db
+            .select_sql::<i64>(ormer::sql!(
+                "SELECT count(*) FROM timescaledb_information.dimensions \
+                 WHERE hypertable_name = 'ormer_apply_hyp_events_wd' \
+                 AND column_name = 'event_time'"
+            ))
+            .collect::<Vec<i64>>()
+            .await?;
+        assert_eq!(
+            dims.first().copied(),
+            Some(1),
+            "time dimension must move to event_time"
+        );
+        assert!(matches!(
+            db.migrate_table::<HypEventFixed>().await?.diagnosis,
+            TableDiagnosis::Ready
+        ));
 
         let _ = db.drop_table::<HypEventFixed>().execute().await;
         Ok(())

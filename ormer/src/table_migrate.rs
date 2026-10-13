@@ -17,6 +17,8 @@ use crate::migration::{
     ExpectedIndexDef, MigrationPlan, MigrationStep, TableMigration,
 };
 use crate::model::WritableModel;
+#[cfg_attr(not(feature = "postgresql"), allow(unused_imports))]
+use crate::model::Value;
 use std::collections::BTreeSet;
 
 /// [`Database::plan_table`] 产出的执行计划（内部诊断路径）。与版本化迁移的
@@ -64,6 +66,12 @@ pub struct TableMigrateOutcome {
     pub created_table: bool,
     /// 实际执行的步骤（含建索引/清漂移索引/ChangePrimaryKey）。
     pub executed: Vec<MigrationStep>,
+    /// 保数据重建路径本次回灌的行数；未走重建路径时为 None。
+    pub migrated_rows: Option<i64>,
+    /// 前置检查清理掉的遗留备份表名（`{schema}.{table}_migrate_old`，拍板 B：
+    /// 正常路径的备份表在阶段一事务内校验通过后即删、不存续，仅异常/历史
+    /// 残留会触发清理并记录在此）；未清理时为 None。
+    pub backup_table: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +652,43 @@ fn is_index_creation_step(step: &MigrationStep) -> bool {
     }
 }
 
+/// 建索引步骤的日志标签：CreateIndex 变体取声明的索引名；Sql 形态（带
+/// 顺序/谓词的特殊索引）从 ormer 自渲染的 `CREATE [UNIQUE] INDEX
+/// [CONCURRENTLY] [IF NOT EXISTS] <name>` 受控文本前缀中提取索引名。
+fn index_step_label(step: &MigrationStep) -> String {
+    match step {
+        MigrationStep::CreateIndex { name, .. } => name.clone(),
+        MigrationStep::Sql { sql } => {
+            let upper = sql.to_ascii_uppercase();
+            let Some(offset) = upper.find(" INDEX") else {
+                return String::new();
+            };
+            let mut rest = sql[offset + " INDEX".len()..].trim_start();
+            for keyword in ["CONCURRENTLY ", "IF ", "NOT ", "EXISTS "] {
+                if rest.len() >= keyword.len()
+                    && rest[..keyword.len()].eq_ignore_ascii_case(keyword)
+                {
+                    rest = rest[keyword.len()..].trim_start();
+                }
+            }
+            let name = match rest.strip_prefix('"') {
+                Some(quoted) => quoted.split('"').next().unwrap_or_default().to_string(),
+                None => rest
+                    .split([' ', '(', '\t', '\n', '\r'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            };
+            if name.is_empty() {
+                String::new()
+            } else {
+                name
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// 校验标识符是合法"纯标识符"（扩展名/库名等不支持参数绑定的拼接前防御）。
 /// 供 ensure_extensions 与数据库级管理 API（database_exists 等）共用。
 pub(crate) fn is_safe_identifier(name: &str) -> bool {
@@ -741,19 +786,38 @@ impl Database {
     /// 索引纳入，PG 非 QuestDB 并发建索引+INVALID 自愈）→ CHECK 约束闭环
     /// （PG）→ 外键对齐 → 普通表→超表原地转换（create_hypertable
     /// migrate_data，存量数据随迁、原表触发器不随迁）。键、列及配置与
-    /// 模型完全一致：保数据推不动（NeedsRebuild）或复验不收敛一律直接
-    /// 返回 [`crate::OrmerError::unmigratable_schema`]，不做任何删表重建；
-    /// 唯一例外是空表兜底——表存在但（连同路由子表）没有任何行时，删表
-    /// 重建是零数据损失的自愈（如超表时间维列与模型不一致的空壳表），
-    /// 自动重建后重跑一轮迁移（见 [`Database::rebuild_empty_table`]）。
+    /// 模型完全一致：推不动的差异一律直接返回
+    /// [`crate::OrmerError::unmigratable_schema`]，不做任何丢数据的重建。
+    /// 两个自动兜底例外（均为零/保数据损失）：
+    /// - 空表兜底——表存在但（连同路由子表）没有任何行时，删表重建是零
+    ///   数据损失的自愈（如超表时间维列与模型不一致的空壳表），自动重建
+    ///   后重跑一轮迁移（见 [`Database::rebuild_empty_table`]）；
+    /// - 非空表保数据重建——差异属"可搬迁类"（超表分区列变更/主键换轨）
+    ///   且前置检查可满足时，老表改名作备份、按新模型重建并回灌，行数
+    ///   对账通过后提交（见
+    ///   [`Database::rebuild_nonempty_table_preserving_data`]）。
     /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
     pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
-        match self.migrate_table_once::<T>().await {
+        match self.migrate_table_once::<T>(false).await {
             Err(err) if err.is_unmigratable_schema() => {
                 if self.rebuild_empty_table::<T>().await {
-                    self.migrate_table_once::<T>().await
-                } else {
-                    Err(err)
+                    return self.migrate_table_once::<T>(false).await;
+                }
+                // 非空表保数据重建（"可搬迁类"NeedsRebuild 的兜底，§3.2）：
+                // 成功则照 rebuild_empty_table 模式重跑一轮迁移承接阶段二
+                // （模型声明索引走事务外 CONCURRENTLY，超表 0A000 自动退回
+                // 普通建索引，逐索引打进度日志）；不适用（Ok(None)）维持原
+                // 拒绝路径，前置检查拒绝（Err）返回附诊断 SQL 的
+                // UnmigratableSchema
+                match self.rebuild_nonempty_table_preserving_data::<T>().await {
+                    Ok(Some(info)) => {
+                        let mut outcome = self.migrate_table_once::<T>(true).await?;
+                        outcome.migrated_rows = Some(info.migrated_rows);
+                        outcome.backup_table = info.dropped_legacy_backup;
+                        Ok(outcome)
+                    }
+                    Ok(None) => Err(err),
+                    Err(rebuild_err) => Err(rebuild_err),
                 }
             }
             result => result,
@@ -761,9 +825,14 @@ impl Database {
     }
 
     /// [`Database::migrate_table`] 的单轮执行（诊断 → 增量执行 → 复验），
-    /// 由外层空表重建兜底包裹。
+    /// 基础表推不动时按序尝试空表兜底与非空表保数据重建。
+    ///
+    /// `index_progress_log`：本计划内每建完一个索引是否打一行进度日志
+    /// （索引名/耗时，§3.8 阶段二观测点）。仅保数据重建的承接轮传 true，
+    /// 普通迁移轮保持静默（共用索引执行器的输出不被污染）。
     async fn migrate_table_once<T: WritableModel>(
         &self,
+        index_progress_log: bool,
     ) -> crate::Result<TableMigrateOutcome> {
         let db_type = self.db_type();
         if !crate::abstract_layer::capabilities::Capabilities::of(db_type).schema_introspection {
@@ -789,9 +858,10 @@ impl Database {
                 created_table |= plan.steps().iter().any(|step| {
                     matches!(step, MigrationStep::CreateTable { table, .. } if table == table_name)
                 });
-                executed.extend(self.execute_plan_steps(&plan).await?);
+                executed.extend(self.execute_plan_steps(&plan, index_progress_log).await?);
             }
-            // 保数据推不动：直接报错，不托管删表重建
+            // 保数据推不动：直接报错，不托管删表重建（空表兜底与"可搬迁类"
+            // 非空表保数据重建由外层 migrate_table 兜底承接）
             TableDiagnosis::NeedsRebuild(cause) => {
                 return Err(crate::OrmerError::unmigratable_schema(
                     cause.table,
@@ -801,11 +871,13 @@ impl Database {
         }
 
         // 路由子表：与基础表同一套 diff 逻辑；推不动同样直接报错
-        for (_child, child_diagnosis) in family.children {
+        #[cfg(feature = "postgresql")]
+        let pg = self.as_postgresql();
+        for (child, child_diagnosis) in family.children {
             match child_diagnosis {
                 TableDiagnosis::Ready => {}
                 TableDiagnosis::Migratable(plan) => {
-                    executed.extend(self.execute_plan_steps(&plan).await?);
+                    executed.extend(self.execute_plan_steps(&plan, index_progress_log).await?);
                 }
                 TableDiagnosis::NeedsRebuild(cause) => {
                     return Err(crate::OrmerError::unmigratable_schema(
@@ -813,6 +885,15 @@ impl Database {
                         cause.reason,
                     ));
                 }
+            }
+            // schema diff 收敛后为旧版本创建的子表幂等补挂列存压缩（写入
+            // 触达路径只覆盖本次进程写入过的子表，迁移必须全覆盖）；
+            // DO 块内部吞掉后端不支持类错误，只会传播连接级错误。
+            #[cfg(feature = "postgresql")]
+            if matches!(db_type, DbType::PostgreSQL)
+                && let Some(pg) = pg
+            {
+                pg.ensure_existing_columnstore_for_model::<T>(&child).await?;
             }
         }
 
@@ -823,6 +904,8 @@ impl Database {
                 diagnosis,
                 created_table,
                 executed,
+                migrated_rows: None,
+                backup_table: None,
             }),
             TableDiagnosis::Migratable(_) => Err(crate::OrmerError::unmigratable_schema(
                 table_name,
@@ -881,6 +964,449 @@ impl Database {
             let _ = self;
             false
         }
+    }
+
+    /// 非空表保数据重建（方案 §3.2 两段式；[`Database::rebuild_empty_table`]
+    /// 的互补路径，migrate_table 的"可搬迁类"NeedsRebuild 兜底）。
+    ///
+    /// 触发条件（§3.1）：NeedsRebuild 原因属于超表时间/空间分区列变更或
+    /// 主键换轨（新主键不含全部分区键）；复验不收敛（半迁移态）不适用
+    /// 重建，返回 `Ok(None)` 维持原拒绝语义。
+    ///
+    /// 前提约束：前置检查与回灌之间老表数据不可修改——该闸门由调用方
+    /// （DataStorer 迁移期间阻塞全部经 get_conn() 的读写）保证，ormer 端
+    /// 不加锁；事务内行数对账（count(old) == count(new)）是前置检查结论
+    /// 仍然成立的最终防线，不等即 ROLLBACK，老表原名原样恢复、零残留。
+    ///
+    /// 返回 `Ok(None)`：不适用重建（非 PG 后端、原因不属于可搬迁类、老表
+    /// 已消失等），调用方走原拒绝路径；`Ok(Some)`：阶段一已提交（备份表
+    /// 已随事务删除，阶段二索引由调用方重跑一轮迁移承接）；`Err`：前置
+    /// 检查拒绝或阶段一失败（事务已回滚）。
+    async fn rebuild_nonempty_table_preserving_data<T: WritableModel>(
+        &self,
+    ) -> crate::Result<Option<PreservedDataRebuild>> {
+        #[cfg(feature = "postgresql")]
+        {
+            let Some(pg) = self.as_postgresql() else {
+                return Ok(None);
+            };
+            // 复诊断门禁：仅当前"基础表"诊断为 NeedsRebuild 且原因属
+            // "可搬迁类"时适用（路由子表推不动、复验不收敛半迁移态等
+            // 场景一律维持原拒绝语义，不做重建）
+            let Ok(family) = self.diagnose_family::<T>().await else {
+                return Ok(None);
+            };
+            let TableDiagnosis::NeedsRebuild(cause) = family.base else {
+                return Ok(None);
+            };
+            if !is_rebuild_eligible_cause(&cause.reason) {
+                return Ok(None);
+            }
+            let db_type = self.db_type();
+            let table = T::table_name_for_db(db_type);
+            let (schema, bare) = crate::model::split_schema_table_name(table, "public");
+            let qualified = crate::model::quote_qualified_identifier(db_type, table);
+            // 备份表名与索引名同受 NAMEDATALEN 63 字节截断：套用既有截断规则
+            let backup_bare = postgres_truncated_identifier(&format!("{bare}_migrate_old"));
+            let backup_qualified = format!(
+                "{}.{}",
+                crate::model::quote_identifier(db_type, schema),
+                crate::model::quote_identifier(db_type, &backup_bare)
+            );
+
+            // 前置检查 a：遗留备份表存在即 DROP（现行流程备份表不跨事务存续，
+            // 残留只可能来自历史版本或异常现场，与本轮迁移数据无关，发现即删）
+            let dropped_legacy_backup =
+                if pg.schema_columns(&backup_qualified).await?.is_some() {
+                    eprintln!(
+                        "[ormer] migrate_table: {qualified}: dropping legacy backup table \
+                         {backup_qualified} before data-preserving rebuild"
+                    );
+                    self.execute_sql(crate::raw_sql::RawSql::plain(format!(
+                        "DROP TABLE IF EXISTS {backup_qualified}"
+                    )))
+                    .await?;
+                    Some(backup_qualified.clone())
+                } else {
+                    None
+                };
+
+            // 老表自省列（诊断刚确认过存在；消失属并发干预，交由外层重试）
+            let Some(old_columns) = pg.schema_columns(&qualified).await? else {
+                return Ok(None);
+            };
+
+            // 列回灌映射（§3.3；前置检查 c 在映射产出后于 b 之后统一拒绝）
+            let mapping =
+                crate::migration::build_rebuild_column_mapping::<T>(db_type, &old_columns);
+
+            // 新主键列的回灌来源表达式（§3.4：预检分组键与回灌映射表达式
+            // 同构，保证冲突/NULL 检测与回灌逐行等价）。主键集合以建表 DDL
+            // 实际写出的有效主键为准：声明主键 + PG 超表自动补齐的空间分区列
+            let effective_primary_keys =
+                crate::model::effective_primary_key_columns::<T>(db_type);
+            let primary_key_sources: Vec<&crate::migration::RebuildColumnEntry> =
+                effective_primary_keys
+                    .iter()
+                    .filter_map(|name| mapping.entries.iter().find(|entry| entry.column == *name))
+                    .collect();
+
+            // 前置检查 b-1：新主键列 NULL 预检（回灌 INSERT 会因 NOT NULL 失败）
+            for entry in &primary_key_sources {
+                if pg
+                    .expression_has_null(schema, bare, &entry.expression)
+                    .await?
+                {
+                    return Err(crate::OrmerError::unmigratable_schema(
+                        table,
+                        format!(
+                            "data-preserving rebuild precondition failed: new primary key \
+                             column {} (sourced as {}) contains NULL rows in the old table; \
+                             detection SQL: SELECT 1 FROM {qualified} WHERE {} IS NULL LIMIT 1; \
+                             resolve NULLs and retry",
+                            entry.column, entry.expression, entry.expression
+                        ),
+                    ));
+                }
+            }
+
+            // 前置检查 b-2：新主键冲突预检（拍板 A：可精确预检 → 迁移前报错
+            // 等人工去重）
+            let group_expressions: Vec<String> = primary_key_sources
+                .iter()
+                .map(|entry| entry.expression.clone())
+                .collect();
+            let detection_sql = format!(
+                "SELECT {}, count(*) FROM {qualified} GROUP BY {} HAVING count(*) > 1 LIMIT 5",
+                group_expressions.join(", "),
+                group_expressions.join(", ")
+            );
+            let samples = pg
+                .duplicate_key_samples(schema, bare, &group_expressions, 5)
+                .await?;
+            if !samples.is_empty() {
+                let sample_text = samples
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|value| value.clone().unwrap_or_else(|| "NULL".to_string()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let dedup_predicates = group_expressions
+                    .iter()
+                    .map(|expression| format!("a.{expression} IS NOT DISTINCT FROM b.{expression}"))
+                    .collect::<Vec<_>>()
+                    .join("\n  AND ");
+                let primary_key_columns = primary_key_sources
+                    .iter()
+                    .map(|entry| entry.column.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table,
+                    format!(
+                        "data-preserving rebuild precondition failed: the new primary key \
+                         ({primary_key_columns}) would be violated by duplicate rows in the \
+                         old table; detection SQL: {detection_sql}; sample duplicate keys: \
+                         [{sample_text}]; deduplicate keeping one row per key, then retry. \
+                         Reference dedup SQL (keeps an arbitrary row per key):\n\
+                         DELETE FROM {qualified} a USING {qualified} b\n\
+                         WHERE a.ctid < b.ctid\n\
+                           AND {dedup_predicates}"
+                    ),
+                ));
+            }
+
+            // 前置检查 c：非空新列填充来源检查
+            if !mapping.unsourced_required.is_empty() {
+                return Err(crate::OrmerError::unmigratable_schema(
+                    table,
+                    format!(
+                        "data-preserving rebuild precondition failed: required column(s) [{}] \
+                         are absent from the old table and declare no default, so no value \
+                         can be derived; backfill the old table or add defaults to the model",
+                        mapping.unsourced_required.join(", ")
+                    ),
+                ));
+            }
+
+            // 表级开始日志（拍板 E：表名、老表总行数）
+            let total = pg.table_row_count(schema, bare).await?;
+            let started = std::time::Instant::now();
+            eprintln!(
+                "[ormer] migrate_table: {qualified}: data-preserving rebuild started, \
+                 {total} row(s) to carry over"
+            );
+
+            // 阶段一（单事务，原子）
+            let mut transaction = self.begin().await?;
+            match Self::copy_table_preserving_data::<T>(
+                &mut transaction,
+                db_type,
+                &qualified,
+                &backup_qualified,
+                &backup_bare,
+                &mapping,
+                total,
+            )
+            .await
+            {
+                Ok(migrated_rows) => {
+                    transaction.commit().await?;
+                    eprintln!(
+                        "[ormer] migrate_table: {qualified}: data-preserving rebuild finished, \
+                         {migrated_rows} row(s) in {:?}; index build follows via re-run",
+                        started.elapsed()
+                    );
+                    Ok(Some(PreservedDataRebuild {
+                        migrated_rows,
+                        dropped_legacy_backup,
+                    }))
+                }
+                Err(error) => {
+                    // 阶段一失败 ROLLBACK = 老表原名原样恢复，零残留
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(feature = "postgresql"))]
+        {
+            Ok(None)
+        }
+    }
+
+    /// 阶段一主体（须在单事务内调用）：RENAME 老表为备份 → 按新模型建新表
+    /// （跳过建表 DDL 内联的索引语句，回灌后由阶段二 CONCURRENTLY 补建）→
+    /// INSERT INTO 新表(显式列清单) SELECT 映射表达式 FROM 备份表 按业务时间
+    /// 列水位分批（每批 [`REBUILD_COPY_BATCH_SIZE`] 行，批内打进度日志）→
+    /// 事务内行数对账 → 校验通过即 DROP 备份表（拍板 B）。任一步失败由
+    /// 调用方 ROLLBACK。
+    /// 事务内执行一个迁移步骤（含 SQL 语句拆分；阶段一 bootstrap 步骤用）。
+    #[cfg(feature = "postgresql")]
+    async fn execute_step_statements(
+        transaction: &mut Transaction<'_>,
+        db_type: DbType,
+        step: &MigrationStep,
+    ) -> crate::Result<()> {
+        let sql = step.sql(db_type)?;
+        for statement in crate::migration::split_sql_statements(&sql) {
+            transaction
+                .execute_sql(crate::raw_sql::RawSql::plain(statement))
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "postgresql")]
+    async fn copy_table_preserving_data<T: WritableModel>(
+        transaction: &mut Transaction<'_>,
+        db_type: DbType,
+        qualified_table: &str,
+        backup_qualified: &str,
+        backup_bare: &str,
+        mapping: &crate::migration::RebuildColumnMapping,
+        expected_rows: i64,
+    ) -> crate::Result<i64> {
+        // 老表整体改名作备份（超表 chunk 数据随行）
+        transaction
+            .execute_sql(crate::raw_sql::RawSql::plain(format!(
+                "ALTER TABLE {qualified_table} RENAME TO {}",
+                crate::model::quote_identifier(db_type, backup_bare)
+            )))
+            .await?;
+
+        // 事务内老表行数（对账基准；前置检查与本事务之间由调用方闸门保证
+        // 无写入，此处复核）
+        let old_rows = transaction
+            .select_sql::<i64>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT count(*) FROM {backup_qualified}"
+            )))
+            .collect::<Vec<i64>>()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(0);
+
+        // 按新模型建新表：前置（枚举/扩展）→ CREATE TABLE → 后置
+        // （create_hypertable / add_dimension，create_default_indexes => FALSE
+        // 由 bootstrap 生成），DDL 序列与 fresh-table bootstrap 路径一致。
+        // 建表 DDL 内联的索引语句跳过，避免 insert 前维护二级索引。
+        let (pre_steps, post_steps) =
+            crate::migration::create_table_bootstrap_steps::<T>(db_type, qualified_table);
+        for step in pre_steps.iter() {
+            Self::execute_step_statements(transaction, db_type, step).await?;
+        }
+        let create_definition = crate::generate_create_table_sql::<T>(db_type)?;
+        for statement in crate::migration::split_sql_statements(&create_definition) {
+            if is_inline_index_statement(&statement) {
+                continue;
+            }
+            transaction
+                .execute_sql(crate::raw_sql::RawSql::plain(statement))
+                .await?;
+        }
+        for step in post_steps.iter() {
+            Self::execute_step_statements(transaction, db_type, step).await?;
+        }
+
+        // 回灌：显式列清单防列序漂移（§3.2）
+        let insert_columns = mapping
+            .entries
+            .iter()
+            .map(|entry| crate::model::quote_identifier(db_type, &entry.column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select_expressions = mapping
+            .entries
+            .iter()
+            .map(|entry| entry.expression.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_prefix = format!(
+            "INSERT INTO {qualified_table} ({insert_columns}) \
+             SELECT {select_expressions} FROM {backup_qualified}"
+        );
+
+        // 分批水位（拍板 E）：按业务时间列推进；时间列的回灌来源必须是
+        // 老表真实列，否则（时间列为合成列）退化为单批全量回灌。
+        let time_expression = T::hypertable_info()
+            .and_then(|(time_column, _)| {
+                mapping
+                    .entries
+                    .iter()
+                    .find(|entry| entry.column == time_column && entry.from_old_table)
+            })
+            .map(|entry| entry.expression.clone());
+
+        let mut migrated: i64 = 0;
+        match time_expression {
+            Some(time_expression) => {
+                let mut watermark: Option<Value> = None;
+                loop {
+                    // 批边界：自水位起第 REBUILD_COPY_BATCH_SIZE 行的时间值
+                    //（同事务快照）
+                    let boundary_sql = match &watermark {
+                        Some(_) => format!(
+                            "SELECT {time_expression} FROM {backup_qualified} \
+                             WHERE {time_expression} >= {{wm}} \
+                             ORDER BY {time_expression} \
+                             OFFSET {} LIMIT 1",
+                            REBUILD_COPY_BATCH_SIZE - 1
+                        ),
+                        None => format!(
+                            "SELECT {time_expression} FROM {backup_qualified} \
+                             ORDER BY {time_expression} \
+                             OFFSET {} LIMIT 1",
+                            REBUILD_COPY_BATCH_SIZE - 1
+                        ),
+                    };
+                    let mut boundary_query = crate::raw_sql::RawSql::new(boundary_sql);
+                    if let Some(value) = &watermark {
+                        boundary_query = boundary_query.bind_named("wm", value.clone());
+                    }
+                    let boundary = transaction
+                        .select_sql::<Option<Value>>(boundary_query)
+                        .collect::<Vec<Option<Value>>>()
+                        .await?
+                        .into_iter()
+                        .flatten()
+                        .next();
+
+                    // 边界为空（剩余不足一批）或与水位相等（剩余行同一时刻）
+                    // → 一次性收尾；否则按 [水位, 边界) 半开区间回灌并推进
+                    // 水位，行不重不漏。
+                    let final_batch = match &boundary {
+                        None => true,
+                        Some(value) => Some(value) == watermark.as_ref(),
+                    };
+                    let inserted = if final_batch {
+                        let sql = match &watermark {
+                            Some(_) => {
+                                format!("{insert_prefix} WHERE {time_expression} >= {{wm}}")
+                            }
+                            None => insert_prefix.clone(),
+                        };
+                        let mut statement = crate::raw_sql::RawSql::new(sql);
+                        if let Some(value) = &watermark {
+                            statement = statement.bind_named("wm", value.clone());
+                        }
+                        transaction.execute_sql(statement).await?
+                    } else {
+                        let bound = boundary.as_ref().expect("boundary checked above");
+                        let sql = match &watermark {
+                            Some(_) => format!(
+                                "{insert_prefix} WHERE {time_expression} >= {{wm}} \
+                                 AND {time_expression} < {{bound}}"
+                            ),
+                            None => {
+                                format!("{insert_prefix} WHERE {time_expression} < {{bound}}")
+                            }
+                        };
+                        let mut statement = crate::raw_sql::RawSql::new(sql);
+                        if let Some(value) = &watermark {
+                            statement = statement.bind_named("wm", value.clone());
+                        }
+                        statement = statement.bind_named("bound", bound.clone());
+                        transaction.execute_sql(statement).await?
+                    };
+                    migrated += inserted as i64;
+                    if old_rows > 0 {
+                        eprintln!(
+                            "[ormer] migrate_table: {qualified_table}: {migrated}/{old_rows} \
+                             row(s) migrated ({:.1}%)",
+                            (migrated as f64 / old_rows as f64) * 100.0
+                        );
+                    }
+                    if final_batch {
+                        break;
+                    }
+                    watermark = boundary;
+                }
+            }
+            None => {
+                migrated += transaction
+                    .execute_sql(crate::raw_sql::RawSql::plain(insert_prefix))
+                    .await? as i64;
+                eprintln!(
+                    "[ormer] migrate_table: {qualified_table}: {migrated}/{old_rows} row(s) \
+                     migrated (single batch)"
+                );
+            }
+        }
+
+        // 行数对账（最终防线）：count(old) == count(new)，不等 ROLLBACK
+        let new_rows = transaction
+            .select_sql::<i64>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT count(*) FROM {qualified_table}"
+            )))
+            .collect::<Vec<i64>>()
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(0);
+        if new_rows != old_rows {
+            return Err(crate::OrmerError::unmigratable_schema(
+                qualified_table,
+                format!(
+                    "data-preserving rebuild aborted: row count mismatch after copy \
+                     (old table {old_rows} row(s), new table {new_rows} row(s), model \
+                     expectation {expected_rows} row(s)); transaction rolled back and the \
+                     old table is restored unchanged"
+                ),
+            ));
+        }
+
+        // 校验通过即删备份（拍板 B）：备份表仅存续于本事务，COMMIT 后无残留
+        transaction
+            .execute_sql(crate::raw_sql::RawSql::plain(format!(
+                "DROP TABLE {backup_qualified}"
+            )))
+            .await?;
+        Ok(migrated)
     }
 
     /// 扩展确保：逐个幂等 `CREATE EXTENSION IF NOT EXISTS`。仅 PostgreSQL
@@ -1142,10 +1668,14 @@ impl Database {
     ///   执行前与失败重试前自动清理同表 INVALID 残留索引（自愈），
     ///   其余步骤保持单事务；
     /// - 其余后端：单事务整体执行。
+    ///
+    /// `index_progress_log`：逐索引进度日志开关（见
+    /// [`Database::migrate_table_once`]），由调用轮次决定。
     #[cfg_attr(not(feature = "postgresql"), allow(unused_variables))]
     pub(crate) async fn execute_plan_steps(
         &self,
         plan: &MigrationPlan,
+        index_progress_log: bool,
     ) -> crate::Result<Vec<MigrationStep>> {
         if plan.is_empty() {
             return Ok(Vec::new());
@@ -1191,7 +1721,8 @@ impl Database {
                 if let Some(open) = transaction.take() {
                     open.commit().await?;
                 }
-                self.create_index_concurrently(step, db_type).await?;
+                self.create_index_concurrently(step, db_type, index_progress_log)
+                    .await?;
             } else {
                 if transaction.is_none() {
                     transaction = Some(self.begin().await?);
@@ -1219,7 +1750,30 @@ impl Database {
     /// TimescaleDB hypertable 不支持 CREATE INDEX CONCURRENTLY（0A000）：
     /// 目标表是 hypertable 时退回普通建索引（事务化执行、失败即回滚，
     /// 不会留下 INVALID 残留，无需并发路径与自愈重试）。
+    ///
+    /// `index_progress_log` 为 true 时（保数据重建承接轮，§3.8 阶段二），
+    /// 每建完一个索引用一行输出索引名与耗时。
     async fn create_index_concurrently(
+        &self,
+        step: &MigrationStep,
+        db_type: DbType,
+        index_progress_log: bool,
+    ) -> crate::Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.create_index_concurrently_inner(step, db_type).await;
+        if index_progress_log && result.is_ok() {
+            eprintln!(
+                "[ormer] migrate_table: {}: index {} built in {:?}",
+                table_name(step),
+                index_step_label(step),
+                started.elapsed()
+            );
+        }
+        result
+    }
+
+    /// 索引构建主体（不含进度日志计时包装）。
+    async fn create_index_concurrently_inner(
         &self,
         step: &MigrationStep,
         db_type: DbType,
@@ -1364,6 +1918,37 @@ impl Database {
         let _ = (schema, table);
         Ok(Vec::new())
     }
+}
+
+/// 保数据重建回灌批大小（行/批，拍板 E：同事务分批推进，每批打进度日志）。
+#[cfg(feature = "postgresql")]
+const REBUILD_COPY_BATCH_SIZE: i64 = 50_000;
+
+/// 保数据重建的一次成功执行结果（[`Database::rebuild_nonempty_table_preserving_data`])。
+struct PreservedDataRebuild {
+    /// 本次回灌进新表的行数（事务内对账通过值）。
+    migrated_rows: i64,
+    /// 前置检查 a 清理掉的遗留备份表名（已限定 schema）；正常路径为 None。
+    dropped_legacy_backup: Option<String>,
+}
+
+/// NeedsRebuild 原因是否属于"可搬迁类"（§3.1 触发条件）：超表时间/空间分区
+/// 列变更（TimescaleDB 报 `Hypertable dimension mismatch`）与主键换轨（新
+/// 主键不含全部分区键，报 `rebuilding the table is the only safe path`）。
+/// 复验不收敛（增量迁移半迁移态）等其他原因不适用重建，维持原拒绝语义
+/// （0924 拍板保留，防半迁移态二次伤害）。
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
+fn is_rebuild_eligible_cause(reason: &str) -> bool {
+    reason.contains("Hypertable dimension mismatch")
+        || reason.contains("rebuilding the table is the only safe path")
+}
+
+/// CREATE TABLE 渲染产物中的内联建索引语句识别（保数据重建跳过用：
+/// insert 前不建二级索引，阶段二由重跑迁移 CONCURRENTLY 补建）。
+#[cfg(feature = "postgresql")]
+fn is_inline_index_statement(statement: &str) -> bool {
+    let upper = statement.trim_start().to_ascii_uppercase();
+    upper.starts_with("CREATE UNIQUE INDEX") || upper.starts_with("CREATE INDEX")
 }
 
 /// 一次诊断的结构化结论：基础表与各路由子表各自独立（migrate 按表分派
