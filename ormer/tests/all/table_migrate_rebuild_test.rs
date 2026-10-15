@@ -4,14 +4,14 @@
 //!
 //! 场景 → 测试函数对照（场景 8 为既有测试回归确认，本文件不改写它们，见文件尾说明）：
 //! 1. 端到端正例                 → `rebuild_preserves_data_end_to_end`
-//! 2. 前置冲突拒绝               → `duplicate_new_pk_rows_rejected_with_diagnostic_sql`
-//!                               → `null_in_new_pk_column_rejected`
+//! 2. 前置冲突自动去重           → `duplicate_new_pk_rows_auto_deduplicated_keeping_first`
+//!    → `null_in_new_pk_column_rejected`
 //! 3. 非空新列无来源拒绝         → `not_null_new_column_without_source_rejected`
 //! 4. 遗留备份自动清理           → `legacy_backup_table_auto_cleaned`
 //! 5. 阶段一失败回滚零残留       → `stage_one_failure_rolls_back_zero_residue`
 //! 6. 跨 schema 不干预（拍板 C） → `cross_schema_public_table_untouched`
 //! 7. 改名列映射（拍板 D）       → `renamed_time_column_maps_old_values`
-//!                               → `unannotated_column_change_drops_old_and_nulls_new`
+//!    → `unannotated_column_change_drops_old_and_nulls_new`
 //!
 //! 约定：
 //! - 全部只走公开入口 `db.migrate_table::<T>()`，不直接调用内部函数；
@@ -396,7 +396,7 @@ async fn rebuild_preserves_data_end_to_end() {
 }
 
 // ---------------------------------------------------------------------------
-// 场景 2：前置冲突拒绝（拍板 A）
+// 场景 2：前置冲突自动去重（拍板 2026-10-14）
 // ---------------------------------------------------------------------------
 
 /// 新 model：主键换轨为 (project_id, zone_id, agvid, event_time)，
@@ -416,11 +416,17 @@ struct RbConflictEvent {
     payload: String,
 }
 
-/// 前置冲突（拍板 A）：老数据存在同 (project_id, zone_id, agvid, event_time)
-/// 两行（ds 重发形态）→ 迁移前拒绝，报 unmigratable_schema，错误信息含
-/// 诊断 SQL 字样；原表行数/结构原样，无备份残留。
+/// 前置冲突（拍板 2026-10-14）：老数据存在同 (project_id, zone_id, agvid, event_time)
+/// 两行（ds 重发形态）→ 不再拒绝迁移，自动去重保留每组最早写入的一行
+/// （先插入的 'first'），后写的 'resend' 按运行期 ON CONFLICT DO NOTHING
+/// 语义丢弃；干净行原样保留，新主键生效，无备份残留。
+///
+/// 回归（2026-10-14 生产实锤）：'first' 与 'resend' 的老表时间维 update_time
+/// 落在不同天 → 不同 chunk，且都是各自 chunk 的首行、ctid 同为 (0,1)——
+/// 裸 ctid 比较对这对行永远不成立而双双漏删，阶段二唯一索引报 already exists。
+/// 去重谓词必须用 (tableoid, ctid) 全序比较才能覆盖跨 chunk 重复对。
 #[tokio::test]
-async fn duplicate_new_pk_rows_rejected_with_diagnostic_sql() {
+async fn duplicate_new_pk_rows_auto_deduplicated_keeping_first() {
     const TABLE: &str = "ormer_rb_conflict_events";
     let db = pg_database().await;
     if !require_timescale(&db).await {
@@ -454,38 +460,54 @@ async fn duplicate_new_pk_rows_rejected_with_diagnostic_sql() {
     db.execute_sql(format!(
         "INSERT INTO {TABLE} (project_id, zone_id, agvid, event_time, update_time, payload) VALUES \
          ('p1', 'z1', 1, '2026-10-01 08:00:00', '2026-10-12 09:00:00', 'first'), \
-         ('p1', 'z1', 1, '2026-10-01 08:00:00', '2026-10-12 10:00:00', 'resend'), \
+         ('p1', 'z1', 1, '2026-10-01 08:00:00', '2026-10-13 10:00:00', 'resend'), \
          ('p1', 'z2', 2, '2026-10-02 08:00:00', '2026-10-12 10:00:00', 'clean')"
     ))
     .await
     .unwrap();
-
-    let err = db
-        .migrate_table::<RbConflictEvent>()
-        .await
-        .expect_err("duplicate rows for the new PK must be rejected");
-    assert!(
-        err.is_unmigratable_schema(),
-        "expected unmigratable_schema, got: {err}"
-    );
-    let message = err.to_string().to_lowercase();
-    assert!(
-        message.contains("group by"),
-        "error must embed the diagnostic SQL, got: {err}"
-    );
-
-    // 原表原样：行数不变、老时间维仍在、无备份残留
-    let count = scalar_i64(&db, format!("SELECT count(*) FROM {TABLE}")).await;
-    assert_eq!(count, 3, "original data must be untouched");
-    let dims = scalar_i64(
+    // 重复对必须落在不同 chunk 且 ctid 相等（各 chunk 首行同为 (0,1)），
+    // 复现裸 ctid 比较漏删的生产形态
+    let ctids = string_rows(
         &db,
         format!(
-            "SELECT count(*) FROM timescaledb_information.dimensions \
-             WHERE hypertable_name = '{TABLE}' AND column_name = 'update_time'"
+            "SELECT ctid::text FROM {TABLE} WHERE payload IN ('first', 'resend') \
+             ORDER BY payload"
         ),
     )
     .await;
-    assert_eq!(dims, 1, "original time dimension must be untouched");
+    assert_eq!(
+        ctids,
+        vec!["(0,1)".to_string(), "(0,1)".to_string()],
+        "duplicate pair must be in different chunks with equal ctids"
+    );
+
+    db.migrate_table::<RbConflictEvent>()
+        .await
+        .expect("migration must succeed via auto-dedup");
+
+    // 每组保留最早写入一行：后写的 'resend' 丢弃，'first' 与干净行保留
+    let count = scalar_i64(&db, format!("SELECT count(*) FROM {TABLE}")).await;
+    assert_eq!(count, 2, "duplicate row dropped, clean row kept");
+    let kept = scalar_i64(
+        &db,
+        format!("SELECT count(*) FROM {TABLE} WHERE payload = 'first'"),
+    )
+    .await;
+    assert_eq!(kept, 1, "the first-inserted row must be the surviving one");
+    let dropped = scalar_i64(
+        &db,
+        format!("SELECT count(*) FROM {TABLE} WHERE payload = 'resend'"),
+    )
+    .await;
+    assert_eq!(dropped, 0, "the later duplicate must be dropped");
+
+    // 新主键生效、无备份残留
+    assert_primary_key_columns(
+        &db,
+        TABLE,
+        &["project_id", "zone_id", "agvid", "event_time"],
+    )
+    .await;
     assert_no_backup_residue(&db, TABLE).await;
 
     cleanup_tables(&db, &[TABLE]).await;

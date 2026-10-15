@@ -4062,15 +4062,15 @@ impl Database {
             .query_one(&format!("SELECT count(*) FROM {qualified}"), &[])
             .trace()
             .await?;
-        Ok(row
-            .try_get::<_, i64>(0)
-            .trace_for("tokio_postgres::Row::try_get")?)
+        row.try_get::<_, i64>(0)
+            .trace_for("tokio_postgres::Row::try_get")
     }
 
-    /// 主键冲突预检执行器（保数据重建前置检查 b，拍板 A：可精确预检 →
-    /// 迁移前报错）：按给定分组表达式 GROUP BY，取 HAVING count(*) > 1 的
+    /// 主键冲突预检执行器（保数据重建前置检查 b，拍板 2026-10-14：检出冲突
+    /// 组即触发自动去重——保留每组最早写入一行，其余按 ON CONFLICT DO NOTHING
+    /// 语义丢弃）：按给定分组表达式 GROUP BY，取 HAVING count(*) > 1 的
     /// 冲突组样例。每行返回各分组表达式的 `::text` 形值（NULL → None），
-    /// 末列为组内行数文本，供错误信息直接引用。
+    /// 末列为组内行数文本，仅作存在性判定引用。
     pub(crate) async fn duplicate_key_samples(
         &self,
         schema_name: &str,

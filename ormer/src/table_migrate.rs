@@ -796,6 +796,7 @@ impl Database {
     ///   且前置检查可满足时，老表改名作备份、按新模型重建并回灌，行数
     ///   对账通过后提交（见
     ///   [`Database::rebuild_nonempty_table_preserving_data`]）。
+    ///
     /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
     pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
         match self.migrate_table_once::<T>(false).await {
@@ -1070,54 +1071,28 @@ impl Database {
                 }
             }
 
-            // 前置检查 b-2：新主键冲突预检（拍板 A：可精确预检 → 迁移前报错
-            // 等人工去重）
+            // 前置检查 b-2：新主键冲突自动去重（拍板 2026-10-14：不再拒绝
+            // 迁移等人工去重——对齐运行期 insert 的 ON CONFLICT DO NOTHING，
+            // 每组保留最早写入的一行（(tableoid, ctid) 最小），其余重复行
+            // 直接丢弃）。检测在这里先行（提示日志）；真正的 DELETE 在阶段一
+            // 事务内、LOCK TABLE 与 RENAME 之间执行——去重若留在事务外，外部
+            // 写者（2026-10-14 jxgc 现场：data_sync 回放）可在"去重完成后到
+            // RENAME 拿锁前"的窗口塞入与既有行同键的新行，回灌必撞唯一约束
+            // 而无限重试；锁内去重保证检测结论对回灌始终成立。
             let group_expressions: Vec<String> = primary_key_sources
                 .iter()
                 .map(|entry| entry.expression.clone())
                 .collect();
-            let detection_sql = format!(
-                "SELECT {}, count(*) FROM {qualified} GROUP BY {} HAVING count(*) > 1 LIMIT 5",
-                group_expressions.join(", "),
-                group_expressions.join(", ")
-            );
             let samples = pg
-                .duplicate_key_samples(schema, bare, &group_expressions, 5)
+                .duplicate_key_samples(schema, bare, &group_expressions, 1)
                 .await?;
             if !samples.is_empty() {
-                let sample_text = samples
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|value| value.clone().unwrap_or_else(|| "NULL".to_string()))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let dedup_predicates = group_expressions
-                    .iter()
-                    .map(|expression| format!("a.{expression} IS NOT DISTINCT FROM b.{expression}"))
-                    .collect::<Vec<_>>()
-                    .join("\n  AND ");
-                let primary_key_columns = primary_key_sources
-                    .iter()
-                    .map(|entry| entry.column.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(crate::OrmerError::unmigratable_schema(
-                    table,
-                    format!(
-                        "data-preserving rebuild precondition failed: the new primary key \
-                         ({primary_key_columns}) would be violated by duplicate rows in the \
-                         old table; detection SQL: {detection_sql}; sample duplicate keys: \
-                         [{sample_text}]; deduplicate keeping one row per key, then retry. \
-                         Reference dedup SQL (keeps an arbitrary row per key):\n\
-                         DELETE FROM {qualified} a USING {qualified} b\n\
-                         WHERE a.ctid < b.ctid\n\
-                           AND {dedup_predicates}"
-                    ),
-                ));
+                eprintln!(
+                    "[ormer] migrate_table: {qualified}: new primary key duplicates \
+                     detected; they will be deduplicated inside the rebuild transaction \
+                     (keeping the earliest row per key, same semantics as runtime insert \
+                     ON CONFLICT DO NOTHING)"
+                );
             }
 
             // 前置检查 c：非空新列填充来源检查
@@ -1143,6 +1118,55 @@ impl Database {
 
             // 阶段一（单事务，原子）
             let mut transaction = self.begin().await?;
+            // 首语句锁表：EXCLUSIVE 级挡住外部 INSERT/UPDATE/DELETE（只读
+            // SELECT 不受影响），持有至 COMMIT——覆盖去重 → RENAME → 回灌 →
+            // 对账全程，封死"上一轮 ROLLBACK 后到本轮 RENAME 拿锁前"的外部
+            // 写入窗口；锁外排队的外部写在 COMMIT 后落到新表，行数对账不受
+            // 干扰，数据零丢失。
+            transaction
+                .execute_sql(crate::raw_sql::RawSql::plain(format!(
+                    "LOCK TABLE {qualified} IN EXCLUSIVE MODE"
+                )))
+                .await?;
+            // 事务内去重（语义见前置检查 b-2 注释；ROLLBACK 时去重一并撤销，
+            // 老表在原重复状态下原样恢复，重试轮重新检测）。先 GROUP BY 探测
+            // （单遍 O(n)，无重复的干净大表避免白吃一次删除 join）；探测命中
+            // 才删除，删除用 row_number 窗口函数单遍定序——每组保留
+            // (tableoid, ctid) 最小（最早写入）行，PARTITION BY 分组与
+            // IS NOT DISTINCT FROM 等价（NULL 同组），执行计划不依赖统计信息。
+            let group_list = group_expressions.join(", ");
+            let has_duplicates = !transaction
+                .select_sql::<i64>(crate::raw_sql::RawSql::plain(format!(
+                    "SELECT 1 FROM {qualified} GROUP BY {group_list} \
+                     HAVING count(*) > 1 LIMIT 1"
+                )))
+                .collect::<Vec<i64>>()
+                .await?
+                .is_empty();
+            let removed = if has_duplicates {
+                // (tableoid, ctid) 双列定位：分区表上裸 ctid 会被谓词下推在
+                // 每个 chunk 内各自匹配（各 chunk 首行同为 (0,1)），跨 chunk
+                // 误删保留行；tableoid 限定 chunk 后 ctid 才是行精确坐标。
+                transaction
+                    .execute_sql(crate::raw_sql::RawSql::plain(format!(
+                        "DELETE FROM {qualified} a WHERE (a.tableoid, a.ctid) IN (\
+                         SELECT s.tableoid, s.ctid FROM (\
+                           SELECT tableoid, ctid, row_number() OVER (\
+                             PARTITION BY {group_list} ORDER BY tableoid, ctid) AS rn \
+                           FROM {qualified}) s WHERE s.rn > 1)"
+                    )))
+                    .await?
+            } else {
+                0
+            };
+            if removed > 0 {
+                eprintln!(
+                    "[ormer] migrate_table: {qualified}: new primary key duplicates \
+                     auto-deduplicated inside the rebuild transaction, kept the earliest \
+                     row per key and dropped the rest (same semantics as runtime insert \
+                     ON CONFLICT DO NOTHING), {removed} row(s) removed"
+                );
+            }
             match Self::copy_table_preserving_data::<T>(
                 &mut transaction,
                 db_type,

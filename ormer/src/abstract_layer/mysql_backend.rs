@@ -1073,8 +1073,11 @@ impl Database {
 
         let mut tables = Vec::with_capacity(rows.len());
         for row in rows {
-            let schema_name: String = row.get(0).unwrap_or_default();
-            let table_name: String = row.get(1).unwrap_or_default();
+            // mysql_async 0.37 的 Row::get 返回 Option 只兜「列缺失」，
+            // 内部 from_value 遇 NULL 仍 panic——information_schema 自省一律
+            // 以 Option<T> 形参读（文档标 NOT NULL 的列不可信，实测可全 NULL）。
+            let schema_name: String = row.get::<Option<String>, _>(0).flatten().unwrap_or_default();
+            let table_name: String = row.get::<Option<String>, _>(1).flatten().unwrap_or_default();
             let columns = self.db_first_columns(&schema_name, &table_name).await?;
             let indexes = self.db_first_indexes(&schema_name, &table_name).await?;
             let foreign_keys = self
@@ -1111,12 +1114,12 @@ impl Database {
         let columns = rows
             .into_iter()
             .map(|row| {
-                let name: String = row.get(0).unwrap_or_default();
-                let type_name: String = row.get(1).unwrap_or_default();
-                let nullable: String = row.get(2).unwrap_or_default();
-                let key: String = row.get(3).unwrap_or_default();
-                let extra: String = row.get(4).unwrap_or_default();
-                let default: Option<String> = row.get(5).unwrap_or(None);
+                let name: String = row.get::<Option<String>, _>(0).flatten().unwrap_or_default();
+                let type_name: String = row.get::<Option<String>, _>(1).flatten().unwrap_or_default();
+                let nullable: String = row.get::<Option<String>, _>(2).flatten().unwrap_or_default();
+                let key: String = row.get::<Option<String>, _>(3).flatten().unwrap_or_default();
+                let extra: String = row.get::<Option<String>, _>(4).flatten().unwrap_or_default();
+                let default: Option<String> = row.get::<Option<String>, _>(5).flatten();
                 DbFirstColumn {
                     name,
                     type_name: type_name.clone(),
@@ -1152,10 +1155,11 @@ impl Database {
             .await?;
         let mut indexes = BTreeMap::<String, DbFirstIndex>::new();
         for row in rows {
-            let name: String = row.get(0).unwrap_or_default();
-            let non_unique: u64 = row.get(1).unwrap_or(1);
-            let column: String = row.get(2).unwrap_or_default();
-            let collation: String = row.get(3).unwrap_or_default();
+            // COLLATION 实测可在宝塔 MySQL 5.7.43 全 NULL（生产崩溃循环 panic 点）
+            let name: String = row.get::<Option<String>, _>(0).flatten().unwrap_or_default();
+            let non_unique: u64 = row.get::<Option<u64>, _>(1).flatten().unwrap_or(1);
+            let column: String = row.get::<Option<String>, _>(2).flatten().unwrap_or_default();
+            let collation: String = row.get::<Option<String>, _>(3).flatten().unwrap_or_default();
             indexes
                 .entry(name.clone())
                 .or_insert_with(|| DbFirstIndex {
@@ -1199,13 +1203,13 @@ impl Database {
             .await?;
         let mut foreign_keys = Vec::with_capacity(rows.len());
         for row in rows {
-            let name: String = row.get(0).unwrap_or_default();
-            let column: String = row.get(1).unwrap_or_default();
-            let ref_schema: String = row.get(2).unwrap_or_default();
-            let ref_table: String = row.get(3).unwrap_or_default();
-            let ref_column: String = row.get(4).unwrap_or_default();
-            let on_delete: String = row.get(5).unwrap_or_default();
-            let on_update: String = row.get(6).unwrap_or_default();
+            let name: String = row.get::<Option<String>, _>(0).flatten().unwrap_or_default();
+            let column: String = row.get::<Option<String>, _>(1).flatten().unwrap_or_default();
+            let ref_schema: String = row.get::<Option<String>, _>(2).flatten().unwrap_or_default();
+            let ref_table: String = row.get::<Option<String>, _>(3).flatten().unwrap_or_default();
+            let ref_column: String = row.get::<Option<String>, _>(4).flatten().unwrap_or_default();
+            let on_delete: String = row.get::<Option<String>, _>(5).flatten().unwrap_or_default();
+            let on_update: String = row.get::<Option<String>, _>(6).flatten().unwrap_or_default();
             foreign_keys.push(DbFirstForeignKey {
                 name: Some(name),
                 column,
@@ -1536,12 +1540,16 @@ impl Database {
             .await?;
         rows.into_iter()
             .map(|row| {
+                // get::<u64/_String> 对 NULL 会在 from_value 内 panic，ok_or_else
+                // 永远轮不到——外层 Option 兜列缺失、内层 Option 兜 NULL。
                 let version = row
-                    .get::<u64, _>(0)
+                    .get::<Option<u64>, _>(0)
+                    .ok_or_else(|| crate::ormer_error!("Migration version column missing"))?
                     .ok_or_else(|| crate::ormer_error!("Migration version is NULL"))?;
-                let name = row.get::<String, _>(1).unwrap_or_default();
+                let name = row.get::<Option<String>, _>(1).flatten().unwrap_or_default();
                 let checksum = row
-                    .get::<String, _>(2)
+                    .get::<Option<String>, _>(2)
+                    .ok_or_else(|| crate::ormer_error!("Migration checksum column missing"))?
                     .ok_or_else(|| crate::ormer_error!("Migration checksum is NULL"))?
                     .parse::<u64>()
                     .map_err(|_| crate::ormer_error!("Migration checksum is invalid"))?;
@@ -1591,10 +1599,10 @@ impl Database {
         let columns = rows
             .into_iter()
             .map(|row| {
-                let name: String = row.get(0).unwrap_or_default();
-                let type_name: String = row.get(1).unwrap_or_default();
-                let nullable: String = row.get(2).unwrap_or_default();
-                let key: String = row.get(3).unwrap_or_default();
+                let name: String = row.get::<Option<String>, _>(0).flatten().unwrap_or_default();
+                let type_name: String = row.get::<Option<String>, _>(1).flatten().unwrap_or_default();
+                let nullable: String = row.get::<Option<String>, _>(2).flatten().unwrap_or_default();
+                let key: String = row.get::<Option<String>, _>(3).flatten().unwrap_or_default();
                 schema_column_with_compression(
                     name,
                     type_name,
