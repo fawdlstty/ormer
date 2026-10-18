@@ -23,22 +23,195 @@ use std::sync::Arc;
 
 type ModelUpdateBatch = common_helpers::ModelUpdateBatch;
 
-async fn traced_sqlite_execute<P: turso::IntoParams>(
-    conn: &Arc<turso::Connection>,
+/// sqlite 共享连接（turso 单连接并发的排队化收口，2026-10-17）：
+/// turso local 模式为单连接，其 `ConcurrentGuard`（AtomicU32 CAS）对并发
+/// step 一律报 `Misuse("concurrent use forbidden")`——而调用方形态（HTTP
+/// 服务器每连接一个任务 + 后台周期任务）天然并发共享同一 `Database`。
+/// 所有语句执行/行拉取经 [`SharedConn::lock`] 排队（tokio Mutex，无竞争时
+/// 零开销）；事务由 `Transaction` 持 `lock_owned()` guard 独占连接至
+/// commit/rollback（事务路径直用 [`SharedConn::raw`]，不再二次拿锁）。
+///
+/// `pub` 仅为满足 `StreamConnection::Sqlite` 公开变体的类型可见性；
+/// 字段均为 `pub(crate)`，外部只能经后端执行器间接使用。
+pub struct SharedConn {
+    pub(crate) raw: Arc<turso::Connection>,
+    /// 语句排队锁（Arc 包装：`Transaction` 经 `lock_owned()` 持独占
+    /// guard，`OwnedMutexGuard` 只能从 `Arc<Mutex<_>>` 获得）。
+    pub(crate) lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl SharedConn {
+    /// 排队执行单条语句（INSERT/UPDATE/DELETE/DDL；不拉行）。
+    async fn execute<P: turso::IntoParams>(&self, sql: &str, params: P) -> turso::Result<u64> {
+        let _guard = self.lock.lock().await;
+        self.raw.execute(sql, params).await
+    }
+
+    /// 排队执行查询并全量拉干：行值在锁内快照为 owned [`turso::Row`]
+    /// （`Vec<turso_sdk_kit::rsapi::Value>`），锁释放后调用方迭代快照不再
+    /// 触碰连接——调用方现消费形态全部为 collect 型（拉完即弃），语义不变。
+    async fn query_all<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<Vec<turso::Row>> {
+        let _guard = self.lock.lock().await;
+        raw_query_all(&self.raw, sql, params).await
+    }
+
+    /// 排队取首行（COUNT 等单行聚合路径）。
+    async fn query_first<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<Option<turso::Row>> {
+        let _guard = self.lock.lock().await;
+        raw_query_first(&self.raw, sql, params).await
+    }
+
+    /// 排队打开流式游标（prepare 与首步在锁内；游标跨 await 持有，
+    /// 后续逐行走 [`SharedConn::next_row`] 行级锁）。
+    async fn query_stream<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<turso::Rows> {
+        let _guard = self.lock.lock().await;
+        self.raw.query(sql, params).await
+    }
+
+    /// 流式查询逐行拉取（每次调用持锁一个 step；游标本身可跨 await
+    /// 长持有，两行之间连接可供其他语句使用）。
+    pub(crate) async fn next_row(
+        &self,
+        rows: &mut turso::Rows,
+    ) -> turso::Result<Option<turso::Row>> {
+        let _guard = self.lock.lock().await;
+        rows.next().await
+    }
+}
+
+/// 查询连接上下文（2026-10-17 排队化改造的第二态）：
+///
+/// - [`QueryConn::Shared`]：普通路径，语句与行拉取经 [`SharedConn`] 排队；
+/// - [`QueryConn::Txn`]：事务独占路径——`Transaction` 已持连接锁 guard，
+///   直用 raw 连接，**经 SharedConn 二次拿锁会自死锁**。
+///
+/// `Transaction::select()/delete()/update()` 等事务内 builder 查询构造
+/// `QueryConn::Txn`，与 `Database` 侧同构 API 共享全部执行器实现。
+#[derive(Clone)]
+pub enum QueryConn {
+    Shared(Arc<SharedConn>),
+    Txn(Arc<turso::Connection>),
+}
+
+impl QueryConn {
+    async fn execute<P: turso::IntoParams>(&self, sql: &str, params: P) -> turso::Result<u64> {
+        match self {
+            QueryConn::Shared(conn) => conn.execute(sql, params).await,
+            QueryConn::Txn(raw) => raw.execute(sql, params).await,
+        }
+    }
+
+    async fn query_all<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<Vec<turso::Row>> {
+        match self {
+            QueryConn::Shared(conn) => conn.query_all(sql, params).await,
+            QueryConn::Txn(raw) => raw_query_all(raw, sql, params).await,
+        }
+    }
+
+    async fn query_first<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<Option<turso::Row>> {
+        match self {
+            QueryConn::Shared(conn) => conn.query_first(sql, params).await,
+            QueryConn::Txn(raw) => raw_query_first(raw, sql, params).await,
+        }
+    }
+
+    async fn query_stream<P: turso::IntoParams>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> turso::Result<turso::Rows> {
+        match self {
+            QueryConn::Shared(conn) => conn.query_stream(sql, params).await,
+            QueryConn::Txn(raw) => raw.query(sql, params).await,
+        }
+    }
+
+    /// 流式游标逐行拉取：Shared 态经 `SharedConn::next_row` 行级锁排队，
+    /// Txn 态独占在手直拉。
+    async fn next_row(&self, rows: &mut turso::Rows) -> turso::Result<Option<turso::Row>> {
+        match self {
+            QueryConn::Shared(conn) => conn.next_row(rows).await,
+            QueryConn::Txn(_raw) => rows.next().await,
+        }
+    }
+}
+
+/// raw 连接查询并全量拉干（无锁；调用方负责并发语义）。
+async fn raw_query_all<P: turso::IntoParams>(
+    raw: &turso::Connection,
+    sql: &str,
+    params: P,
+) -> turso::Result<Vec<turso::Row>> {
+    let mut rows = raw.query(sql, params).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(row);
+    }
+    Ok(out)
+}
+
+/// raw 连接查询取首行（无锁；调用方负责并发语义）。
+async fn raw_query_first<P: turso::IntoParams>(
+    raw: &turso::Connection,
+    sql: &str,
+    params: P,
+) -> turso::Result<Option<turso::Row>> {
+    let mut rows = raw.query(sql, params).await?;
+    rows.next().await
+}
+
+/// 连接上下文转换：traced 执行入口同时接受 Database 侧的
+/// `&Arc<SharedConn>`（排队路径）与执行器内 `&QueryConn`（可能为事务
+/// 独占路径），统一取到 owned [`QueryConn`]。
+trait AsQueryConn {
+    fn as_query_conn(&self) -> QueryConn;
+}
+
+impl AsQueryConn for Arc<SharedConn> {
+    fn as_query_conn(&self) -> QueryConn {
+        QueryConn::Shared(Arc::clone(self))
+    }
+}
+
+impl AsQueryConn for QueryConn {
+    fn as_query_conn(&self) -> QueryConn {
+        self.clone()
+    }
+}
+
+async fn traced_sqlite_execute<Q: AsQueryConn, P: turso::IntoParams>(
+    conn: &Q,
     sql: &str,
     params: P,
     trace_params: &[Value],
 ) -> crate::Result<u64> {
+    let conn = conn.as_query_conn();
     let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
     if let Some(returning_sql) = ddl_introspection::sql_with_returning_count(trace.sql()) {
-        return match conn.query(&returning_sql, params).await {
-            Ok(mut rows) => {
-                let mut count = 0;
-                while rows.next().trace().await?.is_some() {
-                    count += 1;
-                }
+        return match conn.query_all(&returning_sql, params).await {
+            Ok(rows) => {
                 trace.finish_ok();
-                Ok(count)
+                Ok(rows.len() as u64)
             }
             Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
         };
@@ -53,14 +226,16 @@ async fn traced_sqlite_execute<P: turso::IntoParams>(
     }
 }
 
-async fn traced_sqlite_query<P: turso::IntoParams>(
-    conn: &Arc<turso::Connection>,
+/// 排队查询并全量拉干（返回行快照；非流式查询统一出口）。
+async fn traced_sqlite_query<Q: AsQueryConn, P: turso::IntoParams>(
+    conn: &Q,
     sql: &str,
     params: P,
     trace_params: &[Value],
-) -> crate::Result<turso::Rows> {
+) -> crate::Result<Vec<turso::Row>> {
+    let conn = conn.as_query_conn();
     let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
-    match conn.query(trace.sql(), params).await {
+    match conn.query_all(trace.sql(), params).await {
         Ok(rows) => {
             trace.finish_ok();
             Ok(rows)
@@ -69,10 +244,64 @@ async fn traced_sqlite_query<P: turso::IntoParams>(
     }
 }
 
-async fn traced_sqlite_schema_execute(
-    conn: &Arc<turso::Connection>,
+/// 排队查询取首行（`impl_backend_related_count!` 宏的单行出口）。
+async fn traced_sqlite_query_first<Q: AsQueryConn, P: turso::IntoParams>(
+    conn: &Q,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<Option<turso::Row>> {
+    let conn = conn.as_query_conn();
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match conn.query_first(trace.sql(), params).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+    }
+}
+
+/// 无锁执行层（事务独占路径专用：锁 guard 已由 `Transaction` 持有，
+/// 直用 raw 连接，不得再经 `SharedConn` 二次拿锁）。
+async fn traced_sqlite_execute_raw<P: turso::IntoParams>(
+    raw: &turso::Connection,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<u64> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match raw.execute(trace.sql(), params).await {
+        Ok(result) => {
+            trace.finish_ok();
+            Ok(result)
+        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::execute", error)),
+    }
+}
+
+/// 无锁查询层（事务独占路径专用；语义同 [`traced_sqlite_query`]）。
+async fn traced_sqlite_query_raw<P: turso::IntoParams>(
+    raw: &turso::Connection,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<Vec<turso::Row>> {
+    let trace = crate::sql_trace::start_sql_trace(sql, trace_params);
+    match raw_query_all(raw, trace.sql(), params).await {
+        Ok(rows) => {
+            trace.finish_ok();
+            Ok(rows)
+        }
+        Err(error) => Err(trace.finish_external_error("turso::Connection::query", error)),
+    }
+}
+
+async fn traced_sqlite_schema_execute<Q: AsQueryConn>(
+    conn: &Q,
     sql: &str,
 ) -> crate::Result<u64> {
+    let conn = conn.as_query_conn();
     let trace = crate::sql_trace::start_sql_trace(sql, &[]);
     match conn.execute(trace.sql(), ()).await {
         Ok(result) => {
@@ -275,7 +504,7 @@ impl DbBackendTypeMapper for SqliteTypeMapper {
 
 /// Sqlite 数据库连接封装
 pub struct Database {
-    conn: Arc<turso::Connection>,
+    conn: Arc<SharedConn>,
 }
 
 // SAFETY: turso::Connection uses internal synchronization mechanisms
@@ -504,7 +733,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
         for statement in &sql.statements {
             let all_params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows = traced_sqlite_query(
+            let rows = traced_sqlite_query(
                 &self.db.conn,
                 &sql_with_returning,
                 all_params,
@@ -512,7 +741,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> InsertExecutor<'a, I> {
             )
             .await?;
 
-            while let Some(row) = rows.next().trace().await? {
+            for row in &rows {
                 let model =
                     common_helpers::decode_model_from_indexed_values::<I::Model, _>(0, |i| {
                         let value = row.get_value(i)?;
@@ -560,7 +789,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> SqlExecutor for InsertExecut
             if rows_affected == 0 {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
             }
-            let last_id = self.db.conn.last_insert_rowid();
+            let last_id = self.db.conn.raw.last_insert_rowid();
             let result = common_helpers::convert_auto_increment_key::<Self::Output>(last_id)?;
             return Ok(result);
         }
@@ -672,7 +901,7 @@ impl<'a, T: Model + Send + Sync> SqlExecutor for InsertPartialExecutor<'a, T> {
 
         let has_auto_increment = T::column_schema().iter().any(|c| c.is_auto_increment);
         if has_auto_increment {
-            let last_id = self.db.conn.last_insert_rowid();
+            let last_id = self.db.conn.raw.last_insert_rowid();
             return common_helpers::convert_auto_increment_key::<Self::Output>(last_id);
         }
 
@@ -767,7 +996,10 @@ impl Database {
     pub async fn connect(_db_type: super::DbType, path: &str) -> crate::Result<Self> {
         let db = turso::Builder::new_local(path).build().trace().await?;
 
-        let conn = Arc::new(db.connect().trace_for("turso::Database::connect")?);
+        let conn = Arc::new(SharedConn {
+            raw: Arc::new(db.connect().trace_for("turso::Database::connect")?),
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
 
         Ok(Self { conn })
     }
@@ -793,20 +1025,19 @@ impl Database {
         }
 
         let table_names = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT name FROM sqlite_master \
-                     WHERE type = 'table' \
-                       AND name NOT LIKE 'sqlite_%' \
-                       AND name != '__ormer_migrations' \
-                     ORDER BY name",
-                    (),
-                )
-                .trace()
-                .await?;
+            let rows = traced_sqlite_query(
+                &self.conn,
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' \
+                   AND name NOT LIKE 'sqlite_%' \
+                   AND name != '__ormer_migrations' \
+                 ORDER BY name",
+                (),
+                &[],
+            )
+            .await?;
             let mut table_names = Vec::new();
-            while let Some(row) = rows.next().trace().await? {
+            for row in &rows {
                 if let turso::Value::Text(name) =
                     row.get_value(0).trace_for("turso::Row::get_value")?
                 {
@@ -824,15 +1055,14 @@ impl Database {
 
     async fn db_first_table(&self, table_name: &str) -> crate::Result<DbFirstTable> {
         let create_sql = {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                    [table_name],
-                )
-                .trace()
-                .await?;
-            match rows.next().trace().await? {
+            let rows = traced_sqlite_query(
+                &self.conn,
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                [table_name],
+                &[],
+            )
+            .await?;
+            match rows.into_iter().next() {
                 Some(row) => match row.get_value(0).trace_for("turso::Row::get_value")? {
                     turso::Value::Text(sql) => sql,
                     _ => String::new(),
@@ -843,12 +1073,14 @@ impl Database {
         let create_sql_lower = create_sql.to_ascii_lowercase();
         let mut columns = Vec::new();
         {
-            let mut rows = self
-                .conn
-                .query(&format!("PRAGMA table_info({table_name})"), ())
-                .trace()
-                .await?;
-            while let Some(row) = rows.next().trace().await? {
+            let rows = traced_sqlite_query(
+                &self.conn,
+                &format!("PRAGMA table_info({table_name})"),
+                (),
+                &[],
+            )
+            .await?;
+            for row in &rows {
                 let turso::Value::Text(name) =
                     row.get_value(1).trace_for("turso::Row::get_value")?
                 else {
@@ -900,18 +1132,17 @@ impl Database {
     }
 
     async fn sqlite_explicit_indexes(&self, table_name: &str) -> crate::Result<Vec<DbFirstIndex>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT name, sql FROM sqlite_master \
-                 WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
-                 ORDER BY name",
-                [table_name],
-            )
-            .trace()
-            .await?;
+        let rows = traced_sqlite_query(
+            &self.conn,
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL \
+             ORDER BY name",
+            [table_name],
+            &[],
+        )
+        .await?;
         let mut indexes = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let name = match row.get_value(0).trace_for("turso::Row::get_value")? {
                 turso::Value::Text(value) => value,
                 _ => continue,
@@ -1054,7 +1285,7 @@ impl Database {
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Shared(Arc::clone(&self.conn)),
             _marker: PhantomData,
         }
     }
@@ -1063,7 +1294,7 @@ impl Database {
     pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         ProjectionSelectExecutor {
             select: ProjectionSelect::<T, V>::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Shared(Arc::clone(&self.conn)),
             _marker: PhantomData,
         }
     }
@@ -1074,7 +1305,7 @@ impl Database {
             filters: Vec::new(),
             versioned: false,
             table_route: crate::model::TableRoute::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Shared(Arc::clone(&self.conn)),
             _marker: PhantomData,
         }
     }
@@ -1086,7 +1317,7 @@ impl Database {
             filters: Vec::new(),
             model_updates: Vec::new(),
             table_route: crate::model::TableRoute::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Shared(Arc::clone(&self.conn)),
             _marker: PhantomData,
         }
     }
@@ -1095,19 +1326,29 @@ impl Database {
     pub fn related<T: Model + 'static, R: Model>(&self) -> RelatedSelectExecutor<T, R> {
         RelatedSelectExecutor {
             select: Select::<T>::new().from::<R>(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Shared(Arc::clone(&self.conn)),
             _marker: PhantomData,
         }
     }
 
     /// 开始事务
     ///
-    /// 注意：事务运行在共享单连接上，事务期间禁止并发使用同一 `Database`
-    /// 实例执行其他操作（并发语句会混入事务）。
+    /// 事务持有连接互斥锁（begin 至 commit/rollback/drop）：事务期间其他
+    /// 语句排队等待、事务结束后才执行——旧文档「事务期间禁止并发使用同一
+    /// `Database`」的自律约定自 2026-10-17 起由锁强制（并发访问从报错改为
+    /// 排队等待）。
     pub async fn begin(&self) -> crate::Result<Transaction> {
-        traced_sqlite_execute(&self.conn, "BEGIN", (), &[]).await?;
+        let lock_guard = self.conn.lock.clone().lock_owned().await;
+        let trace = crate::sql_trace::start_sql_trace("BEGIN", &[]);
+        match self.conn.raw.execute("BEGIN", ()).await {
+            Ok(_) => trace.finish_ok(),
+            Err(error) => {
+                return Err(trace.finish_external_error("turso::Connection::execute", error));
+            }
+        }
         Ok(Transaction {
             conn: self.conn.clone(),
+            lock_guard: Some(lock_guard),
             state: common_helpers::TransactionState::Active,
         })
     }
@@ -1133,14 +1374,14 @@ impl Database {
         C: FromIterator<V>,
     {
         let turso_params = values_to_params(&params)?;
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let mut values = Vec::new();
             for i in 0..row.column_count() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
@@ -1162,16 +1403,15 @@ impl Database {
     }
 
     pub(crate) async fn migration_history(&self) -> crate::Result<Vec<(u64, String, u64)>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT version, name, checksum FROM __ormer_migrations ORDER BY version",
-                (),
-            )
-            .trace()
-            .await?;
+        let rows = traced_sqlite_query(
+            &self.conn,
+            "SELECT version, name, checksum FROM __ormer_migrations ORDER BY version",
+            (),
+            &[],
+        )
+        .await?;
         let mut versions = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let version = match row.get_value(0).trace_for("turso::Row::get_value")? {
                 turso::Value::Integer(version) if version >= 0 => version as u64,
                 _ => continue,
@@ -1194,15 +1434,14 @@ impl Database {
         &self,
         table_name: &str,
     ) -> crate::Result<Option<Vec<SchemaColumn>>> {
-        let mut exists = self
-            .conn
-            .query(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-                [table_name],
-            )
-            .trace()
-            .await?;
-        let exists = match exists.next().trace().await? {
+        let exists_rows = traced_sqlite_query(
+            &self.conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+            [table_name],
+            &[],
+        )
+        .await?;
+        let exists = match exists_rows.first() {
             Some(row) => matches!(
                 row.get_value(0).trace_for("turso::Row::get_value")?,
                 turso::Value::Integer(count) if count > 0
@@ -1214,13 +1453,15 @@ impl Database {
         }
 
         let escaped = table_name.replace('\'', "''");
-        let mut rows = self
-            .conn
-            .query(&format!("PRAGMA table_info('{escaped}')"), ())
-            .trace()
-            .await?;
+        let rows = traced_sqlite_query(
+            &self.conn,
+            &format!("PRAGMA table_info('{escaped}')"),
+            (),
+            &[],
+        )
+        .await?;
         let mut columns = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let name = match row.get_value(1).trace_for("turso::Row::get_value")? {
                 turso::Value::Text(value) => value,
                 _ => continue,
@@ -1257,7 +1498,9 @@ impl Database {
 
 /// Sqlite 事务对象
 pub struct Transaction {
-    conn: Arc<turso::Connection>,
+    conn: Arc<SharedConn>,
+    /// 连接互斥锁 guard（Some = 事务独占期间；commit/rollback/drop 释放）。
+    lock_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     state: common_helpers::TransactionState,
 }
 
@@ -1267,9 +1510,16 @@ impl Drop for Transaction {
             return;
         }
 
-        let conn = Arc::clone(&self.conn);
         self.state = common_helpers::TransactionState::RolledBack;
-        let _ = futures::executor::block_on(traced_sqlite_execute(&conn, "ROLLBACK", (), &[]));
+        // 先释放连接独占锁，再排队执行 ROLLBACK（事务路径本直用 raw，
+        // guard 释放后与普通语句同队竞争锁）。
+        self.lock_guard = None;
+        let lock = self.conn.lock.clone();
+        let raw = &self.conn.raw;
+        let _ = futures::executor::block_on(async move {
+            let _guard = lock.lock().await;
+            raw.execute("ROLLBACK", ()).await
+        });
     }
 }
 
@@ -1322,12 +1572,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
 
         let mut rows_affected = 0;
         for statement in &sql.statements {
-            let all_params = values_to_params(&statement.params)?;
+            // 事务独占路径：guard 已在 Transaction 手里，必须走 raw 直发，
+            // 经 SharedConn::execute 二次拿锁会自死锁。
             rows_affected += self
                 .txn
-                .conn
-                .execute(&statement.sql, all_params)
-                .trace()
+                .exec_raw(&statement.sql, statement.params.clone())
                 .await?;
         }
         self.models.run_after_insert(hook_ctx).await?;
@@ -1341,7 +1590,7 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertExecutor<'a
             if rows_affected == 0 {
                 return Ok(<I::Model as Model>::AutoIncrementKeyType::default());
             }
-            let last_id = self.txn.conn.last_insert_rowid();
+            let last_id = self.txn.conn.raw.last_insert_rowid();
             let result = common_helpers::convert_auto_increment_key::<
                 <I::Model as Model>::AutoIncrementKeyType,
             >(last_id)?;
@@ -1400,8 +1649,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrUpdateExe
 
         let sql = self.to_sql()?;
         for statement in &sql.statements {
-            let params = values_to_params(&statement.params)?;
-            traced_sqlite_execute(&self.txn.conn, &statement.sql, params, &statement.params).await?;
+            // 事务独占路径：guard 已在 Transaction 手里，必须走 raw 直发，
+            // 经 SharedConn::execute 二次拿锁会自死锁。
+            self.txn
+                .exec_raw(&statement.sql, statement.params.clone())
+                .await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1464,8 +1716,11 @@ impl<'a, I: crate::model::Insertable + Send + Sync> TransactionInsertOrIgnoreExe
 
         let sql = self.to_sql()?;
         for statement in &sql.statements {
-            let params = values_to_params(&statement.params)?;
-            traced_sqlite_execute(&self.txn.conn, &statement.sql, params, &statement.params).await?;
+            // 事务独占路径：guard 已在 Transaction 手里，必须走 raw 直发，
+            // 经 SharedConn::execute 二次拿锁会自死锁。
+            self.txn
+                .exec_raw(&statement.sql, statement.params.clone())
+                .await?;
         }
 
         self.models.run_after_insert(hook_ctx).await?;
@@ -1477,9 +1732,9 @@ impl Transaction {
     pub(crate) async fn exec_raw(&mut self, sql: &str, params: Vec<Value>) -> crate::Result<u64> {
         let turso_params = values_to_params(&params)?;
         if turso_params.is_empty() {
-            traced_sqlite_execute(&self.conn, sql, (), &params).await
+            traced_sqlite_execute_raw(&self.conn.raw, sql, (), &params).await
         } else {
-            traced_sqlite_execute(&self.conn, sql, turso_params, &params).await
+            traced_sqlite_execute_raw(&self.conn.raw, sql, turso_params, &params).await
         }
     }
 
@@ -1489,14 +1744,14 @@ impl Transaction {
         C: FromIterator<V>,
     {
         let turso_params = values_to_params(&params)?;
-        let mut rows = if turso_params.is_empty() {
-            traced_sqlite_query(&self.conn, sql, (), &params).await?
+        let rows = if turso_params.is_empty() {
+            traced_sqlite_query_raw(&self.conn.raw, sql, (), &params).await?
         } else {
-            traced_sqlite_query(&self.conn, sql, turso_params, &params).await?
+            traced_sqlite_query_raw(&self.conn.raw, sql, turso_params, &params).await?
         };
 
         let mut results = Vec::new();
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let mut values = Vec::new();
             for i in 0..row.column_count() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
@@ -1515,7 +1770,8 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        traced_sqlite_execute(&self.conn, "COMMIT", (), &[]).await?;
+        traced_sqlite_execute_raw(&self.conn.raw, "COMMIT", (), &[]).await?;
+        self.lock_guard = None;
         self.state = common_helpers::TransactionState::Committed;
         Ok(())
     }
@@ -1527,7 +1783,8 @@ impl Transaction {
                 "Transaction already committed or rolled back"
             ));
         }
-        traced_sqlite_execute(&self.conn, "ROLLBACK", (), &[]).await?;
+        traced_sqlite_execute_raw(&self.conn.raw, "ROLLBACK", (), &[]).await?;
+        self.lock_guard = None;
         self.state = common_helpers::TransactionState::RolledBack;
         Ok(())
     }
@@ -1537,43 +1794,43 @@ impl Transaction {
         self.rollback().await
     }
 
-    /// 创建 Select 查询执行器
+    /// 创建 Select 查询执行器（事务独占路径：直用 raw 连接，不经排队锁）
     pub fn select<T: Model>(&self) -> SelectExecutor<'_, T> {
         SelectExecutor {
             select: Select::<T>::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Txn(Arc::clone(&self.conn.raw)),
             _marker: PhantomData,
         }
     }
 
-    /// 创建分组聚合查询执行器
+    /// 创建分组聚合查询执行器（事务独占路径）
     pub fn select_column<T: Model, V>(&self) -> ProjectionSelectExecutor<'_, T, V> {
         ProjectionSelectExecutor {
             select: ProjectionSelect::<T, V>::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Txn(Arc::clone(&self.conn.raw)),
             _marker: PhantomData,
         }
     }
 
-    /// 创建 Delete 执行器
+    /// 创建 Delete 执行器（事务独占路径）
     pub fn delete<T: WritableModel>(&self) -> DeleteExecutor<T> {
         DeleteExecutor {
             filters: Vec::new(),
             versioned: false,
             table_route: crate::model::TableRoute::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Txn(Arc::clone(&self.conn.raw)),
             _marker: PhantomData,
         }
     }
 
-    /// 创建 Update 执行器
+    /// 创建 Update 执行器（事务独占路径）
     pub fn update<T: WritableModel>(&self) -> UpdateExecutor<T> {
         UpdateExecutor {
             sets: Vec::new(),
             filters: Vec::new(),
             model_updates: Vec::new(),
             table_route: crate::model::TableRoute::new(),
-            conn: self.conn.clone(),
+            conn: QueryConn::Txn(Arc::clone(&self.conn.raw)),
             _marker: PhantomData,
         }
     }
@@ -1619,7 +1876,7 @@ impl Transaction {
 /// Select 查询执行器
 pub struct SelectExecutor<'a, T: Model> {
     select: Select<T>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: std::marker::PhantomData<&'a T>,
 }
 
@@ -1627,7 +1884,7 @@ impl<'a, T: Model> Clone for SelectExecutor<'a, T> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -1636,7 +1893,7 @@ impl<'a, T: Model> Clone for SelectExecutor<'a, T> {
 /// LEFT JOIN 查询执行器
 pub struct LeftJoinedSelectExecutor<T: Model, J: Model> {
     select: LeftJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -1644,7 +1901,7 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelectExecutor<T, J> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -1653,7 +1910,7 @@ impl<T: Model, J: Model> Clone for LeftJoinedSelectExecutor<T, J> {
 /// INNER JOIN 查询执行器
 pub struct InnerJoinedSelectExecutor<T: Model, J: Model> {
     select: InnerJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -1661,7 +1918,7 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelectExecutor<T, J> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -1670,7 +1927,7 @@ impl<T: Model, J: Model> Clone for InnerJoinedSelectExecutor<T, J> {
 /// RIGHT JOIN 查询执行器
 pub struct RightJoinedSelectExecutor<T: Model, J: Model> {
     select: RightJoinedSelect<T, J>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, J)>,
 }
 
@@ -1678,7 +1935,7 @@ impl<T: Model, J: Model> Clone for RightJoinedSelectExecutor<T, J> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -1687,28 +1944,28 @@ impl<T: Model, J: Model> Clone for RightJoinedSelectExecutor<T, J> {
 /// Related 查询执行器（支持多表关联查询）
 pub struct RelatedSelectExecutor<T: Model, R: Model> {
     select: RelatedSelect<T, R>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, R)>,
 }
 
 /// MultiTable 查询执行器（支持3个表关联查询）
 pub struct MultiTableSelectExecutor<T: Model, R1: Model, R2: Model> {
     select: MultiTableSelect<T, R1, R2>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, R1, R2)>,
 }
 
 /// FourTable 查询执行器（支持4个表关联查询）
 pub struct FourTableSelectExecutor<T: Model, R1: Model, R2: Model, R3: Model> {
     select: FourTableSelect<T, R1, R2, R3>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, R1, R2, R3)>,
 }
 
 /// Projection 查询执行器（字段投影与分组聚合合一）
 pub struct ProjectionSelectExecutor<'a, T: Model, V> {
     select: ProjectionSelect<T, V>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<&'a (T, V)>,
 }
 
@@ -1728,7 +1985,7 @@ impl<'a, T: Model, V> Clone for ProjectionSelectExecutor<'a, T, V> {
     fn clone(&self) -> Self {
         Self {
             select: self.select.clone(),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -1738,7 +1995,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
     pub(crate) fn select_model<R: Model>(&self) -> SelectExecutor<'a, R> {
         SelectExecutor {
             select: Select::new().with_context_filters(self.select.context_filters()),
-            conn: Arc::clone(&self.conn),
+            conn: self.conn.clone(),
             _marker: PhantomData,
         }
     }
@@ -2028,7 +2285,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -2037,7 +2294,7 @@ impl<T: Model, J: Model> LeftJoinedSelectExecutor<T, J> {
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
@@ -2101,7 +2358,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -2110,7 +2367,7 @@ impl<T: Model, J: Model> InnerJoinedSelectExecutor<T, J> {
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let mut t_data = HashMap::new();
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
@@ -2164,7 +2421,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         let (sql, params) = self.select.to_sql_with_params(DbType::Sqlite);
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -2173,7 +2430,7 @@ impl<T: Model, J: Model> RightJoinedSelectExecutor<T, J> {
         let mut results = Vec::new();
         let t_col_count = T::COLUMNS.len();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let mut t_data = HashMap::new();
             let mut t_is_null = true;
             for (i, col_name) in T::COLUMNS.iter().enumerate() {
@@ -2230,7 +2487,7 @@ unsafe impl<'a, T: Model + Send> Send for FirstFuture<'a, T> {}
 /// Aggregate future for聚合函数执行
 pub struct AggregateFuture<T: Model, R> {
     aggregate_select: crate::query::builder::AggregateSelect<T, R>,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<(T, R)>,
 }
 
@@ -2248,13 +2505,13 @@ impl<
 
             let turso_params = values_to_params(&params)?;
 
-            let mut rows = if turso_params.is_empty() {
+            let rows = if turso_params.is_empty() {
                 traced_sqlite_query(&self.conn, &sql, (), &params).await?
             } else {
                 traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
             };
 
-            if let Some(row) = rows.next().trace().await? {
+            if let Some(row) = rows.first() {
                 let value = row.get_value(0).trace_for("turso::Row::get_value")?;
 
                 // 将turso::Value转换为ormer::Value
@@ -2409,14 +2666,14 @@ macro_rules! impl_multi_table_collect_sqlite {
                 let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
                 let turso_params = values_to_params(&params)?;
 
-                let mut rows = if turso_params.is_empty() {
+                let rows = if turso_params.is_empty() {
                     traced_sqlite_query(&self.conn, &sql, (), &params).await?
                 } else {
                     traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
                 };
 
                 let mut results = Vec::new();
-                while let Some(row) = rows.next().trace().await? {
+                for row in &rows {
                     let model =
                         common_helpers::decode_model_from_indexed_values::<$t, _>(0, |i| {
                             let value = row.get_value(i).trace_for("turso::Row::get_value")?;
@@ -2456,7 +2713,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
         let (sql, params) = self.select.try_to_sql_with_params(DbType::Sqlite)?;
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -2464,7 +2721,7 @@ impl<T: Model, R: Model> RelatedSelectExecutor<T, R> {
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 convert_turso_model_value::<T>(i, &value)
@@ -2491,7 +2748,7 @@ impl_backend_related_count!(
     [T: Model, R: Model],
     [T, R],
     DbType::Sqlite,
-    traced_sqlite_query,
+    traced_sqlite_query_first,
     values_to_params,
     TursoRowValue,
     "turso::Row::get_value"
@@ -2501,7 +2758,7 @@ impl_backend_related_count!(
     [T: Model, R1: Model, R2: Model],
     [T, R1, R2],
     DbType::Sqlite,
-    traced_sqlite_query,
+    traced_sqlite_query_first,
     values_to_params,
     TursoRowValue,
     "turso::Row::get_value"
@@ -2511,7 +2768,7 @@ impl_backend_related_count!(
     [T: Model, R1: Model, R2: Model, R3: Model],
     [T, R1, R2, R3],
     DbType::Sqlite,
-    traced_sqlite_query,
+    traced_sqlite_query_first,
     values_to_params,
     TursoRowValue,
     "turso::Row::get_value"
@@ -2535,7 +2792,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -2543,7 +2800,7 @@ impl<'a, T: Model> SelectExecutor<'a, T> {
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                 let value = row.get_value(i).trace_for("turso::Row::get_value")?;
                 convert_turso_model_value::<T>(i, &value)
@@ -2566,7 +2823,7 @@ pub struct DeleteExecutor<T: Model> {
     versioned: bool,
     /// 拆表路由值（`route_table` / `with_table_route` 注入）。
     table_route: crate::model::TableRoute,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<T>,
 }
 
@@ -2633,12 +2890,12 @@ impl<T: Model> DeleteExecutor<T> {
             let params = values_to_params(&statement.params)?;
 
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows =
+            let rows =
                 traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
                     .await?;
 
             let mut statement_results = Vec::new();
-            while let Some(row) = rows.next().trace().await? {
+            for row in &rows {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
                     convert_turso_model_value::<T>(i, &value)
@@ -2707,7 +2964,7 @@ pub struct UpdateExecutor<T: Model> {
     model_updates: ModelUpdateBatch,
     /// 拆表路由值（`route_table` / `with_table_route` 注入）。
     table_route: crate::model::TableRoute,
-    conn: Arc<turso::Connection>,
+    conn: QueryConn,
     _marker: PhantomData<T>,
 }
 
@@ -2801,11 +3058,11 @@ impl<T: Model> UpdateExecutor<T> {
         for statement in &statements.statements {
             let params = values_to_params(&statement.params)?;
             let sql_with_returning = format!("{} RETURNING *", statement.sql);
-            let mut rows =
+            let rows =
                 traced_sqlite_query(&self.conn, &sql_with_returning, params, &statement.params)
                     .await?;
             let mut statement_results = Vec::new();
-            while let Some(row) = rows.next().trace().await? {
+            for row in &rows {
                 let model = common_helpers::decode_model_from_indexed_values::<T, _>(0, |i| {
                     let value = row.get_value(i)?;
                     convert_turso_model_value::<T>(i, &value)
@@ -3098,7 +3355,7 @@ impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
 
         let turso_params = values_to_params(&params)?;
 
-        let mut rows = if turso_params.is_empty() {
+        let rows = if turso_params.is_empty() {
             traced_sqlite_query(&self.conn, &sql, (), &params).await?
         } else {
             traced_sqlite_query(&self.conn, &sql, turso_params, &params).await?
@@ -3106,7 +3363,7 @@ impl<'a, T: Model, V> ProjectionSelectExecutor<'a, T, V> {
 
         let mut results = Vec::new();
 
-        while let Some(row) = rows.next().trace().await? {
+        for row in &rows {
             // 获取行中的所有值（从 column_count 获取列数）
             let column_count = self.select.column_count();
             let typed_value =
@@ -3157,9 +3414,13 @@ impl<'a, T: Model + 'static> SelectStream<'a, T> {
         let turso_params = values_to_params(&params)?;
 
         let rows = if turso_params.is_empty() {
-            traced_sqlite_query(&conn, &sql, (), &params).await?
+            conn.query_stream(&sql, ())
+                .await
+                .trace_for("turso::Connection::query")?
         } else {
-            traced_sqlite_query(&conn, &sql, turso_params, &params).await?
+            conn.query_stream(&sql, turso_params)
+                .await
+                .trace_for("turso::Connection::query")?
         };
 
         Ok(SelectStreamIterator {
@@ -3208,7 +3469,16 @@ impl<'a, T: Model + 'static> SelectStreamIterator<'a, T> {
             return None;
         }
 
-        match self.rows.next().trace_for("turso::Rows::next").await {
+        // 逐行拉取经 SharedConn 行级锁排队：每次 next() 持锁一个 step，
+        // 两行之间连接可供其他任务执行语句（流式语义保持 O(1) 内存）。
+        let conn = match self._conn.expect_sqlite() {
+            Ok(conn) => conn,
+            Err(e) => {
+                self.polluted = true;
+                return Some(Err(e));
+            }
+        };
+        match conn.next_row(&mut self.rows).trace_for("turso::Rows::next").await {
             Ok(Some(row)) => {
                 // 解析行数据为 Model
                 let mut data = HashMap::new();

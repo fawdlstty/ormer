@@ -491,6 +491,18 @@ async fn traced_duckdb_query<P: duckcompat::IntoParams>(
     }
 }
 
+/// 单行聚合查询出口（`impl_backend_related_count!` 宏的 DuckDB 形态）：
+/// 查询已物化，取首行返回。
+async fn traced_duckdb_query_first<P: duckcompat::IntoParams>(
+    conn: &Arc<duckcompat::Connection>,
+    sql: &str,
+    params: P,
+    trace_params: &[Value],
+) -> crate::Result<Option<duckcompat::Row>> {
+    let mut rows = traced_duckdb_query(conn, sql, params, trace_params).await?;
+    rows.next().trace()
+}
+
 /// PRAGMA table_info 的 notnull/pk 标志在 DuckDB 中是 BOOLEAN，
 /// 旧驱动路径可能产出 0/1 整数，两种形态都接受。
 fn duckdb_truthy_flag(value: &duckcompat::Value) -> bool {
@@ -2987,7 +2999,7 @@ impl_backend_related_count!(
     [T: Model, R: Model],
     [T, R],
     DbType::DuckDB,
-    traced_duckdb_query,
+    traced_duckdb_query_first,
     values_to_params,
     DuckRowValue,
     "duckcompat::Row::get_value"
@@ -2997,7 +3009,7 @@ impl_backend_related_count!(
     [T: Model, R1: Model, R2: Model],
     [T, R1, R2],
     DbType::DuckDB,
-    traced_duckdb_query,
+    traced_duckdb_query_first,
     values_to_params,
     DuckRowValue,
     "duckcompat::Row::get_value"
@@ -3007,7 +3019,7 @@ impl_backend_related_count!(
     [T: Model, R1: Model, R2: Model, R3: Model],
     [T, R1, R2, R3],
     DbType::DuckDB,
-    traced_duckdb_query,
+    traced_duckdb_query_first,
     values_to_params,
     DuckRowValue,
     "duckcompat::Row::get_value"

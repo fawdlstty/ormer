@@ -1,6 +1,4 @@
 use std::marker::PhantomData;
-#[cfg(feature = "sqlite")]
-use std::sync::Arc;
 #[cfg(feature = "duckdb")]
 use std::sync::Arc as DuckDbArc;
 
@@ -13,8 +11,8 @@ use std::sync::Arc as DuckDbArc;
 ///
 /// ## SQLite/Turso
 ///
-/// 使用 `Arc<turso::Connection>` 共享所有权。多个流式查询可以共享同一个连接，
-/// 当最后一个 Arc 引用被 drop 时，连接会自动释放。
+/// 使用 [`QueryConn`](super::super::sqlite_backend::QueryConn) 持有连接上下文
+/// （排队共享或事务独占两态），当最后一个引用被 drop 时，连接会自动释放。
 ///
 /// ## DuckDB
 ///
@@ -45,9 +43,12 @@ use std::sync::Arc as DuckDbArc;
 /// // stream 在这里被 drop，连接自动释放
 /// ```
 pub enum StreamConnection<'a> {
-    /// SQLite/Turso 连接 - 使用 Arc 共享所有权
+    /// SQLite/Turso 连接上下文（排队路径 =
+    /// [`QueryConn::Shared`](super::super::sqlite_backend::QueryConn)，事务
+    /// 独占路径 = 同枚举 `Txn` 变体；流式逐行在 Shared 态经
+    /// `SharedConn::next_row` 行级锁排队，Txn 态直用 raw 连接）
     #[cfg(feature = "sqlite")]
-    Sqlite(Arc<turso::Connection>),
+    Sqlite(super::super::sqlite_backend::QueryConn),
 
     /// DuckDB connection. Queries are materialized by the backend before
     /// entering the async iterator.
@@ -66,7 +67,7 @@ impl<'a> StreamConnection<'a> {
     /// 取 SQLite/Turso 连接；变体不匹配说明流式连接被错误地跨后端传递，
     /// 返回错误而非 panic。
     #[cfg(feature = "sqlite")]
-    pub fn expect_sqlite(&self) -> crate::Result<&Arc<turso::Connection>> {
+    pub fn expect_sqlite(&self) -> crate::Result<&super::super::sqlite_backend::QueryConn> {
         match self {
             StreamConnection::Sqlite(conn) => Ok(conn),
             _ => Err(crate::ormer_error!(

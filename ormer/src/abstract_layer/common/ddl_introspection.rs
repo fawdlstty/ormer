@@ -498,23 +498,23 @@ pub fn validate_table_constraints<T: Model>(
 /// `SELECT COUNT(*) FROM (<原子查询>)`，排序与分页已由
 /// to_count_sql_with_params 剥离，count 不受其影响。
 ///
-/// 后端差异点经参数透传：`$db_type`（DbType 常量）、`$query`（traced 查询
-/// 入口）、`$params_fn`（参数转换）、`$value`（行值枚举别名）、
-/// `$trace_label`（trace 标签）。
+/// 后端差异点经参数透传：`$db_type`（DbType 常量）、`$query_first`（traced
+/// 单行查询入口，SQLite 为锁内急拉取形态）、`$params_fn`（参数转换）、
+/// `$value`（行值枚举别名）、`$trace_label`（trace 标签）。
 #[cfg(any(feature = "sqlite", feature = "duckdb"))]
 macro_rules! impl_backend_related_count {
-    ($executor:ident, [$($g:tt)*], [$($ty:tt)*], $db_type:expr, $query:ident, $params_fn:ident, $value:ident, $trace_label:expr) => {
+    ($executor:ident, [$($g:tt)*], [$($ty:tt)*], $db_type:expr, $query_first:ident, $params_fn:ident, $value:ident, $trace_label:expr) => {
         impl<$($g)*> $executor<$($ty)*> {
             /// 统计同谓词总行数（列表分页 total_count 用）。
             pub async fn count(self) -> crate::Result<i64> {
                 let (sql, params) = self.select.to_count_sql_with_params($db_type);
                 let backend_params = $params_fn(&params)?;
-                let mut rows = if backend_params.is_empty() {
-                    $query(&self.conn, &sql, (), &params).await?
+                let row: Option<_> = if backend_params.is_empty() {
+                    $query_first(&self.conn, &sql, (), &params).await?
                 } else {
-                    $query(&self.conn, &sql, backend_params, &params).await?
+                    $query_first(&self.conn, &sql, backend_params, &params).await?
                 };
-                if let Some(row) = rows.next().trace().await? {
+                if let Some(row) = row {
                     match row.get_value(0).trace_for($trace_label)? {
                         $value::Integer(i) => Ok(i),
                         $value::Real(r) => Ok(r as i64),
