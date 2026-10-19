@@ -500,7 +500,7 @@ async fn traced_duckdb_query_first<P: duckcompat::IntoParams>(
     trace_params: &[Value],
 ) -> crate::Result<Option<duckcompat::Row>> {
     let mut rows = traced_duckdb_query(conn, sql, params, trace_params).await?;
-    rows.next().trace()
+    rows.next().trace().await
 }
 
 /// PRAGMA table_info 的 notnull/pk 标志在 DuckDB 中是 BOOLEAN，
