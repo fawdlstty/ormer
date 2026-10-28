@@ -719,6 +719,32 @@ fn model_required_extensions<T: WritableModel>(db_type: DbType) -> Vec<String> {
     Vec::new()
 }
 
+/// sync（data_synchronization）游标复位事件表。sync 在库级安装的事件触发器
+/// [`SYNC_CURSOR_RESET_EVENT_TRIGGER`] 挂在 CREATE TABLE DDL 上，任何建表
+/// （含 `CREATE TABLE IF NOT EXISTS`）都会向该表 INSERT 一行；表上 reset_id
+/// 的序列/默认值一旦缺失（运维事故），INSERT 以 23502 失败并连带让建表 DDL
+/// 整体失败——库内所有 migrate_table 建表全数被炸，2026-10 dghq 实锤。
+#[cfg(feature = "postgresql")]
+const SYNC_CURSOR_RESET_EVENTS_TABLE: &str = "data_sync_table_reset_events";
+/// sync 游标复位事件触发器（库级 EVENT TRIGGER，ON CREATE TABLE DDL）
+#[cfg(feature = "postgresql")]
+const SYNC_CURSOR_RESET_EVENT_TRIGGER: &str = "data_sync_clear_cursors_on_create_table";
+/// reset_id 序列名（sync 原始 serial 形态）
+#[cfg(feature = "postgresql")]
+const SYNC_CURSOR_RESET_EVENTS_SEQ: &str = "data_sync_table_reset_events_reset_id_seq";
+
+/// 判定迁移执行失败是否为 sync 游标复位事件触发器链路失败：数据库错误且消息
+/// 指向游标复位事件表或其序列（23502 缺 reset_id、42P01 序列不存在等——序列
+/// 名含表名子串一并命中）。是否真由该触发器造成由修复入口查 pg_event_trigger
+/// 复核，此处只做廉价的错误特征初筛。
+#[cfg(feature = "postgresql")]
+fn is_sync_cursor_reset_events_error(error: &crate::OrmerError) -> bool {
+    let crate::OrmerError::Database { message, .. } = error else {
+        return false;
+    };
+    message.contains(SYNC_CURSOR_RESET_EVENTS_TABLE)
+}
+
 impl Database {
     /// 诊断（内部路径）：一次性内省这张表（含 PG 路由子表）的全部现状
     /// （schema/列/主键/索引/约束/触发器），与模型比对。
@@ -730,6 +756,127 @@ impl Database {
     #[allow(dead_code)]
     pub(crate) async fn plan_table<T: WritableModel>(&self) -> crate::Result<TableDiagnosis> {
         self.diagnose_family_merged::<T>().await
+    }
+
+    /// sync 游标复位事件触发器链路的自适应修复（PG 专供，其余后端恒
+    /// Ok(false)）。三步：
+    /// ① 复核库里确实装着该事件触发器（pg_event_trigger 有行）——不在即
+    ///    失败另有原因，返回 Ok(false) 不动；
+    /// ② 诊断游标复位事件表的结构缺口：表缺不盲目代建（sync 的表结构归
+    ///    sync 管），reset_id 列在才继续；序列与默认值缺一即修；
+    /// ③ 补齐：建序列（setval 对齐现有最大值）+ 默认值指回序列 + OWNED BY
+    ///    挂回列（sync 原始 serial 形态），语句各自幂等。
+    /// 结构本就完好返回 Ok(false)（失败另有原因，调用方不重试）；实际修复
+    /// 返回 Ok(true)（调用方重跑迁移）。
+    #[cfg(feature = "postgresql")]
+    async fn repair_sync_cursor_reset_events(&self) -> crate::Result<bool> {
+        if self.as_postgresql().is_none() {
+            return Ok(false);
+        }
+        // ① 事件触发器存在性复核："是否为此触发器造成"的判定
+        let trigger_present = !self
+            .select_sql::<i64>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT 1 FROM pg_event_trigger \
+                 WHERE evtname = '{SYNC_CURSOR_RESET_EVENT_TRIGGER}'"
+            )))
+            .collect::<Vec<i64>>()
+            .await?
+            .is_empty();
+        if !trigger_present {
+            eprintln!(
+                "[ormer] migrate_table: error points at {SYNC_CURSOR_RESET_EVENTS_TABLE} but \
+                 event trigger {SYNC_CURSOR_RESET_EVENT_TRIGGER} is not installed; \
+                 not self-healing (unrelated failure)"
+            );
+            return Ok(false);
+        }
+        // ② 结构诊断：事件表、reset_id 列、序列、默认值
+        let table_present = self
+            .select_sql::<Option<String>>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT to_regclass('{SYNC_CURSOR_RESET_EVENTS_TABLE}')::text"
+            )))
+            .collect::<Vec<Option<String>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .next()
+            .is_some();
+        let sequence_present = self
+            .select_sql::<Option<String>>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT to_regclass('{SYNC_CURSOR_RESET_EVENTS_SEQ}')::text"
+            )))
+            .collect::<Vec<Option<String>>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .next()
+            .is_some();
+        let default_rows = self
+            .select_sql::<Option<String>>(crate::raw_sql::RawSql::plain(format!(
+                "SELECT column_default FROM information_schema.columns \
+                 WHERE table_name = '{SYNC_CURSOR_RESET_EVENTS_TABLE}' \
+                   AND column_name = 'reset_id'"
+            )))
+            .collect::<Vec<Option<String>>>()
+            .await?;
+        if !table_present {
+            eprintln!(
+                "[ormer] migrate_table: event trigger {SYNC_CURSOR_RESET_EVENT_TRIGGER} is \
+                 installed but its target table {SYNC_CURSOR_RESET_EVENTS_TABLE} is missing; \
+                 not self-healing (re-creating sync-owned tables is out of scope)"
+            );
+            return Ok(false);
+        }
+        let Some(column_default) = default_rows.into_iter().next() else {
+            eprintln!(
+                "[ormer] migrate_table: {SYNC_CURSOR_RESET_EVENTS_TABLE} has no reset_id \
+                 column; not self-healing (unrecognizable sync-owned schema)"
+            );
+            return Ok(false);
+        };
+        let default_present = column_default.is_some();
+        if sequence_present && default_present {
+            eprintln!(
+                "[ormer] migrate_table: {SYNC_CURSOR_RESET_EVENTS_TABLE} structure is intact; \
+                 the failure has another cause, not self-healing"
+            );
+            return Ok(false);
+        }
+        // ③ 补齐缺口（序列缺则建并对齐现有最大值；默认值缺则指回序列）
+        if !sequence_present {
+            self.execute_sql(
+                format!("CREATE SEQUENCE IF NOT EXISTS {SYNC_CURSOR_RESET_EVENTS_SEQ}").as_str(),
+            )
+            .await?;
+            self.execute_sql(
+                format!(
+                    "SELECT setval('{SYNC_CURSOR_RESET_EVENTS_SEQ}', \
+                     COALESCE((SELECT MAX(reset_id) FROM {SYNC_CURSOR_RESET_EVENTS_TABLE}), 0) + 1, \
+                     false)"
+                )
+                .as_str(),
+            )
+            .await?;
+        }
+        if !default_present {
+            self.execute_sql(
+                format!(
+                    "ALTER TABLE {SYNC_CURSOR_RESET_EVENTS_TABLE} ALTER COLUMN reset_id \
+                     SET DEFAULT nextval('{SYNC_CURSOR_RESET_EVENTS_SEQ}'::regclass)"
+                )
+                .as_str(),
+            )
+            .await?;
+        }
+        self.execute_sql(
+            format!(
+                "ALTER SEQUENCE {SYNC_CURSOR_RESET_EVENTS_SEQ} \
+                 OWNED BY {SYNC_CURSOR_RESET_EVENTS_TABLE}.reset_id"
+            )
+            .as_str(),
+        )
+        .await?;
+        Ok(true)
     }
 
     /// 校验：表结构与模型是否完全一致（只读，不执行任何 DDL）。
@@ -797,6 +944,19 @@ impl Database {
     ///   对账通过后提交（见
     ///   [`Database::rebuild_nonempty_table_preserving_data`]）。
     ///
+    /// 三个自动兜底例外（均为零/保数据损失或根因自愈）：
+    /// - 空表兜底——表存在但（连同路由子表）没有任何行时，删表重建是零
+    ///   数据损失的自愈（如超表时间维列与模型不一致的空壳表），自动重建
+    ///   后重跑一轮迁移（见 [`Database::rebuild_empty_table`]）；
+    /// - 非空表保数据重建——差异属"可搬迁类"（超表分区列变更/主键换轨）
+    ///   且前置检查可满足时，老表改名作备份、按新模型重建并回灌，行数
+    ///   对账通过后提交（见
+    ///   [`Database::rebuild_nonempty_table_preserving_data`]）；
+    /// - sync 触发器链路自愈——建表 DDL 被 sync 游标复位事件触发器连带
+    ///   打炸（其 INSERT 目标表序列/默认值缺失）时，自适应修复事件表后
+    ///   重跑一轮迁移（见
+    ///   [`Database::repair_sync_cursor_reset_events`]）。
+    ///
     /// PG 路由子表与基础表走同一套诊断与执行（子表推不动同样直接报错）。
     pub async fn migrate_table<T: WritableModel>(&self) -> crate::Result<TableMigrateOutcome> {
         match self.migrate_table_once::<T>(false).await {
@@ -819,6 +979,27 @@ impl Database {
                     }
                     Ok(None) => Err(err),
                     Err(rebuild_err) => Err(rebuild_err),
+                }
+            }
+            // sync 游标复位事件触发器链路自愈：修复成功重跑一轮迁移（诊断
+            // 增量执行天然幂等）；只重试一次，修复后仍失败按原错误路径返回。
+            // 判定不命中或修不动（Ok(false)）原样返回，不掩盖真实故障。
+            #[cfg(feature = "postgresql")]
+            Err(err) if is_sync_cursor_reset_events_error(&err) => {
+                match self.repair_sync_cursor_reset_events().await {
+                    Ok(true) => {
+                        eprintln!(
+                            "[ormer] migrate_table: sync cursor-reset event trigger broke the \
+                             DDL (data_sync_table_reset_events was missing its reset_id \
+                             sequence/default); repaired it and retrying migration"
+                        );
+                        self.migrate_table_once::<T>(false).await
+                    }
+                    Ok(false) => Err(err),
+                    Err(repair_err) => Err(crate::ormer_error!(
+                        "migrate_table: sync cursor-reset event-trigger self-heal failed: \
+                         {repair_err} (original error: {err})"
+                    )),
                 }
             }
             result => result,
@@ -2386,6 +2567,40 @@ pub(crate) fn plan_primary_key_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "postgresql")]
+    #[test]
+    fn sync_cursor_reset_events_error_signature_matches_table_and_sequence() {
+        // 23502：触发器 INSERT 缺 reset_id（默认值缺失）——dghq 事故签名
+        let not_null = crate::OrmerError::Database {
+            backend: DbType::PostgreSQL,
+            kind: crate::DatabaseErrorKind::Constraint(crate::ConstraintKind::NotNull),
+            code: Some("23502".to_string()),
+            constraint: None,
+            message: r#"null value in column "reset_id" of relation "data_sync_table_reset_events" violates not-null constraint"#.to_string(),
+        };
+        assert!(is_sync_cursor_reset_events_error(&not_null));
+        // 42P01：默认值还在但序列被删（序列名含表名子串一并命中）
+        let missing_sequence = crate::OrmerError::Database {
+            backend: DbType::PostgreSQL,
+            kind: crate::DatabaseErrorKind::Other,
+            code: Some("42P01".to_string()),
+            constraint: None,
+            message: r#"relation "data_sync_table_reset_events_reset_id_seq" does not exist"#
+                .to_string(),
+        };
+        assert!(is_sync_cursor_reset_events_error(&missing_sequence));
+        // 反例：指向别的表的数据库错误与非数据库错误一律不命中
+        let unrelated = crate::OrmerError::Database {
+            backend: DbType::PostgreSQL,
+            kind: crate::DatabaseErrorKind::Constraint(crate::ConstraintKind::NotNull),
+            code: Some("23502".to_string()),
+            constraint: None,
+            message: r#"null value in column "agvid" of relation "collect_exception_logs" violates not-null constraint"#.to_string(),
+        };
+        assert!(!is_sync_cursor_reset_events_error(&unrelated));
+        assert!(!is_sync_cursor_reset_events_error(&crate::OrmerError::other("boom")));
+    }
 
     #[test]
     fn norm_sql_fragment_collapses_whitespace_and_quotes() {
