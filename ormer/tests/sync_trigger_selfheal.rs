@@ -1,3 +1,5 @@
+#![cfg(feature = "postgresql")]
+
 //! sync 游标复位事件触发器链路自愈的端到端实测：在真实 PG 里复刻
 //! data_synchronization 的库级事件触发器 + 缺序列/默认值的
 //! data_sync_table_reset_events（2026-10 dghq 事故形态），验证
