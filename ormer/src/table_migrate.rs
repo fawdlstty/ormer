@@ -1926,8 +1926,17 @@ impl Database {
                 if let Some(open) = transaction.take() {
                     open.commit().await?;
                 }
-                self.create_index_concurrently(step, db_type, index_progress_log)
-                    .await?;
+                // 归属表传 plan 的表名：Sql 形态的建索引步骤（特殊索引：列清单/
+                // 表达式/谓词）无法从步骤结构取表名，table_name(step) 对其返回
+                // 空串，hypertable 探测/INVALID 清理会误定位 public.""，把超表
+                // 误判成普通表走上 CONCURRENTLY（0A000）必炸。
+                self.create_index_concurrently(
+                    step,
+                    db_type,
+                    index_progress_log,
+                    plan.table_name(),
+                )
+                .await?;
             } else {
                 if transaction.is_none() {
                     transaction = Some(self.begin().await?);
@@ -1963,9 +1972,12 @@ impl Database {
         step: &MigrationStep,
         db_type: DbType,
         index_progress_log: bool,
+        owner_table: &str,
     ) -> crate::Result<()> {
         let started = std::time::Instant::now();
-        let result = self.create_index_concurrently_inner(step, db_type).await;
+        let result = self
+            .create_index_concurrently_inner(step, db_type, owner_table)
+            .await;
         if index_progress_log && result.is_ok() {
             eprintln!(
                 "[ormer] migrate_table: {}: index {} built in {:?}",
@@ -1977,17 +1989,25 @@ impl Database {
         result
     }
 
-    /// 索引构建主体（不含进度日志计时包装）。
+    /// 索引构建主体（不含进度日志计时包装）。`owner_table` 是迁移计划的目标
+    /// 表（plan.table_name()），step 无法提供表名（Sql 形态）时的权威归属；
+    /// 为空才回落 `table_name(step)` 的解析。
     async fn create_index_concurrently_inner(
         &self,
         step: &MigrationStep,
         db_type: DbType,
+        owner_table: &str,
     ) -> crate::Result<()> {
         let sql = step.sql(db_type)?;
         #[cfg(feature = "postgresql")]
         {
             if let Some(db) = self.as_postgresql() {
-                let (schema, bare) = split_qualified_table_name(table_name(step));
+                let owner = if owner_table.is_empty() {
+                    table_name(step)
+                } else {
+                    owner_table
+                };
+                let (schema, bare) = split_qualified_table_name(owner);
                 let schema = schema.unwrap_or("public");
                 if db.is_hypertable_table(schema, bare).await? {
                     self.execute_sql(sql.as_str()).await?;
@@ -2001,7 +2021,7 @@ impl Database {
                 "cannot render CREATE INDEX CONCURRENTLY for step: {sql}"
             ));
         }
-        self.drop_invalid_indexes_for_table(db_type, table_name(step))
+        self.drop_invalid_indexes_for_table(db_type, owner_table)
             .await?;
         match self.execute_sql(concurrent_sql.as_str()).await {
             Ok(_) => Ok(()),
@@ -2188,26 +2208,26 @@ fn merge_diagnoses(left: TableDiagnosis, right: TableDiagnosis) -> TableDiagnosi
 impl ExpectedIndexDef<'_> {
     /// 声明的索引方法（gin/gist/fulltext/...）；未声明视为 btree。
     pub(crate) fn index_method(&self) -> Option<&'static str> {
-        self.columns.iter().find_map(|column| column.index_method)
+        self.columns.iter().find_map(|member| member.column.index_method)
     }
 
     /// 表达式/显式列清单定义文本（全文向量、函数索引、列清单覆盖）。
     pub(crate) fn index_expression(&self) -> Option<String> {
         self.columns
             .iter()
-            .find_map(|column| column.index_expression)
+            .find_map(|member| member.column.index_expression)
             .map(str::to_string)
             .or_else(|| {
                 self.columns
                     .iter()
-                    .find_map(|column| column.index_columns)
+                    .find_map(|member| member.column.index_columns)
                     .map(str::to_string)
             })
     }
 
     /// 部分索引谓词。
     pub(crate) fn index_predicate(&self) -> Option<&'static str> {
-        self.columns.iter().find_map(|column| column.index_where)
+        self.columns.iter().find_map(|member| member.column.index_where)
     }
 
     /// 是否声明了 method/expression/列清单覆盖（无法按列集合比对的特殊索引）。
@@ -2269,10 +2289,10 @@ pub(crate) fn plan_index_semantic_diff(
             expected_def
                 .columns
                 .iter()
-                .map(|column| {
+                .map(|member| {
                     (
-                        column.name.to_string(),
-                        column.index_order == Some("DESC"),
+                        member.column.name.to_string(),
+                        member.order == Some("DESC"),
                     )
                 })
                 .collect()
@@ -2331,14 +2351,14 @@ pub(crate) fn plan_index_semantic_diff(
                     && !expected_def
                         .columns
                         .iter()
-                        .all(|column| available_columns.contains(column.name))
+                        .all(|member| available_columns.contains(member.column.name))
                 {
                     warnings.push(format!(
                         "skipping index on ({}) because some columns are missing from table {table_name}",
                         expected_def
                             .columns
                             .iter()
-                            .map(|column| column.name)
+                            .map(|member| member.column.name)
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -2353,7 +2373,7 @@ pub(crate) fn plan_index_semantic_diff(
                         expected_def
                             .columns
                             .iter()
-                            .map(|column| column.name)
+                            .map(|member| member.column.name)
                             .collect::<Vec<_>>()
                             .join(", ")
                     ));
@@ -2382,7 +2402,7 @@ pub(crate) fn plan_index_semantic_diff(
             expected_def
                 .columns
                 .iter()
-                .map(|column| column.name)
+                .map(|member| member.column.name)
                 .collect::<Vec<_>>()
         })
         .collect();
@@ -2490,9 +2510,9 @@ fn create_index_step(
         let columns_sql = expected
             .columns
             .iter()
-            .map(|column| {
-                let mut value = crate::model::quote_identifier(db_type, column.name);
-                if let Some(order) = column.index_order {
+            .map(|member| {
+                let mut value = crate::model::quote_identifier(db_type, member.column.name);
+                if let Some(order) = member.order {
                     value.push(' ');
                     value.push_str(order);
                 }

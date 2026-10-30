@@ -451,9 +451,73 @@ pub struct ColumnSchema {
     pub index_method: Option<&'static str>,      // fulltext、gin 等索引方法
     pub index_expression: Option<&'static str>,  // 函数索引或全文向量表达式
     pub index_columns: Option<&'static str>,     // 复合索引列清单
+    /// 同字段附加 `#[index(...)]` 声明（`#[index(group=N, ...)]` 多条并列，
+    /// 一列参与多个索引组）。组内列序：全部主声明按模型字段序在前，全部
+    /// 附加声明按 (字段序, 声明序) 追加组尾——低选择性尾键（如
+    /// update_time DESC）放覆盖索引末位即靠此规则表达。
+    pub extra_index_decls: &'static [ExtraIndexDecl],
     /// 老表列名映射（`#[column(old_name = "...")]`）：保数据重建路径把新列的
     /// 值显式取自老表的该列（等价改名保数据）。None 时按同名列取值。
     pub old_name: Option<&'static str>,
+}
+
+/// 同字段附加索引声明（`ColumnSchema::extra_index_decls` 成员）：该列额外
+/// 参与的索引组及其组内显式名/排序。method/expression/columns 清单等特殊
+/// 形态仅主声明支持，附加声明只表达 组归属 + 排序 + 命名。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraIndexDecl {
+    pub group: i32,
+    pub name: Option<&'static str>,
+    pub order: Option<&'static str>,
+}
+
+/// 一个索引组内的键列视图：列引用 + 该列在本组声明中的最终排序
+/// （声明处 order，主声明成员即列级 index_order，附加声明成员即
+/// ExtraIndexDecl::order，不互相回落）。
+#[derive(Debug, Clone, Copy)]
+pub struct GroupMember<'a> {
+    pub column: &'a ColumnSchema,
+    pub order: Option<&'static str>,
+    /// 加入本组的声明显式索引名（组名取成员中第一个非空）
+    pub name: Option<&'static str>,
+}
+
+/// 按索引组聚合模型全部索引声明（主声明 + 附加声明，口径与建表、迁移
+/// diff、db_first 校验三条路径共用）。组内成员序 = 全部主声明按字段序在
+/// 前、全部附加声明按 (字段序, 声明序) 追加组尾。
+pub fn aggregate_index_groups(
+    column_schema: &[ColumnSchema],
+) -> std::collections::BTreeMap<i32, Vec<GroupMember<'_>>> {
+    let mut grouped: std::collections::BTreeMap<i32, Vec<GroupMember<'_>>> =
+        std::collections::BTreeMap::new();
+    // 第一遍：主声明（带组者）按字段序归组
+    for column in column_schema {
+        if !column.is_indexed {
+            continue;
+        }
+        if let Some(group) = column.index_group {
+            grouped.entry(group).or_default().push(GroupMember {
+                column,
+                order: column.index_order,
+                name: column.index_name,
+            });
+        }
+    }
+    // 第二遍：附加声明按 (字段序, 声明序) 追加各组尾部——覆盖索引把
+    // update_time DESC 这类低选择性尾键放末位即靠此规则表达
+    for column in column_schema {
+        if !column.is_indexed {
+            continue;
+        }
+        for extra in column.extra_index_decls {
+            grouped.entry(extra.group).or_default().push(GroupMember {
+                column,
+                order: extra.order,
+                name: extra.name,
+            });
+        }
+    }
+    grouped
 }
 
 /// 数据库专用表级 DDL 选项。
@@ -4194,16 +4258,16 @@ fn generate_indexes_with_name<T: Model>(
         return render_sqlite_fulltext(table_name, &columns);
     }
 
-    let mut grouped_indexes: std::collections::BTreeMap<i32, Vec<&ColumnSchema>> =
-        std::collections::BTreeMap::new();
+    let grouped_indexes = aggregate_index_groups(&column_schema);
 
     for column in column_schema.iter() {
         if !column.is_indexed {
             continue;
         }
 
-        if let Some(group_id) = column.index_group {
-            grouped_indexes.entry(group_id).or_default().push(column);
+        // 有组主声明走组渲染；无组主声明始终走单列渲染（附加声明的组由
+        // grouped_indexes 独立渲染，主声明不被附加声明吞并）。
+        if column.index_group.is_some() {
             continue;
         }
 
@@ -4215,25 +4279,29 @@ fn generate_indexes_with_name<T: Model>(
             db_type,
             table_name,
             &index_name,
-            &[column],
+            &[GroupMember {
+                column,
+                order: column.index_order,
+                name: column.index_name,
+            }],
         )?);
     }
 
-    for (group_id, columns) in grouped_indexes {
-        if columns.is_empty() {
+    for (group_id, members) in grouped_indexes {
+        if members.is_empty() {
             continue;
         }
 
-        let index_name = columns
+        let index_name = members
             .iter()
-            .find_map(|column| column.index_name)
+            .find_map(|member| member.name)
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("idx_{}_{}", table_name.replace('.', "_"), group_id));
         sqls.push(render_index_sql(
             db_type,
             table_name,
             &index_name,
-            &columns,
+            &members,
         )?);
     }
 
@@ -4284,7 +4352,7 @@ fn render_index_sql(
     db_type: crate::abstract_layer::DbType,
     table_name: &str,
     index_name: &str,
-    columns: &[&ColumnSchema],
+    columns: &[GroupMember<'_>],
 ) -> crate::Result<String> {
     #[cfg(feature = "postgresql")]
     let is_postgresql = matches!(db_type, crate::abstract_layer::DbType::PostgreSQL);
@@ -4300,10 +4368,16 @@ fn render_index_sql(
             false
         }
     };
-    let method = columns.iter().find_map(|column| column.index_method);
-    let expression = columns.iter().find_map(|column| column.index_expression);
-    let explicit_columns = columns.iter().find_map(|column| column.index_columns);
-    let where_clause = columns.iter().find_map(|column| column.index_where);
+    let method = columns.iter().find_map(|member| member.column.index_method);
+    let expression = columns
+        .iter()
+        .find_map(|member| member.column.index_expression);
+    let explicit_columns = columns
+        .iter()
+        .find_map(|member| member.column.index_columns);
+    let where_clause = columns
+        .iter()
+        .find_map(|member| member.column.index_where);
     if method.is_some() && expression.is_some() {
         return Err(crate::ormer_error!(
             "An index cannot specify both method and expression"
@@ -4340,9 +4414,9 @@ fn render_index_sql(
 
     let columns_sql = columns
         .iter()
-        .map(|column| {
-            let mut col = quote_identifier(db_type, column.name);
-            if let Some(order) = column.index_order {
+        .map(|member| {
+            let mut col = quote_identifier(db_type, member.column.name);
+            if let Some(order) = member.order {
                 col.push(' ');
                 col.push_str(order);
             }

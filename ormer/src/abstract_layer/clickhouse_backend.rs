@@ -1549,6 +1549,7 @@ mod block_delete_tests {
             index_method: None,
             index_expression: None,
             index_columns: None,
+            extra_index_decls: &[],
             old_name: None,
         }
     }

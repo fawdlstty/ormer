@@ -239,9 +239,12 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             });
             let unique_name = option_string_tokens(unique_attr.name.as_deref());
 
-            // 检查 index 属性
-            let index_attr = info.index_attr.as_ref();
-            let is_indexed = index_attr.is_some();
+            // 检查 index 属性：同字段多个 #[index] 声明各自独立——第一个为
+            // 主声明（ColumnSchema 的 index_* 字段），其余进 extra_index_decls
+            // （一列参与多个索引组，见 ExtraIndexDecl 的组内列序规则）。
+            let index_attrs = &info.index_attr;
+            let index_attr = index_attrs.first();
+            let is_indexed = !index_attrs.is_empty();
             let index_group = option_i32_tokens(index_attr.and_then(|attr| attr.group));
             let index_name = option_string_tokens(index_attr.and_then(|attr| attr.name.as_deref()));
             let index_order =
@@ -254,6 +257,21 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 option_string_tokens(index_attr.and_then(|attr| attr.expression.as_deref()));
             let index_columns =
                 option_string_tokens(index_attr.and_then(|attr| attr.columns.as_deref()));
+            let extra_index_decls = {
+                let items = index_attrs.iter().skip(1).map(|attr| {
+                    let group = &attr.group;
+                    let name = match attr.name.as_deref() {
+                        Some(name) => quote! { Some(#name) },
+                        None => quote! { None },
+                    };
+                    let order = match attr.order.as_deref() {
+                        Some(order) => quote! { Some(#order) },
+                        None => quote! { None },
+                    };
+                    quote! { ::ormer::model::ExtraIndexDecl { group: #group, name: #name, order: #order } }
+                });
+                quote! { &[#(#items),*] }
+            };
 
             // 检查 foreign 属性
             let foreign_key = &info.foreign_key;
@@ -313,6 +331,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     index_method: #index_method,
                     index_expression: #index_expression,
                     index_columns: #index_columns,
+                    extra_index_decls: #extra_index_decls,
                     foreign_key: #foreign_key,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
@@ -349,6 +368,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                extra_index_decls: &[],
                 foreign_key: None,
                 enum_variants: None,
                 data_type: None,
@@ -1539,6 +1559,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                             index_method: None,
                             index_expression: None,
                             index_columns: None,
+                extra_index_decls: &[],
                             foreign_key: None,
                             enum_variants: schema.enum_variants,
                             data_type: schema.data_type,
@@ -2477,6 +2498,7 @@ fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     index_method: None,
                     index_expression: None,
                     index_columns: None,
+                extra_index_decls: &[],
                     foreign_key: None,
                     enum_variants: #enum_variants,
                     data_type: #data_type,
@@ -2819,7 +2841,7 @@ struct FieldInfo<'a> {
     relation_default: Option<proc_macro2::TokenStream>,
     embed: Option<EmbedAttr>,
     unique_attr: UniqueAttr,
-    index_attr: Option<IndexAttr>,
+    index_attr: Vec<IndexAttr>,
     foreign_key: proc_macro2::TokenStream,
     data_type: proc_macro2::TokenStream,
     db_value_type_expr: Option<proc_macro2::TokenStream>,
@@ -4545,7 +4567,8 @@ struct IndexAttr {
     columns: Option<String>,
 }
 
-fn extract_index_attr(field: &syn::Field) -> syn::Result<Option<IndexAttr>> {
+fn extract_index_attr(field: &syn::Field) -> syn::Result<Vec<IndexAttr>> {
+    let mut collected = Vec::new();
     for attr in &field.attrs {
         if attr.path().is_ident("index") {
             let mut index = IndexAttr::default();
@@ -4591,10 +4614,10 @@ fn extract_index_attr(field: &syn::Field) -> syn::Result<Option<IndexAttr>> {
                     }
                 })?;
             }
-            return Ok(Some(index));
+            collected.push(index);
         }
     }
-    Ok(None)
+    Ok(collected)
 }
 
 fn option_i32_tokens(value: Option<i32>) -> proc_macro2::TokenStream {

@@ -474,6 +474,7 @@ fn derive_data_enum_field_type(
                     index_method: None,
                     index_expression: None,
                     index_columns: None,
+                    extra_index_decls: &[],
                     foreign_key: None,
                     enum_variants: <#field_type as ::ormer::model::FieldTypeProvider>::ENUM_VARIANTS,
                     data_type: None,

@@ -62,17 +62,35 @@ pub(crate) fn validate_model_constraints<T: Model>(
             entry.1.push(column.name);
         }
         if column.is_indexed {
-            let group = column.index_group.unwrap_or_else(|| {
-                let value = ungrouped_index;
-                ungrouped_index += 1;
-                value
-            });
-            let entry = expected_indexes
-                .entry(group)
-                .or_insert_with(|| (column.index_name, Vec::new()));
-            entry
-                .1
-                .push((column.name, column.index_order == Some("DESC")));
+            // 与建表/迁移聚合（aggregate_index_groups）同口径：无组主声明
+            // 独立成组；主声明/附加声明两遍处理与 aggregate_index_groups 的
+            // 两遍遍历保持同序（主声明全字段序在前、附加声明追加组尾）。
+            let mut push_decl = |group: i32, name: Option<&'static str>, order: Option<&'static str>| {
+                let entry = expected_indexes
+                    .entry(group)
+                    .or_insert_with(|| (name, Vec::new()));
+                entry.1.push((column.name, order == Some("DESC")));
+            };
+            match column.index_group {
+                Some(group) => push_decl(group, column.index_name, column.index_order),
+                None => {
+                    let value = ungrouped_index;
+                    ungrouped_index += 1;
+                    push_decl(value, column.index_name, column.index_order);
+                }
+            }
+        }
+    }
+
+    // 附加索引声明第二遍（与 aggregate_index_groups 的追加序一致）
+    for column in T::COLUMN_SCHEMA {
+        if column.is_indexed {
+            for extra in column.extra_index_decls {
+                let entry = expected_indexes
+                    .entry(extra.group)
+                    .or_insert_with(|| (extra.name, Vec::new()));
+                entry.1.push((column.name, extra.order == Some("DESC")));
+            }
         }
     }
 

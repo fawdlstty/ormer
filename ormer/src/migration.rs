@@ -13,7 +13,7 @@ use crate::db_first::{DbFirstForeignKey, DbFirstTable};
 use crate::model::CompressionAlgorithm;
 #[cfg(feature = "postgresql")]
 use crate::model::DurationToInterval;
-use crate::model::{ColumnSchema, WritableModel};
+use crate::model::{ColumnSchema, GroupMember, WritableModel};
 use crate::table_migrate::ExpectedCheck;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
@@ -1731,24 +1731,26 @@ pub(crate) fn index_migration_step(
     db_type: DbType,
     name: String,
     table: &str,
-    columns: &[&ColumnSchema],
+    columns: &[GroupMember<'_>],
     unique: bool,
 ) -> crate::Result<MigrationStep> {
     let has_order_or_predicate = columns
         .iter()
-        .any(|column| column.index_order.is_some() || column.index_where.is_some());
+        .any(|member| member.order.is_some() || member.column.index_where.is_some());
     if !has_order_or_predicate {
         return Ok(MigrationStep::CreateIndex {
             name,
             table: table.to_string(),
             columns: columns
                 .iter()
-                .map(|column| column.name.to_string())
+                .map(|member| member.column.name.to_string())
                 .collect(),
             unique,
         });
     }
-    let has_predicate = columns.iter().any(|column| column.index_where.is_some());
+    let has_predicate = columns
+        .iter()
+        .any(|member| member.column.index_where.is_some());
     if has_predicate {
         #[cfg(feature = "sqlite")]
         if matches!(db_type, DbType::Sqlite) {
@@ -1762,9 +1764,9 @@ pub(crate) fn index_migration_step(
 
     let columns_sql = columns
         .iter()
-        .map(|column| {
-            let mut value = crate::model::quote_identifier(db_type, column.name);
-            if let Some(order) = column.index_order {
+        .map(|member| {
+            let mut value = crate::model::quote_identifier(db_type, member.column.name);
+            if let Some(order) = member.order {
                 value.push(' ');
                 value.push_str(order);
             }
@@ -1774,7 +1776,7 @@ pub(crate) fn index_migration_step(
         .join(", ");
     let predicate = columns
         .iter()
-        .find_map(|column| column.index_where)
+        .find_map(|member| member.column.index_where)
         .map(|where_clause| format!(" WHERE {where_clause}"))
         .unwrap_or_default();
     // IF NOT EXISTS 后端分派与标识符引用统一走建表路径的公共入口
@@ -1787,7 +1789,14 @@ pub(crate) fn index_migration_step(
 /// 模型声明的一个索引/唯一约束（diff 的"期望集合"元素）。
 pub(crate) struct ExpectedIndexDef<'a> {
     pub(crate) name: Option<&'a str>,
-    pub(crate) columns: Vec<&'a ColumnSchema>,
+    /// 复合索引组号（自动命名的 `idx_{table}_{group}` 来源）。单列/唯一约束
+    /// 为 None——组号必须取自聚合 key，不能用首个成员的主声明 index_group：
+    /// 附加声明成员的主声明可能在其他组，取成员会把组2 的自动名算成组1，
+    /// 与组1 同名后 CREATE IF NOT EXISTS 永远跳过、diff 不收敛。
+    pub(crate) group: Option<i32>,
+    /// 非唯一索引的键列为 GroupMember（带组内排序/命名覆盖）；唯一约束
+    /// 的成员列不涉排序覆盖，column 字段即全部语义。
+    pub(crate) columns: Vec<GroupMember<'a>>,
     pub(crate) unique: bool,
 }
 
@@ -1877,26 +1886,30 @@ pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
 pub(crate) fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'static>> {
     let mut defs = Vec::new();
 
-    let mut grouped: BTreeMap<i32, Vec<&'static ColumnSchema>> = BTreeMap::new();
     for column in T::COLUMN_SCHEMA {
         if !column.is_indexed {
             continue;
         }
-        match column.index_group {
-            Some(group) => {
-                grouped.entry(group).or_default().push(column);
-            }
-            None => defs.push(ExpectedIndexDef {
+        // 无组主声明走单列路径（附加声明是否出现不影响：组声明由
+        // aggregate_index_groups 独立聚合，两者互不吞并）。
+        if column.index_group.is_none() {
+            defs.push(ExpectedIndexDef {
                 name: column.index_name,
-                columns: vec![column],
+                group: None,
+                columns: vec![GroupMember {
+                    column,
+                    order: column.index_order,
+                    name: column.index_name,
+                }],
                 unique: false,
-            }),
+            });
         }
     }
-    for columns in grouped.into_values() {
+    for (group, members) in crate::model::aggregate_index_groups(T::COLUMN_SCHEMA) {
         defs.push(ExpectedIndexDef {
-            name: columns.iter().find_map(|column| column.index_name),
-            columns,
+            name: members.iter().find_map(|member| member.name),
+            group: Some(group),
+            columns: members,
             unique: false,
         });
     }
@@ -1910,7 +1923,15 @@ pub(crate) fn expected_index_defs<T: WritableModel>() -> Vec<ExpectedIndexDef<'s
     for columns in unique_groups.into_values() {
         defs.push(ExpectedIndexDef {
             name: columns.iter().find_map(|column| column.unique_name),
-            columns,
+            group: None,
+            columns: columns
+                .into_iter()
+                .map(|column| GroupMember {
+                    column,
+                    order: None,
+                    name: None,
+                })
+                .collect(),
             unique: true,
         });
     }
@@ -1964,19 +1985,16 @@ pub(crate) fn default_index_name(table_name: &str, expected: &ExpectedIndexDef<'
             expected
                 .columns
                 .first()
-                .and_then(|column| column.unique_group)
+                .and_then(|member| member.column.unique_group)
                 .map(|group| group.to_string())
-                .unwrap_or_else(|| expected.columns[0].name.to_string())
+                .unwrap_or_else(|| expected.columns[0].column.name.to_string())
         )
-    } else if expected.columns.len() == 1 {
-        format!("idx_{table}_{}", expected.columns[0].name)
+    } else if expected.columns.len() == 1 && expected.group.is_none() {
+        format!("idx_{table}_{}", expected.columns[0].column.name)
+    } else if let Some(group) = expected.group {
+        format!("idx_{table}_{group}")
     } else {
-        expected
-            .columns
-            .first()
-            .and_then(|column| column.index_group)
-            .map(|group| format!("idx_{table}_{group}"))
-            .unwrap_or_else(|| format!("idx_{table}_{}", expected.columns[0].name))
+        format!("idx_{table}_{}", expected.columns[0].column.name)
     }
 }
 
@@ -3749,6 +3767,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                extra_index_decls: &[],
                 old_name: None,
             },
             ColumnSchema {
@@ -3778,6 +3797,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                extra_index_decls: &[],
                 old_name: None,
             },
             ColumnSchema {
@@ -3807,6 +3827,7 @@ mod create_table_bootstrap_tests {
                 index_method: None,
                 index_expression: None,
                 index_columns: None,
+                extra_index_decls: &[],
                 old_name: None,
             },
         ]
