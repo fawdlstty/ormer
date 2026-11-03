@@ -193,7 +193,10 @@ fn postgres_null_expr(column: &ColumnSchema, rust_type: &str) -> String {
         | "Vec<Option<i64>>"
         | "std::vec::Vec<Option<i64>>"
         | "alloc::vec::Vec<Option<i64>>" => "NULL::BIGINT[]",
-        "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => "NULL::TIMESTAMPTZ",
+        "DateTime"
+        | "DateTime<Utc>"
+        | "chrono::DateTime"
+        | "chrono::DateTime<chrono::Utc>" => "NULL::TIMESTAMPTZ",
         "NaiveDateTime" | "chrono::NaiveDateTime" => "NULL::TIMESTAMPTZ",
         "NaiveDate" | "chrono::NaiveDate" => "NULL::DATE",
         "NaiveTime" | "chrono::NaiveTime" => "NULL::TIME",
@@ -826,6 +829,7 @@ fn validate_select_parts(
 /// - `ORDER BY` 仅允许时间列（正/倒序）；
 /// - `OFFSET` 必须伴随 `LIMIT`（只有 start 没有 end 的 range 会生成裸
 ///   `OFFSET`，直接返回 `UnsupportedFeature` 而不是生成非法语句）。
+#[cfg_attr(not(feature = "influxdb"), allow(clippy::extra_unused_type_parameters))]
 fn validate_backend_select_tail<T: Model>(
     order_by: &[OrderBy],
     range_start: Option<usize>,

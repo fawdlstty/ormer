@@ -56,6 +56,22 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     {
         return Err(error);
     }
+    // struct 层 #[columnstore] 声明校验：同一 struct 至多一次；声明列存的模型
+    // 必须存在 #[hypertable(Duration)] 时间分片列（列存压缩依赖超表时间分片）。
+    // 字段级 #[columnstore] 已在 FieldInfo::new 内拒绝（只允许 struct 层声明）。
+    let model_columnstore = extract_model_columnstore_attr(&input)?;
+    if model_columnstore.is_some()
+        && !field_infos.iter().any(|info| info.has_hypertable_time)
+    {
+        return Err(syn::Error::new_spanned(
+            name,
+            "#[columnstore] requires a #[hypertable(Duration)] time-shard column \
+             on the model: columnstore (TimescaleDB compression) is keyed on the \
+             hypertable time dimension",
+        ));
+    }
+    let hypertable_columnstore_config_method =
+        hypertable_columnstore_config_method(model_columnstore.as_ref());
     let hypertable_route_key_method = hypertable_route_key_method(&field_infos)?;
     let hypertable_space_info_method = hypertable_space_info_method(&field_infos)?;
     let mut normal_index = 0;
@@ -223,9 +239,13 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             let column_name = info.column_name.as_str();
             let field_type = info.field_type;
 
-            // 检查是否是自增主键（只有主键字段才可能是自增）
+            // 检查是否是自增主键（只有主键字段才可能是自增）。auto 按字段自身
+            // 的 #[primary(auto)] 声明取，不得继承首个主键的 auto——复合主键
+            // 模型（如超表 id auto + ts 主键）中后者若被连带标 auto，会被
+            // insert_columns 剔除导致 INSERT 缺时间列（2026-11-04 调度服务
+            // 遥测 23502 实证），建表也会把时间列误渲染成 SERIAL。
             let is_primary = info.is_primary;
-            let field_is_auto_increment = if is_primary { is_auto_increment } else { false };
+            let field_is_auto_increment = is_primary && info.primary_auto;
             let is_nullable = info.is_nullable;
             let rust_type = &info.rust_type;
 
@@ -340,6 +360,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     check: #check,
                     hypertable: #hypertable,
                     hypertable_space: #hypertable_space,
+                    columnstore: None,
                     compress: #compress,
                     compression: #compression,
                     old_name: #old_name,
@@ -377,6 +398,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 check: None,
                 hypertable: None,
                 hypertable_space: None,
+                columnstore: None,
                 compress: false,
                 compression: None,
                 old_name: None,
@@ -1568,6 +1590,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                             check: None,
                             hypertable: None,
                             hypertable_space: None,
+                            columnstore: None,
                             compress: schema.compress,
                             compression: schema.compression,
                             old_name: None,
@@ -1813,6 +1836,7 @@ fn derive_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             #version_info_method
             #hypertable_route_key_method
             #hypertable_space_info_method
+            #hypertable_columnstore_config_method
 
             fn query() -> Self::QueryBuilder {
                 ::ormer::Select::new()
@@ -2507,6 +2531,7 @@ fn derive_view_model_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     check: None,
                     hypertable: None,
                     hypertable_space: None,
+                    columnstore: None,
                     compress: false,
                     compression: None,
                     old_name: #old_name,
@@ -2927,6 +2952,7 @@ impl<'a> FieldInfo<'a> {
             })
             .unwrap_or(false);
         let data_type = data_type_tokens(effective_data_type_type.as_ref());
+        reject_columnstore_attr(field)?;
         let hypertable = extract_hypertable(field, field_type)?;
         let (is_primary, primary_auto) = extract_primary_attr(field)?;
         let relation = extract_relation_field(field)?;
@@ -3508,6 +3534,132 @@ fn json_update_struct(
     }
 }
 
+/// struct 层 `#[columnstore]` 解析结果：三个可选参数的字符串字面量值
+/// （None = 用 ormer 推导的默认值：after 取 chunk 分片时长、segmentby 按路由键
+/// 推导、orderby 取 "{时间列} DESC"）。
+#[derive(Default)]
+struct ColumnstoreAttr {
+    after: Option<String>,
+    segment_by: Option<String>,
+    order_by: Option<String>,
+}
+
+impl ColumnstoreAttr {
+    /// 生成 `Some(::ormer::model::ColumnstoreConfig { ... })` 运行时结构字面量
+    /// （绝对路径与 hypertable/compress 字段 emit 风格一致）。
+    fn tokens(&self) -> proc_macro2::TokenStream {
+        let after = option_string_tokens(self.after.as_deref());
+        let segment_by = option_string_tokens(self.segment_by.as_deref());
+        let order_by = option_string_tokens(self.order_by.as_deref());
+        quote! {
+            Some(::ormer::model::ColumnstoreConfig {
+                after: #after,
+                segment_by: #segment_by,
+                order_by: #order_by,
+            })
+        }
+    }
+}
+
+/// `#[columnstore]` 参数值解析：值必须是字符串字面量，原样透传为 &'static str
+/// （格式合法性由 PG 端校验，非法值被列存 DO 块静默吞掉属可接受行为）。
+fn columnstore_meta_value(
+    meta: &syn::meta::ParseNestedMeta<'_>,
+) -> syn::Result<String> {
+    let value = meta.value()?;
+    let lit: syn::LitStr = value.parse()?;
+    Ok(lit.value())
+}
+
+/// 解析单个 `#[columnstore]` / `#[columnstore(...)]` 属性（struct 层与字段层
+/// 拒绝检查共用同一套参数语法）。支持语法：
+/// - #[columnstore]：全默认（参数由运行时按 chunk 时长/路由键/时间列推导）
+/// - #[columnstore(after = "7 days", segment_by = "project_id,agvid", order_by = "event_time DESC")]
+///   三个参数均可选；未知参数名报编译错误（列出合法参数清单）
+fn parse_columnstore_attr_meta(attr: &syn::Attribute) -> syn::Result<ColumnstoreAttr> {
+    let mut config = ColumnstoreAttr::default();
+    match &attr.meta {
+        Meta::Path(_) => {}
+        Meta::List(_) => {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("after") {
+                    config.after = Some(columnstore_meta_value(&meta)?);
+                    Ok(())
+                } else if meta.path.is_ident("segment_by") {
+                    config.segment_by = Some(columnstore_meta_value(&meta)?);
+                    Ok(())
+                } else if meta.path.is_ident("order_by") {
+                    config.order_by = Some(columnstore_meta_value(&meta)?);
+                    Ok(())
+                } else {
+                    Err(meta.error(
+                        "unsupported #[columnstore] argument (expected `after`, `segment_by`, or `order_by`)",
+                    ))
+                }
+            })?;
+        }
+        Meta::NameValue(_) => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "#[columnstore] must use #[columnstore] or #[columnstore(...)]",
+            ));
+        }
+    }
+    Ok(config)
+}
+
+/// 字段层 `#[columnstore]` 一律拒绝：列存是表级存储属性，只能声明在 struct 层
+/// （#[table] 同级），由 `extract_model_columnstore_attr` 解析。
+fn reject_columnstore_attr(field: &syn::Field) -> syn::Result<()> {
+    if let Some(attr) = field
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("columnstore"))
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "#[columnstore] must be declared on the struct (next to #[table = \"...\"]), \
+             not on individual fields",
+        ));
+    }
+    Ok(())
+}
+
+/// 提取 struct 层 `#[columnstore]` 声明（#[table] 同级位置），同一 struct 至多一次。
+fn extract_model_columnstore_attr(input: &DeriveInput) -> syn::Result<Option<ColumnstoreAttr>> {
+    let mut attrs = input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("columnstore"));
+    let Some(attr) = attrs.next() else {
+        return Ok(None);
+    };
+    let config = parse_columnstore_attr_meta(attr)?;
+    if let Some(duplicate) = attrs.next() {
+        return Err(syn::Error::new_spanned(
+            duplicate,
+            "duplicate #[columnstore] declaration; only one is allowed per model",
+        ));
+    }
+    Ok(Some(config))
+}
+
+/// 生成 struct 层 `#[columnstore]` 的 `hypertable_columnstore_config` 覆盖方法；
+/// 未声明时返回空（走 trait 默认实现：列 schema 扫描，派生模型恒为 None）。
+fn hypertable_columnstore_config_method(
+    config: Option<&ColumnstoreAttr>,
+) -> proc_macro2::TokenStream {
+    let Some(config) = config else {
+        return quote! {};
+    };
+    let tokens = config.tokens();
+    quote! {
+        fn hypertable_columnstore_config() -> Option<::ormer::model::ColumnstoreConfig> {
+            #tokens
+        }
+    }
+}
+
 fn extract_compress_attr(field: &syn::Field) -> Option<syn::Ident> {
     let attr = field
         .attrs
@@ -3908,6 +4060,10 @@ fn derive_model_tuple_wrapper(
 
             fn hypertable_route_key() -> Option<&'static str> {
                 <#inner_type as ::ormer::Model>::hypertable_route_key()
+            }
+
+            fn hypertable_columnstore_config() -> Option<::ormer::model::ColumnstoreConfig> {
+                <#inner_type as ::ormer::Model>::hypertable_columnstore_config()
             }
 
             fn table_options() -> Option<::ormer::model::TableOptions> {
@@ -5710,6 +5866,113 @@ mod tests {
         assert_eq!(
             normalize_type_string(quote! { #effective_type }.to_string()),
             "i32"
+        );
+    }
+
+    // #[columnstore] 只允许 struct 层声明：struct 层生成配置覆盖方法，字段层拒绝
+
+    fn columnstore_model_tokens(attrs: proc_macro2::TokenStream) -> String {
+        let input: DeriveInput = syn::parse_quote! {
+            #attrs
+            struct CsEvent {
+                #[primary]
+                #[hypertable(std::time::Duration::from_secs(86400))]
+                event_time: chrono::NaiveDateTime,
+                #[primary]
+                project_id: String,
+                val: f64,
+            }
+        };
+        derive_model(input).to_string()
+    }
+
+    #[test]
+    fn struct_level_columnstore_emits_config_override() {
+        let tokens = columnstore_model_tokens(quote! {
+            #[table = "cs_events"]
+            #[columnstore(after = "1 days")]
+        });
+        assert!(
+            tokens.contains("fn hypertable_columnstore_config"),
+            "{tokens}"
+        );
+        assert!(tokens.contains("after : Some (\"1 days\")"), "{tokens}");
+    }
+
+    #[test]
+    fn bare_struct_level_columnstore_emits_config_override() {
+        let tokens = columnstore_model_tokens(quote! {
+            #[table = "cs_events"]
+            #[columnstore]
+        });
+        assert!(
+            tokens.contains("fn hypertable_columnstore_config"),
+            "{tokens}"
+        );
+        // 全默认：三个参数均为 None，由运行时按 chunk 时长/路由键/时间列推导
+        assert!(tokens.contains("after : None , segment_by : None"), "{tokens}");
+    }
+
+    #[test]
+    fn rejects_field_level_columnstore() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[table = "cs_events"]
+            struct CsEvent {
+                #[primary]
+                #[hypertable(std::time::Duration::from_secs(86400))]
+                event_time: chrono::NaiveDateTime,
+                #[columnstore(after = "1 days")]
+                val: f64,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("must be declared on the struct")
+                && tokens.contains("not on individual fields"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_struct_level_columnstore() {
+        let tokens = columnstore_model_tokens(quote! {
+            #[table = "cs_events"]
+            #[columnstore]
+            #[columnstore(after = "2 days")]
+        });
+        assert!(
+            tokens.contains("duplicate #[columnstore] declaration"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_struct_level_columnstore_without_hypertable_time() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[table = "cs_events"]
+            #[columnstore(after = "1 days")]
+            struct CsEvent {
+                #[primary]
+                event_time: chrono::NaiveDateTime,
+                val: f64,
+            }
+        };
+        let tokens = derive_model(input).to_string();
+        assert!(
+            tokens.contains("#[columnstore] requires a #[hypertable(Duration)] time-shard column"),
+            "{tokens}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_columnstore_argument() {
+        let tokens = columnstore_model_tokens(quote! {
+            #[table = "cs_events"]
+            #[columnstore(segmentby = "project_id")]
+        });
+        assert!(
+            tokens.contains("unsupported #[columnstore] argument"),
+            "{tokens}"
         );
     }
 }

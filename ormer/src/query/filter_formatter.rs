@@ -1070,6 +1070,12 @@ fn render_dynamic_subquery(
     }
 }
 
+// pg/mssql 分支需在循环体内 peek/next 手动推进迭代器，while let 是唯一
+// 写法；其余组合体内不再使用迭代器，按名豁免 while_let_on_iterator
+#[cfg_attr(
+    not(any(feature = "postgresql", feature = "mssql")),
+    allow(clippy::while_let_on_iterator)
+)]
 pub(crate) fn rebase_subquery_sql(sql: &str, db_type: DbType, offset: usize) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut chars = sql.char_indices().peekable();

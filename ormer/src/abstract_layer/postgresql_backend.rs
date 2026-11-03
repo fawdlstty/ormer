@@ -1141,6 +1141,7 @@ fn pg_value_from_row_cell(
             "NaiveDateTime"
             | "chrono::NaiveDateTime"
             | "DateTime"
+            | "DateTime<Utc>"
             | "chrono::DateTime"
             | "chrono::DateTime<chrono::Utc>" => Ok(pg_datetime_value_from_row(row, idx)?
                 .map(crate::model::Value::DateTime)
@@ -1266,6 +1267,7 @@ fn pg_value_from_row_cell(
             "NaiveDateTime"
             | "chrono::NaiveDateTime"
             | "DateTime"
+            | "DateTime<Utc>"
             | "chrono::DateTime"
             | "chrono::DateTime<chrono::Utc>" => pg_datetime_value_from_row(row, idx)?
                 .map(crate::model::Value::DateTime)
@@ -1593,6 +1595,23 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             return common_helpers::sql_type_with_nullability(&enum_name, is_nullable);
         }
 
+        // 自增列（SERIAL 族）先于主键分支处理：复合主键建表路径传
+        // is_primary=false 只为省列级 PRIMARY KEY，序列默认值仍须生成
+        // （2026-11-04 复合主键超表 id 被降级普通 bigint 实证）
+        if is_auto_increment {
+            let serial_type = match rust_type {
+                "i8" | "i16" | "i32" => "SERIAL",
+                "i64" | "u16" | "u32" | "u64" | "usize" | "isize" => "BIGSERIAL",
+                "u8" => "SMALLSERIAL", // PostgreSQL 最小序列类型
+                _ => "SERIAL",         // 默认使用 SERIAL
+            };
+            return if is_primary {
+                format!("{serial_type} PRIMARY KEY")
+            } else {
+                serial_type.to_string()
+            };
+        }
+
         // 基础类型映射
         let base_type = match rust_type {
             // 整数类型
@@ -1630,8 +1649,13 @@ impl DbBackendTypeMapper for PostgreSQLTypeMapper {
             "Vec<String>" | "std::vec::Vec<String>" | "alloc::vec::Vec<String>" => "TEXT[]",
             // UUID 类型（如果使用 uuid crate）
             "Uuid" | "uuid::Uuid" => "UUID",
-            // 日期时间类型（如果使用 chrono crate）
-            "DateTime" | "chrono::DateTime" | "chrono::DateTime<chrono::Utc>" => "TIMESTAMPTZ",
+            // 日期时间类型（如果使用 chrono crate）。"DateTime<Utc>"：模型字段
+            // 经 use chrono::{DateTime, Utc} 引入时 quote 出的是非限定形态，
+            // 缺它会把 timestamptz 列误判为 TEXT（2026-11-04 调度服务回归实证）
+            "DateTime"
+            | "DateTime<Utc>"
+            | "chrono::DateTime"
+            | "chrono::DateTime<chrono::Utc>" => "TIMESTAMPTZ",
             "NaiveDateTime" | "chrono::NaiveDateTime" => "TIMESTAMPTZ",
             "NaiveDate" | "chrono::NaiveDate" => "DATE",
             "NaiveTime" | "chrono::NaiveTime" => "TIME",
@@ -1951,21 +1975,28 @@ fn mark_columnstore_ensured(db_type: DbType, table: &str) {
     ensured_columnstore().insert(format!("{db_type:?}|{table}"));
 }
 
-/// 生成路由子表的 TimescaleDB 列存压缩 DDL（单条幂等 DO 块）。
+/// 生成 TimescaleDB 列存压缩 DDL（单条幂等 DO 块）。
 ///
-/// 拆表子表的路由列值在子表内固定，行存 heap 下逐行写盘；启用 columnstore
+/// 触发条件（满足其一）：模型声明 `#[columnstore]`（任意超表，不限路由拆表），
+/// 或模型同时声明 route key 与 `#[hypertable]`（路由子表，原行为）。压缩参数
+/// 优先级：模型 `#[columnstore(...)]` 声明 > 路由键推导 > chunk 时长/时间列默认。
+///
+/// 路由子表的路由列值在子表内固定，行存 heap 下逐行写盘；启用 columnstore
 /// 后按批压缩，存量与增量 chunk 由自动压缩策略（policy）滚动压缩。压缩窗口
-/// 取模型声明的 chunk 间隔，与 `create_hypertable` 的 chunk 时间对齐。
+/// 默认取模型声明的 chunk 间隔，与 `create_hypertable` 的 chunk 时间对齐
+/// （`#[columnstore(after = "...")]` 可显式覆盖）。
 ///
-/// `segmentby`：路由列在主键内时取路由列（满足"唯一索引必须包含全部
+/// `segmentby` 默认：路由列在主键内时取路由列（满足"唯一索引必须包含全部
 /// segmentby 列"的约束，路由列按批键存储零行开销）；否则置空，交由字典
 /// 压缩处理子表内的固定值（此时主键不含路由列，任何含路由列的 segmentby
-/// 都会让 chunk 压缩在运行时报唯一索引错误）。
+/// 都会让 chunk 压缩在运行时报唯一索引错误）。`#[columnstore(segment_by = "...")]`
+/// 可显式覆盖（声明方需自行保证唯一索引包含全部 segmentby 列）。
 ///
-/// 仅 PostgreSQL 且模型同时声明 route key 与 `#[hypertable]` 时返回语句；
-/// 无时间列的路由子表是普通表，没有列存能力。DO 块在 TimescaleDB 不支持
-/// 新版参数时降级旧版 `timescaledb.compress*`，仍不支持（如未装扩展）则
-/// 整体静默跳过——列存是纯存储优化，失败不影响功能正确性。
+/// `orderby` 默认 `"{时间列} DESC"`，`#[columnstore(order_by = "...")]` 可覆盖。
+///
+/// 仅 PostgreSQL 且模型有超表时间列时返回语句；无时间列的表是普通表，没有
+/// 列存能力。DO 块在 TimescaleDB 不支持新版参数时降级旧版 `timescaledb.compress*`，
+/// 仍不支持（如未装扩展）则整体静默跳过——列存是纯存储优化，失败不影响功能正确性。
 pub(crate) fn hypertable_columnstore_sql<T: crate::model::Model>(
     db_type: DbType,
     table: &str,
@@ -1973,11 +2004,24 @@ pub(crate) fn hypertable_columnstore_sql<T: crate::model::Model>(
     if db_type != DbType::PostgreSQL {
         return None;
     }
-    let route_key = T::hypertable_route_key()?;
+    let config = T::hypertable_columnstore_config();
+    let route_key = T::hypertable_route_key();
+    if config.is_none() && route_key.is_none() {
+        return None;
+    }
     let (time_column, chunk_interval) = T::hypertable_info()?;
-    let route_in_primary = T::column_schema()
-        .iter()
-        .any(|column| column.is_primary && column.name == route_key);
+
+    // segmentby 推导：模型声明优先；否则按路由键（路由列在主键内才取，见上
+    // 文约束）；无声明无路由时空串。
+    let route_segmentby = route_key.and_then(|route_key| {
+        let route_in_primary = T::column_schema()
+            .iter()
+            .any(|column| column.is_primary && column.name == route_key);
+        route_in_primary.then_some(route_key)
+    });
+    let effective_segmentby = config
+        .and_then(|config| config.segment_by)
+        .or(route_segmentby);
 
     let (schema, table_name) = split_schema_table_name(table, "public");
     let qualified = format!(
@@ -1986,18 +2030,27 @@ pub(crate) fn hypertable_columnstore_sql<T: crate::model::Model>(
         crate::model::quote_identifier(db_type, table_name)
     );
     let regclass = sql_string_literal(&qualified);
-    let segmentby = if route_in_primary {
-        sql_string_literal(route_key)
-    } else {
-        "''".to_string()
+    let segmentby = match effective_segmentby {
+        Some(segment_by) => sql_string_literal(segment_by),
+        None => "''".to_string(),
     };
-    let legacy_segmentby = if route_in_primary {
-        format!("timescaledb.compress_segmentby = {}, ", sql_string_literal(route_key))
-    } else {
-        String::new()
+    let legacy_segmentby = match effective_segmentby {
+        Some(segment_by) => format!(
+            "timescaledb.compress_segmentby = {}, ",
+            sql_string_literal(segment_by)
+        ),
+        None => String::new(),
     };
-    let orderby = sql_string_literal(&format!("{time_column} DESC"));
-    let interval = chunk_interval.to_interval_string();
+    let default_orderby = format!("{time_column} DESC");
+    let orderby = sql_string_literal(
+        config
+            .and_then(|config| config.order_by)
+            .unwrap_or(default_orderby.as_str()),
+    );
+    let interval = match config.and_then(|config| config.after) {
+        Some(after) => after.to_string(),
+        None => chunk_interval.to_interval_string(),
+    };
 
     Some(format!(
         "DO $ormer_columnstore$\n\
@@ -2036,9 +2089,12 @@ async fn ensure_existing_columnstore<T: crate::model::Model>(
 }
 
 impl Database {
-    /// migrate_table 用的路由子表列存补挂入口：旧版本 ormer 或外部创建的
-    /// 子表没有压缩属性，迁移作为全量对账入口也必须补齐（与写入触达
-    /// `ensure_routed_table_on_client` 同一幂等 DO 块与进程级缓存）。
+    /// migrate_table 用的列存补挂入口：路由子表（旧版本 ormer 或外部创建的
+    /// 子表没有压缩属性，迁移作为全量对账入口也必须补齐）与声明
+    /// `#[columnstore]` 的存量超表（由迁移自动补挂列存）共用（与写入触达
+    /// `ensure_routed_table_on_client` 同一幂等 DO 块与进程级缓存；
+    /// `hypertable_columnstore_sql` 对无 route 无 columnstore 声明的模型返回
+    /// None，调用方不受影响）。
     pub(crate) async fn ensure_existing_columnstore_for_model<T: crate::model::Model>(
         &self,
         table: &str,
@@ -2053,7 +2109,8 @@ pub struct CreateTableExecutor<'a, T: crate::model::Model> {
     table_name: Option<String>,
     /// 路由子表建表标记：DDL 序列尾部追加 TimescaleDB 列存压缩 DO 块
     /// （仅 PG 且模型同时声明 route key 与 `#[hypertable]` 时生效，见
-    /// `hypertable_columnstore_sql`）。基础表建表不带该步骤。
+    /// `hypertable_columnstore_sql`）。基础表建表不带该步骤；声明
+    /// `#[columnstore]` 的超表无需该标记，to_sql 会按模型声明自行追加。
     route_columnstore: bool,
     _marker: std::marker::PhantomData<T>,
 }
@@ -2162,8 +2219,11 @@ impl<'a, T: crate::model::Model> CreateTableExecutor<'a, T> {
             }
         }
 
-        // 路由子表收尾：追加列存压缩 DO 块（需在 create_hypertable 之后执行）。
-        if self.route_columnstore
+        // 列存收尾：路由子表（route_columnstore 标记）或声明 #[columnstore] 的
+        // 任意超表，都在 create_hypertable 之后追加列存压缩 DO 块（幂等；DO 块
+        // 内部吞掉后端不支持类错误，hypertable_columnstore_sql 已内置 PG-only
+        // 与时间列存在性检查，非超表/非 PG 返回 None）。
+        if (self.route_columnstore || T::hypertable_columnstore_config().is_some())
             && let Some(columnstore_sql) = hypertable_columnstore_sql::<T>(self.db_type, table_name)
         {
             statements.push(SingleSqlStatement::new(columnstore_sql, Vec::new()));
@@ -6312,6 +6372,7 @@ fn pg_value_to_param(value: &Value, rust_type: Option<&str>) -> PostgreSQLParam 
             }
             Some(
                 "DateTime"
+                | "DateTime<Utc>"
                 | "chrono::DateTime"
                 | "chrono::DateTime<chrono::Utc>"
                 | "NaiveDateTime"
@@ -7148,6 +7209,7 @@ mod block_delete_tests {
             check: None,
             hypertable: None,
             hypertable_space: None,
+            columnstore: None,
             compress: false,
             compression: None,
             index_method: None,

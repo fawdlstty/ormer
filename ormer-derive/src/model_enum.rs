@@ -483,6 +483,7 @@ fn derive_data_enum_field_type(
                     check: None,
                     hypertable: None,
                     hypertable_space: None,
+                    columnstore: None,
                     compress: false,
                     compression: None,
                     old_name: None,

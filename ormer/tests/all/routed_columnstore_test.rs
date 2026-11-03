@@ -8,6 +8,10 @@
 //! 两个阶段共用同一组表名，固定在单个测试函数内顺序执行以避免并行互扰。
 
 #[derive(Debug, Clone, ormer::Model)]
+#[cfg_attr(
+    not(any(feature = "postgresql", feature = "questdb")),
+    allow(dead_code)
+)]
 #[table = "routed_cs_events"]
 struct RoutedCsEvent {
     #[primary]

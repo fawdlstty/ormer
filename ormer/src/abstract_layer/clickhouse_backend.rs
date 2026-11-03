@@ -1544,6 +1544,7 @@ mod block_delete_tests {
             check: None,
             hypertable: None,
             hypertable_space: None,
+            columnstore: None,
             compress: false,
             compression: None,
             index_method: None,

@@ -1976,6 +1976,7 @@ fn parse_column_value_options(
                 None => Ok(Value::Null),
             },
             "DateTime"
+            | "DateTime<Utc>"
             | "chrono::DateTime"
             | "chrono::DateTime<chrono::Utc>"
             | "NaiveDateTime"
@@ -2102,6 +2103,7 @@ fn parse_column_value_options(
             }
             (
                 "DateTime"
+                | "DateTime<Utc>"
                 | "chrono::DateTime"
                 | "chrono::DateTime<chrono::Utc>"
                 | "NaiveDateTime"
@@ -2112,6 +2114,7 @@ fn parse_column_value_options(
             )),
             (
                 "DateTime"
+                | "DateTime<Utc>"
                 | "chrono::DateTime"
                 | "chrono::DateTime<chrono::Utc>"
                 | "NaiveDateTime"

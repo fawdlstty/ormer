@@ -48,6 +48,7 @@ pub fn is_strict_rust_type(rust_type: &str) -> bool {
             | "Vec<u8>"
             | "&[u8]"
             | "DateTime"
+            | "DateTime<Utc>"
             | "chrono::DateTime"
             | "chrono::DateTime<chrono::Utc>"
             | "NaiveDateTime"

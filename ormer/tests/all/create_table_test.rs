@@ -7,6 +7,7 @@ define_test_user!(TestUser, "create_table_users_1");
 define_test_complete_types!(TestCompleteTypes, "create_table_complete_types_1");
 
 #[derive(Debug, ormer::Model)]
+#[cfg_attr(not(feature = "postgresql"), allow(dead_code))]
 #[table = "create_table_datetime_pk_1"]
 struct TestDateTimePrimaryKey {
     #[primary]

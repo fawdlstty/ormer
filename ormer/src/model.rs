@@ -422,6 +422,21 @@ impl DurationToInterval for std::time::Duration {
     }
 }
 
+/// TimescaleDB 列存压缩声明（struct 层 `#[columnstore]` 标注的运行时形态）。
+/// 任意超表（不限路由拆表）声明后，建表/迁移/首写触达路径会为表挂上
+/// columnstore 属性与自动压缩策略（详见 postgresql_backend 的列存 DO 块）。
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnstoreConfig {
+    /// 压缩策略触发阈值（`after => INTERVAL '<值>'` 的字面量，如 "7 days"）；
+    /// None 时取 chunk 分片时长。
+    pub after: Option<&'static str>,
+    /// segmentby 列清单字面量（如 "project_id,agvid"）；None 时按路由键推导
+    /// （路由列在主键内取路由列，否则空串交由字典压缩处理）。
+    pub segment_by: Option<&'static str>,
+    /// orderby 排序字面量（如 "event_time DESC"）；None 时取 "{时间列} DESC"。
+    pub order_by: Option<&'static str>,
+}
+
 /// 字段元数据
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
@@ -446,6 +461,10 @@ pub struct ColumnSchema {
     pub check: Option<CheckConstraint>,                                           // CHECK 约束
     pub hypertable: Option<std::time::Duration>, // TimescaleDB hypertable 分片时长
     pub hypertable_space: Option<u16>,           // TimescaleDB hypertable 空间分区数量
+    /// TimescaleDB 列存压缩声明的兼容载体：标注已上移 struct 层，派生模型
+    /// 恒为 None（配置经 `hypertable_columnstore_config()` 覆盖方法直传），
+    /// 仅手工构建 schema 的 Model 实现仍可在此填充。
+    pub columnstore: Option<ColumnstoreConfig>,
     pub compress: bool,                          // 是否启用数据库级压缩
     pub compression: Option<CompressionAlgorithm>, // 压缩算法
     pub index_method: Option<&'static str>,      // fulltext、gin 等索引方法
@@ -1743,6 +1762,14 @@ fn hypertable_space_infos_of_schema(schema: &[ColumnSchema]) -> Vec<(&'static st
         .collect()
 }
 
+/// 从列 schema 中提取 TimescaleDB 列存压缩声明（首个携带声明的列）。派生模型
+/// 的列不再携带声明（标注已上移 struct 层，由宏直接生成
+/// `hypertable_columnstore_config()` 覆盖），本函数仅服务手工构建的 schema。
+/// `Model` 默认实现共用。
+fn columnstore_config_of_schema(schema: &[ColumnSchema]) -> Option<ColumnstoreConfig> {
+    schema.iter().find_map(|col| col.columnstore)
+}
+
 /// 从列 schema 中提取主键 Rust 字段名列表，`ViewModel` 与 `Model` 默认实现共用。
 fn primary_field_names_of_schema(schema: &[ColumnSchema]) -> Vec<&'static str> {
     schema
@@ -1874,6 +1901,13 @@ pub trait Model: Sized {
     /// 获取 TimescaleDB 全部空间分区列（按声明顺序，可多个）。
     fn hypertable_space_infos() -> Vec<(&'static str, u16)> {
         hypertable_space_infos_of_schema(&Self::column_schema())
+    }
+
+    /// 获取 TimescaleDB 列存压缩声明（struct 层 `#[columnstore]`）。派生模型由
+    /// 宏生成本方法的覆盖实现直传声明；默认实现扫描列 schema（兼容手工构建）。
+    /// 任意超表声明后，建表/迁移/首写触达路径自动挂 columnstore 与压缩策略。
+    fn hypertable_columnstore_config() -> Option<ColumnstoreConfig> {
+        columnstore_config_of_schema(&Self::column_schema())
     }
 
     /// 获取 TimescaleDB 字符串拆表路由键（如果有）。

@@ -181,6 +181,28 @@ struct Event {
 }
 ```
 
+## 列存压缩（columnstore）
+
+`#[columnstore]` 声明在 struct 层（`#[table]` 同级），为整个 TimescaleDB 超表启用列存与自动压缩策略；列字段上不允许声明（编译报错）。声明模型必须存在 `#[hypertable(Duration)]` 时间分片列。
+
+```rust
+#[derive(Debug, Model)]
+#[table = "events"]
+#[columnstore(after = "7 days")]
+struct Event {
+    #[hypertable] // 空间分区列（可选）
+    tenant: String,
+    #[primary]
+    #[hypertable(std::time::Duration::from_secs(86400))]
+    created_at: chrono::NaiveDateTime,
+    payload: String,
+}
+```
+
+三个参数均可选：`after`（压缩策略触发阈值，默认取 chunk 分片时长）、`segment_by`（segmentby 列清单，默认按路由键推导）、`order_by`（orderby 排序，默认 `{时间列} DESC`）。
+
+任意超表（不限路由拆表）声明后，建表、`ensure_table` / `migrate_table` 迁移与首写触达路径都会为表挂上 columnstore 属性与压缩策略：已存在的行存超表会被自动迁移为列存（幂等 `ALTER TABLE ... SET (timescaledb.columnstore = ...)` + `add_columnstore_policy`），存量 chunk 滚动压缩。后端不支持（未装 TimescaleDB 或旧版本）时静默跳过，不影响功能。route key + `#[hypertable]` 的拆表子表无需声明即自动启用列存（见下节）。
+
 ## 拆表路由键
 
 `#[hypertable(route)]` 把一个 `String` 字段（每模型至多一个）声明为拆表路由键：PostgreSQL 上物理表名为 `{表名}_{路由字段值}`，如表 `aaa`、路由值 `val` 读写子表 `aaa_val`；其他后端忽略 route key，读写基础表名。它与所有后端生效的表名模板 `#[table = "orders_{tenant_id}"]`（见"动态表路由"）是两种独立的拆表风格。

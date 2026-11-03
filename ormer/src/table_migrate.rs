@@ -707,6 +707,7 @@ pub(crate) fn is_safe_identifier(name: &str) -> bool {
 /// 同源：PG 且声明了 hypertable 的模型需要 timescaledb；非 PG 或无超表
 /// 声明返回空。
 #[allow(unused_variables)]
+#[cfg_attr(not(feature = "postgresql"), allow(clippy::extra_unused_type_parameters))]
 fn model_required_extensions<T: WritableModel>(db_type: DbType) -> Vec<String> {
     #[cfg(feature = "postgresql")]
     {
@@ -1055,6 +1056,8 @@ impl Database {
         // 路由子表：与基础表同一套 diff 逻辑；推不动同样直接报错
         #[cfg(feature = "postgresql")]
         let pg = self.as_postgresql();
+        // child 仅在 postgresql 分支补挂列存压缩时使用，默认 feature 构建下未使用
+        #[cfg_attr(not(feature = "postgresql"), allow(unused_variables))]
         for (child, child_diagnosis) in family.children {
             match child_diagnosis {
                 TableDiagnosis::Ready => {}
@@ -1077,6 +1080,19 @@ impl Database {
             {
                 pg.ensure_existing_columnstore_for_model::<T>(&child).await?;
             }
+        }
+
+        // 基础超表 schema diff 收敛后幂等补挂列存压缩：仅声明 #[columnstore]
+        // 的超表执行——存量普通超表在启动迁移时自动补齐列存；纯路由模型
+        // 不进此分支，路由拆表路径行为不变。幂等 DO 块 + 进程级缓存保证
+        // 每表每进程只处理一次。
+        #[cfg(feature = "postgresql")]
+        if matches!(db_type, DbType::PostgreSQL)
+            && T::hypertable_columnstore_config().is_some()
+            && let Some(pg) = pg
+        {
+            pg.ensure_existing_columnstore_for_model::<T>(table_name)
+                .await?;
         }
 
         // 复验（同源：整体重新诊断）。仍有差异说明增量迁移未收敛，
@@ -1111,6 +1127,7 @@ impl Database {
 ///
 /// 判空用 `SELECT 1 .. LIMIT 1` 探测，不做全表计数；表名来自模型
 /// 声明与库内自省，非用户输入，无注入面。
+    #[cfg_attr(not(feature = "postgresql"), allow(clippy::extra_unused_type_parameters))]
     async fn rebuild_empty_table<T: WritableModel>(&self) -> bool {
         #[cfg(feature = "postgresql")]
         {
@@ -1164,6 +1181,7 @@ impl Database {
     /// 已消失等），调用方走原拒绝路径；`Ok(Some)`：阶段一已提交（备份表
     /// 已随事务删除，阶段二索引由调用方重跑一轮迁移承接）；`Err`：前置
     /// 检查拒绝或阶段一失败（事务已回滚）。
+    #[cfg_attr(not(feature = "postgresql"), allow(clippy::extra_unused_type_parameters))]
     async fn rebuild_nonempty_table_preserving_data<T: WritableModel>(
         &self,
     ) -> crate::Result<Option<PreservedDataRebuild>> {
@@ -2319,7 +2337,16 @@ pub(crate) fn plan_index_semantic_diff(
                     .name
                     .map(ToString::to_string)
                     .unwrap_or_else(|| default_index_name_fallback(table_name, expected_def));
-                let name_checks = unique_name_reliable || !expected_def.unique;
+                // 未显式命名的唯一组：建表路径的内联 UNIQUE 落库是约束形态
+                // （PG 自动名 {table}_{column}_key），语义相等即认领，不做名字
+                // 归一——否则每次启动都计划 DROP 约束底层数组（2BP01）再按
+                // uq_{table}_{group} 重建，永不收敛（2026-11-04 调度服务启动
+                // 回归实证：users_username_key）。显式命名的唯一声明仍归一。
+                let name_checks = if expected_def.unique {
+                    unique_name_reliable && expected_def.name.is_some()
+                } else {
+                    unique_name_reliable
+                };
                 #[cfg(feature = "postgresql")]
                 let name_matches = actual_index.name == ormer_name
                     || (db_type == DbType::PostgreSQL

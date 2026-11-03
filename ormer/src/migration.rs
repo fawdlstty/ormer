@@ -1602,6 +1602,8 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
     #[cfg(not(any(feature = "postgresql", feature = "mysql")))]
     let _ = &algorithm;
 
+    // match 即函数返回值：支持的后端校验算法后返回 Ok，其余后端统一返回
+    // 不支持错误，各 feature 组合下均无需 cfg 分支的尾部表达式
     match db_type {
         #[cfg(feature = "postgresql")]
         DbType::PostgreSQL => {
@@ -1615,6 +1617,7 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
                     column.name
                 ));
             }
+            Ok(())
         }
         #[cfg(feature = "mysql")]
         DbType::MySQL => {
@@ -1628,52 +1631,39 @@ fn validate_compression(db_type: DbType, column: &ColumnSchema) -> crate::Result
                     column.name
                 ));
             }
+            Ok(())
         }
         #[cfg(feature = "mssql")]
-        DbType::MSSQL => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::MSSQL => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
         #[cfg(feature = "sqlite")]
-        DbType::Sqlite => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::Sqlite => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
         #[cfg(feature = "duckdb")]
-        DbType::DuckDB => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::DuckDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
         #[cfg(feature = "clickhouse")]
-        DbType::ClickHouse => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::ClickHouse => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
         #[cfg(feature = "questdb")]
-        DbType::QuestDB => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::QuestDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
         #[cfg(feature = "influxdb")]
-        DbType::InfluxDB => {
-            return Err(crate::OrmerError::UnsupportedFeature {
-                backend: db_type,
-                feature: "column compression",
-            });
-        }
+        DbType::InfluxDB => Err(crate::OrmerError::UnsupportedFeature {
+            backend: db_type,
+            feature: "column compression",
+        }),
     }
-    #[cfg(any(feature = "postgresql", feature = "mysql"))]
-    Ok(())
 }
 
 #[cfg(any(feature = "postgresql", feature = "mysql"))]
@@ -1806,14 +1796,15 @@ pub(crate) struct ExpectedIndexDef<'a> {
 /// 路径（`db_first::validate_model_constraints`）一致：未分组单列索引按列
 /// 独立成组，`index_group`/`unique_group` 各自聚合。
 /// 建表配套步骤：与 `CreateTableExecutor` 的 DDL 序列对齐，把建表 DDL
-/// 不覆盖的部分拆成前置（EXTENSION、枚举类型）与后置（create_hypertable）
-/// 两组。`MigrationStep::CreateTable` 的渲染只含 CREATE TABLE/索引 DDL；
+/// 不覆盖的部分拆成前置（EXTENSION、枚举类型）与后置（create_hypertable、
+/// `#[columnstore]` 超表的列存 DO 块）两组。`MigrationStep::CreateTable` 的渲染只含 CREATE TABLE/索引 DDL；
 /// 建表计划若不带这些步骤，增量路径（含 ensure 对缺失表的自动建表）建出
 /// 的表要么缺枚举类型直接报错，要么是普通表、复验转入原地转换补救
 /// （历史版本此处直接报 Hypertable mismatch 卡死）。后置步骤同时服务
 /// 存量普通表的原地转换（migrate_data => TRUE）。
 /// 返回 `(前置步骤, 后置步骤)`：前置须在 CreateTable 之前执行，后置在其后。
 #[allow(unused_variables)]
+#[cfg_attr(not(feature = "postgresql"), allow(clippy::extra_unused_type_parameters))]
 pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
     db_type: DbType,
     table_name: &str,
@@ -1874,6 +1865,19 @@ pub(crate) fn create_table_bootstrap_steps<T: WritableModel>(
                             "SELECT add_dimension('{table_name}', '{space_column}', number_partitions => {partitions}, if_not_exists => TRUE)"
                         ),
                     });
+                }
+                // 声明 #[columnstore] 的超表：后置步骤追加列存压缩 DO 块（与
+                // CreateTableExecutor 的 DDL 尾部同源幂等），保证保数据重建/
+                // 空表重建后的新表也带上列存；无 route 无 columnstore 声明的
+                // 模型返回 None，路由表行为不变。
+                if T::hypertable_columnstore_config().is_some()
+                    && let Some(columnstore_sql) =
+                        crate::abstract_layer::postgresql_backend::hypertable_columnstore_sql::<T>(
+                            db_type,
+                            table_name,
+                        )
+                {
+                    post.push(MigrationStep::Sql { sql: columnstore_sql });
                 }
                 return (pre, post);
             }
@@ -3306,6 +3310,7 @@ impl Database {
         Ok(rows.into_iter().next().unwrap_or(0).max(0) as u64)
     }
 
+    #[cfg_attr(not(feature = "postgresql"), allow(clippy::extra_unused_type_parameters))]
     async fn validate_hypertable_for_migration<T: WritableModel>(&self) -> crate::Result<()> {
         match self {
             #[cfg(feature = "questdb")]
@@ -3762,6 +3767,7 @@ mod create_table_bootstrap_tests {
                 check: None,
                 hypertable: Some(std::time::Duration::from_secs(7 * 86_400)),
                 hypertable_space: None,
+                columnstore: None,
                 compress: false,
                 compression: None,
                 index_method: None,
@@ -3792,6 +3798,7 @@ mod create_table_bootstrap_tests {
                 check: None,
                 hypertable: None,
                 hypertable_space: Some(4),
+                columnstore: None,
                 compress: false,
                 compression: None,
                 index_method: None,
@@ -3822,6 +3829,7 @@ mod create_table_bootstrap_tests {
                 check: None,
                 hypertable: None,
                 hypertable_space: None,
+                columnstore: None,
                 compress: false,
                 compression: None,
                 index_method: None,

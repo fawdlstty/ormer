@@ -19,6 +19,7 @@ use proc_macro::TokenStream;
         default,
         check,
         hypertable,
+        columnstore,
         compress,
         mysql,
         postgresql,
